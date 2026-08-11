@@ -35,16 +35,31 @@ services:
       # on the *Navidrome* container so AudioMuse's newest-albums scan surfaces
       # them. See CLAUDE.md.
 
-      # ── Credentials (set these — do not hardcode) ─────────────────────────
-      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
-      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
-      NAVIDROME_URL: "${NAVIDROME_URL}"
-      NAVIDROME_USER: "${NAVIDROME_USER}"
-      NAVIDROME_PASSWORD: "${NAVIDROME_PASSWORD}"
-      SLSKD_URL: "${SLSKD_URL}"
-      SLSKD_API_KEY: "${SLSKD_API_KEY}"
-      LISTENBRAINZ_USER: "${LISTENBRAINZ_USER}"
-      MBZ_CONTACT: "${MBZ_CONTACT}"
+      # ── Credentials and integration (from .env — see .env.example) ────────
+      # `${VAR:-}` rather than `${VAR}` so an unset optional var is simply empty
+      # instead of emitting a compose warning on every command.
+      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+      NAVIDROME_URL: "${NAVIDROME_URL:-}"
+      NAVIDROME_USER: "${NAVIDROME_USER:-}"
+      NAVIDROME_PASSWORD: "${NAVIDROME_PASSWORD:-}"
+      SLSKD_URL: "${SLSKD_URL:-}"
+      SLSKD_API_KEY: "${SLSKD_API_KEY:-}"
+      LISTENBRAINZ_USER: "${LISTENBRAINZ_USER:-}"
+      MBZ_CONTACT: "${MBZ_CONTACT:-}"
+
+      # navi-connect hub push-refresh. Without these the bot still works; open
+      # client pages just won't refresh themselves when a download lands.
+      LB_BOT_HUB_URL: "${LB_BOT_HUB_URL:-}"
+      LB_BOT_HUB_TOKEN: "${LB_BOT_HUB_TOKEN:-}"
+
+      # Optional enrichment.
+      LASTFM_API_KEY: "${LASTFM_API_KEY:-}"
+      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
+      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
+
+      # Tuning (commented out in .env.example; defaults apply when unset).
+      LB_BOT_INDEX_TTL_DAYS: "${LB_BOT_INDEX_TTL_DAYS:-30}"
     volumes:
       - /mnt/user/appdata/lb-bot:/config
       - /mnt/user/appdata/slskd/downloads:/downloads

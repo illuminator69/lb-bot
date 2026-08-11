@@ -201,8 +201,14 @@ python listenbrainz_bot.py                 # starts bot + web UI on :8899
 
 ## Configuration (environment variables)
 
-Credentials must be supplied via env (compose reads them from the host env). Do
-not hardcode.
+Copy **`.env.example`** to `.env` beside `docker-compose.yml` and fill it in;
+Compose picks it up automatically. `.env` is gitignored — nothing here belongs in
+the repo, and every secret-bearing variable defaults to empty in the code.
+
+```bash
+cp .env.example .env    # then edit
+docker compose up -d
+```
 
 **Credentials / connections**
 

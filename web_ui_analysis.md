@@ -24,7 +24,7 @@ When a download is started from a different source than the auto-picked suggesti
 1. **Stale Metadata Display:** The UI displays metadata (format, bitrate, size) from the client-side optimistic `chosenSrc` state, rather than matching the active download's actual peer. If the server fails over from a 31MB OPUS source to a 78MB FLAC source, the UI will continue to claim it is downloading the OPUS file.
    * **Fix:** Resolve the active source dynamically by matching the active transfer's username against the source list:
      `const activeSrc = sources.find(s => s.peer === mine[0]?.username) || chosenSrc`.
-2. **Stuck Progress Bar (0%):** On starting a download, the progress bar remains stuck at `0%` and doesn't move. This happens because [App.jsx](file:///c:/Users/icher/Lb-bot-missing/web/src/App.jsx#L175) only fetches `/api/transfers` if the *previous* state's summary indicated active downloads. Since `summary` is on a slow 5s loop, the transfers query is blocked on first load.
+2. **Stuck Progress Bar (0%):** On starting a download, the progress bar remains stuck at `0%` and doesn't move. This happens because [App.jsx](./web/src/App.jsx#L175) only fetches `/api/transfers` if the *previous* state's summary indicated active downloads. Since `summary` is on a slow 5s loop, the transfers query is blocked on first load.
    * **Fix:** Unblock the transfers API fetch if any album in the gaps list has a status of `'downloading'`:
      `if (!ui.summary || ... || ui.gaps?.items?.some(g => g.status === 'downloading'))`.
 
@@ -33,7 +33,7 @@ When a download is started from a different source than the auto-picked suggesti
 ## 2. Visual & Accessibility (Color Contrast) Bugs
 
 ### ❌ Unreadable Green Buttons under Light Theme
-The theme generator in [tokens.js](file:///c:/Users/icher/Lb-bot-missing/web/src/lib/tokens.js#L62) hardcodes `--green-on` to `#0f2019` (a very dark green) for both Light and Dark themes:
+The theme generator in [tokens.js](./web/src/lib/tokens.js#L62) hardcodes `--green-on` to `#0f2019` (a very dark green) for both Light and Dark themes:
 ```javascript
 '--green': green, '--green-on': '#0f2019', ...
 ```
@@ -45,11 +45,11 @@ style={{ background: 'var(--green)', color: 'var(--green-on)' }}
 * **Light Theme:** Background is `#3f8f66` (dark green), text is `#0f2019` (dark) $\rightarrow$ **Very Low Contrast (~2.5:1)** $\rightarrow$ **Fail (Unreadable)**.
 
 > [!TIP]  
-> **Fix:** Make `--green-on` dynamic in [tokens.js](file:///c:/Users/icher/Lb-bot-missing/web/src/lib/tokens.js):
+> **Fix:** Make `--green-on` dynamic in [tokens.js](./web/src/lib/tokens.js):
 > `theme === 'dark' ? '#0f2019' : '#ffffff'`.
 
 ### ❌ Monospace Bitrate Text Overflow in `SourceRow`
-In `SourceRow` ([ui.jsx](file:///c:/Users/icher/Lb-bot-missing/web/src/components/ui.jsx#L161)), the bitrate and size details are rendered as a single monospace string:
+In `SourceRow` ([ui.jsx](./web/src/components/ui.jsx#L161)), the bitrate and size details are rendered as a single monospace string:
 ```jsx
 <span className="font-mono text-[14px] font-semibold">
   {[src.bitrate, src.size].filter(Boolean).join(' · ') || '—'}
@@ -69,27 +69,27 @@ In the Downloads/Transfers screen statistics:
 ## 3. Functional & Architectural Inconsistencies
 
 ### ❌ Obsolete Beets Integration (Work Item A Deviation)
-A primary decision in the project roadmap ([CLAUDE.md](file:///c:/Users/icher/Lb-bot-missing/CLAUDE.md#L45)) is the complete removal of **beets** from the placement path, replaced by mutagen-based tagging and direct folder moves. 
+A primary decision in the project roadmap ([CLAUDE.md](./CLAUDE.md#L45)) is the complete removal of **beets** from the placement path, replaced by mutagen-based tagging and direct folder moves. 
 However, the UI still heavily references Beets:
 * The Advanced tab contains an **Import** panel which directly hits `/api/beets/folders` and `/api/beets/import`.
 * When an album is in the `untagged` state, the Artist view displays a button: `Retag with beets →`.
 * Since the backend is dropping beets support and will not perform existing library retagging, this UI is obsolete. It should be renamed to general "Placement" and point to the new beets-free matching endpoints.
 
 ### ❌ Polling Performance issues in Search
-In `Library.jsx`, [SearchResults](file:///c:/Users/icher/Lb-bot-missing/web/src/panels/Library.jsx#L64-L82) sets up a 3-second interval polling the broad `/api/searches` endpoint:
+In `Library.jsx`, [SearchResults](./web/src/panels/Library.jsx#L64-L82) sets up a 3-second interval polling the broad `/api/searches` endpoint:
 ```javascript
 const all = await api('/api/searches')
 const entries = Object.values(all || {}).filter(s => s.query === query)
 ```
 This fetches the history of all searches from the backend on every poll tick, causing high network overhead when search histories grow.
-* **Fix:** The API should expose `/api/searches/{id}` to poll a single search, or the frontend should consume the SSE event stream as planned in [BACKEND_RECOMMENDATIONS.md](file:///c:/Users/icher/Lb-bot-missing/BACKEND_RECOMMENDATIONS.md).
+* **Fix:** The API should expose `/api/searches/{id}` to poll a single search, or the frontend should consume the SSE event stream as planned in [BACKEND_RECOMMENDATIONS.md](./BACKEND_RECOMMENDATIONS.md).
 
 ---
 
 ## 4. General UX & Flow Frictions
 
 ### 🟡 Redundant "Add Music" Actions
-In [Library.jsx](file:///c:/Users/icher/Lb-bot-missing/web/src/panels/Library.jsx#L428-L431), the "Find album" and "Search slskd" buttons perform the exact same action:
+In [Library.jsx](./web/src/panels/Library.jsx#L428-L431), the "Find album" and "Search slskd" buttons perform the exact same action:
 ```jsx
 <button className="primary" disabled={!addQuery.trim()}
   onClick={() => setActiveSearch(addQuery.trim())}>Find album</button>
@@ -117,7 +117,7 @@ If a request is already in progress, any rapid tab clicks are silently ignored, 
 ## 5. Comprehension, Usability & Workflow Analysis
 
 ### ❌ Fresh Tab: Flat Date Organization and Lack of Grouping
-In [Fresh.jsx](file:///c:/Users/icher/Lb-bot-missing/web/src/panels/Fresh.jsx), releases are rendered as a flat grid without temporal division. In a list spanning 90 days, it is highly difficult to distinguish releases from this week, last week, or earlier weeks.
+In [Fresh.jsx](./web/src/panels/Fresh.jsx), releases are rendered as a flat grid without temporal division. In a list spanning 90 days, it is highly difficult to distinguish releases from this week, last week, or earlier weeks.
 * **Improvement:** Group the items dynamically in a `useMemo` call by age (e.g., "This Week", "Last Week", "Two Weeks Ago", "Older") and render them under clear weekly divider headers (`SectionRule`).
 
 ### ❌ Fresh Tab: Double-Download Friction for Owned Albums

@@ -41,7 +41,7 @@ A comprehensive audit of `listenbrainz_bot.py` identified critical root causes f
 
 ### Core Backend (`listenbrainz_bot.py`)
 
-#### [MODIFY] [listenbrainz_bot.py](file:///c:/Users/icher/Lb-bot-missing/listenbrainz_bot.py)
+#### [MODIFY] [listenbrainz_bot.py](./listenbrainz_bot.py)
 
 1. **Path & Track Normalization (`_song_relpath`, `_song_abs_path`, `_duplicate_file_sets`)**
    - Normalize all backslashes `\` to `/` in `_song_relpath` and `_song_abs_path`.

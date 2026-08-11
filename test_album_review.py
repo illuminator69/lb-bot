@@ -899,7 +899,7 @@ class AlbumReviewTests(unittest.TestCase):
 
     def test_settings_cards_redact_secrets_and_private_hosts(self):
         user = {
-            "navidrome_user": "icher",
+            "navidrome_user": "testuser",
             "navidrome_password": "secret-pass",
             "listenbrainz_user": "lbz",
             "playlist_sources": {"weekly": "Weekly"},

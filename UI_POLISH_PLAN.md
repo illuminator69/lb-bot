@@ -102,7 +102,7 @@ Fix the known UI issues in the most efficient order: first misleading data label
 
 ## Coding Agent Prompt
 
-You are working in `C:\Users\icher\Lb-bot-missing`. Implement the UI polish plan above. Start from the bug map paths and line numbers; do not spend time rediscovering patterns.
+You are working in `the lb-bot repo`. Implement the UI polish plan above. Start from the bug map paths and line numbers; do not spend time rediscovering patterns.
 
 Fix in this order:
 

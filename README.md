@@ -27,6 +27,7 @@ is the place to start; it covers both halves.
 - [Architecture at a glance](#architecture-at-a-glance)
   - [The React web frontend](#the-react-web-frontend)
 - [External systems it talks to](#external-systems-it-talks-to)
+- [Library tagging — recommended](#library-tagging--recommended)
 - [Runtime & deployment](#runtime--deployment)
   - [Local development](#local-development)
 - [Configuration (environment variables)](#configuration-environment-variables)
@@ -150,6 +151,36 @@ never move in the default `newest` sort. Placement stamps placed files with a
 current mtime; set **`ND_RECENTLYADDEDBYMODTIME=true` on the Navidrome container**
 so AudioMuse's newest-albums scan surfaces filled albums. The bot does **not**
 call AudioMuse directly — it only makes filled tracks visible to it.
+
+
+## Library tagging — recommended
+
+The discography scan resolves your Navidrome albums against MusicBrainz release-groups
+in two passes (`_match_albums_to_release_groups`): an album carrying a
+`musicBrainzId` claims its release-group exactly; anything untagged falls back to
+fuzzy title matching at `DISCOGRAPHY_TITLE_THRESHOLD` (0.92). It therefore **works
+on an untagged library** — but not equally well.
+
+| Library | Result |
+|---|---|
+| **MusicBrainz-tagged** (Picard or equivalent) | Full function: missing releases **and** per-track gap filling. |
+| **Untagged, consistently named** | Missing releases only. Owned albums classify as `untagged` and completeness is not computed. |
+| **Album-artist names that don't match MusicBrainz** | The artist's library bucket comes back empty, so the whole catalog reads as `missing`. |
+
+Two deliberate design decisions produce those rows:
+
+- In `build_artist_discography`, a release-group whose matched albums carry no
+  `musicBrainzId` is emitted as `status: "untagged"` and **skipped before**
+  `_make_review_group` — completeness computed from an unverified match would be
+  confidently wrong, so it is flagged rather than guessed.
+- The per-artist library bucket uses **exact** normalized album-artist matching. A
+  cross-artist fuzzy fallback used to live there and was removed: when an artist's
+  tags didn't normalize cleanly it handed the scan a different artist's catalog, and
+  every later title match produced a wrong ownership verdict. An empty bucket is the
+  safer failure.
+
+**Recommendation:** tag with Picard before the first scan. Untagged still finds whole
+missing albums; it just won't fill partial ones.
 
 ---
 

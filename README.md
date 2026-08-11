@@ -6,10 +6,45 @@ missing tracks and incomplete albums, acquires the missing audio from Soulseek
 of what's already there. It runs as a single long-lived Python process exposing
 **both a Telegram bot and a React web UI**.
 
+It also has a **second front end you don't run yourself**: through
+[navi-connect](https://github.com/illuminator69/navi-connect), lb-bot's
+discography and gap-filling surface appears *inside* the music players — the
+albums you're missing show up on the artist page next to the ones you own, and a
+download is reviewed and started from there. If that's what you came for, the
+[navi-connect setup guide](https://github.com/illuminator69/navi-connect/blob/main/TESTING-SETUP.md)
+is the place to start; it covers both halves.
+
 > **For agents / new contributors:** this README is the fast orientation.
 > `CLAUDE.md` holds the deep, opinionated design notes (placement internals,
 > beets removal, runtime chown quirks). Read this first, then `CLAUDE.md` before
 > touching the gap-fill / repair pipeline.
+
+---
+
+## Contents
+
+- [What it does (scope)](#what-it-does-scope)
+- [Architecture at a glance](#architecture-at-a-glance)
+  - [The React web frontend](#the-react-web-frontend)
+- [External systems it talks to](#external-systems-it-talks-to)
+- [Runtime & deployment](#runtime--deployment)
+  - [Local development](#local-development)
+- [Configuration (environment variables)](#configuration-environment-variables)
+- [Telegram commands](#telegram-commands)
+- [Web API surface (/api/*)](#web-api-surface-api)
+  - [Keeping the polled path cheap](#keeping-the-polled-path-cheap)
+  - [Watching a fill from outside](#watching-a-fill-from-outside)
+  - [Background work must be visible and must not strand an album](#background-work-must-be-visible-and-must-not-strand-an-album)
+- [How placement works (the important part)](#how-placement-works-the-important-part)
+  - [The placement guard](#the-placement-guard)
+  - [Finding the right album in the first place](#finding-the-right-album-in-the-first-place)
+  - [Source coverage — "is this the right album?"](#source-coverage--is-this-the-right-album)
+  - [Duplicates](#duplicates)
+  - [Navidrome paths vs /music](#navidrome-paths-vs-music)
+- [Active work / status](#active-work--status)
+- [Repo map](#repo-map)
+
+---
 
 ---
 
@@ -918,7 +953,7 @@ the track gone.
   wheels only, and the code falls back to `difflib` if it is missing rather than
   failing to import).
 - `CLAUDE.md` — authoritative design notes; **read before editing the pipeline.**
-- `AGENTS.md`, `BUILD_NOTES.md` — agent instructions and build notes.
+- `AGENTS.md` — agent instructions.
 - `test_album_review.py` — test scaffolding for the album-review flow. Its
   baseline is **32 errors**, all `No module named 'mutagen'` in this
   environment; anything beyond that is yours.

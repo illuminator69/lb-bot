@@ -1,0 +1,18 @@
+# Runtime / state — not source
+*.blb
+lb_bot_state.json
+missing_album_review.json
+__pycache__/
+*.pyc
+.env
+
+# Frontend build output — produced in Docker, not committed
+web/dist/
+web/node_modules/
+
+# Local agent / editor tooling
+.claude/
+.codex/
+.codex-*/
+.vscode/
+.idea/

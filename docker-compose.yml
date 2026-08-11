@@ -1,0 +1,55 @@
+services:
+  lb-bot:
+    image: lb-bot:local
+    restart: unless-stopped
+    # nobody:users — the Unraid convention. Without this the bot runs as root and
+    # every track it places into /music lands root-owned. All three mounts below
+    # must be writable by 99:100 (/downloads too: placement unlinks the source).
+    user: "99:100"
+    environment:
+      # ── State files ─────────────────────────────────────────────────────────
+      LB_BOT_STATE: /config/lb_bot_state.json
+      LB_BOT_REVIEW_FILE: /config/missing_album_review.json
+
+      # ── Web UI ───────────────────────────────────────────────────────────────
+      LB_BOT_WEB: "1"
+      LB_BOT_WEB_HOST: 0.0.0.0
+      LB_BOT_WEB_PORT: "8899"
+
+      # ── Paths ────────────────────────────────────────────────────────────────
+      LB_BOT_MUSIC_DIR: /music
+      SLSKD_DOWNLOAD_DIR: /downloads
+
+      # ── Placement ────────────────────────────────────────────────────────────
+      # 002 -> 0775 dirs / 0664 files, so the `users` group can write what the
+      # bot places. Read by the bot itself (os.umask) — this image has no
+      # s6/linuxserver init that would honour a bare UMASK var.
+      LB_BOT_UMASK: "002"
+
+      # AudioMuse is driven separately (run its own analysis) — the bot just
+      # stamps placed files with a current mtime. Set ND_RECENTLYADDEDBYMODTIME=true
+      # on the *Navidrome* container so AudioMuse's newest-albums scan surfaces
+      # them. See CLAUDE.md.
+
+      # ── Credentials (set these — do not hardcode) ─────────────────────────
+      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+      NAVIDROME_URL: "${NAVIDROME_URL}"
+      NAVIDROME_USER: "${NAVIDROME_USER}"
+      NAVIDROME_PASSWORD: "${NAVIDROME_PASSWORD}"
+      SLSKD_URL: "${SLSKD_URL}"
+      SLSKD_API_KEY: "${SLSKD_API_KEY}"
+      LISTENBRAINZ_USER: "${LISTENBRAINZ_USER}"
+      MBZ_CONTACT: "${MBZ_CONTACT}"
+    volumes:
+      - /mnt/user/appdata/lb-bot:/config
+      - /mnt/user/appdata/slskd/downloads:/downloads
+      - /mnt/user/Music:/music
+    ports:
+      - "8899:8899"
+    networks:
+      - media
+
+networks:
+  media:
+    external: true

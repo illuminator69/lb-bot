@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Space Grotesk', system-ui, sans-serif; background: #17130f; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #2f251c; border-radius: 999px; border: 2px solid #17130f; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</helmet>
+<div style="min-height:100vh;background:#17130f;color:#f2e9dd;font-family:'Space Grotesk',system-ui,sans-serif">
+  <!-- app header -->
+  <div style="position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:18px;padding:14px 24px;background:#1c1611;border-bottom:1px solid #2a2018">
+    <div style="font-size:20px;font-weight:700;color:#f2e9dd;letter-spacing:-.01em">lb-bot</div>
+    <div style="display:flex;gap:4px;background:#120e0a;border:1px solid #2a2018;border-radius:10px;padding:3px">
+      <span style="padding:6px 14px;border-radius:7px;font-size:14px;font-weight:600;background:#e0913f;color:#17130f">Fill gaps</span>
+      <span style="padding:6px 14px;border-radius:7px;font-size:14px;color:#a89684">Downloads</span>
+      <span style="padding:6px 14px;border-radius:7px;font-size:14px;color:#a89684">Library</span>
+      <span style="padding:6px 14px;border-radius:7px;font-size:14px;color:#a89684">System</span>
+    </div>
+    <span style="flex:1"></span>
+    <span style="font-size:13px;color:#6fae8f;display:flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:#6fae8f;display:inline-block"></span>Live · synced 3s ago</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 57px)">
+    <!-- ================= QUEUE RAIL ================= -->
+    <div style="background:#140f0b;border-right:1px solid #2a2018;display:flex;flex-direction:column;height:calc(100vh - 57px);position:sticky;top:57px">
+      <div style="padding:14px 14px 10px">
+        <input placeholder="Search 3,142 albums…" style="width:100%;background:#0f0c09;border:1px solid #2a2018;border-radius:9px;padding:10px 12px;color:#f2e9dd;font:inherit;font-size:13px" />
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+          <span style="font-size:12px;padding:5px 11px;border-radius:999px;background:#e0913f;color:#17130f;font-weight:600;cursor:pointer">Needs you · 46</span>
+          <span style="font-size:12px;padding:5px 11px;border-radius:999px;background:#1c1611;color:#a89684;border:1px solid #2a2018;cursor:pointer">Working · 12</span>
+          <span style="font-size:12px;padding:5px 11px;border-radius:999px;background:#1c1611;color:#a89684;border:1px solid #2a2018;cursor:pointer">Done</span>
+        </div>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:4px 10px 14px">
+        <sc-for list="{{ queue }}" as="q" hint-placeholder-count="6">
+          <div onClick="{{ q.onClick }}" style="{{ q.style }}">
+            <div style="display:flex;gap:11px;align-items:center">
+              <div style="{{ q.art }}"></div>
+              <div style="min-width:0;flex:1">
+                <div style="font-weight:600;font-size:13.5px;color:#f2e9dd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ q.album }}</div>
+                <div style="font-size:12px;color:#a89684;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ q.artist }}</div>
+                <div style="margin-top:5px;display:flex;align-items:center;gap:6px"><span style="{{ q.dot }}"></span><span style="font-size:11.5px;color:{{ q.stColor }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ q.state }}</span></div>
+              </div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <!-- ================= FOCUS PANE ================= -->
+    <div style="padding:28px 34px;background:radial-gradient(130% 90% at 100% 0%,#241a12 0%,#17130f 55%);overflow-y:auto;height:calc(100vh - 57px)">
+      <!-- prev/next -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+        <button onClick="{{ prev }}" style="background:#1c1611;border:1px solid #2a2018;color:#cbb9a4;border-radius:8px;padding:7px 13px;font:inherit;font-size:13px;cursor:pointer">← Prev</button>
+        <span style="font-size:12.5px;color:#7a6a58">{{ posLabel }}</span>
+        <button onClick="{{ next }}" style="background:#1c1611;border:1px solid #2a2018;color:#cbb9a4;border-radius:8px;padding:7px 13px;font:inherit;font-size:13px;cursor:pointer">Next →</button>
+        <span style="flex:1"></span>
+        <button onClick="{{ noop }}" style="background:#1c1611;border:1px solid #2a2018;color:#a89684;border-radius:8px;padding:7px 13px;font:inherit;font-size:13px;cursor:pointer">Skip this album</button>
+        <button onClick="{{ noop }}" title="More" style="background:#1c1611;border:1px solid #2a2018;color:#a89684;border-radius:8px;padding:7px 12px;font:inherit;font-size:13px;cursor:pointer">⋯</button>
+      </div>
+
+      <!-- album hero -->
+      <div style="display:flex;gap:26px;align-items:flex-start">
+        <div style="{{ heroArt }}"></div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#e0913f;font-weight:600">{{ sel.artist }}</div>
+          <div style="font-size:32px;font-weight:700;color:#f2e9dd;line-height:1.08;margin:3px 0 12px">{{ sel.album }}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <span style="font-size:12.5px;padding:4px 11px;border-radius:999px;background:#1c1611;border:1px solid #2a2018;color:#cbb9a4">{{ sel.presentLabel }}</span>
+            <span style="font-size:12.5px;padding:4px 11px;border-radius:999px;background:#1c1611;border:1px solid #2a2018;color:#cbb9a4">canonical set</span>
+            <span style="font-size:12.5px;padding:4px 11px;border-radius:999px;background:#2a1f13;border:1px solid #4a3418;color:#e0913f">{{ sel.missingLabel }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ ACTION CARD (state machine) ============ -->
+
+      <!-- READY: chosen source + get button -->
+      <sc-if value="{{ isReady }}" hint-placeholder-val="{{ true }}">
+        <div style="margin-top:24px;background:#1c1611;border:1px solid #3a2b1a;border-radius:14px;padding:20px">
+          <div style="display:flex;align-items:flex-start;gap:18px">
+            <div style="flex:1">
+              <div style="font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#a89684;font-weight:600;margin-bottom:6px">Next step · fill {{ sel.missingCount }} tracks</div>
+              <div style="font-size:18px;font-weight:600;color:#f2e9dd;margin-bottom:12px">Chosen source</div>
+              <!-- chosen source summary with bitrate + size -->
+              <div style="display:flex;align-items:center;gap:14px;background:#170f0a;border:1px solid #2f2318;border-radius:11px;padding:13px 15px">
+                <div style="width:38px;height:38px;border-radius:8px;background:{{ chosen.badgeBg }};display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;color:{{ chosen.badgeFg }}">{{ chosen.format }}</div>
+                <div style="min-width:0;flex:1">
+                  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                    <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:#f2e9dd;font-weight:600">{{ chosen.bitrate }}</span>
+                    <span style="color:#4a3c2e">·</span>
+                    <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:#f2e9dd;font-weight:600">{{ chosen.size }}</span>
+                    <span style="color:#4a3c2e">·</span>
+                    <span style="font-size:13px;color:#a89684">{{ chosen.peer }}</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap">
+                    <span style="font-size:12px;color:#6fae8f">{{ chosen.coverage }}</span>
+                    <span style="color:#4a3c2e">·</span>
+                    <span style="font-size:12px;color:#a89684">{{ chosen.speed }}</span>
+                    <span style="{{ chosen.recStyle }}">{{ chosen.recLabel }}</span>
+                  </div>
+                </div>
+                <button onClick="{{ openPicker }}" style="background:#241a12;border:1px solid #4a3418;color:#e0913f;border-radius:9px;padding:9px 15px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Change source</button>
+              </div>
+            </div>
+            <button onClick="{{ getMissing }}" style="align-self:stretch;font-size:15px;font-weight:600;padding:0 26px;border-radius:12px;cursor:pointer;white-space:nowrap;border:1px solid #e0913f;background:#e0913f;color:#17130f;min-height:100%">Get {{ sel.missingCount }} tracks →</button>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- PICKING: manual source list -->
+      <sc-if value="{{ isPicking }}" hint-placeholder-val="{{ true }}">
+        <div style="margin-top:24px;background:#1c1611;border:1px solid #3a2b1a;border-radius:14px;padding:20px">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px">
+            <div style="font-size:18px;font-weight:600;color:#f2e9dd">Choose a source</div>
+            <span style="flex:1"></span>
+            <span style="font-size:12.5px;color:#7a6a58">{{ sel.sourceCount }} found on slskd · flac & opus only</span>
+            <button onClick="{{ closePicker }}" style="background:#241a12;border:1px solid #4a3418;color:#cbb9a4;border-radius:9px;padding:8px 14px;font:inherit;font-size:13px;cursor:pointer">Cancel</button>
+          </div>
+          <div style="font-size:12.5px;color:#a89684;margin-bottom:14px">Ranked by coverage, format and speed. The top one is auto-selected — pick any other if you prefer.</div>
+          <sc-for list="{{ sources }}" as="s" hint-placeholder-count="4">
+            <div style="{{ s.rowStyle }}">
+              <div style="width:44px;height:44px;border-radius:9px;background:{{ s.badgeBg }};display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;color:{{ s.badgeFg }};flex-shrink:0">{{ s.format }}</div>
+              <div style="min-width:0;flex:1">
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                  <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:#f2e9dd;font-weight:600">{{ s.bitrate }}</span>
+                  <span style="color:#4a3c2e">·</span>
+                  <span style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:#f2e9dd;font-weight:600">{{ s.size }}</span>
+                  <span style="{{ s.recStyle }}">{{ s.recLabel }}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap">
+                  <span style="font-size:12.5px;color:#a89684">{{ s.peer }}</span>
+                  <span style="color:#4a3c2e">·</span>
+                  <span style="font-size:12.5px;color:#a89684">{{ s.speed }}</span>
+                  <span style="color:#4a3c2e">·</span>
+                  <span style="font-size:12.5px;color:{{ s.covColor }}">{{ s.coverage }}</span>
+                </div>
+                <div style="{{ s.flagWrap }}"><sc-for list="{{ s.flags }}" as="f" hint-placeholder-count="1"><span style="font-size:11px;padding:2px 8px;border-radius:999px;background:#2a1f13;border:1px solid #4a3418;color:#e4ac4e;margin-right:5px">{{ f }}</span></sc-for></div>
+              </div>
+              <button onClick="{{ s.choose }}" style="{{ s.chooseBtn }}">{{ s.chooseLabel }}</button>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <!-- DOWNLOADING -->
+      <sc-if value="{{ isDownloading }}" hint-placeholder-val="{{ true }}">
+        <div style="margin-top:24px;background:#1c1611;border:1px solid #3a2b1a;border-radius:14px;padding:20px">
+          <div style="display:flex;align-items:center;gap:16px">
+            <div style="flex:1">
+              <div style="font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#6fae8f;font-weight:600;margin-bottom:3px">Working</div>
+              <div style="font-size:18px;font-weight:600;color:#f2e9dd">Getting {{ sel.missingCount }} tracks from {{ chosen.peer }}</div>
+              <div style="font-size:13px;color:#a89684;margin-top:2px">{{ chosen.format }} · {{ chosen.bitrate }} · {{ chosen.size }} — will file into the album folder automatically when done.</div>
+            </div>
+            <button onClick="{{ cancel }}" style="background:#241a12;border:1px solid #4a3418;color:#e0913f;border-radius:10px;padding:11px 18px;font:inherit;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
+          </div>
+          <div style="height:7px;border-radius:999px;background:#0f0c09;overflow:hidden;margin-top:16px"><span style="display:block;height:100%;width:46%;background:linear-gradient(90deg,#e0913f,#f0b56a)"></span></div>
+          <div style="font-size:12px;color:#a89684;margin-top:7px;font-family:'IBM Plex Mono',monospace">36.1 / 78.4 MB · 46% · 4.2 MB/s · ~10s left</div>
+        </div>
+      </sc-if>
+
+      <!-- FAILED -->
+      <sc-if value="{{ isFailed }}" hint-placeholder-val="{{ true }}">
+        <div style="margin-top:24px;background:#221310;border:1px solid #5a2a22;border-radius:14px;padding:20px">
+          <div style="display:flex;align-items:flex-start;gap:14px">
+            <div style="width:34px;height:34px;border-radius:50%;background:#3a1a15;border:1px solid #5a2a22;display:flex;align-items:center;justify-content:center;color:#e88;font-size:18px;flex-shrink:0">!</div>
+            <div style="flex:1">
+              <div style="font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#e88;font-weight:600;margin-bottom:3px">Download failed</div>
+              <div style="font-size:18px;font-weight:600;color:#f2e9dd">{{ sel.failReason }}</div>
+              <div style="font-size:13px;color:#c8a99f;margin-top:4px">{{ sel.failDetail }}</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px">
+            <button onClick="{{ tryNext }}" style="font-size:14px;font-weight:600;padding:11px 20px;border-radius:11px;cursor:pointer;border:1px solid #6fae8f;background:#6fae8f;color:#12201a">Try next best source →</button>
+            <button onClick="{{ openPicker }}" style="font-size:14px;font-weight:600;padding:11px 18px;border-radius:11px;cursor:pointer;border:1px solid #4a3418;background:#241a12;color:#e0913f">Pick a source manually</button>
+            <button onClick="{{ getMissing }}" style="font-size:14px;font-weight:500;padding:11px 18px;border-radius:11px;cursor:pointer;border:1px solid #2a2018;background:#1c1611;color:#a89684">Retry same peer</button>
+          </div>
+          <div style="margin-top:14px;background:#170f0a;border:1px solid #2f2318;border-radius:10px;padding:11px 13px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#a89684;line-height:1.7">
+            <div><span style="color:#7a6a58">14:02:11</span> enqueue @{{ chosen.peerRaw }} — accepted</div>
+            <div><span style="color:#7a6a58">14:02:41</span> queued remotely · position 4</div>
+            <div style="color:#e88"><span style="color:#7a6a58">14:04:11</span> no bytes for 90s — watchdog cancelled, advancing</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ============ MISSING TRACKS ============ -->
+      <div style="margin-top:24px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+          <div style="font-size:13px;font-weight:600;color:#cbb9a4;letter-spacing:.02em">MISSING TRACKS</div>
+          <span style="flex:1;height:1px;background:#2a2018"></span>
+          <button onClick="{{ noop }}" style="font-size:12px;color:#a89684;background:none;border:none;cursor:pointer">Reconcile downloaded files</button>
+        </div>
+        <sc-for list="{{ tracks }}" as="t" hint-placeholder-count="2">
+          <div style="display:flex;align-items:center;gap:14px;padding:11px 14px;border-radius:10px;background:#170f0a;margin-bottom:7px;border:1px solid #221913">
+            <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#7a6a58;width:24px">{{ t.pos }}</span>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:14px;color:#f2e9dd">{{ t.title }}</div>
+              <div style="font-size:11.5px;color:#7a6a58">{{ t.artist }}</div>
+            </div>
+            <span style="{{ t.chip }}">{{ t.state }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1360,&quot;height&quot;:860}}">
+class Component extends DCLogic {
+  state = { selId:'ir', modes:{}, chosen:{} }
+
+  albums() {
+    const mkSrc = (id, format, bitrate, size, peer, speed, coverage, flags, rec) => ({
+      id, format, bitrate, size, peer, speed, coverage, flags: flags||[], rec: rec||null,
+    })
+    return [
+      {
+        id:'ir', artist:'Radiohead', album:'In Rainbows', present:8, total:10, base:'ready',
+        grad:'linear-gradient(135deg,#3a2b1e,#6b4a2f)',
+        tracks:[ {pos:'03',title:'Nude'}, {pos:'07',title:'Reckoner'} ],
+        sources:[
+          mkSrc('s1','FLAC','1006 kbps','78.4 MB','@lossless_lord','4.2 MB/s','full album · 2/2 tracks',[], 'best'),
+          mkSrc('s2','FLAC','989 kbps','74.1 MB','@flac_vault','1.1 MB/s','full album · 2/2 tracks',['slow peer']),
+          mkSrc('s3','OPUS','256 kbps','22.8 MB','@quickshare','6.0 MB/s','full album · 2/2 tracks',['not flac']),
+          mkSrc('s4','FLAC','2916 kbps','214 MB','@audiophile_x','0.5 MB/s','full · 24-bit/96',['very large','slow peer']),
+          mkSrc('s5','FLAC','1011 kbps','41.0 MB','@halfshare','3.4 MB/s','partial · 1/2 tracks',['missing Reckoner']),
+        ],
+      },
+      {
+        id:'saw', artist:'Aphex Twin', album:'Selected Ambient Works 85-92', present:11, total:13, base:'picking',
+        grad:'linear-gradient(135deg,#2e2436,#4a3a5e)',
+        tracks:[ {pos:'05',title:'Heliosphan'}, {pos:'09',title:'Schottkey 7th Path'} ],
+        sources:[
+          mkSrc('s1','FLAC','998 kbps','96.2 MB','@ambient_arc','3.1 MB/s','full album · 2/2 tracks',[], 'best'),
+          mkSrc('s2','OPUS','256 kbps','29.4 MB','@fastpeer','7.2 MB/s','full album · 2/2 tracks',['not flac']),
+          mkSrc('s3','FLAC','1004 kbps','61.8 MB','@partialp','2.0 MB/s','partial · 1/2 tracks',['missing 1 track']),
+        ],
+      },
+      {
+        id:'unt', artist:'Burial', album:'Untrue', present:12, total:14, base:'downloading',
+        grad:'linear-gradient(135deg,#1e2a30,#33505a)',
+        tracks:[ {pos:'04',title:'Archangel'}, {pos:'11',title:'Near Dark'} ],
+        sources:[ mkSrc('s1','FLAC','1010 kbps','88.0 MB','@peer_2481','4.2 MB/s','full album · 2/2 tracks',[], 'best') ],
+      },
+      {
+        id:'mez', artist:'Massive Attack', album:'Mezzanine', present:9, total:11, base:'failed',
+        grad:'linear-gradient(135deg,#2a1c1c,#4a2e2e)',
+        failReason:'Peer went offline mid-transfer',
+        failDetail:'@slowpoke_99 accepted the request but sent no data for 90 seconds. The stall watchdog cancelled it — nothing was left half-downloaded.',
+        tracks:[ {pos:'04',title:'Dissolved Girl'}, {pos:'08',title:'Group Four'} ],
+        sources:[
+          mkSrc('s1','FLAC','1002 kbps','82.6 MB','@bristol_sound','3.8 MB/s','full album · 2/2 tracks',[], 'next best'),
+          mkSrc('s2','FLAC','995 kbps','80.1 MB','@triphop_hoard','1.4 MB/s','full album · 2/2 tracks',['slow peer']),
+          mkSrc('s3','OPUS','256 kbps','24.0 MB','@quickshare','6.5 MB/s','full album · 2/2 tracks',['not flac']),
+        ],
+      },
+      {
+        id:'geo', artist:'Boards of Canada', album:'Geogaddi', present:21, total:23, base:'ready',
+        grad:'linear-gradient(135deg,#2c2a1a,#54502e)',
+        tracks:[ {pos:'12',title:'The Devil Is in the Details'}, {pos:'19',title:'Dawn Chorus'} ],
+        sources:[
+          mkSrc('s1','FLAC','1008 kbps','142 MB','@warp_archivist','2.9 MB/s','full album · 2/2 tracks',[], 'best'),
+          mkSrc('s2','OPUS','256 kbps','34.1 MB','@fastpeer','6.8 MB/s','full album · 2/2 tracks',['not flac']),
+        ],
+      },
+    ]
+  }
+
+  renderVals() {
+    const noop = () => {}
+    const albums = this.albums()
+    const sel = albums.find(a => a.id === this.state.selId) || albums[0]
+    const idx = albums.indexOf(sel)
+    const mode = this.state.modes[sel.id] ?? sel.base
+    const chosenId = this.state.chosen[sel.id] ?? sel.sources[0].id
+    const chosenSrc = sel.sources.find(s => s.id === chosenId) || sel.sources[0]
+
+    const toneColor = { need:'#e0913f', work:'#6fae8f', decide:'#d9b45f', fail:'#d9705f' }
+    const modeTone = (m) => m==='downloading'?'work':m==='failed'?'fail':m==='picking'?'need':m==='ready'?'need':'need'
+    const stateWord = (a) => {
+      const m = this.state.modes[a.id] ?? a.base
+      const miss = a.total - a.present
+      if (m==='downloading') return `downloading ${miss} of ${miss}`
+      if (m==='failed') return 'failed — needs recovery'
+      if (m==='picking') return 'choosing a source'
+      return `${miss} missing · source ready`
+    }
+
+    const queue = albums.map(a => {
+      const active = a.id === sel.id
+      const tone = modeTone(this.state.modes[a.id] ?? a.base)
+      return {
+        album:a.album, artist:a.artist, state: stateWord(a), stColor: toneColor[tone],
+        onClick: () => this.setState({ selId: a.id }),
+        style:`padding:11px;border-radius:11px;margin-bottom:6px;cursor:pointer;border:1px solid ${active?'#4a3418':'transparent'};background:${active?'#1f1710':'transparent'}`,
+        art:`width:44px;height:44px;border-radius:8px;flex-shrink:0;background:${a.grad}`,
+        dot:`width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${toneColor[tone]};display:inline-block`,
+      }
+    })
+
+    const badge = (fmt) => fmt==='FLAC' ? ['#1a2620','#6fae8f'] : ['#2a2213','#e4ac4e']
+    const recPill = (rec) => {
+      if (rec==='best') return `font-size:11px;padding:2px 9px;border-radius:999px;background:#1a2620;border:1px solid #2f5a48;color:#6fae8f;font-weight:600;margin-left:2px`
+      if (rec==='next best') return `font-size:11px;padding:2px 9px;border-radius:999px;background:#1a2620;border:1px solid #2f5a48;color:#6fae8f;font-weight:600;margin-left:2px`
+      return 'display:none'
+    }
+    const chosen = {
+      format: chosenSrc.format, bitrate: chosenSrc.bitrate, size: chosenSrc.size,
+      peer: chosenSrc.peer, peerRaw: chosenSrc.peer.replace('@',''),
+      coverage: chosenSrc.coverage, speed: chosenSrc.speed,
+      badgeBg: badge(chosenSrc.format)[0], badgeFg: badge(chosenSrc.format)[1],
+      recLabel: chosenSrc.rec==='best'?'✓ recommended':'', recStyle: recPill(chosenSrc.rec),
+    }
+
+    const covColor = (c) => c.startsWith('partial') ? '#e4ac4e' : '#6fae8f'
+    const sources = sel.sources.map(s => {
+      const isChosen = s.id === chosenId
+      const [bg,fg] = badge(s.format)
+      return {
+        format:s.format, bitrate:s.bitrate, size:s.size, peer:s.peer, speed:s.speed, coverage:s.coverage,
+        covColor: covColor(s.coverage), badgeBg:bg, badgeFg:fg,
+        recLabel: s.rec ? (s.rec==='best'?'✓ auto-pick':'✓ next best') : '', recStyle: recPill(s.rec),
+        flags: s.flags, flagWrap: s.flags.length ? 'margin-top:7px' : 'display:none',
+        rowStyle:`display:flex;align-items:flex-start;gap:14px;padding:14px;border-radius:12px;margin-bottom:8px;background:${isChosen?'#211610':'#170f0a'};border:1px solid ${isChosen?'#5a3f14':'#2a2018'}`,
+        choose: () => this.setState(st => ({ chosen:{...st.chosen, [sel.id]:s.id}, modes:{...st.modes, [sel.id]:'ready'} })),
+        chooseLabel: isChosen ? 'Selected' : 'Use this →',
+        chooseBtn:`align-self:center;font-size:13px;font-weight:600;padding:10px 16px;border-radius:10px;cursor:pointer;white-space:nowrap;border:1px solid ${isChosen?'#5a3f14':'#e0913f'};background:${isChosen?'#241a12':'#e0913f'};color:${isChosen?'#e0913f':'#17130f'}`,
+      }
+    })
+
+    const setMode = (m) => this.setState(st => ({ modes:{...st.modes, [sel.id]:m} }))
+    const tryNext = () => {
+      const nextSrc = sel.sources[1] || sel.sources[0]
+      this.setState(st => ({ chosen:{...st.chosen, [sel.id]:nextSrc.id}, modes:{...st.modes, [sel.id]:'downloading'} }))
+    }
+
+    const trackChip = (m) => {
+      const map = {
+        ready:['#2a1f13','#e0913f','ready'], downloading:['#1a2620','#6fae8f','downloading'],
+        queued:['#1a2620','#6fae8f','queued'], failed:['#2a1414','#e88','failed'],
+      }
+      const st = m==='downloading'?'downloading':m==='failed'?'failed':m==='ready'||m==='picking'?'ready':'ready'
+      const [bg,fg,label] = map[st] || map.ready
+      return { chip:`font-size:11.5px;padding:3px 11px;border-radius:999px;font-weight:600;background:${bg};color:${fg}`, label }
+    }
+    const tc = trackChip(mode)
+    const tracks = sel.tracks.map((t,i) => {
+      let state = tc.label
+      if (mode==='downloading') state = i===0 ? 'downloading' : 'queued'
+      if (mode==='failed') state = 'failed'
+      const st = state==='downloading'||state==='queued'?['#1a2620','#6fae8f']:state==='failed'?['#2a1414','#e88']:['#2a1f13','#e0913f']
+      return { pos:t.pos, title:t.title, artist:sel.artist, state,
+        chip:`font-size:11.5px;padding:3px 11px;border-radius:999px;font-weight:600;background:${st[0]};color:${st[1]}` }
+    })
+
+    return {
+      noop,
+      queue,
+      sel: {
+        artist:sel.artist, album:sel.album,
+        presentLabel:`${sel.present} of ${sel.total} present`,
+        missingLabel:`${sel.total-sel.present} tracks missing`,
+        missingCount: sel.total-sel.present,
+        sourceCount: sel.sources.length,
+        failReason: sel.failReason || 'Download failed',
+        failDetail: sel.failDetail || '',
+      },
+      heroArt:`width:154px;height:154px;border-radius:13px;background:${sel.grad};flex-shrink:0;box-shadow:0 14px 34px -10px rgba(0,0,0,.65);display:flex;align-items:flex-end;padding:11px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:rgba(255,255,255,.55)`,
+      posLabel:`Album ${idx+1} of 46 that need you`,
+      prev: () => this.setState({ selId: albums[Math.max(0, idx-1)].id }),
+      next: () => this.setState({ selId: albums[Math.min(albums.length-1, idx+1)].id }),
+      isReady: mode==='ready', isPicking: mode==='picking', isDownloading: mode==='downloading', isFailed: mode==='failed',
+      chosen, sources, tracks,
+      openPicker: () => setMode('picking'), closePicker: () => setMode('ready'),
+      getMissing: () => setMode('downloading'), cancel: () => setMode('ready'),
+      tryNext,
+    }
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root {
+    color-scheme: light dark;
+    --line: #d7dce2; --ink: #17202a; --muted: #657282;
+    --bg: #f5f7f9; --panel: #fff; --accent: #1f7a6b;
+    --accent-fg: #fff; --bad: #a33232; --warn: #9a6500;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --line: #303842; --ink: #edf2f7; --muted: #a7b0bc;
+      --bg: #11161c; --panel: #181f27; --accent: #58b8a8;
+      --bad: #e06b6b; --warn: #e4ac4e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+</style>
+</helmet>
+<div style="min-height:100vh;background:var(--bg);color:var(--ink)">
+  <header style="position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;gap:14px;border-bottom:1px solid var(--line);background:var(--panel);padding:12px 16px">
+    <h1 style="font-size:18px;margin:0 8px 0 0">lb-bot</h1>
+    <nav style="display:flex;flex-wrap:wrap;gap:6px">
+      <sc-for list="{{ sections }}" as="s" hint-placeholder-count="4">
+        <button onClick="{{ s.onClick }}" style="{{ s.style }}">{{ s.key }}</button>
+      </sc-for>
+    </nav>
+    <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Refresh</button>
+    <span style="font-size:12px;color:var(--muted)">Updated 12:44:07 PM</span>
+    <span style="font-size:12px;color:var(--muted)">(3s ago)</span>
+  </header>
+
+  <main style="padding:18px;max-width:1400px;margin:0 auto">
+    <!-- OVERVIEW -->
+    <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
+      <h2 style="margin:0 0 12px;font-size:20px">Overview</h2>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+        <sc-for list="{{ actionCards }}" as="c" hint-placeholder-count="4">
+          <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05);display:flex;flex-direction:column;gap:8px;min-height:150px">
+            <b>{{ c.title }}</b>
+            <h2 style="font-size:34px;margin:0">{{ c.count }}</h2>
+            <div style="font-size:12px;color:var(--muted)">{{ c.detail }}</div>
+            <span style="flex:1 1 auto"></span>
+            <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">{{ c.action }}</button>
+          </div>
+        </sc-for>
+      </div>
+      <h3 style="margin:18px 0 8px;font-size:15px">Recent state</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+        <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)"><b>Last scan</b><div style="font-size:12px;color:var(--muted)">Scanned 4,213 albums · 187 with missing tracks</div></div>
+        <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)"><b>Last import</b><div style="font-size:12px;color:var(--muted)">Placed 3 files into Radiohead — In Rainbows</div></div>
+        <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)"><b>Last error</b><div style="color:var(--bad)">slskd peer rejected: user offline</div></div>
+      </div>
+      <h3 style="margin:18px 0 8px;font-size:15px">Recent tasks</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+        <sc-for list="{{ tasks }}" as="t" hint-placeholder-count="3">
+          <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)">
+            <b>{{ t.label }}</b>
+            <div style="height:8px;margin:6px 0;overflow:hidden;border-radius:999px;background:color-mix(in srgb,var(--line) 40%,transparent)"><span style="{{ t.barStyle }}"></span></div>
+            <div style="font-size:12px;color:var(--muted)">{{ t.status }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <!-- ALBUM REVIEW -->
+    <sc-if value="{{ isReview }}" hint-placeholder-val="{{ true }}">
+      <h2 style="margin:0 0 12px;font-size:20px">Album Review</h2>
+      <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+        <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" /> fuzzy</label>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">Scan duplicates</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">Scan missing for all albums</button>
+        <span style="flex:1 1 auto"></span>
+        <select style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;font:inherit"><option>All (187)</option></select>
+        <select style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;font:inherit"><option>Sort: Next action</option></select>
+      </div>
+      <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Next actionable</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Next failed</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Next needs source</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Next needs match</button>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);align-items:start;gap:14px">
+        <aside style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05);display:flex;flex-direction:column;overflow:hidden">
+          <input placeholder="Search artist, album, status, track, MBID" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;font:inherit;margin-bottom:8px" />
+          <div style="min-height:220px;flex:1;overflow-y:auto">
+            <div style="font-size:12px;color:var(--muted);padding:4px 10px">showing 6 of 187</div>
+            <sc-for list="{{ groups }}" as="g" hint-placeholder-count="6">
+              <div onClick="{{ g.onClick }}" style="{{ g.itemStyle }}">
+                <b>{{ g.artist }} - {{ g.album }}</b>
+                <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:2px">
+                  <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ g.nextLabel }}</span>
+                  <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ g.missingCount }} missing</span>
+                </div>
+                <div style="font-size:12px;color:var(--muted)">{{ g.subline }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </aside>
+        <section>
+          <div style="position:sticky;top:0;z-index:1;display:flex;flex-wrap:wrap;align-items:center;gap:8px;border-bottom:1px solid var(--line);background:var(--bg);padding:8px 0;margin-bottom:12px">
+            <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Previous</button>
+            <span style="font-size:12px;color:var(--muted)">{{ selIndex }} of 187</span>
+            <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Next</button>
+            <span style="flex:1 1 auto"></span>
+            <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">{{ sel.primary }}</button>
+            <button onClick="{{ noop }}" title="More actions" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">⋯</button>
+          </div>
+          <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)">
+            <h3 style="margin:0 0 8px;font-size:15px">{{ sel.artist }} - {{ sel.album }}</h3>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+              <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ sel.nextLabel }}</span>
+              <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ sel.groupType }}</span>
+              <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ sel.present }} present</span>
+              <span style="display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px">{{ sel.nextAction }}</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));margin:12px 0;gap:8px">
+              <sc-for list="{{ sel.steps }}" as="st" hint-placeholder-count="5">
+                <div style="{{ st.style }}"><b>{{ st.label }}</b><div style="font-size:12px;color:var(--muted)">{{ st.detail }}</div></div>
+              </sc-for>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+              <span style="font-size:12px;color:var(--muted)">Match completed downloads</span>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">Auto match</button>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Manual match</button>
+            </div>
+          </div>
+
+          <details open style="margin-top:10px;border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:10px">
+            <summary style="cursor:pointer;font-weight:600">Missing tracks — {{ sel.missingSummary }}</summary>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px">
+              <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" /> select all</label>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Batch approve</button>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Batch skip</button>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Reset</button>
+              <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Reconcile downloaded files</button>
+            </div>
+            <table style="width:100%;border-collapse:collapse;margin-top:8px">
+              <thead><tr>
+                <th style="border-bottom:1px solid var(--line);padding:7px;text-align:left;font-size:12px;font-weight:600;color:var(--muted)"></th>
+                <th style="border-bottom:1px solid var(--line);padding:7px;text-align:left;font-size:12px;font-weight:600;color:var(--muted)">#</th>
+                <th style="border-bottom:1px solid var(--line);padding:7px;text-align:left;font-size:12px;font-weight:600;color:var(--muted)">Track</th>
+                <th style="border-bottom:1px solid var(--line);padding:7px;text-align:left;font-size:12px;font-weight:600;color:var(--muted)">Decision</th>
+              </tr></thead>
+              <tbody>
+                <sc-for list="{{ sel.missingTracks }}" as="t" hint-placeholder-count="4">
+                  <tr>
+                    <td style="border-bottom:1px solid var(--line);padding:7px;vertical-align:top"><input type="checkbox" /></td>
+                    <td style="border-bottom:1px solid var(--line);padding:7px;vertical-align:top">{{ t.position }}</td>
+                    <td style="border-bottom:1px solid var(--line);padding:7px;vertical-align:top">{{ t.name }}</td>
+                    <td style="border-bottom:1px solid var(--line);padding:7px;vertical-align:top"><span style="{{ t.chipStyle }}">{{ t.decision }}</span></td>
+                  </tr>
+                </sc-for>
+              </tbody>
+            </table>
+          </details>
+
+          <details style="margin-top:10px;border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:10px">
+            <summary style="cursor:pointer;font-weight:600">Sources — best source covers full release</summary>
+          </details>
+        </section>
+      </div>
+    </sc-if>
+
+    <!-- GET MUSIC / DOWNLOADS -->
+    <sc-if value="{{ isDownloads }}" hint-placeholder-val="{{ true }}">
+      <h2 style="margin:0 0 12px;font-size:20px">Get Music</h2>
+      <div style="margin-bottom:14px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">By release</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">By search</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">From playlist</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 10px;cursor:pointer;font:inherit">Downloads</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Needs placement</button>
+      </div>
+      <h2 style="margin:0 0 12px;font-size:20px">Downloads / Queue</h2>
+      <div style="margin-bottom:12px;display:flex;gap:8px"><button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Clear finished</button></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+        <sc-for list="{{ islands }}" as="isl" hint-placeholder-count="4">
+          <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05);display:flex;flex-direction:column;max-height:70vh;min-height:240px">
+            <h3 style="margin:0 0 8px;font-size:15px">{{ isl.title }}</h3>
+            <div style="min-height:0;flex:1;overflow-y:auto">
+              <sc-for list="{{ isl.rows }}" as="r" hint-placeholder-count="3">
+                <div style="margin-bottom:10px">
+                  <b>{{ r.title }}</b>
+                  <div style="font-size:12px;color:var(--muted)">{{ r.sub }}</div>
+                  <div style="height:8px;margin:6px 0;overflow:hidden;border-radius:999px;background:color-mix(in srgb,var(--line) 40%,transparent)"><span style="{{ r.barStyle }}"></span></div>
+                  <div style="font-size:12px;color:var(--muted)">{{ r.status }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <!-- SYSTEM / DIAGNOSTICS -->
+    <sc-if value="{{ isSystem }}" hint-placeholder-val="{{ true }}">
+      <h2 style="margin:0 0 12px;font-size:20px">System</h2>
+      <h3 style="margin:18px 0 8px;font-size:15px">Health checks</h3>
+      <div style="margin-bottom:12px;display:flex;gap:8px">
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Quick Navidrome scan</button>
+        <button onClick="{{ noop }}" style="border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 10px;cursor:pointer;font:inherit">Full scan</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">
+        <sc-for list="{{ checks }}" as="c" hint-placeholder-count="4">
+          <div style="border-radius:.5rem;border:1px solid var(--line);background:var(--panel);padding:12px;box-shadow:0 1px 2px rgba(0,0,0,.05)">
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px"><b>{{ c.label }}</b><span style="{{ c.pillStyle }}">{{ c.state }}</span></div>
+            <div style="font-size:12px;color:var(--muted)">{{ c.detail }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = { tab: 'Album Review', sel: 'g2' }
+  renderVals() {
+    const tab = this.state.tab
+    const noop = () => {}
+    const navKeys = [['Overview','Overview'],['Library','Album Review'],['Get Music','Downloads'],['System','System']]
+    const btn = (active) => `border-radius:6px;padding:8px 10px;cursor:pointer;font:inherit;border:1px solid ${active?'var(--accent)':'var(--line)'};background:${active?'var(--accent)':'var(--panel)'};color:${active?'var(--accent-fg)':'var(--ink)'}`
+    const sections = navKeys.map(([key, t]) => ({
+      key,
+      style: btn(t === tab || (t === 'Downloads' && tab === 'Downloads') || (key==='Library' && tab==='Album Review')),
+      onClick: () => this.setState({ tab: t }),
+    }))
+
+    const bar = (pct, color) => `display:block;height:100%;width:${pct}%;background:${color||'var(--accent)'};transition:width .3s`
+    const pill = 'display:inline-block;border-radius:999px;border:1px solid var(--line);padding:1px 7px;font-size:12px'
+    const chip = (c) => {
+      const border = c==='failed'?'var(--bad)':['approved','downloaded'].includes(c)?'var(--accent)':['queued','downloading','source_pending'].includes(c)?'var(--warn)':'var(--line)'
+      const col = c==='failed'?'var(--bad)':['approved','downloaded'].includes(c)?'var(--accent)':['queued','downloading','source_pending'].includes(c)?'var(--warn)':'var(--ink)'
+      return `display:inline-block;border-radius:999px;padding:1px 7px;font-size:12px;border:1px solid ${border};color:${col}`
+    }
+
+    const rawGroups = [
+      { id:'g1', artist:'Boards of Canada', album:'Geogaddi', nextLabel:'Pick canonical', nextAction:'Choose release', bucket:'needs_canonical', groupType:'duplicate', present:'21/23', missing:2, type:'album', status:'needs canonical' },
+      { id:'g2', artist:'Radiohead', album:'In Rainbows', nextLabel:'Review missing', nextAction:'Approve tracks', bucket:'has_missing', groupType:'album', present:'8/10', missing:2, status:'has missing' },
+      { id:'g3', artist:'Aphex Twin', album:'Selected Ambient Works 85-92', nextLabel:'Find source', nextAction:'Search slskd', bucket:'source_pending', groupType:'album', present:'11/13', missing:2, status:'source pending' },
+      { id:'g4', artist:'Burial', album:'Untrue', nextLabel:'Downloading', nextAction:'In progress', bucket:'downloading', groupType:'album', present:'12/14', missing:2, status:'downloading' },
+      { id:'g5', artist:'Portishead', album:'Dummy', nextLabel:'Needs match', nextAction:'Place folder', bucket:'needs_match', groupType:'album', present:'10/11', missing:1, status:'needs match' },
+      { id:'g6', artist:'Massive Attack', album:'Mezzanine', nextLabel:'Failed', nextAction:'Retry', bucket:'failed', groupType:'album', present:'9/11', missing:2, status:'failed' },
+    ]
+
+    const groups = rawGroups.map(g => ({
+      ...g,
+      missingCount: g.missing,
+      subline: `${g.nextAction} - ${g.groupType} - ${g.status}`,
+      onClick: () => this.setState({ sel: g.id }),
+      itemStyle: `cursor:pointer;border-bottom:1px solid var(--line);padding:10px;${this.state.sel===g.id?'background:color-mix(in srgb,var(--accent) 12%,transparent)':''}`,
+    }))
+
+    const selRaw = rawGroups.find(g => g.id === this.state.sel) || rawGroups[1]
+    const stepBuckets = ['needs_canonical','has_missing','source_pending','downloading','completed']
+    const stepDefs = [
+      ['1. Pick canonical album','Choose the release to keep'],
+      ['2. Review missing tracks',`${selRaw.missing} track(s) in scope`],
+      ['3. Find/select source','Search slskd when ready'],
+      ['4. Download/import status','0 active/result track(s)'],
+      ['5. Verify/rescan','Trigger Navidrome after imports'],
+    ]
+    const steps = stepDefs.map(([label, detail], i) => ({
+      label, detail,
+      style: `border-radius:.5rem;border:1px solid ${stepBuckets[i]===selRaw.bucket?'var(--accent)':'var(--line)'};background:var(--panel);padding:10px;min-height:72px;${stepBuckets[i]===selRaw.bucket?'box-shadow:inset 0 0 0 1px var(--accent)':''}`,
+    }))
+    const mt = [
+      { position:'3', artist:selRaw.artist, title:'Nude', decision:'approved' },
+      { position:'7', artist:selRaw.artist, title:'Reckoner', decision:'source_pending' },
+    ]
+    const sel = {
+      ...selRaw,
+      primary: selRaw.bucket==='source_pending'?'Find sources':'Retag & next',
+      steps,
+      missingSummary: `${selRaw.missing} missing, 1 approved, 1 source pending, 0 queued, 0 downloading, 0 failed`,
+      missingTracks: mt.map(t => ({ ...t, name: `${t.artist} - ${t.title}`, chipStyle: chip(t.decision) })),
+    }
+
+    const actionCards = [
+      { key:'canon', title:'Needs canonical', count:34, detail:'Boards of Canada - Geogaddi | Autechre - Amber', action:'Review', tab:'Album Review' },
+      { key:'missing', title:'Has missing tracks', count:187, detail:'Radiohead - In Rainbows | Aphex Twin - SAW', action:'Review', tab:'Album Review' },
+      { key:'source', title:'Source pending', count:52, detail:'Aphex Twin - SAW 85-92 | Boards of Canada', action:'Find sources', tab:'Album Review' },
+      { key:'match', title:'Needs placement', count:6, detail:'Portishead - Dummy | The xx - xx', action:'Place', tab:'Import' },
+    ]
+    const tasks = [
+      { label:'Scan missing for all albums', status:'running 62%', barStyle: bar(62) },
+      { label:'slskd search: Aphex Twin', status:'complete 100%', barStyle: bar(100) },
+      { label:'Place folder: Portishead - Dummy', status:'complete 100%', barStyle: bar(100) },
+    ]
+
+    const islands = [
+      { title:'Album groups', rows:[{ title:'Burial - Untrue', sub:'a1b2c3 release', status:'2/4 42%', barStyle: bar(42) }] },
+      { title:'Bot pending', rows:[
+        { title:'Burial - Archangel', sub:'@peer_2481 · repair', status:'downloading 42%', barStyle: bar(42) },
+        { title:'Burial - Near Dark', sub:'@lossless_lord · repair', status:'queued 0%', barStyle: bar(0) },
+      ] },
+      { title:'slskd transfers', rows:[{ title:'04 - Archangel.flac', sub:'@peer_2481', status:'InProgress 42%', barStyle: bar(42) }] },
+      { title:'Needs review / match', rows:[{ title:'Portishead - Dummy', sub:'/downloads/Portishead - Dummy', status:'needs pick', barStyle: bar(0) }] },
+    ]
+
+    const checks = [
+      { label:'Navidrome', state:'PASS', ok:true, detail:'Connected · 4,213 albums indexed' },
+      { label:'slskd', state:'PASS', ok:true, detail:'Connected · 1 active transfer' },
+      { label:'MusicBrainz', state:'PASS', ok:true, detail:'Reachable · rate-limited OK' },
+      { label:'Music dir /music', state:'FAIL', ok:false, detail:'Path writable check failed' },
+    ].map(c => ({ ...c, pillStyle: `${pill};${c.ok?'':'border-color:var(--bad);color:var(--bad)'}` }))
+
+    return {
+      noop, sections,
+      isOverview: tab==='Overview', isReview: tab==='Album Review',
+      isDownloads: tab==='Downloads', isSystem: tab==='System',
+      groups, sel, selIndex: rawGroups.indexOf(selRaw)+1,
+      actionCards, tasks, islands, checks,
+    }
+  }
+}
+</script>
+</body>
+</html>

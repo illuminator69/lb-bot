@@ -1,0 +1,11 @@
+python-telegram-bot==21.10
+httpx==0.28.1
+requests==2.32.3
+Flask==3.1.0
+# mutagen — tag read/write for placement. Previously transitive via beets;
+# declared explicitly after beets removal (BUILD_NOTES.md, Tier 2, done).
+mutagen==1.47.0
+# rapidfuzz — fuzzy ratios for folder ranking and file↔track matching.
+# Ships as wheels, so no build step is added to the image. The code falls back
+# to difflib if it is missing rather than failing to import.
+rapidfuzz==3.14.5

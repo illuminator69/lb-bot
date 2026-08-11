@@ -843,7 +843,7 @@ library). Validate against running containers; watch target-folder resolution on
 split/duplicate albums, Opus vs FLAC tag keys, and Navidrome path vs container
 `/music` path reconciliation.
 
-From `DOWNLOAD_RELIABILITY_PLAN.md` (2026-08-08), landed with 21 new unit tests
+From the 2026-08-08 download-reliability round, landed with 21 new unit tests
 but **not yet run against the live stack**: the multi-pass query builder,
 album-aware folder ranking, the quality preference, the extended matcher tiers
 (fuzzy / duration / position) with match-basis reporting, and the album-fetch
@@ -862,8 +862,7 @@ of a 46-album list after every pick and re-offered albums you had just dealt
 with. This is positional rather than a server-supplied `nextId`: `_gaps_view`
 already returns a stable, ordered list across polls, so the index is enough.
 
-From the 2026-08-08 design-handoff round (`design_handoff_lb_bot_frontend/`,
-`BACKEND_HANDOFF_NEW_ELEMENTS.md`), all landed and building but **not yet run
+From the 2026-08-08 design-handoff round, all landed and building but **not yet run
 against the live stack**: the scoped `POST /api/gaps/<id>/rescan`; per-track
 `present` on `/api/album/tracklist`; the variant × edition shape of
 `/api/album/releases` and per-release cover art; `/api/album/similar`; and
@@ -919,19 +918,11 @@ the track gone.
   wheels only, and the code falls back to `difflib` if it is missing rather than
   failing to import).
 - `CLAUDE.md` — authoritative design notes; **read before editing the pipeline.**
-- `AGENTS.md`, `handoff.md`, `implementation_plan.md`, `*_PLAN.md`, `BUILD_NOTES.md`,
-  `BACKEND_RECOMMENDATIONS.md`, `SESSION_*.md` — planning / handoff history.
-- `design_handoff_lb_bot_frontend/` — the design bundle. **Diff it before
-  working from it:** its `README.md` is byte-identical to `handoff.md` and its
-  `BACKEND_RECOMMENDATIONS.md` differs from the root copy by one bullet, so most
-  of it describes work already shipped. `BACKEND_HANDOFF_NEW_ELEMENTS.md` is the
-  part that was new, and is implemented as of 2026-08-08.
+- `AGENTS.md`, `BUILD_NOTES.md` — agent instructions and build notes.
 - `test_album_review.py` — test scaffolding for the album-review flow. Its
   baseline is **32 errors**, all `No module named 'mutagen'` in this
   environment; anything beyond that is yours.
-- `*.dc.html`, `support.js`, `covers/` — UI mockups and assets. The `.dc.html`
-  format is a mock runtime (`<sc-if>`, `<sc-for>`, `{{ }}`) — read it for
-  values and copy, never port its markup.
+
 
 > Line numbers in `CLAUDE.md` and code comments are snapshot hints and drift —
 > navigate by function name.

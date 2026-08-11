@@ -1,7 +1,7 @@
 # BUILD_NOTES.md — Docker build time
 
 Tracking the ~30-minute container build and how to bring it down. Companion to
-`CLAUDE.md` (pipeline) and `UI_PLAN.md` (frontend).
+`CLAUDE.md` (pipeline) and `README.md` (frontend).
 
 ## Dependency inventory
 

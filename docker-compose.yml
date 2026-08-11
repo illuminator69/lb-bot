@@ -1,6 +1,10 @@
 services:
   lb-bot:
-    image: lb-bot:local
+    # Published to GHCR by .github/workflows/docker.yml on every push to main.
+    # `docker compose pull && docker compose up -d` picks up a new build.
+    # To build locally instead, comment the image line and uncomment `build: .`.
+    image: ghcr.io/illuminator69/lb-bot:latest
+    # build: .
     restart: unless-stopped
     # nobody:users — the Unraid convention. Without this the bot runs as root and
     # every track it places into /music lands root-owned. All three mounts below

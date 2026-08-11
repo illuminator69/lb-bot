@@ -123,6 +123,16 @@ call AudioMuse directly — it only makes filled tracks visible to it.
 Docker, defined by `Dockerfile` (two-stage: Node builds the SPA, then a
 `python:3.11-slim` runtime) and `docker-compose.yml`.
 
+A prebuilt image is published to **GHCR** on every push to `main`
+(`.github/workflows/docker.yml`), and `docker-compose.yml` pulls from there:
+
+```bash
+docker compose pull && docker compose up -d    # update to the latest build
+```
+
+To build locally instead, comment the `image:` line in the compose file and
+uncomment `build: .`.
+
 **Mounts (host → container):**
 
 - `/mnt/user/appdata/lb-bot` → `/config` — state, index DB, review file

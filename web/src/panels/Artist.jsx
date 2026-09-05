@@ -853,7 +853,7 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
     setDownloading(true)
     try {
       await action('/api/album/download',
-        { rgid, ...releaseOverride(release, variant, artist.name) })
+        { rgid, ...releaseOverride(release, variant, displayArtist) })
     } catch (e) {
       // Only a failure un-latches the button — on success it deliberately
       // stays disabled reading "Requested". Resetting outside the try means a
@@ -981,7 +981,7 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
 
       {status === 'missing' && release && (
         <AlbumSourcePicker rgid={rgid} open={pickOpen}
-          override={releaseOverride(release, variant, artist.name)}
+          override={releaseOverride(release, variant, displayArtist)}
           onDownloaded={() => setDownloading(true)} />
       )}
       {readOnly && (

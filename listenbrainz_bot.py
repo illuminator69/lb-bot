@@ -2353,6 +2353,17 @@ def _task_run(kind: str, label: str, target, total: int = 0, **extra) -> str:
         except Exception as e:
             _web_log(f"task {kind} failed: {e}")
             _task_finish(task_id, error=str(e))
+            # A crash before `_album_download_task` opened the ledger row left
+            # nothing to poll: `album/status` answers `unknown`, which renders as
+            # the plain "not in your library" state, so a fill that died at the
+            # first line looked exactly like one that was never started. The task
+            # list carried the error and no client reads the task list.
+            if kind == "album-download" and extra.get("release_mbid"):
+                try:
+                    _album_fill_fail(extra["release_mbid"], "transfer_failed",
+                                     f"The download task failed to start: {e}")
+                except Exception as inner:  # noqa: BLE001
+                    _web_log(f"could not record the failure of {kind}: {inner}")
 
     threading.Thread(target=_runner, daemon=True, name=f"web-task-{kind}").start()
     return task_id
@@ -2656,6 +2667,34 @@ def mbz_search_release_groups(query: str, limit: int = 5) -> list:
             "score":        int(rg.get("score", 0) or 0),
         })
     return out
+
+def _as_int(value, default: int = 0) -> int:
+    """int() that answers `default` instead of raising on junk."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_release_override(data: dict) -> dict:
+    """A caller's own resolved release, in `mbz_resolve_album`'s vocabulary.
+
+    Three callers send this and only two of them speak that vocabulary: both
+    remote clients post `title`/`total_tracks`, while the SPA reuses the names
+    its `/api/album/sources` query string uses (`album`/`total`). Aliasing them
+    here rather than at each call site keeps the download and the source search
+    resolving the *same* release from the *same* payload — which is the whole
+    point of letting a client pass its edition through.
+    """
+    return {
+        "release_mbid": str(data.get("release_mbid") or "").strip(),
+        "artist": str(data.get("artist") or data.get("artist_name") or "").strip(),
+        "title": str(data.get("title") or data.get("album") or "").strip(),
+        # A client that sends "12" (a query string reused as a JSON body) must
+        # not turn a download into a 500 on int().
+        "total_tracks": _as_int(data.get("total_tracks") or data.get("total") or 0),
+    }
+
 
 def mbz_resolve_album(rgid: str) -> dict:
     """
@@ -14881,10 +14920,19 @@ def start_web_dashboard() -> None:
         # its user choose a pressing was overruled without either of them
         # hearing about it. `rgid` still rides along, because placement uses it
         # to flip this release-group's index row.
-        resolved = (data if data.get("release_mbid")
+        resolved = (_normalize_release_override(data) if data.get("release_mbid")
                     else (mbz_resolve_album(rgid) if rgid else data))
         if not resolved.get("release_mbid"):
             return jsonify({"error": "Could not resolve album"}), 400
+        # A caller-supplied release must carry the two fields the search is built
+        # from. Checked HERE, at the request, because the download runs in a task:
+        # a missing key surfaced as `task album-download failed: 'title'` in the
+        # log, while the caller was told `ok` and the fill ledger — which is only
+        # opened once the task is inside _album_download_task — had no row to fail.
+        # The user saw "queued", slskd saw nothing, and nothing ever said why.
+        if not resolved.get("artist") or not resolved.get("title"):
+            return jsonify({"error": "release_mbid needs artist and title "
+                                     "(or album) alongside it"}), 400
         release_mbid = resolved["release_mbid"]
 
         existing_gid, _ag = _album_group_for_release(release_mbid)

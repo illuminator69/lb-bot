@@ -1659,6 +1659,28 @@ class AlbumReviewTests(unittest.TestCase):
         out = bot._fresh_apply_limit(rows, limit=3)
         self.assertEqual(len(out), 8)
 
+    def test_release_override_accepts_the_spa_field_names(self):
+        """The SPA reuses its /api/album/sources query-string names (album/total)
+        for the download body, while both remote clients post title/total_tracks.
+        Reading `resolved["title"]` blind meant the SPA's download answered `ok`,
+        queued a task, and died inside it with KeyError: 'title' — no slskd
+        search, no ledger row, nothing for the client to poll."""
+        out = bot._normalize_release_override(
+            {"release_mbid": "r1", "artist": "A", "album": "B", "total": 15})
+        self.assertEqual(out["title"], "B")
+        self.assertEqual(out["total_tracks"], 15)
+
+    def test_release_override_prefers_the_canonical_names(self):
+        out = bot._normalize_release_override(
+            {"release_mbid": "r1", "artist": "A", "title": "Canon",
+             "album": "Alias", "total_tracks": 9, "total": 3})
+        self.assertEqual((out["title"], out["total_tracks"]), ("Canon", 9))
+
+    def test_release_override_survives_a_non_numeric_total(self):
+        out = bot._normalize_release_override(
+            {"release_mbid": "r1", "artist": "A", "album": "B", "total": "twelve"})
+        self.assertEqual(out["total_tracks"], 0)
+
     def test_single_release_add_is_readable_back(self):
         """The write used to store a release_groups row with no artists parent —
         and _index_get_artist selects artists FIRST, so the row was invisible and

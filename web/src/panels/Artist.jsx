@@ -32,12 +32,17 @@ const externalArtists = new Map()
 // Runs (or reuses) the discography scan for one artist. The scan needs a
 // MusicBrainz artist mbid; Navidrome supplies one for tagged libraries, and
 // we silently resolve the top text-search hit otherwise.
-function useDiscography(artist) {
+function useDiscography(artist, { autoScan = true } = {}) {
   const { action } = useApp()
   const [disco, setDisco] = useState(() => (artist ? discoCache.get(artist.id) || null : null))
   const [progress, setProgress] = useState(null) // { done, total, current }
   const [error, setError] = useState(null)
   const [nonce, setNonce] = useState(0)
+  // Whether the server HAS an index for this artist: true / false / null while
+  // we're still asking. `disco` alone cannot answer that — it is null both while
+  // loading and for the whole multi-minute scan — and a caller that needs to act
+  // on "not indexed" was left waiting on a value that only arrives at the end.
+  const [indexed, setIndexed] = useState(null)
   const pollRef = useRef(null)
   const forceScanRef = useRef(false)
 
@@ -48,6 +53,7 @@ function useDiscography(artist) {
     setDisco(cached || null)
     setError(null)
     setProgress(null)
+    setIndexed(cached ? true : null)
     if (cached) return
     let dead = false
     const forceScan = forceScanRef.current
@@ -61,12 +67,19 @@ function useDiscography(artist) {
             + `?mbid=${encodeURIComponent(artist.mbid || '')}`
             + `&nd_id=${encodeURIComponent(artistId)}`)
           if (dead) return
+          setIndexed(idx.indexed === true)
           if (idx.indexed) {
             discoCache.set(artistId, idx)
             setDisco(idx)
             return
           }
         }
+        // Not indexed. Whether to fix that by walking the artist's whole
+        // MusicBrainz discography is the CALLER's decision, not this hook's: it
+        // is one request per second per release-group, minutes for a real
+        // artist, and an album page that merely wants one row must never start
+        // it. See AlbumDetail, which passes autoScan:false.
+        if (!autoScan) return
         let mbid = artist.mbid
         if (!mbid) {
           const r = await api('/api/artist/lookup?q=' + encodeURIComponent(artist.name))
@@ -114,7 +127,15 @@ function useDiscography(artist) {
     forceScanRef.current = true
     setNonce(n => n + 1)
   }
-  return { disco, progress, error, rescan }
+  // Re-read the *stored* index, without forcing a MusicBrainz rescan. The
+  // session-lived discoCache means even a tab switch won't re-fetch, so
+  // something that changed one row server-side (a single-release add, a
+  // completed fill) has no other way to become visible.
+  const refreshIndex = () => {
+    if (artistId) discoCache.delete(artistId)
+    setNonce(n => n + 1)
+  }
+  return { disco, indexed, progress, error, rescan, refreshIndex }
 }
 
 // ── Artist index ─────────────────────────────────────────────────────────────
@@ -460,29 +481,58 @@ function DiscographyView({ artist, onOpenAlbum, onBack }) {
 // the best-ranked peer); this is the deliberate override — it runs the slskd
 // search, ranks folders, and downloads the exact one you choose through the same
 // album pipeline (so failover to alt_sources still applies).
-function AlbumSourcePicker({ rgid, open, onDownloaded }) {
+// The release the user actually has on screen, in the shape both /api/album/sources
+// and /api/album/download accept as an override. Sending it is not an
+// optimisation: the server's own resolver picks "official, earliest" on its own,
+// so an edition the user chose here would otherwise be silently overruled — and
+// `mbz_resolve_album` parks a transient MusicBrainz 503 in a five-minute
+// negative cache, which turns one hiccup into "Could not resolve album" for
+// every attempt inside that window, with nothing the user can do about it.
+function releaseOverride(release, variant, artistName) {
+  if (!variant?.releaseMbid) return {}
+  return {
+    release_mbid: variant.releaseMbid,
+    artist: artistName || '',
+    album: release?.title || variant.title || '',
+    total: variant.trackCount || 0,
+  }
+}
+
+function AlbumSourcePicker({ rgid, open, onDownloaded, override }) {
   const { action, pushToast } = useApp()
   const [sources, setSources] = useState(null)   // null=loading, []=none
   const [chosen, setChosen] = useState(null)
   const [busy, setBusy] = useState(false)
 
+  // Serialized so the effect re-runs when the user switches edition, without
+  // making the object identity a dependency.
+  const overrideKey = JSON.stringify(override || {})
+
   useEffect(() => {
     if (!open) return
     let dead = false
     setSources(null)
-    api('/api/album/sources?rgid=' + encodeURIComponent(rgid))
+    const q = new URLSearchParams({ rgid })
+    for (const [k, v] of Object.entries(JSON.parse(overrideKey))) {
+      if (v) q.set(k, String(v))
+    }
+    api('/api/album/sources?' + q)
       .then(r => !dead && setSources(r.sources || []))
       .catch(e => { if (!dead) { setSources([]); pushToast(`Source search failed: ${e.message}`, 'error') } })
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, rgid])
+  }, [open, rgid, overrideKey])
 
   async function useSource(src) {
     setBusy(true)
     setChosen(src.id)
     try {
+      // The peer is a *preference*, not a guarantee: lb-bot floats it to the
+      // front of its own ranked list and keeps the rest as failover, so if this
+      // peer has gone by transfer time the best ranked folder wins instead.
       await action('/api/album/download',
-        { rgid, sourceUsername: src.peer, sourceFolder: src.folder })
+        { rgid, ...(override || {}),
+          sourceUsername: src.peer, sourceFolder: src.folder })
       pushToast('Queued from @' + src.peer + ' — see Downloads')
       onDownloaded?.()
     } catch (e) {
@@ -658,28 +708,118 @@ function SimilarAlbums({ artistMbid, artistName, rgid, onOpen }) {
   )
 }
 
-function AlbumDetail({ artist, rgid, onBack }) {
+function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   const { dispatch, action, pushToast } = useApp()
-  const { disco } = useDiscography(artist)
+  // autoScan:false — an album page must NEVER start a whole-artist MusicBrainz
+  // walk. It is one request per second per release-group, minutes for a real
+  // discography, and arriving here from Fresh is precisely the unindexed case
+  // that used to trigger it while the user stared at skeletons.
+  const { disco, indexed, refreshIndex } = useDiscography(artist, { autoScan: false })
   // Two axes: which release variant (tracklist) and which edition of it
   // (pressing + cover art). See EditionSwitcher.
   const [variants, setVariants] = useState(null)
+  // The release-group's own title and credited artist, from MusicBrainz rather
+  // than from the index — the header for a release the index has never heard of,
+  // and the artist name the index add is stamped with.
+  const [groupTitle, setGroupTitle] = useState('')
+  const [releaseArtist, setReleaseArtist] = useState('')
+  // The row /api/artist/release classified and returned. Rendering from this
+  // rather than re-reading the index keeps the page working even if the write
+  // landed under an artist key the reader doesn't look under.
+  const [addedRelease, setAddedRelease] = useState(null)
   const [sel, setSel] = useState({ variant: 0, edition: 0 })
   const [tracks, setTracks] = useState(null)
   const [downloading, setDownloading] = useState(false)
   const [fillingGaps, setFillingGaps] = useState(false)
-  const [pickOpen, setPickOpen] = useState(false)
+  const [pickOpen, setPickOpen] = useState(autoPick)
+  // 'adding' while the single-release index add is in flight, 'failed' if it
+  // could not be done. Distinguished from "still loading the discography",
+  // which is what an absent release used to be indistinguishable from.
+  const [indexAdd, setIndexAdd] = useState(null)
+  const addedRef = useRef('')
 
-  const release = (disco?.releases || []).find(r => r.rgid === rgid)
+  // The component is not remounted when the route changes rgid, so the initial
+  // state above only covers a cold arrival.
+  useEffect(() => { if (autoPick) setPickOpen(true) }, [autoPick, rgid])
+  // Same reason: a new album must not inherit the previous one's added row.
+  useEffect(() => { setAddedRelease(null); setIndexAdd(null) }, [rgid])
+
+  const indexedRelease = (disco?.releases || []).find(r => r.rgid === rgid)
+  // If the index cannot be taught about this release (no MusicBrainz artist,
+  // MusicBrainz down), the page must still work: /api/album/releases and
+  // /api/album/download both take the raw rgid. An unindexed release the
+  // library demonstrably does not list is `missing`.
+  // Three sources, best first. `addedRelease` is the row /api/artist/release
+  // just classified and handed back — rendering from THAT rather than
+  // re-reading the index is what makes this page independent of whether the
+  // index write landed under a key the reader looks for.
+  const release = indexedRelease
+    || addedRelease
+    || (indexAdd === 'failed'
+      ? { rgid, title: groupTitle, status: 'missing' }
+      : null)
   const status = release?.status
   const readOnly = status === 'complete' || status === 'untagged'
+  // A `mb:`-deep-linked artist has no name but its own MBID (the synthetic
+  // artist in the root below), so prefer the one MusicBrainz credited this
+  // release-group to rather than printing a UUID as the artist.
+  const displayArtist = artist.external ? (releaseArtist || artist.name) : artist.name
+
+  // A release the artist's stored index predates — the normal case for anything
+  // arrived at from Fresh, because the index is served immediately even when
+  // stale, by design. Add the one row rather than offering a full rescan: that
+  // is a MusicBrainz request per second per release-group, for one album.
+  //
+  // Gated on `indexed !== null` — "the server has answered" — and NOT on a
+  // loaded `disco`. That was the bug: for an unindexed artist `disco` stays null
+  // for the whole scan, so the fast path never ran in exactly the case it was
+  // written for, and the page sat on skeletons with no buttons at all.
+  useEffect(() => {
+    if (indexed === null || indexedRelease || addedRelease) return
+    if (addedRef.current === rgid) return
+    addedRef.current = rgid
+    let dead = false
+    setIndexAdd('adding')
+    action('/api/artist/release', {
+      rgid,
+      mbid: artist.mbid || '',
+      nd_id: artist.id || '',
+      // The synthetic external artist's `name` is its raw MBID, which would go
+      // into the index as the artist's name. Prefer the real one MusicBrainz
+      // gave us for this release-group.
+      name: releaseArtist || (artist.external ? '' : artist.name || ''),
+      external: !!artist.external,
+    })
+      .then(r => {
+        if (dead) return
+        setIndexAdd(null)
+        if (r?.release) setAddedRelease(r.release)
+        // Best-effort only: the page already has what it needs to render, and
+        // this just makes the artist's own discography agree.
+        refreshIndex()
+      })
+      .catch(e => {
+        if (dead) return
+        setIndexAdd('failed')
+        pushToast(`Could not add this release to the index: ${e.message}`, 'error')
+      })
+    return () => { dead = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist])
 
   useEffect(() => {
     let dead = false
     setVariants(null)
+    setGroupTitle('')
+    setReleaseArtist('')
     setSel({ variant: 0, edition: 0 })
     api('/api/album/releases?rgid=' + encodeURIComponent(rgid))
-      .then(r => !dead && setVariants(r.releases || []))
+      .then(r => {
+        if (dead) return
+        setVariants(r.releases || [])
+        setGroupTitle(r.title || '')
+        setReleaseArtist(r.artist && r.artist !== '?' ? r.artist : '')
+      })
       .catch(e => !dead && pushToast(`Release lookup failed: ${e.message}`, 'error'))
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -712,7 +852,8 @@ function AlbumDetail({ artist, rgid, onBack }) {
   async function downloadBest() {
     setDownloading(true)
     try {
-      await action('/api/album/download', { rgid })
+      await action('/api/album/download',
+        { rgid, ...releaseOverride(release, variant, artist.name) })
     } catch (e) {
       // Only a failure un-latches the button — on success it deliberately
       // stays disabled reading "Requested". Resetting outside the try means a
@@ -766,7 +907,7 @@ function AlbumDetail({ artist, rgid, onBack }) {
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[12px] font-semibold uppercase tracking-[.12em]" style={{ color: 'var(--accent)' }}>
-            {artist.name}
+            {displayArtist}
           </div>
           {!release ? (
             <>
@@ -826,7 +967,7 @@ function AlbumDetail({ artist, rgid, onBack }) {
         </div>
       </div>
 
-      <SimilarAlbums artistMbid={artist.mbid || ''} artistName={artist.name}
+      <SimilarAlbums artistMbid={artist.mbid || ''} artistName={displayArtist}
         rgid={rgid} onOpen={(artistId, otherRgid) => navigate('Artist', artistId, otherRgid)} />
 
       <SectionRule label="Tracklist"
@@ -839,7 +980,9 @@ function AlbumDetail({ artist, rgid, onBack }) {
             rows={Math.max(4, Math.min(trackCount || 8, 14))} />}
 
       {status === 'missing' && release && (
-        <AlbumSourcePicker rgid={rgid} open={pickOpen} onDownloaded={() => setDownloading(true)} />
+        <AlbumSourcePicker rgid={rgid} open={pickOpen}
+          override={releaseOverride(release, variant, artist.name)}
+          onDownloaded={() => setDownloading(true)} />
       )}
       {readOnly && (
         <p className="muted mt-3">
@@ -856,8 +999,11 @@ export default function Artist() {
   const { state } = useApp()
   // Drill-down state derives from the route; App's single hashchange listener
   // keeps it current.
+  // A third param opens the source picker on arrival — how Fresh's "Get this
+  // album" reaches the review step instead of firing a blind download.
   const route = { artistId: state.routeParams[0] || null,
-                  rgid: state.routeParams[1] || null }
+                  rgid: state.routeParams[1] || null,
+                  pick: state.routeParams[2] === 'sources' }
   const [artists, setArtists] = useState(null)
   const [artistsErr, setArtistsErr] = useState(null)
 
@@ -913,7 +1059,8 @@ export default function Artist() {
       </EmptyState>
     )
   } else if (route.rgid) {
-    body = <AlbumDetail artist={artist} rgid={route.rgid} onBack={() => nav(artist.id)} />
+    body = <AlbumDetail artist={artist} rgid={route.rgid} autoPick={route.pick}
+      onBack={() => nav(artist.id)} />
   } else {
     body = <DiscographyView artist={artist} onOpenAlbum={rgid => nav(artist.id, rgid)}
       onBack={() => nav()} />

@@ -99,6 +99,25 @@ MAX_FILE_RETRIES  = 2   # per-file alt-source retries before giving up on a trac
 STATE_FILE        = os.environ.get("LB_BOT_STATE", "lb_bot_state.json")
 STATE_FLUSH_INT   = 30    # seconds between background state saves
 
+# The MusicBrainz entity cache lives in its own file, and that split is load-
+# bearing rather than tidiness. Measured on a real state file: 26.03 MB of the
+# 26.8 MB total (97.1%) was `mbz_cache` — 4,592 immutable entity lookups —
+# while everything with an actual durability requirement (pending_downloads,
+# pending_album_groups, repair_jobs, albums) came to under 1 MB combined.
+# Writing them together meant all 31 eager `_save_state()` call sites paid to
+# re-serialize 26 MB of cache that had not changed and that costs nothing to
+# lose: a dropped entry is one rate-limited refetch, not lost work.
+#
+# So the volatile <1 MB stays eager, and the cache is written only on the
+# periodic flush and at shutdown, and only when it has actually changed.
+MBZ_CACHE_FILE    = os.environ.get(
+    "LB_BOT_MBZ_CACHE",
+    os.path.join(os.path.dirname(os.path.abspath(STATE_FILE)), "mbz_cache.json"))
+# Declared here rather than beside _mbz_cache itself: _save_mbz_cache and
+# _load_state are defined hundreds of lines earlier than the cache is.
+_mbz_cache_rev = 0             # bumped on every write into _mbz_cache
+_mbz_cache_saved_rev = -1      # the rev last written to MBZ_CACHE_FILE
+
 # Local web dashboard. The dashboard is intentionally served by the bot process
 # so it can reuse the same Navidrome, slskd, MusicBrainz and beets helpers.
 WEB_UI_ENABLED = os.environ.get("LB_BOT_WEB", "1").lower() not in ("0", "false", "no")
@@ -362,6 +381,15 @@ _review_state = {
 }
 _web_events: list = []
 
+# Review-state writes are coalesced rather than done per mutation — see
+# _save_review_state for the measurements and the durability tradeoff. The
+# interval is the maximum age of an unwritten change, and the maximum a hard
+# kill can lose; orderly shutdown flushes regardless (_install_shutdown_flush).
+REVIEW_FLUSH_INT = float(os.environ.get("LB_BOT_REVIEW_FLUSH_INT", "2.0"))
+_review_dirty = threading.Event()
+_review_flush_thread = None
+_review_flush_guard = threading.Lock()
+
 _uid_counter = 0
 _atomic_write_locks = {}
 _atomic_write_locks_guard = threading.Lock()
@@ -456,9 +484,15 @@ def _save_state_unlocked() -> None:
             "dismissed_folders":    sorted(_dismissed_folders),
             "folder_identity":      _folder_identity,
             "last_scan_ts":         _last_scan_ts,
-            # MB entity lookups are immutable — persist them (skip search queries)
-            "mbz_cache":            {k: v for k, v in _mbz_cache.items()
-                                     if "/" in k.split("?", 1)[0]},
+            # `mbz_cache` used to live here and was 97% of this file. It is its
+            # own sidecar now (MBZ_CACHE_FILE / _save_mbz_cache) so these ~0.8 MB
+            # of genuinely volatile rows stay cheap to write eagerly.
+            # The fill ledger belongs with pending_album_groups / pending_downloads
+            # rather than in memory: those two *are* restored, so the download
+            # really does resume across a restart — only its ledger row used to be
+            # lost, leaving every client polling /api/album/status on `unknown`
+            # forever and _finalize_group with no rgid to flip the index with.
+            "album_fill_status":    _album_fill_for_disk(),
             # tuple-keyed dict -> list of [ [username, filename], value ]
             "pending_downloads":    [[list(k), v] for k, v in pending_downloads.items()],
         }
@@ -466,13 +500,54 @@ def _save_state_unlocked() -> None:
     except Exception as e:
         print(f"  state save failed: {e}")
 
+def _mbz_cache_for_disk() -> dict:
+    """The durable half of the MusicBrainz cache: entity lookups, not searches.
+
+    **Taken under `_mbz_lock`.** It used to be built by iterating `_mbz_cache`
+    with no lock at all while `_mbz_cache_put` mutates it under that lock — so a
+    MusicBrainz answer landing mid-save raised `dictionary changed size during
+    iteration`, which `_save_state_unlocked`'s bare `except` swallowed as
+    "state save failed". That did not just lose the cache: it abandoned the
+    whole state write, `pending_downloads` and all, and printed one line about it.
+
+    Note `mbz_get` holds `_mbz_lock` across its 1 req/sec pacing sleep *and* the
+    HTTP call, so this can wait seconds behind an in-flight MusicBrainz request.
+    That is fine and deliberate: every caller of this is a background flusher or
+    a shutdown path, never a request thread. Do not call it from a route.
+    """
+    with _mbz_lock:
+        return {k: v for k, v in _mbz_cache.items() if "/" in k.split("?", 1)[0]}
+
+def _save_mbz_cache(force: bool = False) -> None:
+    """Write the MB entity cache, but only when it has actually changed.
+
+    `_mbz_cache_rev` counts writes into the cache, so an idle bot re-serializing
+    26 MB every STATE_FLUSH_INT is skipped entirely — which is the common case,
+    since the cache only grows when something asks MusicBrainz a new question.
+    """
+    global _mbz_cache_saved_rev
+    if not MBZ_CACHE_FILE:
+        return
+    if not force and _mbz_cache_rev == _mbz_cache_saved_rev:
+        return
+    try:
+        rev = _mbz_cache_rev
+        _atomic_json_write(MBZ_CACHE_FILE, _mbz_cache_for_disk())
+        _mbz_cache_saved_rev = rev
+    except Exception as e:
+        print(f"  mbz cache save failed: {e}")
+
 def _save_state() -> None:
     with _state_save_lock:
         _save_state_unlocked()
 
 def _load_state() -> None:
     """Restore state from STATE_FILE if present. Safe to call once at startup."""
-    global _uid_counter
+    global _uid_counter, _mbz_cache_rev
+    # Before the early return below: the MB cache is a separate file now, and a
+    # bot whose volatile state file is missing (fresh install, wiped appdata)
+    # should still keep the entity lookups it already paid for.
+    _load_mbz_cache()
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -501,12 +576,44 @@ def _load_state() -> None:
     _dismissed_folders.update(s.get("dismissed_folders", []))
     _folder_identity.update(s.get("folder_identity", {}))
     _last_scan_ts.update(s.get("last_scan_ts", {}))
-    _mbz_cache.update(s.get("mbz_cache", {}))
+    # Legacy state files carry the MB cache inline. Read it if present so an
+    # upgrade keeps the entries it already paid for at 1 req/sec; the sidecar
+    # below then wins, and the next periodic flush writes the split form.
+    legacy_mbz = s.get("mbz_cache", {})
+    if legacy_mbz:
+        # Only fills gaps: the sidecar loaded above is the newer copy and wins.
+        for k, v in legacy_mbz.items():
+            _mbz_cache.setdefault(k, v)
+        # Bumped *after* _load_mbz_cache set saved_rev, so the next periodic
+        # flush actually writes the migrated entries into the sidecar. Without
+        # this they would sit in memory until some unrelated MusicBrainz call
+        # happened to dirty the cache.
+        _mbz_cache_rev += 1
+        print(f"  migrated {len(legacy_mbz)} MB cache entr(ies) out of {STATE_FILE}")
     for k, v in s.get("pending_downloads", []):
         pending_downloads[tuple(k)] = v
+    _album_fill_restore(s.get("album_fill_status", {}))
     print(f"  state restored from {STATE_FILE} "
           f"({len(pending_downloads)} active download(s), "
           f"{len(pending_album_groups)} album group(s))")
+
+def _load_mbz_cache() -> None:
+    """Restore the MB entity cache sidecar. Absent or corrupt is not an error —
+    the cache is rebuildable by definition, one rate-limited call at a time."""
+    global _mbz_cache_saved_rev
+    if not MBZ_CACHE_FILE or not os.path.exists(MBZ_CACHE_FILE):
+        return
+    try:
+        with open(MBZ_CACHE_FILE, encoding="utf-8") as fh:
+            rows = json.load(fh)
+    except Exception as e:
+        print(f"  mbz cache load failed (rebuilding on demand): {e}")
+        return
+    if isinstance(rows, dict):
+        _mbz_cache.update(rows)
+        # Nothing has changed since load, so an immediate flush writes nothing.
+        _mbz_cache_saved_rev = _mbz_cache_rev
+        print(f"  mbz cache restored from {MBZ_CACHE_FILE} ({len(rows)} entr(ies))")
 
 _LOG_TAG_WORDS = ("slskd", "navidrome", "beets", "telegram", "spotify",
                   "musicbrainz", "scan", "task", "import", "placement",
@@ -614,16 +721,66 @@ def _load_review_state() -> None:
     except Exception as e:
         print(f"  review state load failed: {e}")
 
-def _save_review_state() -> None:
-    """Persist the review state, holding _review_lock only to serialize.
+def _review_flush_now() -> None:
+    """Serialize the review state and write it, holding _review_lock only to dump.
 
-    Called from ~50 places, several of them on the 2s poll path. It used to
-    serialize the (multi-MB) state three times — dumps + loads for a deep copy,
-    then a pretty-printed sorted json.dump — and fsync it, all inside
-    _review_lock, which every /api/gaps and /api/summary request also wants.
     One dump to a string under the lock *is* the snapshot: nothing can mutate a
-    str, so the write happens safely outside. The file is machine-only, so
+    str, so the fsync happens safely outside. The file is machine-only, so
     indent/sort_keys buy nothing and roughly double the bytes written.
+    """
+    if not REVIEW_FILE:
+        return
+    try:
+        with _review_lock:
+            text = json.dumps(_review_state_for_disk())
+        _atomic_json_write(REVIEW_FILE, None, text=text)
+    except Exception as e:
+        print(f"  review state save failed: {e}")
+
+def _review_flush_loop() -> None:
+    """Coalesce a burst of saves into one write, at most every REVIEW_FLUSH_INT."""
+    while True:
+        _review_dirty.wait()
+        time.sleep(REVIEW_FLUSH_INT)
+        # Cleared *before* the dump, never after: a mutation arriving during the
+        # dump is either already in it or sets the flag again for the next round.
+        # Clearing afterwards would drop that write entirely.
+        _review_dirty.clear()
+        _review_flush_now()
+
+def _ensure_review_flusher() -> None:
+    global _review_flush_thread
+    if _review_flush_thread is not None and _review_flush_thread.is_alive():
+        return
+    with _review_flush_guard:
+        if _review_flush_thread is not None and _review_flush_thread.is_alive():
+            return
+        _review_flush_thread = threading.Thread(
+            target=_review_flush_loop, name="review-state-flush", daemon=True)
+        _review_flush_thread.start()
+
+def _save_review_state(*, urgent: bool = False) -> None:
+    """Mark the review state dirty; the flusher writes it within REVIEW_FLUSH_INT.
+
+    Called from ~50 places, several of them on the 2s poll path — and it used to
+    serialize the whole state and fsync it on *every one of them*. Measured on a
+    real 19.9 MB review file (3,154 groups): 110 ms of `json.dumps` under
+    _review_lock plus a 12.4 MB atomic write, per call. That is the lock
+    contention behind the intermittent 502s the clients see, because every
+    lb-bot route wants _review_lock and the hub's proxy timeout is the only
+    thing separating "slow" from "gateway error".
+
+    Two things stay eager, because they are correctness rather than durability:
+    the per-request snapshot memo is dropped immediately (a later read in the
+    same request must see this mutation), and `updated_at` is stamped
+    immediately (views return it, so it must reflect mutation time, not flush
+    time).
+
+    The cost is a crash window: a hard kill can lose up to REVIEW_FLUSH_INT of
+    state. That is bounded by the SIGTERM/SIGINT/atexit flush below, and the
+    loader already treats an interrupted restart as a first-class case — it
+    marks running tasks and operations "Interrupted by an app restart". Callers
+    that genuinely need the bytes on disk before returning pass `urgent=True`.
     """
     _invalidate_review_snapshot()
     if not REVIEW_FILE:
@@ -631,10 +788,64 @@ def _save_review_state() -> None:
     try:
         with _review_lock:
             _review_state["updated_at"] = time.time()
-            text = json.dumps(_review_state_for_disk())
-        _atomic_json_write(REVIEW_FILE, None, text=text)
     except Exception as e:
-        print(f"  review state save failed: {e}")
+        print(f"  review state stamp failed: {e}")
+        return
+    if urgent:
+        _review_dirty.clear()
+        _review_flush_now()
+        return
+    _review_dirty.set()
+    _ensure_review_flusher()
+
+def _flush_all_state(reason: str = "") -> None:
+    """Write every durable file now. Safe to call twice; used on every exit path."""
+    try:
+        _save_state()
+    except Exception as e:
+        print(f"  state flush failed: {e}")
+    try:
+        if _review_dirty.is_set():
+            _review_dirty.clear()
+            _review_flush_now()
+    except Exception as e:
+        print(f"  review flush failed: {e}")
+    try:
+        # No-ops unless the cache changed since the last periodic flush, so an
+        # idle shutdown does not rewrite 26 MB on the way out.
+        _save_mbz_cache()
+    except Exception as e:
+        print(f"  mbz cache flush failed: {e}")
+    if reason:
+        print(f"  state flushed ({reason})")
+
+def _install_shutdown_flush() -> None:
+    """Flush coalesced state on the ways this process actually dies.
+
+    `docker stop` sends SIGTERM, and Python's default handler exits *without*
+    running `finally` blocks or atexit — so without this, coalescing would trade
+    a real durability guarantee for the throughput win. With it, an orderly stop
+    loses nothing and only a hard kill (SIGKILL, power loss) can cost up to
+    REVIEW_FLUSH_INT.
+    """
+    import atexit
+    import signal
+    atexit.register(_flush_all_state)
+
+    def _on_signal(signum, _frame):
+        _flush_all_state(f"signal {signum}")
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            # Not the main thread, or the platform refuses it — atexit still covers
+            # the ordinary exit path.
+            pass
 
 # Keys on a source_results folder holding the raw slskd payload: the peer's
 # search hits, the expanded directory listing, and the per-file claim ledger.
@@ -682,6 +893,37 @@ def _invalidate_review_snapshot() -> None:
     if scope is not None:
         scope.__dict__.pop("_lb_review_snap", None)
         scope.__dict__.pop("_lb_review_list_snap", None)
+        scope.__dict__.pop("_lb_tasks_snap", None)
+
+def _tasks_snapshot() -> dict:
+    """Just the task rows, copied — never the whole review state.
+
+    `/api/tasks/<id>` is what the SPA polls while a scan or a download runs, and
+    it used to answer by deep-copying the entire multi-MB review state and then
+    reading one key off it. On a real 19.9 MB review file that is 234 ms of CPU,
+    under the GIL, every two seconds, to return one task row.
+
+    A per-task `dict()` is a complete copy here, not a shortcut: a task row is
+    flat scalars (`_task_create`), and the only keys any caller stamps on top of
+    it are `group_id`, `release_mbid`, `skip_library` and `total` — all scalars
+    too. **If a nested value is ever added to a task row, this has to become a
+    deep copy**, or a caller could reach back into live state through it.
+
+    Same reasoning as `_running_album_download_task` and `_review_list_snapshot`:
+    read the narrow thing under the lock rather than copying everything and
+    discarding 99% of it.
+    """
+    scope = _request_scope()
+    if scope is not None:
+        snap = scope.__dict__.get("_lb_tasks_snap")
+        if snap is not None:
+            return snap
+    with _review_lock:
+        snap = {tid: dict(task)
+                for tid, task in (_review_state.get("tasks") or {}).items()}
+    if scope is not None:
+        scope.__dict__["_lb_tasks_snap"] = snap
+    return snap
 
 def _review_snapshot() -> dict:
     """Deep copy of the review state, memoized for the duration of a web request.
@@ -691,6 +933,24 @@ def _review_snapshot() -> dict:
     while holding the global review lock. Within one request nothing changes
     under us unless the request itself saves — and _save_review_state drops the
     memo when it does — so one copy is enough.
+
+    Only the `dumps` half holds the lock: a `dumps` under the lock already *is*
+    the snapshot, since nothing can mutate a str, so parsing it back is safe
+    outside. Same reasoning _save_review_state and _atomic_json_write apply to
+    the write path.
+
+    **Do not expect throughput from that split.** It was measured, and this
+    workload is GIL-bound: 8 × `json.loads` of a real 19.9 MB review state runs
+    1.07 s serially and 1.03 s across four threads — a 1.04× "speedup". CPython's
+    json holds the GIL, so releasing _review_lock earlier lets another thread
+    take the lock but not actually run. It changes who waits where, nothing more.
+    It is kept because it is strictly not worse and it does matter if anything
+    that releases the GIL (an fsync, a socket) ever enters this critical section.
+
+    The lever here is **doing less work**, not holding the lock less. On that
+    same file a full copy costs 234 ms while the narrow `_review_list_snapshot`
+    projection costs 2.8 ms — 85× cheaper. Callers that need one slice of the
+    state should take a projection (see `_tasks_snapshot`) rather than this.
     """
     scope = _request_scope()
     if scope is not None:
@@ -698,7 +958,8 @@ def _review_snapshot() -> dict:
         if snap is not None:
             return snap
     with _review_lock:
-        snap = json.loads(json.dumps(_review_state))
+        text = json.dumps(_review_state)
+    snap = json.loads(text)
     if scope is not None:
         scope.__dict__["_lb_review_snap"] = snap
     return snap
@@ -1265,10 +1526,15 @@ def _verify_placement_worker(group_id: str) -> None:
 # progress is *not* written here — it is read straight off pending_album_groups
 # when the status endpoint is called, so the hot download-poll path pays nothing.
 #
-# In memory only, and deliberately so: an in-flight download does not survive a
-# restart either (slskd source results are dropped on load for the same reason),
-# and a client that finds no entry falls back to "unknown", which renders as the
-# plain "not in your library" state.
+# It used to be in memory only, reasoning that an in-flight download does not
+# survive a restart either. That reasoning was wrong in one important way:
+# `pending_album_groups` and `pending_downloads` *are* persisted and restored, so
+# the download genuinely does resume — only its ledger row was lost. A client
+# then polled /api/album/status forever on `unknown` (which renders as the plain
+# "not in your library" state, i.e. the fill silently vanished from every
+# downloads view), and `_finalize_group` had no `rgid` to flip the index row
+# with, so the filled album kept listing as missing. It is persisted now, with
+# the same eviction cap and a prune on load.
 # ---------------------------------------------------------------------------
 
 _album_fill_status: dict = {}          # release_mbid -> status dict
@@ -1277,10 +1543,23 @@ _ALBUM_FILL_STATUS_MAX = 200
 ALBUM_FILL_VERIFY_TIMEOUT = PLACEMENT_VERIFY_TIMEOUT
 ALBUM_FILL_VERIFY_INTERVAL = PLACEMENT_VERIFY_INTERVAL
 
+# How long a terminal ledger row is worth keeping across a restart. A `verified`
+# fill is history the moment the library has it; a `failed` one is still worth a
+# day, because the retry buttons in both clients hang off exactly this row.
+_ALBUM_FILL_TERMINAL_TTL = {"verified": 6 * 3600, "failed": 24 * 3600}
+
 def _album_fill_set(release_mbid: str, state: str, **fields) -> None:
-    """Record where one release-group's fill has got to. Last writer wins."""
+    """Record where one release-group's fill has got to. Last writer wins.
+
+    Persistence is deferred to the 30 s `state_flush_loop` and the shutdown
+    flush rather than written here: `_save_state()` is ~59 ms and this is called
+    from `_finalize_group`, which the user is waiting on. Callers that have just
+    recorded something a restart must not lose — the initial `searching` row,
+    which is what a resumed download is found by — pass `durable=True`.
+    """
     if not release_mbid:
         return
+    durable = bool(fields.pop("durable", False))
     with _album_fill_lock:
         entry = _album_fill_status.setdefault(release_mbid, {})
         entry.update(fields)
@@ -1292,10 +1571,137 @@ def _album_fill_set(release_mbid: str, state: str, **fields) -> None:
                             key=lambda kv: kv[1].get("updated_at", 0))
             for key, _ in oldest[:len(_album_fill_status) - _ALBUM_FILL_STATUS_MAX]:
                 _album_fill_status.pop(key, None)
+    if durable:
+        # Outside the lock: _save_state takes _album_fill_lock itself via
+        # _album_fill_for_disk, and this one is a plain Lock, not an RLock.
+        _save_state()
 
 def _album_fill_get(release_mbid: str) -> dict:
     with _album_fill_lock:
         return dict(_album_fill_status.get(release_mbid) or {})
+
+def _album_fill_for_disk() -> dict:
+    """The ledger as a plain snapshot, for `_save_state_unlocked`."""
+    with _album_fill_lock:
+        return {k: dict(v) for k, v in _album_fill_status.items()}
+
+def _album_fill_restore(rows) -> None:
+    """Restore the ledger, dropping terminal rows that have aged out.
+
+    Non-terminal rows are kept regardless of age: `pending_album_groups` and
+    `pending_downloads` come back with them, so a fill interrupted mid-transfer
+    really is still in flight and its row is the only thing that can say so.
+    A stalled one is swept by the usual watchdogs, not by this.
+    """
+    if not isinstance(rows, dict):
+        return
+    now = time.time()
+    kept = 0
+    with _album_fill_lock:
+        for mbid, entry in rows.items():
+            if not isinstance(entry, dict) or not mbid:
+                continue
+            ttl = _ALBUM_FILL_TERMINAL_TTL.get(entry.get("state", ""))
+            if ttl is not None and now - float(entry.get("updated_at") or 0) > ttl:
+                continue
+            _album_fill_status[mbid] = dict(entry)
+            kept += 1
+        if len(_album_fill_status) > _ALBUM_FILL_STATUS_MAX:
+            oldest = sorted(_album_fill_status.items(),
+                            key=lambda kv: kv[1].get("updated_at", 0))
+            for key, _ in oldest[:len(_album_fill_status) - _ALBUM_FILL_STATUS_MAX]:
+                _album_fill_status.pop(key, None)
+    if kept:
+        print(f"  album fill ledger restored ({kept} entr(ies))")
+
+# ---------------------------------------------------------------------------
+# Failure kinds — what went wrong, so clients stop matching on the sentence
+#
+# The free-text `reason` stays, verbatim, and stays the thing shown to the user:
+# "103 peers offered 2,047 files, but none in FLAC, OPUS" is the useful answer
+# and paraphrasing it loses the evidence. What the clients could not do was
+# *decide* from it — which button to offer, whether a retry has any chance —
+# without matching on English. These fields answer that.
+#
+# `retryable` means "a plain Retry is worth offering". It is deliberately False
+# for a format rejection that MP3 would fix: re-running the identical search
+# against the identical peers under the identical format policy is not a retry,
+# it is the same failure again, and Allow-MP3-and-retry is the real action.
+# ---------------------------------------------------------------------------
+
+FILL_FAILURE_KINDS = ("no_source", "format_rejected", "transfer_failed",
+                      "placement_failed", "mb_unavailable")
+
+# Only the genuinely transient ones. `no_source` must never auto-retry: lb-bot
+# walks its entire ranked source list before reporting failure, so an automatic
+# retry re-runs the same search against the same peers. The user asking again is
+# the new information, and that stays a button.
+FILL_AUTO_RETRY_KINDS = ("mb_unavailable", "transfer_failed")
+FILL_AUTO_RETRY_MAX = 1
+FILL_AUTO_RETRY_DELAY = 45.0
+
+def _album_fill_fail(release_mbid: str, kind: str, reason: str,
+                     *, retryable: bool = None, **fields) -> None:
+    """Record a terminal failure with its kind, and schedule the one auto-retry
+    the transient kinds get.
+
+    `attempts` counts fills of this release in this ledger row — it survives a
+    restart with the row, so a client can tell one failure from four.
+    """
+    if kind not in FILL_FAILURE_KINDS:
+        kind = "transfer_failed"
+    prior = _album_fill_get(release_mbid)
+    attempts = int(prior.get("attempts") or 0) + 1
+    if retryable is None:
+        retryable = not (kind == "format_rejected"
+                         and bool(fields.get("mp3WouldHelp",
+                                             prior.get("mp3WouldHelp"))))
+    _album_fill_set(release_mbid, "failed", reason=reason, failureKind=kind,
+                    retryable=bool(retryable), attempts=attempts,
+                    durable=True, **fields)
+    if kind in FILL_AUTO_RETRY_KINDS and attempts <= FILL_AUTO_RETRY_MAX:
+        _schedule_album_fill_retry(release_mbid, prior, delay=FILL_AUTO_RETRY_DELAY)
+
+def _schedule_album_fill_retry(release_mbid: str, prior: dict,
+                               delay: float = FILL_AUTO_RETRY_DELAY) -> None:
+    """Re-run one album fill after a backoff, from the ledger row's own details.
+
+    Everything the download task needs — artist, album, track count, rgid,
+    quality — is already on the ledger row, which is why this can exist at all
+    without a second copy of the request. The chosen peer is deliberately *not*
+    replayed: the kinds that reach here failed at transfer or at MusicBrainz, so
+    re-ranking the sources from scratch is the point.
+
+    Guarded the same way `/api/album/download` is: if anything has started a fill
+    for this release in the meantime, that is the answer and this does nothing.
+    """
+    artist = prior.get("artist", "")
+    album = prior.get("album", "")
+    if not release_mbid or not artist or not album:
+        return
+
+    def _worker():
+        try:
+            time.sleep(max(0.0, delay))
+            gid, _ag = _album_group_for_release(release_mbid)
+            if gid or _running_album_download_task(release_mbid):
+                return
+            if (_album_fill_get(release_mbid).get("state") or "") != "failed":
+                return          # something else moved it on; leave it alone
+            _task_run(
+                "album-download",
+                f"Retry album: {artist} - {album}",
+                lambda tid: _album_download_task(
+                    tid, release_mbid, artist, album,
+                    int(prior.get("total") or 0), None,
+                    prior.get("rgid", ""), prior.get("quality", "")),
+                total=int(prior.get("total") or 0),
+                release_mbid=release_mbid)
+        except Exception as e:  # noqa: BLE001 — a retry must never kill the process
+            print(f"  album fill auto-retry failed: {e}")
+
+    threading.Thread(target=_worker, daemon=True,
+                     name=f"album-retry-{release_mbid[:8]}").start()
 
 def _album_group_for_release(release_mbid: str) -> tuple:
     """(group_id, group) of the in-flight transfer group for this release, if any."""
@@ -1406,6 +1812,14 @@ def _album_fill_view(release_mbid: str) -> dict:
         "percent": 0,
         "reason": entry.get("reason", ""),
         "mp3WouldHelp": bool(entry.get("mp3WouldHelp")),
+        # What kind of failure, whether a plain Retry is worth offering, and how
+        # many fills this release has had. Clients used to infer all three from
+        # `reason`'s wording; these let them render the right button from fields.
+        # Empty/False/0 on anything that has not failed, so a client can read
+        # them unconditionally.
+        "failureKind": entry.get("failureKind", ""),
+        "retryable": bool(entry.get("retryable")),
+        "attempts": int(entry.get("attempts") or 0),
         "groupId": entry.get("groupId", "") or gid,
         "taskId": entry.get("taskId", ""),
         "updatedAt": entry.get("updated_at", 0),
@@ -2024,6 +2438,8 @@ def _resolve_token(context) -> str:
 MBZ_API       = "https://musicbrainz.org/ws/2"
 _mbz_last_req = 0.0
 _mbz_cache: dict = {}          # "path?sortedparams" -> response json
+# Its revision counters are declared up with MBZ_CACHE_FILE, because
+# _save_mbz_cache / _load_state are defined long before this point.
 MBZ_CACHE_MAX = 8000           # in-memory cap
 # A missing/invalid mbid is a permanent answer and is cached as {}. Anything
 # else (503, timeout) is temporary and only earns a cooldown, never a cache
@@ -2037,9 +2453,14 @@ MBZ_PLACEMENT_RETRY_BACKOFF = (5.0, 20.0)
 _mbz_fail_until: dict = {}     # key -> retry-after timestamp (not persisted)
 
 def _mbz_cache_put(key: str, data: dict) -> None:
+    global _mbz_cache_rev
     if len(_mbz_cache) >= MBZ_CACHE_MAX:
         _mbz_cache.pop(next(iter(_mbz_cache)))   # drop oldest insertion
     _mbz_cache[key] = data
+    # Bumped on every write, not derived from len(): the cache evicts as well as
+    # grows, so the count can be identical either side of a real change. This is
+    # what lets _save_mbz_cache skip re-serializing 26 MB on an idle flush.
+    _mbz_cache_rev += 1
 # The web UI runs Flask with threaded=True, so request threads and background
 # scan/index tasks call mbz_get concurrently. Without this the 1/sec pacing was
 # advisory: every thread read _mbz_last_req, computed the same "no wait needed",
@@ -2375,6 +2796,39 @@ def mbz_artist_release_groups(artist_mbid: str, *,
     out.sort(key=lambda r: (r["first_release_date"] or "9999", r["title"].lower()))
     return out
 
+def mbz_release_group_row(rgid: str) -> dict:
+    """One release-group in the same shape `mbz_artist_release_groups` emits.
+
+    The single-release index refresh needs exactly one row and the browse above
+    is the wrong tool for it: an artist with 200 release-groups costs 2 paged
+    MusicBrainz requests to find one the caller already named. This is one
+    lookup, and it deliberately does **not** apply the secondary-type exclusions
+    — the caller asked for this specific release, so filtering it back out would
+    answer a question nobody asked.
+    """
+    if not rgid:
+        return {}
+    rg = mbz_get(f"release-group/{rgid}", {"inc": "artist-credits"})
+    if not rg.get("id"):
+        return {}
+    sec_raw = rg.get("secondary-types") or []
+    sec = [(t if isinstance(t, str) else (t.get("name") or "")).lower()
+           for t in sec_raw]
+    credit = rg.get("artist-credit") or []
+    artist_mbid = ""
+    if credit and isinstance(credit[0], dict):
+        artist_mbid = ((credit[0].get("artist") or {}).get("id") or "")
+    return {
+        "rgid":               rg.get("id", ""),
+        "title":              rg.get("title", ""),
+        "primary_type":       (rg.get("primary-type") or "").lower(),
+        "secondary_types":    sec,
+        "year":               (rg.get("first-release-date") or "")[:4],
+        "first_release_date": rg.get("first-release-date") or "",
+        "artist_mbid":        artist_mbid,
+        "artist_name":        _artist_credit_str(credit),
+    }
+
 _spotify_token: dict = {"access_token": None, "expires_at": 0.0}
 
 def _spotify_auth_header() -> dict:
@@ -2556,6 +3010,42 @@ def lbz_get_tracks(uuid: str, playlist_name: str) -> list:
 
 _FRESH_CACHE = {"ts": 0.0, "days": 0, "rows": []}
 _FRESH_TTL = 3600   # the fresh-releases feed moves slowly
+
+# How many rows /api/fresh-releases will return. The unbounded answer was the
+# entire site-wide ListenBrainz window, which is comfortably past the
+# navi-connect hub's 4 MB response ceiling — and that ceiling truncates silently
+# at HTTP 200, so both remote clients received a half-finished JSON document and
+# showed an empty tab. Owned artists are always kept whatever the limit; see
+# api_fresh_releases.
+FRESH_DEFAULT_LIMIT = 400
+FRESH_MAX_LIMIT = 1000
+
+
+def _fresh_apply_limit(rows: list, limit: int) -> list:
+    """Trim the enriched fresh feed to `limit`, keeping every owned artist.
+
+    **Owned rows are never dropped, whatever the limit.** A new album by an
+    artist already in the library is exactly the row a plain popularity cut
+    would lose — an obscure artist you own has almost no site-wide listens — and
+    it is the row the whole page exists for. They are a small minority of a
+    global feed, so keeping all of them costs nothing worth counting.
+
+    The remainder is filled by listen count, then the result is put back into the
+    feed's own release-date order: the clients bucket by week, and handing them a
+    popularity ranking would scramble that.
+
+    Deliberately not done inside `lbz_fresh_releases`, which caches for an hour
+    keyed only on `days` — baking a limit into the cached rows would let the
+    first caller's limit stick for every caller for the rest of the hour.
+    """
+    if limit <= 0 or len(rows) <= limit:
+        return rows
+    owned = [r for r in rows if r.get("artistOwned")]
+    rest = sorted((r for r in rows if not r.get("artistOwned")),
+                  key=lambda r: int(r.get("listenCount") or 0), reverse=True)
+    kept = owned + rest[:max(0, limit - len(owned))]
+    order = {id(r): i for i, r in enumerate(rows)}
+    return sorted(kept, key=lambda r: order[id(r)])
 
 # ── Similar artists ─────────────────────────────────────────────────────────
 # Two independent sources, because each alone has a characteristic blind spot:
@@ -4066,89 +4556,83 @@ def build_artist_discography(artist_mbid: str, artist_name: str,
                 progress(done, total, artist_name, rg["title"])
             except Exception:
                 pass
-        matches = claims.get(rg["rgid"])
-        match_info = claim_meta.get(rg["rgid"], {})
-
-        if not matches:
-            releases.append({
-                "rgid": rg["rgid"], "title": rg["title"], "year": rg["year"],
-                "primary_type": rg["primary_type"],
-                "secondary_types": rg.get("secondary_types") or [],
-                "effective_type": _effective_release_type(
-                    rg["primary_type"], rg.get("secondary_types")),
-                "status": "missing",
-            })
-            continue
-
-        tagged = [a for a in matches if a.get("musicBrainzId")]
-        if not tagged:
-            releases.append({
-                "rgid": rg["rgid"], "title": rg["title"], "year": rg["year"],
-                "primary_type": rg["primary_type"],
-                "secondary_types": rg.get("secondary_types") or [],
-                "effective_type": _effective_release_type(
-                    rg["primary_type"], rg.get("secondary_types")),
-                "status": "untagged",
-                "match_method": match_info.get("method", ""),
-                "match_score": match_info.get("score", 0),
-                "navidrome_album_ids": [a.get("id", "") for a in matches],
-            })
-            continue
-
-        # Wrong-release guard: a title-matched album's own mbid may belong to
-        # a different release-group (or not resolve at all) — computing
-        # completeness from that tag would judge this release-group by some
-        # other album's tracklist. Pin the canonical tracklist to a release
-        # actually inside this release-group instead.
-        canonical_override = ""
-        if match_info.get("method") == "title":
-            records_sorted = sorted(
-                tagged, key=lambda r: (-(int(r.get("songCount") or 0)), r.get("name", "")))
-            own_mbid = records_sorted[0].get("musicBrainzId") or ""
-            own_rg = own_mbid if own_mbid == rg["rgid"] else mbz_release_group_of(own_mbid)
-            if own_rg != rg["rgid"]:
-                canonical_override = mbz_resolve_album(rg["rgid"]).get("release_mbid", "")
-
-        records = [_album_record(a, nd_user, nd_pass) for a in tagged]
-        group   = _make_review_group(records, "duplicate" if len(records) > 1 else "incomplete",
-                                     canonical_mbid=canonical_override)
-        if group.get("missing_tracks"):
-            group["source"] = "artist_discography"
-            group["rgid"]   = rg["rgid"]
+        release, group = _classify_release_group(
+            rg, claims.get(rg["rgid"]), claim_meta.get(rg["rgid"], {}),
+            nd_user, nd_pass)
+        releases.append(release)
+        if group is not None:
             # Group ids derive from the matched album records; single-claim
             # matching should make collisions impossible, but never emit two
             # groups with the same id regardless.
             if not any(g["id"] == group["id"] for g in review_groups):
                 review_groups.append(group)
-            releases.append({
-                "rgid": rg["rgid"], "title": rg["title"], "year": rg["year"],
-                "primary_type": rg["primary_type"],
-                "secondary_types": rg.get("secondary_types") or [],
-                "effective_type": _effective_release_type(
-                    rg["primary_type"], rg.get("secondary_types")),
-                "status": "incomplete",
-                "match_method": match_info.get("method", ""),
-                "match_score": match_info.get("score", 0),
-                "group_id": group["id"], "present": group["present"], "total": group["total"],
-                # Carried so the album detail page can ask for per-track
-                # presence without first resolving the review group.
-                "navidrome_album_ids": [a.get("id", "") for a in tagged],
-            })
-        else:
-            releases.append({
-                "rgid": rg["rgid"], "title": rg["title"], "year": rg["year"],
-                "primary_type": rg["primary_type"],
-                "secondary_types": rg.get("secondary_types") or [],
-                "effective_type": _effective_release_type(
-                    rg["primary_type"], rg.get("secondary_types")),
-                "status": "complete",
-                "match_method": match_info.get("method", ""),
-                "match_score": match_info.get("score", 0),
-                "navidrome_album_ids": [a.get("id", "") for a in tagged],
-            })
 
     return {"artist_mbid": artist_mbid, "artist_name": artist_name,
             "releases": releases, "review_groups": review_groups}
+
+def _classify_release_group(rg: dict, matches, match_info: dict,
+                            nd_user: str, nd_pass: str) -> tuple:
+    """Classify one release-group against the Navidrome albums that claimed it.
+
+    Extracted out of `build_artist_discography`'s loop so the single-release
+    refresh route (`/api/artist/release`) classifies by exactly the same rules —
+    a second copy of this would drift, and the two answers disagreeing about one
+    album is the "shows up twice" failure in a different costume.
+
+    Returns `(release_row, review_group_or_None)`; the group is non-None only for
+    an `incomplete` result, and carries the `group_id` the Fill-gaps workspace is
+    reached by.
+    """
+    base = {
+        "rgid": rg["rgid"], "title": rg["title"], "year": rg.get("year", ""),
+        "primary_type": rg.get("primary_type", ""),
+        "secondary_types": rg.get("secondary_types") or [],
+        "effective_type": _effective_release_type(
+            rg.get("primary_type", ""), rg.get("secondary_types")),
+    }
+    if not matches:
+        return {**base, "status": "missing"}, None
+
+    tagged = [a for a in matches if a.get("musicBrainzId")]
+    if not tagged:
+        return {**base, "status": "untagged",
+                "match_method": match_info.get("method", ""),
+                "match_score": match_info.get("score", 0),
+                "navidrome_album_ids": [a.get("id", "") for a in matches]}, None
+
+    # Wrong-release guard: a title-matched album's own mbid may belong to
+    # a different release-group (or not resolve at all) — computing
+    # completeness from that tag would judge this release-group by some
+    # other album's tracklist. Pin the canonical tracklist to a release
+    # actually inside this release-group instead.
+    canonical_override = ""
+    if match_info.get("method") == "title":
+        records_sorted = sorted(
+            tagged, key=lambda r: (-(int(r.get("songCount") or 0)), r.get("name", "")))
+        own_mbid = records_sorted[0].get("musicBrainzId") or ""
+        own_rg = own_mbid if own_mbid == rg["rgid"] else mbz_release_group_of(own_mbid)
+        if own_rg != rg["rgid"]:
+            canonical_override = mbz_resolve_album(rg["rgid"]).get("release_mbid", "")
+
+    records = [_album_record(a, nd_user, nd_pass) for a in tagged]
+    group   = _make_review_group(records, "duplicate" if len(records) > 1 else "incomplete",
+                                 canonical_mbid=canonical_override)
+    if group.get("missing_tracks"):
+        group["source"] = "artist_discography"
+        group["rgid"]   = rg["rgid"]
+        return {**base, "status": "incomplete",
+                "match_method": match_info.get("method", ""),
+                "match_score": match_info.get("score", 0),
+                "group_id": group["id"], "present": group["present"],
+                "total": group["total"],
+                # Carried so the album detail page can ask for per-track
+                # presence without first resolving the review group.
+                "navidrome_album_ids": [a.get("id", "") for a in tagged]}, group
+
+    return {**base, "status": "complete",
+            "match_method": match_info.get("method", ""),
+            "match_score": match_info.get("score", 0),
+            "navidrome_album_ids": [a.get("id", "") for a in tagged]}, None
 
 # ---------------------------------------------------------------------------
 # Library index — persistent per-artist discography classification (SQLite,
@@ -4311,7 +4795,8 @@ def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
                 "match_method, match_score, updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
-def _index_mark_release_present(rgid: str = "", group_id: str = "") -> int:
+def _index_mark_release_present(rgid: str = "", group_id: str = "",
+                                artist_key: str = "", title: str = "") -> int:
     """Flip an indexed release-group to `present` after its files were placed.
 
     Without this the index keeps saying `missing` until the artist is rescanned
@@ -4325,7 +4810,18 @@ def _index_mark_release_present(rgid: str = "", group_id: str = "") -> int:
     `total` and the Navidrome album ids are left alone: nothing here knows the
     real numbers, and the next full scan will fill them in.
 
-    Returns the number of index rows changed.
+    **This used to be UPDATE-only, and silently did nothing whenever the rgid was
+    not already a row.** That is not a rare case: a download started from a Fresh
+    release, or from an artist whose index predates the release, has no row to
+    update, so `rowcount` was 0 and the album kept listing as missing forever.
+    With `artist_key` the row is inserted instead — `present` is a fifth status
+    value no scan ever produces (the scanner emits only complete / incomplete /
+    untagged / missing), which is exactly why no client may filter discography
+    rows on `status == 'missing'`.
+
+    Returns the number of index rows changed. **Check it.** A silent no-op here
+    is the "album shows up twice" failure the design doc warns about, so the one
+    caller that can't insert logs a warning rather than dropping it on the floor.
     """
     if not rgid and not group_id:
         return 0
@@ -4342,10 +4838,165 @@ def _index_mark_release_present(rgid: str = "", group_id: str = "") -> int:
                     cur = conn.execute(
                         "UPDATE release_groups SET status = 'present', updated_at = ? "
                         "WHERE group_id = ? AND status != 'present'", (now, group_id))
+                changed = cur.rowcount or 0
+                if changed or not (rgid and artist_key):
+                    return changed
+                # Nothing to update and we know whose discography it belongs to:
+                # insert the row. INSERT OR IGNORE rather than a plain INSERT
+                # because the UPDATE above also reports 0 for a row that is
+                # already 'present', and racing another fill must not raise.
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO release_groups "
+                    "(artist_key, rgid, title, status, updated_at) "
+                    "VALUES (?,?,?,'present',?)", (artist_key, rgid, title, now))
                 return cur.rowcount or 0
     except Exception as e:  # noqa: BLE001 — a bookkeeping write must not fail a placement
         print(f"  index: could not mark release present: {e}")
         return 0
+
+def _index_upsert_release(artist_key: str, release: dict) -> bool:
+    """Write one classified release-group row, replacing whatever was there.
+
+    The only other writers into `release_groups` are `_index_store_artist` (a
+    whole-artist delete-and-reinsert, reachable only from a full scan) and
+    `_index_mark_release_present`. Neither can add or refresh one release, so the
+    smallest unit of refresh used to be an entire artist at one MusicBrainz
+    request per second per release-group — for an album that just came out.
+
+    REPLACE rather than INSERT OR IGNORE: this is a re-classification, so a row
+    saying `missing` for a release the library now holds has to lose.
+    """
+    if not artist_key or not release.get("rgid"):
+        return False
+    try:
+        with _index_lock:
+            conn = _index_db()
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO release_groups "
+                    "(artist_key, rgid, title, primary_type, secondary_types, year, "
+                    " status, group_id, present, total, nd_album_ids, match_method, "
+                    " match_score, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (artist_key, release.get("rgid", ""), release.get("title", ""),
+                     release.get("primary_type", ""),
+                     json.dumps(release.get("secondary_types") or []),
+                     release.get("year", ""), release.get("status", "missing"),
+                     release.get("group_id", ""), int(release.get("present") or 0),
+                     int(release.get("total") or 0),
+                     json.dumps(release.get("navidrome_album_ids") or []),
+                     release.get("match_method", ""),
+                     float(release.get("match_score") or 0), time.time()))
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"  index: could not upsert release {release.get('rgid', '')}: {e}")
+        return False
+
+def _index_existing_artist_key(artist_mbid: str = "", nd_artist_id: str = "") -> str:
+    """The `artist_key` an already-stored `artists` row uses for this artist, or "".
+
+    **The read and the write must agree on this key or the row is invisible.**
+    `_index_get_artist` finds an artist three ways — by `artist_key == <mbid>`, by
+    `artist_key == 'nd:<id>'`, and by `nd_artist_id == <id>` — while
+    `_index_artist_key` only ever *mints* the first two. A scan started from a
+    Navidrome id whose tags carried no mbid stores `artist_key = <resolved mbid>`
+    with `nd_artist_id = <nd id>`; a later single-release write that knows only
+    the nd id would mint `nd:<id>`, land under a key nothing reads, and leave the
+    caller staring at a release that "stored" successfully and cannot be found.
+
+    So: look for the existing row first, exactly the way the reader does, and only
+    mint a fresh key when there genuinely isn't one.
+    """
+    if not artist_mbid and not nd_artist_id:
+        return ""
+    try:
+        with _index_lock:
+            conn = _index_db()
+            if artist_mbid:
+                row = conn.execute(
+                    "SELECT artist_key FROM artists WHERE artist_key = ? OR artist_mbid = ? "
+                    "ORDER BY scanned_at DESC LIMIT 1",
+                    (artist_mbid, artist_mbid)).fetchone()
+                if row and row["artist_key"]:
+                    return row["artist_key"]
+            if nd_artist_id:
+                row = conn.execute(
+                    "SELECT artist_key FROM artists WHERE artist_key = ? OR nd_artist_id = ? "
+                    "ORDER BY scanned_at DESC LIMIT 1",
+                    (f"nd:{nd_artist_id}", nd_artist_id)).fetchone()
+                if row and row["artist_key"]:
+                    return row["artist_key"]
+    except Exception as e:  # noqa: BLE001 — a lookup for a bookkeeping write
+        print(f"  index: existing artist key lookup failed: {e}")
+    return ""
+
+def _index_ensure_artist(artist_key: str, artist_mbid: str = "",
+                         nd_artist_id: str = "", name: str = "") -> None:
+    """Make sure a `release_groups` row has an `artists` parent to hang off.
+
+    Without this the single-release write is a no-op in practice:
+    `_index_get_artist` selects from `artists` *first* and returns None when
+    there is no row, so the release-group row is stored, invisible, and the
+    client's re-read answers `indexed: false` — which sends it off to start the
+    whole-artist MusicBrainz walk this route exists to avoid.
+
+    **INSERT OR IGNORE, never REPLACE.** A real scan owns `name`, `scanned_at`
+    and `scan_version`; stamping this cheap path's values over them would make a
+    fully-scanned artist look freshly scanned and suppress the rescan prompt.
+    `scanned_at = 0` marks the row as never actually walked.
+    """
+    if not artist_key:
+        return
+    try:
+        with _index_lock:
+            conn = _index_db()
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO artists "
+                    "(artist_key, artist_mbid, nd_artist_id, name, scanned_at, scan_version) "
+                    "VALUES (?,?,?,?,0,0)",
+                    (artist_key, artist_mbid, nd_artist_id, name))
+    except Exception as e:  # noqa: BLE001
+        print(f"  index: could not ensure artist row {artist_key}: {e}")
+
+def _index_artist_key_for_rgid(rgid: str, artist_mbid: str = "",
+                               artist_name: str = "") -> str:
+    """Which indexed artist a release-group belongs to, or "" if none does.
+
+    Feeds `_index_mark_release_present`'s insert path. Deliberately returns ""
+    for an artist nobody has indexed: with no stored discography there is no list
+    showing this album as missing, so there is nothing for the row to fix and
+    inventing an `artists`-less key would only leave an orphan.
+
+    Order is cheapest-first and never asks MusicBrainz: an existing row for the
+    same rgid under any artist, then the artist mbid, then the artist's name.
+    """
+    if not rgid:
+        return ""
+    try:
+        with _index_lock:
+            conn = _index_db()
+            row = conn.execute(
+                "SELECT artist_key FROM release_groups WHERE rgid = ? LIMIT 1",
+                (rgid,)).fetchone()
+            if row and row["artist_key"]:
+                return row["artist_key"]
+            if artist_mbid:
+                row = conn.execute(
+                    "SELECT artist_key FROM artists WHERE artist_key = ? "
+                    "OR artist_mbid = ? LIMIT 1",
+                    (artist_mbid, artist_mbid)).fetchone()
+                if row and row["artist_key"]:
+                    return row["artist_key"]
+            if artist_name:
+                row = conn.execute(
+                    "SELECT artist_key FROM artists "
+                    "WHERE lower(name) = lower(?) LIMIT 1",
+                    (artist_name,)).fetchone()
+                if row and row["artist_key"]:
+                    return row["artist_key"]
+    except Exception as e:  # noqa: BLE001 — a lookup for a bookkeeping write
+        print(f"  index: artist key lookup failed: {e}")
+    return ""
 
 def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | None:
     """Stored discography for an artist, or None if not indexed. Shape matches
@@ -7414,15 +8065,17 @@ async def _finalize_group(bot, ag_id: str):
     # where the fill ended up.
     fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
     if ag["completed"] <= 0:
-        _album_fill_set(fill_mbid, "failed",
-                        reason=f"No file downloaded ({fails} failed)")
+        _album_fill_fail(fill_mbid, "transfer_failed",
+                         f"No file downloaded ({fails} failed)")
     if ag["completed"] > 0 and not ag["local_dirs"]:
         import_note = (
             f"\n⚠️ Downloaded files could not be located under {SLSKD_DOWNLOAD_DIR}. "
             "Check the shared downloads volume and place them manually.")
-        _album_fill_set(fill_mbid, "failed",
-                        reason="Downloaded, but the files could not be found in "
-                               "the downloads volume")
+        # Not retryable by button: the bytes arrived and the volume mapping is
+        # wrong. Re-downloading lands them in the same place nobody can see.
+        _album_fill_fail(fill_mbid, "placement_failed",
+                         "Downloaded, but the files could not be found in "
+                         "the downloads volume", retryable=False)
     if ag["completed"] > 0 and ag["local_dirs"]:
         album_dir = max(ag["local_dirs"].items(), key=lambda kv: kv[1])[0]
         if ag.get("match_mode") == "manual" and ag.get("review_group_id"):
@@ -7471,11 +8124,31 @@ async def _finalize_group(bot, ag_id: str):
             # The library index still says this release-group is missing, and
             # every client's "not in your library" list reads that row — so a
             # freshly filled album would sit in both lists until the next scan.
-            _index_mark_release_present(
-                rgid=_album_fill_get(fill_mbid).get("rgid", ""),
-                group_id=ag.get("review_group_id", ""))
+            #
+            # The rgid used to come from the fill ledger alone, which was in
+            # memory only: after a restart it was "", an artist-page download has
+            # no review_group_id to fall back on, and the flip and the hub
+            # broadcast both silently did nothing. The ledger is persisted now
+            # (see _album_fill_set), and this derives the rgid from the release
+            # itself as a second source so the fix does not rest on it.
+            fill_row = _album_fill_get(fill_mbid)
+            fill_rgid = fill_row.get("rgid", "")
+            if not fill_rgid and fill_mbid:
+                # Off the event loop: rgid_from_release goes to MusicBrainz, and
+                # mbz_get holds its lock across a 1 req/sec pacing sleep.
+                fill_rgid = await asyncio.to_thread(rgid_from_release, fill_mbid)
+            changed = _index_mark_release_present(
+                rgid=fill_rgid,
+                group_id=ag.get("review_group_id", ""),
+                artist_key=_index_artist_key_for_rgid(
+                    fill_rgid, artist_name=ag.get("artist", "")),
+                title=ag.get("album", ""))
+            if not changed:
+                print(f"  index: nothing marked present for {fill_rgid or fill_mbid} "
+                      f"({ag.get('artist', '')} - {ag.get('album', '')}) — the album "
+                      "may keep listing as missing until the artist is rescanned")
             _notify_hub_library_change(
-                fill_mbid, rgid=_album_fill_get(fill_mbid).get("rgid", ""),
+                fill_mbid, rgid=fill_rgid,
                 artist=ag.get("artist", ""), album=ag.get("album", ""))
             # A review group already has _verify_placement_worker polling its
             # tracks; an artist-page download has no group, so nothing else would
@@ -7486,7 +8159,14 @@ async def _finalize_group(bot, ag_id: str):
         else:
             status = "failed"
             import_note = f"\n⚠️ Placement failed: {result['error']}"
-            _album_fill_set(fill_mbid, "failed", reason=result.get("error", ""))
+            # `retryable` on the placement result is set for exactly one case:
+            # a pinned release whose tracklist MusicBrainz would not return (see
+            # _deterministic_album_import). The files are downloaded and waiting;
+            # asking again in a few minutes is genuinely the fix.
+            _album_fill_fail(
+                fill_mbid,
+                "mb_unavailable" if result.get("retryable") else "placement_failed",
+                result.get("error", ""))
 
     if fails:
         head = (f"⚠️ Album finished with errors: {label}\n"
@@ -10929,9 +11609,13 @@ def _album_download_task(task_id: str, release_mbid: str, artist: str,
     # The rgid rides along purely so a successful placement can flip the library
     # index row for this release-group (see _index_mark_release_present) — the
     # transfer machinery below is all keyed on the release, not the group.
+    # Written through to disk: this row carries the artist/album/rgid/quality
+    # that `_finalize_group` flips the index with and that an auto-retry rebuilds
+    # the request from, and the fill it describes outlives a restart because
+    # pending_album_groups does.
     _album_fill_set(release_mbid, "searching", artist=artist, album=album,
                     taskId=task_id, total=total_tracks, rgid=rgid,
-                    quality=quality or "")
+                    quality=quality or "", durable=True)
     # An empty quality is "whatever Source preferences say"; the scope covers the
     # search and the enqueue, and the group below carries it for the failover.
     with _quality_preference(quality):
@@ -10950,8 +11634,13 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
     if not folders:
         reason = _no_source_reason(stats)
         mp3_would_help = MP3_FALLBACK_EXT in (stats.get("rejected_formats") or ())
-        _album_fill_set(release_mbid, "failed", reason=reason,
-                        mp3WouldHelp=bool(mp3_would_help))
+        # Peers offered files and the format policy turned them all away, versus
+        # nobody had it at all. The first is what Allow-MP3-and-retry is for; the
+        # second has no better action than the user asking again later.
+        rejected = stats.get("rejected_formats") or ()
+        _album_fill_fail(release_mbid,
+                         "format_rejected" if rejected else "no_source",
+                         reason, mp3WouldHelp=bool(mp3_would_help))
         _task_finish(task_id, error=f"No usable source: {reason}",
                      no_source_reason=reason, mp3_would_help=bool(mp3_would_help))
         return
@@ -10980,10 +11669,10 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
     if ok:
         _album_fill_set(release_mbid, "queued", groupId=ag_id or "",
                         done=0, total=total, failed=0,
-                        source=fd.get("username", ""))
+                        source=fd.get("username", ""), durable=True)
     else:
-        _album_fill_set(release_mbid, "failed",
-                        reason="slskd accepted none of the album's files")
+        _album_fill_fail(release_mbid, "transfer_failed",
+                         "slskd accepted none of the album's files")
     _task_finish(task_id, f"Queued {ok}/{total} file(s)" if ok else "Could not queue album",
                  "" if ok else "Could not queue album")
 
@@ -12648,7 +13337,8 @@ def _active_scan_task_view(snap: dict = None) -> dict:
         tid = _active_review_scan_task_id
     if not tid:
         return None
-    task = ((snap or _review_snapshot()).get("tasks", {}) or {}).get(tid) or {}
+    tasks = (snap.get("tasks") or {}) if snap else _tasks_snapshot()
+    task = tasks.get(tid) or {}
     if task.get("status") != "running":
         return None
     return {
@@ -12867,7 +13557,7 @@ def _transfers_view() -> dict:
     # The Downloads tab polls only this endpoint, so carry the identify sweep's
     # progress here rather than making it poll /api/tasks too.
     task = next(
-        (t for t in (_review_snapshot().get("tasks", {}) or {}).values()
+        (t for t in _tasks_snapshot().values()
          if t.get("kind") == "identify" and t.get("status") in ("queued", "running")),
         None)
     identify = {
@@ -13484,7 +14174,7 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/tasks")
     def api_tasks():
-        return jsonify(_review_snapshot().get("tasks", {}))
+        return jsonify(_tasks_snapshot())
 
     @app.get("/api/operations")
     def api_operations():
@@ -13499,7 +14189,7 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/tasks/<task_id>")
     def api_task(task_id):
-        task = _review_snapshot().get("tasks", {}).get(task_id)
+        task = _tasks_snapshot().get(task_id)
         if not task:
             return jsonify({"error": "Task not found"}), 404
         return jsonify(task)
@@ -13799,7 +14489,7 @@ def start_web_dashboard() -> None:
         """Resolve download folders to MusicBrainz releases in the background.
         User-initiated: the sweep is rate-limited to 1 MB req/sec."""
         data = request.get_json(silent=True) or {}
-        tasks = _review_snapshot().get("tasks", {}) or {}
+        tasks = _tasks_snapshot()
         running = next(
             (tid for tid, t in tasks.items()
              if t.get("kind") == "identify" and t.get("status") in ("queued", "running")),
@@ -13853,7 +14543,7 @@ def start_web_dashboard() -> None:
                 "no_release", "No release match for this folder",
                 "Run Identify, or pick the release manually.")), 400
         # Active-job dedupe: one placement task per folder at a time.
-        tasks = _review_snapshot().get("tasks", {})
+        tasks = _tasks_snapshot()
         running = next(
             (tid for tid, t in tasks.items()
              if t.get("kind") == "placement"
@@ -14348,6 +15038,16 @@ def start_web_dashboard() -> None:
         except ValueError:
             days = 30
         days = max(1, min(90, days))
+        # The feed is the whole site-wide ListenBrainz window and it used to be
+        # returned entire — routinely well past the navi-connect hub's 4 MB
+        # response ceiling, which truncates *silently* at HTTP 200 and hands both
+        # remote clients half a JSON document. lb-bot's own SPA never saw it,
+        # because it talks to this process directly.
+        try:
+            limit = int(request.args.get("limit") or FRESH_DEFAULT_LIMIT)
+        except ValueError:
+            limit = FRESH_DEFAULT_LIMIT
+        limit = max(1, min(FRESH_MAX_LIMIT, limit))
         try:
             rows = lbz_fresh_releases(days)
         except LBZError as e:
@@ -14378,7 +15078,11 @@ def start_web_dashboard() -> None:
             row["releaseOwned"] = release_owned
             row["owned"] = bool(artist_id)   # compat alias for artistOwned
             out.append(row)
-        return jsonify({"releases": out, "days": days})
+        # Cut AFTER enrichment, so the cut can be ownership-aware at all.
+        total = len(out)
+        out = _fresh_apply_limit(out, limit)
+        return jsonify({"releases": out, "days": days, "limit": limit,
+                        "total": total, "truncated": total > len(out)})
 
     @app.get("/api/artist/discography")
     def api_artist_discography_read():
@@ -14416,12 +15120,105 @@ def start_web_dashboard() -> None:
                                                  skip_library=skip_library))
         return jsonify({"ok": True, "task_id": task_id})
 
+    @app.post("/api/artist/release")
+    def api_artist_release():
+        """Add or refresh **one** release-group in an artist's stored index.
+
+        The gap this fills: `_index_store_artist` is a whole-artist
+        delete-and-reinsert reachable only from a full scan, and
+        `_index_mark_release_present` can only flip an existing row to `present`.
+        So the smallest refresh unit was one entire artist at one MusicBrainz
+        request per second per release-group — which is what a Fresh release
+        landing on an artist page it predates was otherwise asking for.
+
+        Cost here is one or two MusicBrainz calls. The classification is
+        `_classify_release_group`, the *same* function the full scan runs per
+        row, so an `incomplete` result gets a real `group_id` and the Fill-gaps
+        workspace is reachable from it exactly as it would be after a rescan.
+
+        Synchronous, not a task: it is fast enough to answer in the request, and
+        the caller (a client landing on an album) needs the row before it can
+        render anything.
+        """
+        data = request.get_json(silent=True) or {}
+        rgid = str(data.get("rgid") or "").strip()
+        mbid = str(data.get("mbid") or "").strip()
+        nd_id = str(data.get("nd_id") or "").strip()
+        if not rgid:
+            return jsonify({"error": "rgid is required"}), 400
+        if not mbid and not nd_id:
+            return jsonify({"error": "mbid or nd_id is required"}), 400
+
+        rg = mbz_release_group_row(rgid)
+        if not rg.get("rgid"):
+            # Distinguished from a bad request: mbz_resolve_album's five-minute
+            # negative cache means a transient MusicBrainz failure answers here
+            # too, and a client that retries in a minute is doing the right thing.
+            return jsonify({"error": "MusicBrainz did not return that release-group",
+                            "retryable": True}), 502
+
+        # `mb:` ids are the not-in-the-library form the discography scan already
+        # understands; there is nothing to match against, so everything is missing.
+        external = bool(data.get("external")) or nd_id.startswith("mb:")
+        artist_mbid = mbid or rg.get("artist_mbid", "")
+        if nd_id.startswith("mb:"):
+            # Not a Navidrome id at all — it is the artist's own MBID wearing the
+            # prefix `api_artist_discography` uses for artists off the library.
+            artist_mbid = artist_mbid or nd_id[3:]
+            nd_id = ""
+        # An existing row's key wins over a freshly minted one. The reader looks an
+        # artist up three ways and this only mints two of them, so minting blindly
+        # can file the release under a key nothing reads — stored, and invisible.
+        artist_key = (_index_existing_artist_key(artist_mbid, nd_id)
+                      or _index_artist_key(artist_mbid, nd_id))
+        if not artist_key:
+            return jsonify({"error": "Could not identify the artist to index against"}), 400
+
+        release, group = None, None
+        if external:
+            release, group = _classify_release_group(rg, None, {}, "", "")
+        else:
+            user = _default_web_user()
+            if not user:
+                return jsonify({"error": "No configured user"}), 400
+            artist_name = data.get("name", "").strip() or rg.get("artist_name", "")
+            artist_norm = _norm_album_text(artist_name)
+            # Same exact-normalization bucket the full scan uses. A cross-artist
+            # fuzzy fallback is deliberately absent there too: a wrong match
+            # produces a confidently wrong ownership verdict, which is worse
+            # than `missing`.
+            all_albums = _nd_album_index()
+            by_artist = [a for a in all_albums
+                         if _norm_album_text(a.get("artist")
+                                             or a.get("albumArtist") or "") == artist_norm]
+            claims, claim_meta = _match_albums_to_release_groups([rg], by_artist)
+            release, group = _classify_release_group(
+                rg, claims.get(rgid), claim_meta.get(rgid, {}),
+                user.get("navidrome_user", ""), user.get("navidrome_password", ""))
+
+        if group is not None:
+            # Union, never replace — the same rule the single-artist scan
+            # follows, so refreshing one release cannot wipe gaps accumulated
+            # from other artists or from a full-library scan.
+            _union_review_groups([group])
+
+        # The parent row first: a release_groups row with no artists row above it
+        # cannot be read back at all (_index_get_artist selects artists first and
+        # returns None), so the write would look like it worked and change nothing.
+        _index_ensure_artist(
+            artist_key, artist_mbid=artist_mbid, nd_artist_id=nd_id,
+            name=data.get("name", "").strip() or rg.get("artist_name", ""))
+        stored = _index_upsert_release(artist_key, release)
+        return jsonify({"ok": True, "stored": stored, "artistKey": artist_key,
+                        "release": release,
+                        "groupId": (group or {}).get("id", "")})
+
     @app.post("/api/library-index/build")
     def api_library_index_build():
         user = _default_web_user()
         if not user:
             return jsonify({"error": "No configured user"}), 400
-        tasks = _review_snapshot().get("tasks", {}) or {}
+        tasks = _tasks_snapshot()
         running = next(
             (tid for tid, t in tasks.items()
              if t.get("kind") == "library-index" and t.get("status") == "running"),
@@ -14455,7 +15252,7 @@ def start_web_dashboard() -> None:
             if (float(m["scanned_at"] or 0) < stale_cutoff
                     or int(m["scan_version"] or 0) != INDEX_SCAN_VERSION):
                 stale += 1
-        tasks = _review_snapshot().get("tasks", {}) or {}
+        tasks = _tasks_snapshot()
         build = next(
             (t for t in tasks.values()
              if t.get("kind") == "library-index" and t.get("status") == "running"),
@@ -15320,10 +16117,17 @@ async def tuesday_scheduler(apps: list):
             print(f"  weekly scan failed: {e} — will retry next week")
 
 async def state_flush_loop():
-    """Periodically snapshot durable state so a restart loses as little as possible."""
+    """Periodically snapshot durable state so a restart loses as little as possible.
+
+    The MB entity cache rides on this loop rather than on the ~31 eager
+    `_save_state()` call sites: it was 97% of the state file, and it is
+    rebuildable, so paying to re-serialize it on every button press bought
+    nothing. `_save_mbz_cache` no-ops unless the cache actually changed.
+    """
     while True:
         await asyncio.sleep(STATE_FLUSH_INT)
         await asyncio.to_thread(_save_state)
+        await asyncio.to_thread(_save_mbz_cache)
 
 async def housekeeping_loop(apps: list):
     """Drop untouched button state so memory doesn't grow without bound."""
@@ -15465,11 +16269,15 @@ async def main():
         while True:
             await asyncio.sleep(3600)
     finally:
-        _save_state()
+        _flush_all_state("shutdown")
 
 if __name__ == "__main__":
+    # Review-state saves are coalesced, so the exit paths have to write what the
+    # flusher has not yet. SIGTERM (`docker stop`) does not run `finally` or
+    # atexit on its own — _install_shutdown_flush is what makes it.
+    _install_shutdown_flush()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        _save_state()
+        _flush_all_state("interrupt")
         sys.exit(0)

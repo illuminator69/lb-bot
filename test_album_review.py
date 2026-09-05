@@ -86,13 +86,76 @@ class AlbumReviewTests(unittest.TestCase):
                 with bot._review_lock:
                     bot._review_state = bot._empty_review_state()
                     bot._review_state["groups"] = [{"id": "g1", "missing_tracks": []}]
-                bot._save_review_state()
+                # urgent: ordinary saves are coalesced by the background flusher,
+                # so a round-trip assertion has to ask for the synchronous write.
+                bot._save_review_state(urgent=True)
                 with bot._review_lock:
                     bot._review_state = bot._empty_review_state()
                 bot._load_review_state()
                 self.assertEqual(bot._review_snapshot()["groups"][0]["id"], "g1")
         finally:
             bot.REVIEW_FILE = old_file
+            with bot._review_lock:
+                bot._review_state = old_state
+
+    def test_review_save_is_coalesced_but_stamps_immediately(self):
+        """An ordinary save defers the write; updated_at and the memo do not defer.
+
+        The write is what costs ~110ms of _review_lock plus a multi-MB fsync, so
+        it is coalesced. `updated_at` is read by the views and must reflect
+        mutation time rather than flush time, so it stays eager — as does
+        dropping the per-request snapshot memo.
+        """
+        old_file = bot.REVIEW_FILE
+        old_state = bot._review_snapshot()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                bot.REVIEW_FILE = os.path.join(td, "review.json")
+                with bot._review_lock:
+                    bot._review_state = bot._empty_review_state()
+                    bot._review_state["groups"] = [{"id": "g9", "missing_tracks": []}]
+                bot._review_dirty.clear()
+
+                # No flusher thread: prove the deferral without racing it.
+                with patch.object(bot, "_ensure_review_flusher", lambda: None):
+                    bot._save_review_state()
+
+                self.assertTrue(bot._review_dirty.is_set(),
+                                "an ordinary save must mark the state dirty")
+                self.assertFalse(os.path.exists(bot.REVIEW_FILE),
+                                 "an ordinary save must not write synchronously")
+                self.assertGreater(bot._review_state["updated_at"], 0,
+                                   "updated_at must be stamped eagerly")
+
+                # The flusher's body writes it, and clears the flag first so a
+                # mutation arriving mid-dump is not dropped.
+                bot._review_dirty.clear()
+                bot._review_flush_now()
+                self.assertTrue(os.path.exists(bot.REVIEW_FILE))
+                with open(bot.REVIEW_FILE, encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh)["groups"][0]["id"], "g9")
+        finally:
+            bot.REVIEW_FILE = old_file
+            bot._review_dirty.clear()
+            with bot._review_lock:
+                bot._review_state = old_state
+
+    def test_review_snapshot_is_a_copy_not_a_reference(self):
+        """The read path releases _review_lock before parsing, and must still
+        hand back an isolated copy — mutating the snapshot cannot reach the
+        live state, and a later live mutation cannot reach a handed-out snap."""
+        old_state = bot._review_snapshot()
+        try:
+            with bot._review_lock:
+                bot._review_state = bot._empty_review_state()
+                bot._review_state["groups"] = [{"id": "g1", "missing_tracks": []}]
+            snap = bot._review_snapshot()
+            snap["groups"][0]["id"] = "mutated"
+            with bot._review_lock:
+                self.assertEqual(bot._review_state["groups"][0]["id"], "g1")
+                bot._review_state["groups"][0]["id"] = "changed-later"
+            self.assertEqual(snap["groups"][0]["id"], "mutated")
+        finally:
             with bot._review_lock:
                 bot._review_state = old_state
 
@@ -899,7 +962,7 @@ class AlbumReviewTests(unittest.TestCase):
 
     def test_settings_cards_redact_secrets_and_private_hosts(self):
         user = {
-            "navidrome_user": "testuser",
+            "navidrome_user": "icher",
             "navidrome_password": "secret-pass",
             "listenbrainz_user": "lbz",
             "playlist_sources": {"weekly": "Weekly"},
@@ -1318,6 +1381,365 @@ class AlbumReviewTests(unittest.TestCase):
                 bot.STATE_FILE = old_state
                 bot.repair_jobs.clear()
                 bot.repair_jobs.update(old_jobs)
+
+    def _state_files(self, td):
+        """Point both persistence paths at a temp dir and restore them after."""
+        old = (bot.STATE_FILE, bot.MBZ_CACHE_FILE,
+               bot._mbz_cache.copy(), bot._mbz_cache_rev, bot._mbz_cache_saved_rev)
+        bot.STATE_FILE = os.path.join(td, "state.json")
+        bot.MBZ_CACHE_FILE = os.path.join(td, "mbz_cache.json")
+
+        def restore():
+            (bot.STATE_FILE, bot.MBZ_CACHE_FILE, cache,
+             bot._mbz_cache_rev, bot._mbz_cache_saved_rev) = old
+            bot._mbz_cache.clear()
+            bot._mbz_cache.update(cache)
+
+        self.addCleanup(restore)
+
+    def test_mbz_cache_is_a_sidecar_not_part_of_the_state_file(self):
+        """The MB cache was 97% of a 26.8 MB state file and is rebuildable, so
+        the ~31 eager _save_state() sites must not pay to re-serialize it."""
+        with tempfile.TemporaryDirectory() as td:
+            self._state_files(td)
+            bot._mbz_cache.clear()
+            bot._mbz_cache["release/abc?inc=recordings"] = {"id": "abc"}
+            bot._mbz_cache["release?query=foo"] = {"searched": True}
+            bot._mbz_cache_rev += 1
+
+            bot._save_state()
+            with open(bot.STATE_FILE, encoding="utf-8") as fh:
+                written = json.load(fh)
+            self.assertNotIn("mbz_cache", written,
+                             "_save_state must not carry the MB cache any more")
+            self.assertFalse(os.path.exists(bot.MBZ_CACHE_FILE),
+                             "_save_state must not write the sidecar either")
+
+            bot._save_mbz_cache()
+            with open(bot.MBZ_CACHE_FILE, encoding="utf-8") as fh:
+                cached = json.load(fh)
+            # Entity lookups persist; search queries deliberately do not.
+            self.assertIn("release/abc?inc=recordings", cached)
+            self.assertNotIn("release?query=foo", cached)
+
+    def test_mbz_cache_save_skips_when_unchanged(self):
+        """An idle bot must not re-serialize 26 MB every STATE_FLUSH_INT."""
+        with tempfile.TemporaryDirectory() as td:
+            self._state_files(td)
+            bot._mbz_cache.clear()
+            bot._mbz_cache["release/abc"] = {"id": "abc"}
+            bot._mbz_cache_rev += 1
+
+            bot._save_mbz_cache()
+            first = os.path.getmtime(bot.MBZ_CACHE_FILE)
+
+            writes = []
+            real = bot._atomic_json_write
+            with patch.object(bot, "_atomic_json_write",
+                              lambda *a, **k: (writes.append(a[0]), real(*a, **k))[1]):
+                bot._save_mbz_cache()          # nothing changed -> no write
+                self.assertEqual(writes, [], "unchanged cache must not be rewritten")
+                bot._mbz_cache_put("release/def", {"id": "def"})
+                bot._save_mbz_cache()          # a real write bumped the rev
+                self.assertEqual(writes, [bot.MBZ_CACHE_FILE])
+            self.assertGreaterEqual(os.path.getmtime(bot.MBZ_CACHE_FILE), first)
+
+    def test_legacy_inline_mbz_cache_is_migrated_not_lost(self):
+        """Upgrading past the split must keep entries already paid for at 1 req/s."""
+        with tempfile.TemporaryDirectory() as td:
+            self._state_files(td)
+            # A state file in the old combined format.
+            with open(bot.STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"uid_counter": 0,
+                           "mbz_cache": {"release/legacy?inc=x": {"id": "legacy"}}}, fh)
+            bot._mbz_cache.clear()
+            bot._mbz_cache_rev = 0
+            bot._mbz_cache_saved_rev = -1
+
+            bot._load_state()
+            self.assertIn("release/legacy?inc=x", bot._mbz_cache)
+            # and the migration must leave a write pending, so the entries
+            # actually reach the sidecar rather than sitting in memory until
+            # some unrelated MusicBrainz call happens to dirty the cache.
+            self.assertNotEqual(bot._mbz_cache_rev, bot._mbz_cache_saved_rev)
+            bot._save_mbz_cache()
+            with open(bot.MBZ_CACHE_FILE, encoding="utf-8") as fh:
+                self.assertIn("release/legacy?inc=x", json.load(fh))
+
+    def test_sidecar_wins_over_legacy_inline_copy(self):
+        """The sidecar is the newer copy; the legacy blob only fills gaps."""
+        with tempfile.TemporaryDirectory() as td:
+            self._state_files(td)
+            with open(bot.MBZ_CACHE_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"release/k": {"v": "new"}}, fh)
+            with open(bot.STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"uid_counter": 0,
+                           "mbz_cache": {"release/k": {"v": "old"},
+                                         "release/only-legacy": {"v": "kept"}}}, fh)
+            bot._mbz_cache.clear()
+            bot._load_state()
+            self.assertEqual(bot._mbz_cache["release/k"], {"v": "new"})
+            self.assertEqual(bot._mbz_cache["release/only-legacy"], {"v": "kept"})
+
+    def _fill_ledger(self):
+        """Isolate the album-fill ledger and restore it afterwards."""
+        old = bot._album_fill_status.copy()
+
+        def restore():
+            bot._album_fill_status.clear()
+            bot._album_fill_status.update(old)
+
+        self.addCleanup(restore)
+        bot._album_fill_status.clear()
+
+    def test_fill_ledger_survives_a_restart(self):
+        """The whole point of §1: pending_album_groups and pending_downloads are
+        restored, so the download really does resume — only its ledger row used
+        to be lost, leaving clients polling album/status on `unknown` forever."""
+        with tempfile.TemporaryDirectory() as td:
+            self._state_files(td)
+            self._fill_ledger()
+            bot._album_fill_set("rel-1", "queued", artist="A", album="B",
+                                rgid="rg-1", quality="flac", total=9)
+            bot._save_state()
+
+            bot._album_fill_status.clear()
+            bot._load_state()
+            row = bot._album_fill_get("rel-1")
+            self.assertEqual(row.get("state"), "queued")
+            # rgid is the field _finalize_group flips the index with, and the
+            # one whose absence made the flip a silent no-op after a restart.
+            self.assertEqual(row.get("rgid"), "rg-1")
+            self.assertEqual(row.get("quality"), "flac")
+
+    def test_fill_ledger_prunes_only_aged_out_terminal_rows(self):
+        """A stale `verified` is history; an interrupted transfer is not, however
+        old it looks — pending_album_groups came back with it."""
+        self._fill_ledger()
+        now = time.time()
+        bot._album_fill_restore({
+            "old-verified": {"state": "verified", "updated_at": now - 7 * 3600},
+            "old-failed":   {"state": "failed",   "updated_at": now - 2 * 86400},
+            "recent-failed": {"state": "failed",  "updated_at": now - 60},
+            "stale-queued": {"state": "queued",   "updated_at": now - 30 * 86400},
+        })
+        self.assertNotIn("old-verified", bot._album_fill_status)
+        self.assertNotIn("old-failed", bot._album_fill_status)
+        self.assertIn("recent-failed", bot._album_fill_status)
+        self.assertIn("stale-queued", bot._album_fill_status)
+
+    def test_failure_kind_and_retryable_are_on_the_status_view(self):
+        """Clients used to infer the button from the sentence. §4 gives them
+        fields — and a format rejection MP3 would fix is deliberately NOT a
+        plain-retry, because that re-runs the identical rejected search."""
+        self._fill_ledger()
+        with patch.object(bot, "_save_state", lambda: None), \
+             patch.object(bot, "_schedule_album_fill_retry", lambda *a, **k: None):
+            bot._album_fill_fail("rel-fmt", "format_rejected",
+                                 "103 peers offered 2,047 files, none in FLAC",
+                                 mp3WouldHelp=True)
+            view = bot._album_fill_view("rel-fmt")
+            self.assertEqual(view["failureKind"], "format_rejected")
+            self.assertFalse(view["retryable"])
+            self.assertTrue(view["mp3WouldHelp"])
+            self.assertEqual(view["attempts"], 1)
+            # The free-text reason stays verbatim: it is the evidence.
+            self.assertIn("2,047 files", view["reason"])
+
+            bot._album_fill_fail("rel-none", "no_source", "Nobody had it")
+            self.assertTrue(bot._album_fill_view("rel-none")["retryable"])
+
+    def test_only_transient_kinds_auto_retry_and_only_once(self):
+        """no_source must never auto-retry: lb-bot already walked its whole
+        ranked source list, so an automatic retry re-runs the same search."""
+        self._fill_ledger()
+        scheduled = []
+        with patch.object(bot, "_save_state", lambda: None), \
+             patch.object(bot, "_schedule_album_fill_retry",
+                          lambda mbid, prior, **k: scheduled.append(mbid)):
+            bot._album_fill_fail("a", "no_source", "none")
+            bot._album_fill_fail("b", "format_rejected", "wrong format")
+            self.assertEqual(scheduled, [])
+
+            bot._album_fill_fail("c", "transfer_failed", "peer went away",
+                                 artist="A", album="B")
+            self.assertEqual(scheduled, ["c"])
+            # attempts is cumulative on the row, so the second failure is past
+            # FILL_AUTO_RETRY_MAX and stops rather than looping forever.
+            bot._album_fill_fail("c", "transfer_failed", "peer went away again")
+            self.assertEqual(scheduled, ["c"])
+            self.assertEqual(bot._album_fill_view("c")["attempts"], 2)
+
+    def test_status_view_reports_failure_fields_on_a_healthy_fill(self):
+        """A client reads these unconditionally, so they must be present and
+        falsey on anything that has not failed."""
+        self._fill_ledger()
+        with patch.object(bot, "_save_state", lambda: None):
+            bot._album_fill_set("rel-ok", "placed")
+        view = bot._album_fill_view("rel-ok")
+        self.assertEqual(view["failureKind"], "")
+        self.assertFalse(view["retryable"])
+        self.assertEqual(view["attempts"], 0)
+
+    def _index_file(self):
+        """Point the library index at a scratch DB. Cleanups are LIFO, so the
+        directory removal is registered first and therefore runs last — on
+        Windows the file cannot be unlinked while the connection is open."""
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
+        bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
+        bot._index_conn = None
+
+        def restore():
+            try:
+                if bot._index_conn is not None:
+                    bot._index_conn.close()
+            except Exception:
+                pass
+            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
+
+        self.addCleanup(restore)
+
+    def test_mark_release_present_inserts_when_there_is_no_row(self):
+        """It was UPDATE-only, so a download of a release the artist's index
+        predates changed nothing and the album kept listing as missing."""
+        self._index_file()
+        bot._index_upsert_release("artist-key", {
+            "rgid": "rg-known", "title": "Known", "status": "missing"})
+
+        self.assertEqual(
+            bot._index_mark_release_present(rgid="rg-known"), 1,
+            "an existing row must still be flipped by the UPDATE path")
+
+        # No row at all, and no artist to attach one to: nothing to do, and
+        # saying so is the point of the return value.
+        self.assertEqual(bot._index_mark_release_present(rgid="rg-new"), 0)
+
+        # With the artist key the row is inserted instead.
+        self.assertEqual(
+            bot._index_mark_release_present(
+                rgid="rg-new", artist_key="artist-key", title="Brand New"), 1)
+        with bot._index_lock:
+            row = bot._index_db().execute(
+                "SELECT status, title FROM release_groups WHERE rgid = ?",
+                ("rg-new",)).fetchone()
+        self.assertEqual(row["status"], "present")
+        self.assertEqual(row["title"], "Brand New")
+
+    def test_fresh_releases_cap_never_drops_an_owned_artist(self):
+        """The cut is ownership-aware on purpose. An obscure artist you own has
+        few listens site-wide, so a plain popularity cut would drop exactly the
+        row this page exists for."""
+        rows = [{"releaseName": f"r{i}", "artistMbids": [], "listenCount": i,
+                 "releaseGroupMbid": f"rg{i}"} for i in range(50)]
+        # The one owned row is also the least-listened.
+        rows[0]["artistOwned"] = True
+        out = bot._fresh_apply_limit(rows, limit=5)
+        self.assertEqual(len(out), 5)
+        self.assertIn("rg0", [r["releaseGroupMbid"] for r in out],
+                      "an owned row must survive the cut whatever its listen count")
+        # The rest are the most-listened, and the feed's own date order is kept.
+        self.assertEqual([r["releaseGroupMbid"] for r in out],
+                         sorted((r["releaseGroupMbid"] for r in out),
+                                key=lambda k: int(k[2:])),
+                         "the cut must not leave the rows in popularity order")
+
+    def test_fresh_releases_cap_is_a_noop_under_the_limit(self):
+        rows = [{"releaseGroupMbid": f"rg{i}", "listenCount": i, "artistOwned": False}
+                for i in range(3)]
+        self.assertEqual(bot._fresh_apply_limit(rows, limit=10), rows)
+
+    def test_fresh_releases_cap_keeps_every_owned_row_past_the_limit(self):
+        """Owned rows are kept even when there are more of them than the limit —
+        losing one is the failure the cap exists to avoid, not a tradeoff."""
+        rows = [{"releaseGroupMbid": f"rg{i}", "listenCount": 0, "artistOwned": True}
+                for i in range(8)]
+        out = bot._fresh_apply_limit(rows, limit=3)
+        self.assertEqual(len(out), 8)
+
+    def test_single_release_add_is_readable_back(self):
+        """The write used to store a release_groups row with no artists parent —
+        and _index_get_artist selects artists FIRST, so the row was invisible and
+        the client re-read answered `indexed: false`, sending it off to start the
+        very whole-artist scan this route exists to avoid."""
+        self._index_file()
+        key = bot._index_artist_key("artist-mbid", "")
+        bot._index_ensure_artist(key, artist_mbid="artist-mbid", name="An Artist")
+        bot._index_upsert_release(key, {"rgid": "rg1", "title": "Album",
+                                        "status": "missing"})
+
+        stored = bot._index_get_artist("artist-mbid", "")
+        self.assertIsNotNone(stored, "the release must be readable back")
+        self.assertEqual([r["rgid"] for r in stored["releases"]], ["rg1"])
+
+    def test_ensure_artist_never_clobbers_a_real_scan(self):
+        """A real scan owns name/scanned_at/scan_version. Stamping this cheap
+        path's values over them would make a scanned artist look freshly scanned
+        and suppress the rescan prompt."""
+        self._index_file()
+        bot._index_store_artist(
+            {"artist_mbid": "m1", "artist_name": "Real Name", "releases": []}, "")
+        bot._index_ensure_artist("m1", artist_mbid="m1", name="Wrong Name")
+        with bot._index_lock:
+            row = bot._index_db().execute(
+                "SELECT name, scanned_at, scan_version FROM artists "
+                "WHERE artist_key = ?", ("m1",)).fetchone()
+        self.assertEqual(row["name"], "Real Name")
+        self.assertGreater(row["scanned_at"], 0)
+        self.assertEqual(row["scan_version"], bot.INDEX_SCAN_VERSION)
+
+    def test_existing_artist_key_wins_over_a_minted_one(self):
+        """The reader finds an artist three ways; _index_artist_key only mints
+        two of them. A scan started from an nd id whose tags had no mbid stores
+        artist_key=<resolved mbid>, so a later write that knows only the nd id
+        would mint `nd:<id>` and file the release where nothing reads."""
+        self._index_file()
+        bot._index_store_artist(
+            {"artist_mbid": "resolved-mbid", "artist_name": "A", "releases": []},
+            "nd-123")
+        self.assertEqual(
+            bot._index_existing_artist_key("", "nd-123"), "resolved-mbid")
+        self.assertEqual(
+            bot._index_existing_artist_key("resolved-mbid", ""), "resolved-mbid")
+        # Nothing stored for this artist: no key to reuse, and the caller mints.
+        self.assertEqual(bot._index_existing_artist_key("", "nd-unknown"), "")
+
+    def test_upsert_release_replaces_a_stale_classification(self):
+        """§3's route re-classifies; a row still saying `missing` for a release
+        the library now holds has to lose."""
+        self._index_file()
+        bot._index_upsert_release("ak", {"rgid": "rg", "title": "T",
+                                         "status": "missing"})
+        bot._index_upsert_release("ak", {"rgid": "rg", "title": "T",
+                                         "status": "incomplete",
+                                         "group_id": "g1", "present": 9,
+                                         "total": 12,
+                                         "navidrome_album_ids": ["nd1"]})
+        with bot._index_lock:
+            rows = bot._index_db().execute(
+                "SELECT * FROM release_groups WHERE rgid = ?", ("rg",)).fetchall()
+        self.assertEqual(len(rows), 1, "upsert must not duplicate the row")
+        self.assertEqual(rows[0]["status"], "incomplete")
+        self.assertEqual(rows[0]["group_id"], "g1")
+        self.assertEqual(json.loads(rows[0]["nd_album_ids"]), ["nd1"])
+
+    def test_classify_release_group_is_shared_by_scan_and_single_refresh(self):
+        """The extraction exists so one album cannot be classified two ways."""
+        rg = {"rgid": "rg1", "title": "Album", "year": "2020",
+              "primary_type": "album", "secondary_types": []}
+        release, group = bot._classify_release_group(rg, None, {}, "", "")
+        self.assertEqual(release["status"], "missing")
+        self.assertIsNone(group)
+        self.assertEqual(release["effective_type"],
+                         bot._effective_release_type("album", []))
+
+        untagged, group = bot._classify_release_group(
+            rg, [{"id": "nd1", "name": "Album"}], {"method": "title"}, "", "")
+        self.assertEqual(untagged["status"], "untagged")
+        self.assertEqual(untagged["navidrome_album_ids"], ["nd1"])
+        self.assertIsNone(group)
 
     def test_normalized_download_error_timeout_and_cancel_states(self):
         old_jobs = bot.repair_jobs.copy()

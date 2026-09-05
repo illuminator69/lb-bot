@@ -58,23 +58,22 @@ const BUCKET_LABEL = {
   4: 'Earlier',
 }
 
-// One fresh release: cover + name → the artist's page (owned page when we have
-// it, else a MusicBrainz browse page), plus a one-click Get that downloads the
-// album through the normal album pipeline (auto source, with failover).
-function FreshCard({ r, onOpenArtist, onGet }) {
-  const [busy, setBusy] = useState(false)
-  const [got, setGot] = useState(false)
+// One fresh release: cover + name → the *album* page for this release-group
+// (which resolves editions, tracklist and sources), plus a Get that goes to the
+// same page with the source picker open.
+//
+// "Get" used to POST {rgid} straight from here — no source review, and no
+// `release_mbid`, so one transient MusicBrainz 503 hard-failed that album for
+// the next five minutes with nothing the user could do. The album page is the
+// review step, and it sends the release it resolved.
+function FreshCard({ r, onOpenArtist, onOpenAlbum, onGetSources }) {
   const upcoming = r.releaseDate && r.releaseDate > new Date().toISOString().slice(0, 10)
-
-  async function get() {
-    setBusy(true)
-    try { await onGet(r); setGot(true) } finally { setBusy(false) }
-  }
 
   return (
     <div className="flex flex-col rounded-[12px] border border-line bg-panel p-2.5">
-      <button className="!block !border-0 !bg-transparent !p-0 text-left" onClick={() => onOpenArtist(r)}
-        title={`Open ${r.artist}`}>
+      <button className="!block !border-0 !bg-transparent !p-0 text-left"
+        onClick={() => (r.releaseGroupMbid ? onOpenAlbum(r) : onOpenArtist(r))}
+        title={r.releaseGroupMbid ? `Open ${r.releaseName}` : `Open ${r.artist}`}>
         <div className="mb-2"><Cover url={r.coverUrl} name={r.releaseName} fluid /></div>
         <div className="truncate text-[13px] font-semibold">{r.releaseName}</div>
         <div className="muted truncate text-[11.5px]">{r.artist}</div>
@@ -95,11 +94,10 @@ function FreshCard({ r, onOpenArtist, onGet }) {
         </button>
       ) : (
         <button className="primary mt-2.5 !py-1 !text-[12.5px]"
-          disabled={busy || got || !r.releaseGroupMbid || upcoming}
-          aria-busy={busy}
-          title={upcoming ? 'Not released yet' : ''}
-          onClick={get}>
-          {got ? '✓ Queued — see Downloads' : busy ? 'Queuing…' : 'Get this album →'}
+          disabled={!r.releaseGroupMbid || upcoming}
+          title={upcoming ? 'Not released yet' : 'Review sources, then download'}
+          onClick={() => onGetSources(r)}>
+          Get this album →
         </button>
       )}
     </div>
@@ -107,7 +105,7 @@ function FreshCard({ r, onOpenArtist, onGet }) {
 }
 
 export default function Fresh() {
-  const { action, dispatch, pushToast } = useApp()
+  const { pushToast } = useApp()
   const [days, setDays] = useState(() => Number(stored('days', 30)))
   const [scope, setScope] = useState(() => stored('scope', 'yours'))   // 'yours' | 'all'
   const [sort, setSort] = useState(() => stored('sort', 'date'))       // 'date' | 'artist'
@@ -166,21 +164,27 @@ export default function Fresh() {
       }))
   }, [shown, sort])
 
-  function openArtist(r) {
-    const id = r.artistOwned && r.artistId
+  // The artist id the album page needs: the owned Navidrome one where we have
+  // it, else the `mb:` form the discography scan already understands for
+  // artists off the library.
+  function artistRouteId(r) {
+    return r.artistOwned && r.artistId
       ? r.artistId
       : (r.artistMbids?.[0] ? 'mb:' + r.artistMbids[0] : null)
-    if (!id) { pushToast('No MusicBrainz artist for this release', 'info'); return }
-    navigate('Artist', id)
   }
 
-  async function getAlbum(r) {
-    try {
-      await action('/api/album/download', { rgid: r.releaseGroupMbid })
-      pushToast(`Queued ${r.releaseName} — see Downloads`)
-    } catch (e) {
-      pushToast(`Download failed: ${e.message}`, 'error')
-      throw e
+  // Carrying the release-group is the whole difference between landing on the
+  // album and landing on an artist index that predates it. The album page adds
+  // the single index row itself when it finds the rgid missing — which it will,
+  // for anything fresh, because a stored discography is served immediately even
+  // when stale, by design.
+  function openArtist(r, { album = false, sources = false } = {}) {
+    const id = artistRouteId(r)
+    if (!id) { pushToast('No MusicBrainz artist for this release', 'info'); return }
+    if (album && r.releaseGroupMbid) {
+      navigate('Artist', id, r.releaseGroupMbid, sources ? 'sources' : undefined)
+    } else {
+      navigate('Artist', id)
     }
   }
 
@@ -252,7 +256,9 @@ export default function Fresh() {
             <div className="tile-grid">
               {g.items.map(r => (
                 <FreshCard key={r.releaseMbid || r.releaseGroupMbid} r={r}
-                  onOpenArtist={openArtist} onGet={getAlbum} />
+                  onOpenArtist={openArtist}
+                  onOpenAlbum={x => openArtist(x, { album: true })}
+                  onGetSources={x => openArtist(x, { album: true, sources: true })} />
               ))}
             </div>
           </div>

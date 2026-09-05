@@ -2844,10 +2844,19 @@ def mbz_release_group_row(rgid: str) -> dict:
     lookup, and it deliberately does **not** apply the secondary-type exclusions
     — the caller asked for this specific release, so filtering it back out would
     answer a question nobody asked.
+
+    The `inc=` is deliberately the **same string `/api/album/releases` sends**
+    (`releases artist-credits media`), even though nothing below reads a release.
+    `mbz_get` caches — and cools down after a failure — by the exact
+    `path?params` key, so asking for a narrower payload was a different cache
+    entry with its own five-minute failure memory: an album page could render its
+    tracklist and its download button off a warm `releases artist-credits media`
+    while the index add alone answered a stale failure it was the only caller to
+    record. Sharing the key means a page that rendered *cannot* fail to index.
     """
     if not rgid:
         return {}
-    rg = mbz_get(f"release-group/{rgid}", {"inc": "artist-credits"})
+    rg = mbz_get(f"release-group/{rgid}", {"inc": "releases artist-credits media"})
     if not rg.get("id"):
         return {}
     sec_raw = rg.get("secondary-types") or []
@@ -2866,6 +2875,30 @@ def mbz_release_group_row(rgid: str) -> dict:
         "first_release_date": rg.get("first-release-date") or "",
         "artist_mbid":        artist_mbid,
         "artist_name":        _artist_credit_str(credit),
+    }
+
+def _release_group_row_override(rgid: str, data: dict) -> dict:
+    """The same row shape built from a caller's own metadata, or {}.
+
+    The escape hatch for a MusicBrainz outage (or its five-minute failure
+    cooldown) on the index-add path. A title is the one field classification
+    cannot do without — everything else only sharpens the row — so a caller that
+    supplies none gets {} and the route still 502s.
+    """
+    title = str(data.get("title") or data.get("album") or "").strip()
+    if not rgid or not title:
+        return {}
+    primary = str(data.get("primary_type") or data.get("type") or "").strip().lower()
+    year = str(data.get("year") or "").strip()[:4]
+    return {
+        "rgid":               rgid,
+        "title":              title,
+        "primary_type":       primary,
+        "secondary_types":    [],
+        "year":               year,
+        "first_release_date": year,
+        "artist_mbid":        str(data.get("mbid") or "").strip(),
+        "artist_name":        str(data.get("artist") or data.get("name") or "").strip(),
     }
 
 _spotify_token: dict = {"access_token": None, "expires_at": 0.0}
@@ -4795,6 +4828,90 @@ def _index_album_rgids() -> dict:
             if album_id:
                 out[album_id] = row["rgid"]
     return out
+
+def _index_rgid_album_ids() -> dict:
+    """Release-group MBID -> one Navidrome album id, for whatever is indexed.
+
+    The inverse of `_index_album_rgids`, which is what a Fresh row needs: it
+    knows the release-group and wants somewhere to send the tap. First id wins —
+    a release-group held as several Navidrome albums (a deluxe edition beside
+    the original) has no one right answer, and any of them lands the user on the
+    record they asked for.
+    """
+    out = {}
+    for album_id, rgid in _index_album_rgids().items():
+        out.setdefault(rgid, album_id)
+    return out
+
+def _index_backfill_present_album_ids(artist_key: str) -> int:
+    """Fill in `nd_album_ids` for this artist's `present` rows. Returns rows fixed.
+
+    `_index_mark_release_present` flips a row to `present` after placement and
+    deliberately leaves the Navidrome album ids alone — nothing on the placement
+    path knows the real numbers — and nothing else fills them in short of a full
+    rescan. But `_index_owned_rgids` counts any non-`missing` row, so a filled
+    album badges as **In library** while every "open the real album" path in
+    both clients reads `navidrome_album_ids` and finds `[]`. The result was a
+    tile that says the library holds the record and a tap that opens the
+    *download* page — and, in Navic, an entire external artist page stuck on
+    "Added — syncing", because `pendingSync` is exactly `album == null &&
+    !isMissing`.
+
+    Resolved against `_nd_album_index()`, which is cached on the 300 s Navidrome
+    TTL, by normalized title within this artist — **no MusicBrainz**, so this is
+    safe on a page-open path. Cheap when there is nothing to do: the SELECT is
+    the only cost, and the Navidrome index is not touched unless a row needs it.
+
+    A row that matches nothing keeps its ids empty and stays `present`:
+    Navidrome genuinely may not have scanned the files yet, and that is what
+    `pendingSync` is *for*. Persisted, so the walk is paid once.
+    """
+    if not artist_key:
+        return 0
+    try:
+        with _index_lock:
+            conn = _index_db()
+            rows = conn.execute(
+                "SELECT rgid, title FROM release_groups "
+                "WHERE artist_key = ? AND status = 'present' AND rgid != '' "
+                "AND (nd_album_ids = '' OR nd_album_ids = '[]')",
+                (artist_key,)).fetchall()
+            artist = conn.execute(
+                "SELECT name, nd_artist_id FROM artists WHERE artist_key = ?",
+                (artist_key,)).fetchone()
+        if not rows:
+            return 0
+        artist_norm = _norm_album_text(artist["name"] if artist else "")
+        nd_artist_id = (artist["nd_artist_id"] if artist else "") or ""
+        by_title: dict = {}
+        for album in _nd_album_index():
+            credited = album.get("artist") or album.get("albumArtist") or ""
+            same_artist = ((nd_artist_id and album.get("artistId") == nd_artist_id)
+                           or (artist_norm and _norm_album_text(credited) == artist_norm))
+            if not same_artist:
+                continue
+            key = _norm_album_text(album.get("name", ""))
+            if key and album.get("id"):
+                by_title.setdefault(key, []).append(album["id"])
+        if not by_title:
+            return 0
+        fixed = 0
+        with _index_lock:
+            conn = _index_db()
+            with conn:
+                for row in rows:
+                    album_ids = by_title.get(_norm_album_text(row["title"]))
+                    if not album_ids:
+                        continue
+                    conn.execute(
+                        "UPDATE release_groups SET nd_album_ids = ?, updated_at = ? "
+                        "WHERE artist_key = ? AND rgid = ?",
+                        (json.dumps(album_ids), time.time(), artist_key, row["rgid"]))
+                    fixed += 1
+        return fixed
+    except Exception as e:  # noqa: BLE001 — an enrichment must not fail the read
+        print(f"  index: present-row album id backfill failed: {e}")
+        return 0
 
 def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
     """Write one discography scan result into the index (idempotent:
@@ -14824,6 +14941,12 @@ def start_web_dashboard() -> None:
             "title": data.get("title", ""),
             "artist": _artist_credit_str(data.get("artist-credit")) or "?",
             "coverUrl": caa_front_url(rgid, 250),
+            # Carried so a caller can hand them straight back to
+            # `/api/artist/release` as its MusicBrainz-outage override. The type
+            # is what decides which section of the artist page the row lands in,
+            # so an add that had to guess it would file the album under "Other".
+            "primaryType": (data.get("primary-type") or "").lower(),
+            "year": (data.get("first-release-date") or "")[:4],
             "releases": out[:8],
         })
 
@@ -15080,6 +15203,11 @@ def start_web_dashboard() -> None:
             Drives the "Your artists" scope and artist deep-links.
           - `releaseOwned`: this exact release-group is already on disk (from the
             library index). Drives the "in library" chip and hides the download.
+          - `releaseAlbumId`: the Navidrome album id behind `releaseOwned`, so a
+            tile badged "in library" can open the *library* album rather than a
+            download page. Without it a client had only the redirect inside the
+            virtual album page, which cannot fire for an album lb-bot filled
+            itself — those rows carry no album ids until the backfill runs.
         `owned` is kept as a backward-compatible alias for `artistOwned`."""
         try:
             days = int(request.args.get("days", "30"))
@@ -15106,12 +15234,14 @@ def start_web_dashboard() -> None:
         # "no badges", not sink the whole Fresh tab.
         id_by_mbid = {}
         owned_rgids: set = set()
+        album_id_by_rgid: dict = {}
         try:
             for a in _nd_artist_index():
                 mbid = a.get("musicBrainzId") or ""
                 if mbid:
                     id_by_mbid[mbid] = a.get("id", "")
             owned_rgids = _index_owned_rgids()
+            album_id_by_rgid = _index_rgid_album_ids()
         except Exception as e:
             print(f"  fresh-releases: ownership enrichment unavailable: {e}")
         out = []
@@ -15124,6 +15254,8 @@ def start_web_dashboard() -> None:
             row["artistOwned"] = bool(artist_id)
             row["artistId"] = artist_id
             row["releaseOwned"] = release_owned
+            row["releaseAlbumId"] = (album_id_by_rgid.get(r.get("releaseGroupMbid") or "", "")
+                                     if release_owned else "")
             row["owned"] = bool(artist_id)   # compat alias for artistOwned
             out.append(row)
         # Cut AFTER enrichment, so the cut can be ownership-aware at all.
@@ -15142,6 +15274,11 @@ def start_web_dashboard() -> None:
         nd_id = request.args.get("nd_id", "").strip()
         if not mbid and not nd_id:
             return jsonify({"error": "mbid or nd_id is required"}), 400
+        # Before reading: give this artist's `present` rows their Navidrome album
+        # ids, so a client can open an album lb-bot itself filled. Placement
+        # cannot write them and only a full rescan otherwise would. No-ops (one
+        # SELECT) unless there is such a row, and never asks MusicBrainz.
+        _index_backfill_present_album_ids(_index_existing_artist_key(mbid, nd_id))
         stored = _index_get_artist(mbid, nd_id)
         if not stored:
             return jsonify({"indexed": False})
@@ -15199,9 +15336,20 @@ def start_web_dashboard() -> None:
 
         rg = mbz_release_group_row(rgid)
         if not rg.get("rgid"):
-            # Distinguished from a bad request: mbz_resolve_album's five-minute
-            # negative cache means a transient MusicBrainz failure answers here
-            # too, and a client that retries in a minute is doing the right thing.
+            # A caller that already knows the release is believed, exactly as
+            # `/api/album/sources` and `/api/album/download` believe one.
+            # `mbz_release_group_row` parks a transient 503 or timeout in
+            # `_mbz_fail_until` for five minutes and answers {} inside that
+            # window without asking again, so one hiccup used to be a hard 502
+            # on this album for everyone who asked next — and every caller
+            # reaches here from a Fresh row or an album page that already holds
+            # the title, artist, type and year. Classification only needs the
+            # title; the rest sharpens the row.
+            rg = _release_group_row_override(rgid, data)
+        if not rg.get("rgid"):
+            # Neither MusicBrainz nor the caller could name it. Distinguished
+            # from a bad request: a client that retries in a minute is doing the
+            # right thing.
             return jsonify({"error": "MusicBrainz did not return that release-group",
                             "retryable": True}), 502
 

@@ -114,7 +114,15 @@ function useDiscography(artist, { autoScan = true } = {}) {
         }
         pollRef.current = setTimeout(tick, delay)
       } catch (e) {
-        if (!dead) setError(e.message)
+        if (dead) return
+        setError(e.message)
+        // A probe that FAILED is not "still asking". Leaving `indexed` at null
+        // left AlbumDetail's index-add effect returning early forever, so the
+        // add never ran, `release` stayed null and the page sat on skeletons
+        // with no title and no buttons — permanently, for one failed request.
+        // The single-release add is exactly the cheap path that should still
+        // run here.
+        setIndexed(false)
       }
     }
     start()
@@ -714,7 +722,7 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   // walk. It is one request per second per release-group, minutes for a real
   // discography, and arriving here from Fresh is precisely the unindexed case
   // that used to trigger it while the user stared at skeletons.
-  const { disco, indexed, refreshIndex } = useDiscography(artist, { autoScan: false })
+  const { disco, indexed, error: discoError, refreshIndex } = useDiscography(artist, { autoScan: false })
   // Two axes: which release variant (tracklist) and which edition of it
   // (pressing + cover art). See EditionSwitcher.
   const [variants, setVariants] = useState(null)
@@ -723,6 +731,9 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   // and the artist name the index add is stamped with.
   const [groupTitle, setGroupTitle] = useState('')
   const [releaseArtist, setReleaseArtist] = useState('')
+  // The release-group's primary type and year, carried so the index add can be
+  // classified correctly without MusicBrainz answering a second time.
+  const [groupMeta, setGroupMeta] = useState({ primaryType: '', year: '' })
   // The row /api/artist/release classified and returned. Rendering from this
   // rather than re-reading the index keeps the page working even if the write
   // landed under an artist key the reader doesn't look under.
@@ -736,13 +747,17 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   // could not be done. Distinguished from "still loading the discography",
   // which is what an absent release used to be indistinguishable from.
   const [indexAdd, setIndexAdd] = useState(null)
+  const [addError, setAddError] = useState('')
+  // Bumped by "Try again". The effect below is keyed on the release, so without
+  // this a retry has nothing to re-trigger it with.
+  const [addNonce, setAddNonce] = useState(0)
   const addedRef = useRef('')
 
   // The component is not remounted when the route changes rgid, so the initial
   // state above only covers a cold arrival.
   useEffect(() => { if (autoPick) setPickOpen(true) }, [autoPick, rgid])
   // Same reason: a new album must not inherit the previous one's added row.
-  useEffect(() => { setAddedRelease(null); setIndexAdd(null) }, [rgid])
+  useEffect(() => { setAddedRelease(null); setIndexAdd(null); setAddError('') }, [rgid])
 
   const indexedRelease = (disco?.releases || []).find(r => r.rgid === rgid)
   // If the index cannot be taught about this release (no MusicBrainz artist,
@@ -759,6 +774,10 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
       ? { rgid, title: groupTitle, status: 'missing' }
       : null)
   const status = release?.status
+  // The index row's title if we have one, else MusicBrainz's — the header must
+  // not be hostage to the index, which is exactly what left this page on
+  // skeletons with no title and no buttons when a probe failed.
+  const headerTitle = release?.title || groupTitle
   const readOnly = status === 'complete' || status === 'untagged'
   // A `mb:`-deep-linked artist has no name but its own MBID (the synthetic
   // artist in the root below), so prefer the one MusicBrainz credited this
@@ -774,16 +793,29 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   // loaded `disco`. That was the bug: for an unindexed artist `disco` stays null
   // for the whole scan, so the fast path never ran in exactly the case it was
   // written for, and the page sat on skeletons with no buttons at all.
+  //
+  // Waits for the /api/album/releases lookup to settle (`variants !== null`)
+  // because that lookup is where the override below comes from — and it is a
+  // MusicBrainz call this add can then be answered from without making a
+  // second one.
   useEffect(() => {
-    if (indexed === null || indexedRelease || addedRelease) return
+    if (indexed === null || indexedRelease || addedRelease || variants === null) return
     if (addedRef.current === rgid) return
     addedRef.current = rgid
     let dead = false
     setIndexAdd('adding')
+    setAddError('')
     action('/api/artist/release', {
       rgid,
       mbid: artist.mbid || '',
       nd_id: artist.id || '',
+      // The route's escape hatch for a MusicBrainz outage: `mbz_release_group_row`
+      // remembers a transient failure for five minutes and answers {} without
+      // asking again, and /api/album/releases has already told us all of this.
+      title: groupTitle || '',
+      artist: releaseArtist || '',
+      type: groupMeta.primaryType || '',
+      year: groupMeta.year || '',
       // The synthetic external artist's `name` is its raw MBID, which would go
       // into the index as the artist's name. Prefer the real one MusicBrainz
       // gave us for this release-group.
@@ -801,17 +833,31 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
       .catch(e => {
         if (dead) return
         setIndexAdd('failed')
+        setAddError(e.message)
+        // `addedRef` is stamped BEFORE the request, so a failure used to be
+        // permanent for the life of the mount — the toast said what went wrong
+        // and nothing could act on it. Clearing it is what makes "Try again"
+        // (and a later dep change) able to run at all.
+        addedRef.current = ''
         pushToast(`Could not add this release to the index: ${e.message}`, 'error')
       })
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist])
+  }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist, variants, addNonce])
+
+  const retryIndexAdd = () => {
+    addedRef.current = ''
+    setIndexAdd(null)
+    setAddError('')
+    setAddNonce(n => n + 1)
+  }
 
   useEffect(() => {
     let dead = false
     setVariants(null)
     setGroupTitle('')
     setReleaseArtist('')
+    setGroupMeta({ primaryType: '', year: '' })
     setSel({ variant: 0, edition: 0 })
     api('/api/album/releases?rgid=' + encodeURIComponent(rgid))
       .then(r => {
@@ -819,8 +865,17 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
         setVariants(r.releases || [])
         setGroupTitle(r.title || '')
         setReleaseArtist(r.artist && r.artist !== '?' ? r.artist : '')
+        setGroupMeta({ primaryType: r.primaryType || '', year: r.year || '' })
       })
-      .catch(e => !dead && pushToast(`Release lookup failed: ${e.message}`, 'error'))
+      .catch(e => {
+        if (dead) return
+        // `[]`, not null: null means "still asking", and the index add below
+        // waits for this lookup to settle so it can hand the server the title
+        // MusicBrainz already gave us. A failure that left this null would hang
+        // the add forever.
+        setVariants([])
+        pushToast(`Release lookup failed: ${e.message}`, 'error')
+      })
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rgid])
@@ -902,14 +957,18 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
             {/* The chosen edition's own sleeve, with the release-group's as the
                 fallback for a pressing the Archive has no art for. */}
             <Cover url={edition?.coverUrl || rgCover} fallbackUrl={rgCover}
-              name={release?.title || ''} size={132} />
+              name={headerTitle} size={132} />
           </div>
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[12px] font-semibold uppercase tracking-[.12em]" style={{ color: 'var(--accent)' }}>
             {displayArtist}
           </div>
-          {!release ? (
+          {/* The header renders from `groupTitle` when there is no index row —
+              /api/album/releases fetches it independently of the index, so an
+              index probe or add that failed no longer blanks the page. Only a
+              release-group we cannot name at all falls back to skeletons. */}
+          {!headerTitle ? (
             <>
               <Skeleton className="mb-2 mt-1.5 h-6 w-3/5" />
               <Skeleton className="h-3 w-2/5" />
@@ -917,18 +976,32 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
           ) : (
             <>
               <div className="mb-1.5 mt-0.5 flex flex-wrap items-center gap-2.5">
-                <span className="text-[24px] font-bold leading-[1.1]">{release.title}</span>
+                <span className="text-[24px] font-bold leading-[1.1]">{headerTitle}</span>
                 <EditionSwitcher variants={variants} variantIdx={sel.variant}
                   editionIdx={sel.edition}
                   onPick={(variant, edition) => setSel({ variant, edition })} />
-                <AlbumStateChip state={status}
-                  count={status === 'incomplete' ? (release.total || 0) - (release.present || 0) : null} />
+                {status && <AlbumStateChip state={status}
+                  count={status === 'incomplete' ? (release.total || 0) - (release.present || 0) : null} />}
               </div>
               <div className="muted mb-3.5 text-[12.5px]">
-                {[release.year, variant ? `${variant.trackCount} tracks` : null, heroMeta]
+                {[release?.year || groupMeta.year,
+                  variant ? `${variant.trackCount} tracks` : null, heroMeta]
                   .filter(Boolean).join(' · ')}
               </div>
             </>
+          )}
+
+          {/* Fetched and then discarded before: a failed index probe or add left
+              the page with no title, no buttons and no explanation. Both are
+              recoverable, so both say so and offer the retry. */}
+          {(addError || (discoError && !release)) && (
+            <div className="muted mb-3 text-[12.5px]">
+              {addError
+                ? `Could not add this release to the index: ${addError}`
+                : `Could not read this artist's index: ${discoError}`}
+              {' '}
+              <button className="link-inline" onClick={retryIndexAdd}>Try again</button>
+            </div>
           )}
 
           {status === 'missing' && (

@@ -1628,6 +1628,86 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(row["status"], "present")
         self.assertEqual(row["title"], "Brand New")
 
+    def test_present_row_backfill_resolves_an_album_id_by_title(self):
+        """_index_mark_release_present cannot write nd_album_ids — nothing on the
+        placement path knows them — so a filled album badged "In library" had no
+        id for any client to open, and every "open the real album" path fell
+        through to the download page instead."""
+        self._index_file()
+        bot._index_ensure_artist("ak", artist_mbid="ak", name="An Artist")
+        bot._index_mark_release_present(rgid="rg-filled", artist_key="ak",
+                                        title="The Filled One")
+        bot._index_mark_release_present(rgid="rg-elsewhere", artist_key="ak",
+                                        title="Not Scanned Yet")
+
+        albums = [{"id": "nd-1", "name": "the filled one!", "artist": "An Artist"},
+                  {"id": "nd-2", "name": "Someone Else's", "artist": "Other Artist"}]
+        with patch.object(bot, "_nd_album_index", lambda force=False: albums):
+            self.assertEqual(bot._index_backfill_present_album_ids("ak"), 1)
+
+        stored = bot._index_get_artist("ak", "")
+        by_rgid = {r["rgid"]: r for r in stored["releases"]}
+        self.assertEqual(by_rgid["rg-filled"]["navidrome_album_ids"], ["nd-1"])
+        # Unmatched rows stay `present` with no ids: Navidrome may genuinely not
+        # have scanned the files yet, and that is what pendingSync is for.
+        self.assertNotIn("navidrome_album_ids", by_rgid["rg-elsewhere"])
+        self.assertEqual(by_rgid["rg-elsewhere"]["status"], "present")
+
+    def test_present_row_backfill_never_asks_navidrome_with_nothing_to_do(self):
+        """It runs on every discography read, so the no-op case must cost one
+        SELECT and no library fetch."""
+        self._index_file()
+        bot._index_ensure_artist("ak", artist_mbid="ak", name="An Artist")
+        bot._index_upsert_release("ak", {"rgid": "rg", "title": "T",
+                                         "status": "complete",
+                                         "navidrome_album_ids": ["nd-1"]})
+
+        def _boom(force=False):
+            raise AssertionError("the Navidrome index must not be fetched")
+
+        with patch.object(bot, "_nd_album_index", _boom):
+            self.assertEqual(bot._index_backfill_present_album_ids("ak"), 0)
+            self.assertEqual(bot._index_backfill_present_album_ids(""), 0)
+
+    def test_fresh_row_album_id_comes_from_the_index(self):
+        """A Fresh tile that says "in library" has to be able to open it. The
+        mapping is stored album id -> rgid; the row needs the inverse."""
+        self._index_file()
+        bot._index_upsert_release("ak", {"rgid": "rg1", "title": "One",
+                                         "status": "complete",
+                                         "navidrome_album_ids": ["nd-a", "nd-b"]})
+        bot._index_upsert_release("ak", {"rgid": "rg2", "title": "Two",
+                                         "status": "missing"})
+        mapping = bot._index_rgid_album_ids()
+        self.assertEqual(mapping.get("rg1"), "nd-a")
+        self.assertNotIn("rg2", mapping)
+
+    def test_artist_release_classifies_from_caller_metadata(self):
+        """mbz_release_group_row parks a transient failure for five minutes and
+        answers {} without asking again, so one hiccup was a hard 502 on that
+        album for everyone who asked next. Every caller reaches the route from a
+        row that already names the release."""
+        rg = bot._release_group_row_override("rg1", {
+            "title": "Album", "artist": "An Artist", "type": "Album",
+            "year": "2026-03-04", "mbid": "artist-mbid"})
+        self.assertEqual(rg["rgid"], "rg1")
+        self.assertEqual(rg["primary_type"], "album")
+        self.assertEqual(rg["year"], "2026")
+        self.assertEqual(rg["artist_name"], "An Artist")
+        # Classifies by the same rules as a real row.
+        release, group = bot._classify_release_group(rg, None, {}, "", "")
+        self.assertEqual(release["status"], "missing")
+        self.assertEqual(release["title"], "Album")
+        self.assertIsNone(group)
+
+    def test_artist_release_override_needs_a_title(self):
+        """A title is the one field classification cannot do without, so a
+        caller supplying none must still get the 502 rather than a blank row."""
+        self.assertEqual(
+            bot._release_group_row_override("rg1", {"artist": "An Artist"}), {})
+        self.assertEqual(
+            bot._release_group_row_override("", {"title": "Album"}), {})
+
     def test_fresh_releases_cap_never_drops_an_owned_artist(self):
         """The cut is ownership-aware on purpose. An obscure artist you own has
         few listens site-wide, so a plain popularity cut would drop exactly the

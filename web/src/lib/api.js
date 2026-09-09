@@ -1,8 +1,33 @@
 export async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  })
+  // `timeoutMs` is opt-in, not a default: some routes here deliberately run for
+  // minutes (scans, source searches). It exists for the read-only lookups a
+  // screen *blocks on* — a MusicBrainz call that never answers used to leave
+  // the album page on skeletons with its buttons disabled forever, because
+  // fetch on its own has no timeout at all.
+  const { timeoutMs, ...init } = opts
+  const controller = timeoutMs ? new AbortController() : null
+  const timer = controller
+    ? setTimeout(() => controller.abort(new DOMException('timeout', 'TimeoutError')), timeoutMs)
+    : null
+  let res
+  try {
+    res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...(controller ? { signal: controller.signal } : {}),
+      ...init,
+    })
+  } catch (e) {
+    // A caller that aborted us is the only reason to claim a timeout: an
+    // upstream `signal` in `init` aborting is the caller's own cancellation.
+    if (controller?.signal.aborted && !init.signal?.aborted) {
+      const err = new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s`)
+      err.timeout = true
+      throw err
+    }
+    throw e
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
   const text = await res.text()
   let data
   try {

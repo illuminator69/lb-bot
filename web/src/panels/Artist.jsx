@@ -496,6 +496,12 @@ function DiscographyView({ artist, onOpenAlbum, onBack }) {
 // `mbz_resolve_album` parks a transient MusicBrainz 503 in a five-minute
 // negative cache, which turns one hiccup into "Could not resolve album" for
 // every attempt inside that window, with nothing the user can do about it.
+// Ceiling for the two MusicBrainz-backed lookups the album page blocks on.
+// They are one hop to MusicBrainz behind a global one-request-per-second lock,
+// so a busy scan or an unhappy MusicBrainz can park them well past any useful
+// wait — and the page has a sensible answer for "we don't know" in both cases.
+const LOOKUP_TIMEOUT_MS = 10000
+
 function releaseOverride(release, variant, artistName) {
   if (!variant?.releaseMbid) return {}
   return {
@@ -859,7 +865,8 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
     setReleaseArtist('')
     setGroupMeta({ primaryType: '', year: '' })
     setSel({ variant: 0, edition: 0 })
-    api('/api/album/releases?rgid=' + encodeURIComponent(rgid))
+    api('/api/album/releases?rgid=' + encodeURIComponent(rgid),
+        { timeoutMs: LOOKUP_TIMEOUT_MS })
       .then(r => {
         if (dead) return
         setVariants(r.releases || [])
@@ -892,17 +899,29 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
   // switching Digital → Vinyl must not re-fetch or flash a skeleton.
   const trackReleaseMbid = variant?.releaseMbid || ''
   useEffect(() => {
-    if (!trackReleaseMbid) { setTracks(null); return }
+    // Every exit from here settles `tracks` to something. `null` means "still
+    // asking" and renders a skeleton with no timer behind it, so the two cases
+    // that used to leave it null — the releases lookup answering with no
+    // usable release, and a tracklist request that never comes back — were an
+    // infinite spinner. Both are now finished states with a reason.
+    if (variants === null) { setTracks(null); return }
+    if (!trackReleaseMbid) {
+      setTracks({ rows: [], presenceKnown: false, reason: 'no-release' })
+      return
+    }
     let dead = false
     setTracks(null)
     const q = new URLSearchParams({ release_mbid: trackReleaseMbid })
     if (albumIds) q.set('album_ids', albumIds)
     else if (groupId) q.set('group_id', groupId)
-    api('/api/album/tracklist?' + q)
+    api('/api/album/tracklist?' + q, { timeoutMs: LOOKUP_TIMEOUT_MS })
       .then(r => !dead && setTracks({ rows: r.tracks || [], presenceKnown: !!r.presenceKnown }))
-      .catch(() => !dead && setTracks({ rows: [], presenceKnown: false }))
+      .catch(e => !dead && setTracks({
+        rows: [], presenceKnown: false, reason: e.timeout ? 'timeout' : 'error',
+        error: e.message,
+      }))
     return () => { dead = true }
-  }, [trackReleaseMbid, albumIds, groupId])
+  }, [variants, trackReleaseMbid, albumIds, groupId])
 
   async function downloadBest() {
     setDownloading(true)
@@ -1008,10 +1027,16 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
             <div className="flex flex-wrap items-center gap-2.5">
               {/* Soulseek first and primary: choosing the source is the real
                   decision here, and the one-tap auto path sits beside it. */}
-              <button className="primary" disabled={!variant} onClick={() => setPickOpen(o => !o)}>
+              {/* Never gated on the MusicBrainz lookups. Both routes take the
+                  raw `rgid` and resolve the release server-side; the variant
+                  only ever *refines* the request (exact release, track count).
+                  Disabling them until a variant arrived meant an album whose
+                  release lookup was slow, empty or unofficial-only could not be
+                  downloaded at all — the one thing the page is for. */}
+              <button className="primary" onClick={() => setPickOpen(o => !o)}>
                 {pickOpen ? 'Hide sources' : 'Find sources on Soulseek →'}
               </button>
-              <button disabled={downloading || !variant} onClick={downloadBest}>
+              <button disabled={downloading} onClick={downloadBest}>
                 {downloading ? '✓ Requested — see Downloads' : 'Get this album'}
               </button>
             </div>
@@ -1047,7 +1072,11 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
         sub={variant ? `${variant.trackCount} tracks${variant.year ? ` · ${variant.year}` : ''}` : ''} />
       {tracks && !tracks.rows.length
         ? <EmptyState title="No tracklist available"
-            hint="MusicBrainz has no track data for this edition." />
+            hint={{
+              timeout: 'MusicBrainz did not answer within 10 seconds. The tracklist is only a reference — finding sources and downloading still work.',
+              error: `Could not load the tracklist${tracks.error ? `: ${tracks.error}` : ''}. Finding sources and downloading still work.`,
+              'no-release': 'MusicBrainz lists no release for this album, so there is no tracklist to show. You can still search Soulseek for it.',
+            }[tracks.reason] || 'MusicBrainz has no track data for this edition.'} />
         : <TrackList tracks={tracks?.rows} loading={tracks === null}
             presenceKnown={!!tracks?.presenceKnown}
             rows={Math.max(4, Math.min(trackCount || 8, 14))} />}

@@ -4883,24 +4883,44 @@ def _index_backfill_present_album_ids(artist_key: str) -> int:
             return 0
         artist_norm = _norm_album_text(artist["name"] if artist else "")
         nd_artist_id = (artist["nd_artist_id"] if artist else "") or ""
+        # Two maps, consulted in order of confidence.
+        #
+        # `exact` is the original test: Navidrome filed the album under precisely this artist.
+        # `credit` catches the collaboration case it missed — an album by "A & B" that Navidrome
+        # filed under B, downloaded from A's page. Both arms of the exact test are B's (the
+        # artistId literally is B's, and "artist a artist b" != "artist a"), so the row was never
+        # even a candidate and kept `nd_album_ids = '[]'` forever: the permanent "Added — syncing".
+        #
+        # The credit map is a fallback rather than a peer because containment is looser than
+        # equality: a short name is a substring of longer ones ("Pink" in "Pink Floyd"), and only
+        # the exact map can rule that out when both happen to hold the same normalized title.
         by_title: dict = {}
+        by_title_credit: dict = {}
         for album in _nd_album_index():
             credited = album.get("artist") or album.get("albumArtist") or ""
-            same_artist = ((nd_artist_id and album.get("artistId") == nd_artist_id)
-                           or (artist_norm and _norm_album_text(credited) == artist_norm))
-            if not same_artist:
+            credited_norm = _norm_album_text(credited)
+            if (nd_artist_id and album.get("artistId") == nd_artist_id) or (
+                    artist_norm and credited_norm == artist_norm):
+                target = by_title
+            elif artist_norm and f" {artist_norm} " in f" {credited_norm} ":
+                # Whole-token containment. `_norm_album_text` has already collapsed everything
+                # non-alphanumeric to single spaces, so the padding makes this a word-boundary
+                # test rather than a substring one.
+                target = by_title_credit
+            else:
                 continue
             key = _norm_album_text(album.get("name", ""))
             if key and album.get("id"):
-                by_title.setdefault(key, []).append(album["id"])
-        if not by_title:
+                target.setdefault(key, []).append(album["id"])
+        if not by_title and not by_title_credit:
             return 0
         fixed = 0
         with _index_lock:
             conn = _index_db()
             with conn:
                 for row in rows:
-                    album_ids = by_title.get(_norm_album_text(row["title"]))
+                    title_key = _norm_album_text(row["title"])
+                    album_ids = by_title.get(title_key) or by_title_credit.get(title_key)
                     if not album_ids:
                         continue
                     conn.execute(
@@ -4944,6 +4964,30 @@ def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
                     "DELETE FROM artists WHERE artist_key = ?", (f"nd:{nd_artist_id}",))
                 conn.execute(
                     "DELETE FROM release_groups WHERE artist_key = ?", (f"nd:{nd_artist_id}",))
+            # A rescan must not forget what we FILLED.
+            #
+            # `present` is a fifth status no scan ever produces, written by
+            # `_index_mark_release_present` after a download lands. Delete-and-reinsert
+            # therefore destroyed it: the album reverted to "Not in your library" and
+            # invited a second download of a record already on disk. Carry those rows
+            # across — but only where the fresh scan still says `missing`, since a real
+            # verdict of complete/incomplete is better information than our flag and
+            # must win.
+            kept = {}
+            for r in conn.execute(
+                    "SELECT rgid, nd_album_ids FROM release_groups "
+                    "WHERE artist_key = ? AND status = 'present' AND rgid != ''",
+                    (key,)).fetchall():
+                kept[r["rgid"]] = r["nd_album_ids"] or "[]"
+            if kept:
+                rows = [
+                    (r[0], r[1], r[2], r[3], r[4], r[5],
+                     "present" if (r[1] in kept and r[6] == "missing") else r[6],
+                     r[7], r[8], r[9],
+                     kept[r[1]] if (r[1] in kept and r[10] in ("", "[]")) else r[10],
+                     r[11], r[12], r[13])
+                    for r in rows
+                ]
             conn.execute("DELETE FROM release_groups WHERE artist_key = ?", (key,))
             conn.executemany(
                 "INSERT INTO release_groups (artist_key, rgid, title, primary_type, "
@@ -14894,11 +14938,17 @@ def start_web_dashboard() -> None:
             return fmt or "Other"
         _EDITION_ORDER = {"Digital": 0, "CD": 1, "Vinyl": 2, "Cassette": 3}
 
+        # Official pressings only — *when there are any*. A release-group whose
+        # releases are all promo/bootleg/withdrawn used to filter down to zero
+        # variants, and a caller with no variant has no release MBID, no track
+        # count and (before this) no download button: the album page sat on a
+        # tracklist skeleton forever with everything greyed out. An unofficial
+        # release is a worse answer than an official one, never worse than none.
+        all_releases = data.get("releases", []) or []
+        official = [r for r in all_releases
+                    if (r.get("status") or "").lower() in ("", "official")]
         variants = {}
-        for rel in data.get("releases", []):
-            status = (rel.get("status") or "").lower()
-            if status and status != "official":
-                continue
+        for rel in (official or all_releases):
             media = rel.get("media", []) or []
             track_count = sum(int(m.get("track-count", 0) or 0) for m in media)
             fmt = next((m.get("format") for m in media if m.get("format")), "")

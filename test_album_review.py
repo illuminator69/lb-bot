@@ -1492,6 +1492,157 @@ class AlbumReviewTests(unittest.TestCase):
         self.addCleanup(restore)
         bot._album_fill_status.clear()
 
+    def _isolated_transfers(self, forbid_auto_retry=True):
+        """Isolate the in-flight transfer tables, stub slskd and persistence."""
+        old_groups, old_pending = bot.pending_album_groups.copy(), bot.pending_downloads.copy()
+
+        def restore():
+            bot.pending_album_groups.clear()
+            bot.pending_album_groups.update(old_groups)
+            bot.pending_downloads.clear()
+            bot.pending_downloads.update(old_pending)
+
+        self.addCleanup(restore)
+        bot.pending_album_groups.clear()
+        bot.pending_downloads.clear()
+        cancels = []
+        # transfer_failed legitimately schedules its one auto-retry; a cancel never may.
+        retry = ((lambda *a, **k: self.fail("a cancelled fill must never auto-retry"))
+                 if forbid_auto_retry else (lambda *a, **k: None))
+        for name, value in (("_slskd_cancel", lambda u, f: cancels.append((u, f))),
+                            ("_save_state", lambda *a, **k: None),
+                            ("_schedule_album_fill_retry", retry)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return cancels
+
+    def _group(self, completed=0):
+        bot.pending_album_groups["ag1"] = {
+            "label": "Artist - Album", "total": 3, "completed": completed, "failed": 0,
+            "local_dirs": {}, "token": "tok", "chat_id": "chat",
+            "release_mbid": "rel1", "artist": "Artist", "album": "Album",
+            "source_user": "slowpeer", "ts": time.time() - 3600}
+        for n in (1, 2, 3):
+            bot.pending_downloads[("slowpeer", f"Album\\0{n}.flac")] = {
+                "album_group_id": "ag1", "token": "tok", "chat_id": "chat",
+                "track": {"artist": "Artist", "title": f"T{n}"}, "candidates": [],
+                "queued_at": time.time() - 3600}
+
+    def test_cancel_stops_an_in_flight_album_and_offers_retry(self):
+        """There was no cancel at all: a slow download stopped in slskd left every
+        client on "downloading", with no failure to hang a Retry button on."""
+        self._fill_ledger()
+        cancels = self._isolated_transfers()
+        self._group()
+        bot._album_fill_set("rel1", "downloading", artist="Artist", album="Album")
+
+        self.assertTrue(bot._cancel_album_fill("rel1", "Cancelled"))
+
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot.pending_downloads, {})
+        self.assertEqual(len(cancels), 3, "every outstanding transfer is cancelled in slskd")
+        view = bot._album_fill_view("rel1")
+        self.assertEqual((view["state"], view["failureKind"], view["retryable"]),
+                         ("failed", "cancelled", True))
+        # Nothing in flight any more: a second cancel is a no-op, not an error.
+        self.assertFalse(bot._cancel_album_fill("rel1", "Cancelled"))
+
+    def test_cancel_during_search_stops_the_enqueue(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        enqueued = []
+        with patch.object(bot, "slskd_search_album_folders",
+                          lambda *a, **k: (bot._album_fill_cancel_requested.add("rel1")
+                                           or [{"username": "p", "files": [{}]}])), \
+                patch.object(bot, "slskd_enqueue_folder",
+                             lambda *a, **k: enqueued.append(a) or (1, 1, "ag")), \
+                patch.object(bot, "_task_finish", lambda *a, **k: None):
+            bot._album_download_search_and_enqueue("t1", "rel1", "A", "B", 3, None, "")
+        self.assertEqual(enqueued, [], "a cancel that lands mid-search must not be overtaken")
+
+    def test_try_another_source_excludes_the_previous_peer(self):
+        self._fill_ledger()
+        self._isolated_transfers(forbid_auto_retry=False)
+        chosen = []
+        folders = [{"username": "SlowPeer", "files": [{}]}, {"username": "fast", "files": [{}]}]
+        with patch.object(bot, "slskd_search_album_folders", lambda *a, **k: list(folders)), \
+                patch.object(bot, "slskd_expand_directory", lambda *a, **k: []), \
+                patch.object(bot, "_default_web_user", lambda: {}), \
+                patch.object(bot, "slskd_enqueue_folder",
+                             lambda user, *a, **k: chosen.append(user) or (0, 0, "")), \
+                patch.object(bot, "_task_finish", lambda *a, **k: None):
+            bot._album_download_search_and_enqueue("t1", "rel1", "A", "B", 3, None, "",
+                                                   ("slowpeer",))
+        self.assertEqual(chosen, ["fast"])
+
+    def _poll_once(self, downloads):
+        app = type("App", (), {"bot": AsyncMock()})()
+        with patch.object(bot, "slskd_get_all_downloads", lambda force=False: downloads), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock), \
+                patch.object(bot, "_update_group_progress", new_callable=AsyncMock), \
+                patch.object(bot, "_resolve_local_path", lambda f: ""):
+            asyncio.run(bot._poll_downloads_once({"tok": app}))
+
+    def test_cancel_in_slskd_cancels_the_album_instead_of_failing_over(self):
+        """A user-cancelled transfer used to be failed over to another peer — the
+        download the user had just stopped, re-queued."""
+        self._fill_ledger()
+        cancels = self._isolated_transfers()
+        self._group(completed=1)
+        bot._album_fill_set("rel1", "downloading")
+        with patch.object(bot, "_retry_file_from_alt_source",
+                          lambda *a, **k: self.fail("must not fail a user cancel over")):
+            self._poll_once([{"_username": "slowpeer", "filename": "Album\\01.flac",
+                              "state": "Completed, Cancelled"},
+                             {"_username": "slowpeer", "filename": "Album\\02.flac",
+                              "state": "InProgress"}])
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel1")["failureKind"], "cancelled")
+        self.assertTrue(cancels, "the album's other transfers are stopped too")
+
+    def test_watchdog_cancel_still_fails_over(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=1)
+        bot.pending_downloads[("slowpeer", "Album\\01.flac")]["_watchdog_cancelled"] = True
+        retried = []
+        with patch.object(bot, "_retry_file_from_alt_source",
+                          lambda ag, ag_id, info, user: retried.append(user) or "other"):
+            self._poll_once([{"_username": "slowpeer", "filename": "Album\\01.flac",
+                              "state": "Completed, Cancelled"},
+                             {"_username": "slowpeer", "filename": "Album\\02.flac",
+                              "state": "InProgress"}])
+        self.assertEqual(retried, ["slowpeer"])
+        self.assertIn("ag1", bot.pending_album_groups)
+
+    def test_source_failing_before_any_track_records_a_failure(self):
+        """The group was dropped and the ledger left on `queued` — "downloading"
+        in every client, forever."""
+        self._fill_ledger()
+        self._isolated_transfers(forbid_auto_retry=False)
+        self._group(completed=0)
+        bot._album_fill_set("rel1", "queued")
+        with patch.object(bot, "InlineKeyboardButton", lambda *a, **k: None), \
+                patch.object(bot, "InlineKeyboardMarkup", lambda *a, **k: None):
+            self._poll_once([{"_username": "slowpeer", "filename": "Album\\01.flac",
+                              "state": "Completed, Rejected"}])
+        view = bot._album_fill_view("rel1")
+        self.assertEqual((view["state"], view["failureKind"], view["retryable"]),
+                         ("failed", "transfer_failed", True))
+
+    def test_transfers_removed_from_slskd_cancel_the_album(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=0)
+        bot._album_fill_set("rel1", "downloading")
+        other = [{"_username": "someone", "filename": "x.flac", "state": "InProgress"}]
+        self._poll_once(other)
+        self.assertIn("ag1", bot.pending_album_groups, "one missing poll is not enough")
+        self._poll_once(other)
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel1")["failureKind"], "cancelled")
+
     def test_fill_ledger_survives_a_restart(self):
         """The whole point of §1: pending_album_groups and pending_downloads are
         restored, so the download really does resume — only its ledger row used

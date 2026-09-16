@@ -1653,6 +1653,83 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertNotIn("navidrome_album_ids", by_rgid["rg-elsewhere"])
         self.assertEqual(by_rgid["rg-elsewhere"]["status"], "present")
 
+    def _run_threads_inline(self):
+        class Inline:
+            def __init__(self, target=None, args=(), kwargs=None, **_kw):
+                self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+        patcher = patch.object(bot.threading, "Thread", Inline)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_album_fill_verifier_waits_for_scan_then_announces_album_ids(self):
+        """The clients show a landed album the moment this verifier says so. It
+        used to sleep 30 s between probes, announce nothing, and leave the album's
+        Navidrome id to a title guess against a 300 s cached index — so a filled
+        album kept opening the download page for minutes."""
+        self._index_file()
+        self._run_threads_inline()
+        bot._index_ensure_artist("ak", artist_mbid="ak", name="An Artist")
+        bot._index_mark_release_present(rgid="rg-1", artist_key="ak", title="Landed")
+
+        scans = iter([{"scanning": True}, {"scanning": False}])
+        searches = []
+
+        def search(user, pw, query, count=5, _retry=True):
+            searches.append(_retry)
+            return [{"id": "s1", "title": "Song", "artist": "An Artist",
+                     "albumId": "nd-al-1", "artistId": "nd-ar-1"}]
+
+        notified = []
+        sleeps = []
+        with patch.object(bot, "_default_web_user",
+                          lambda: {"navidrome_user": "u", "navidrome_password": "p"}), \
+                patch.object(bot, "nd_get_scan_status", lambda u, p: next(scans)), \
+                patch.object(bot, "_nd_search", search), \
+                patch.object(bot.time, "sleep", lambda s: sleeps.append(s)), \
+                patch.object(bot, "_notify_hub_library_change",
+                             lambda *a, **k: notified.append((a, k))), \
+                patch.object(bot, "_album_fill_set", lambda *a, **k: None):
+            bot._ND_ALBUM_INDEX["ts"] = time.time()
+            bot._start_album_fill_verification(
+                "rel-1", {"per_file": [{"status": "matched", "title": "Song",
+                                        "recording_mbid": "rec-1"}]},
+                artist="An Artist", rgid="rg-1", album="Landed")
+
+        self.assertEqual(sleeps, [bot.PLACEMENT_VERIFY_FAST_INTERVAL],
+                         "one fast wait while scanning, then a successful probe")
+        self.assertTrue(searches and not any(searches),
+                        "verifier probes must skip the 3 s warm-up retry")
+        self.assertEqual(len(notified), 1)
+        args, kw = notified[0]
+        self.assertEqual(args[0], "rel-1")
+        self.assertEqual(kw["event"], "albumIndexed")
+        self.assertEqual(kw["nd_album_ids"], ["nd-al-1"])
+        self.assertEqual(kw["nd_artist_id"], "nd-ar-1")
+        self.assertEqual(kw["row"]["rgid"], "rg-1")
+        self.assertEqual(kw["row"]["navidrome_album_ids"], ["nd-al-1"])
+        self.assertEqual(bot._ND_ALBUM_INDEX["ts"], 0.0)
+        stored = {r["rgid"]: r for r in bot._index_get_artist("ak", "")["releases"]}
+        self.assertEqual(stored["rg-1"]["navidrome_album_ids"], ["nd-al-1"])
+
+    def test_verifier_ids_never_overwrite_a_scans_own_ids(self):
+        self._index_file()
+        bot._index_ensure_artist("ak", artist_mbid="ak", name="An Artist")
+        bot._index_upsert_release("ak", {"rgid": "rg-2", "title": "Partial",
+                                         "status": "incomplete", "group_id": "g2",
+                                         "navidrome_album_ids": ["scan-id"]})
+        rows = bot._index_set_release_album_ids(group_id="g2", album_ids=["probe-id"])
+        self.assertEqual(rows[0]["navidrome_album_ids"], ["scan-id"])
+
+    def test_placement_verify_delay_is_fast_then_backs_off(self):
+        now = time.time()
+        self.assertEqual(bot._placement_verify_delay(now),
+                         bot.PLACEMENT_VERIFY_FAST_INTERVAL)
+        self.assertEqual(bot._placement_verify_delay(now - bot.PLACEMENT_VERIFY_FAST_WINDOW - 1),
+                         bot.PLACEMENT_VERIFY_INTERVAL)
+
     def test_present_row_backfill_never_asks_navidrome_with_nothing_to_do(self):
         """It runs on every discography read, so the no-op case must cost one
         SELECT and no library fetch."""

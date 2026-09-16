@@ -1424,6 +1424,57 @@ def _mark_group_tracks_placed(group: dict, result: dict = None) -> int:
 
 PLACEMENT_VERIFY_TIMEOUT  = 600  # give Navidrome's scan this long to index
 PLACEMENT_VERIFY_INTERVAL = 30
+# A quick scan of one new folder usually finishes in seconds, and the clients show
+# the album the moment a verifier says so — so the first minute is polled tightly
+# and only a slow scan falls back to the old 30 s cadence.
+PLACEMENT_VERIFY_FAST_INTERVAL = 2
+PLACEMENT_VERIFY_FAST_WINDOW   = 60
+
+def _placement_verify_delay(started: float) -> float:
+    if time.time() - started < PLACEMENT_VERIFY_FAST_WINDOW:
+        return PLACEMENT_VERIFY_FAST_INTERVAL
+    return PLACEMENT_VERIFY_INTERVAL
+
+def _nd_scanning(nd_user: str, nd_pass: str) -> bool:
+    """True only when Navidrome positively says a scan is running.
+
+    Probing mid-scan is wasted search3 calls; an unreadable status counts as
+    "not scanning" so a Navidrome that never answers it still gets probed.
+    """
+    try:
+        return bool(nd_get_scan_status(nd_user, nd_pass).get("scanning"))
+    except Exception:  # noqa: BLE001
+        return False
+
+def _album_ids_of(songs) -> list:
+    """Distinct Navidrome album ids of matched songs, first-seen order."""
+    out = []
+    for song in songs:
+        album_id = (song or {}).get("albumId") or ""
+        if album_id and album_id not in out:
+            out.append(album_id)
+    return out
+
+def _announce_album_indexed(release_mbid: str, rgid: str, group_id: str,
+                            songs: list, artist: str = "", album: str = "") -> None:
+    """Navidrome has the album: record its ids and tell every client, once.
+
+    This is the moment the album becomes playable, and the one worth announcing.
+    `albumPlaced` fires before Navidrome's scan, so a client refetching on it
+    mostly re-reads the library as it was.
+    """
+    album_ids = _album_ids_of(songs)
+    artist_id = next((s.get("artistId") for s in songs if s and s.get("artistId")), "")
+    rows = _index_set_release_album_ids(rgid=rgid, group_id=group_id, album_ids=album_ids)
+    # Backfill and ownership checks read the cached album index, which is now
+    # wrong by exactly this album.
+    with _ND_ALBUM_INDEX_LOCK:
+        _ND_ALBUM_INDEX["ts"] = 0.0
+    row = rows[0] if rows else None
+    _notify_hub_library_change(
+        release_mbid, rgid=rgid or (row or {}).get("rgid", ""),
+        artist=artist, album=album, event="albumIndexed",
+        nd_album_ids=album_ids, nd_artist_id=artist_id, row=row)
 
 _placement_verifiers: set = set()
 _placement_verify_lock = threading.Lock()
@@ -1471,27 +1522,43 @@ def _verify_placement_worker(group_id: str) -> None:
             return
         nd_user = user.get("navidrome_user", "")
         nd_pass = user.get("navidrome_password", "")
-        deadline = time.time() + PLACEMENT_VERIFY_TIMEOUT
+        started = time.time()
+        deadline = started + PLACEMENT_VERIFY_TIMEOUT
+        announced = False
         while True:
             outstanding = _placed_track_indexes(group_id)
             if not outstanding:
                 _refresh_group_counts_after_fill(group_id)
                 _save_review_state()
                 return
-            for idx, track in outstanding:
-                try:
-                    present = nd_track_present(
-                        track.get("artist", ""), track.get("title", ""),
-                        track.get("mbid", ""), nd_user, nd_pass)
-                except Exception as e:
-                    print(f"  placement verify: Navidrome check failed: {e}")
-                    present = False
-                if present:
-                    _set_review_track_state(group_id, idx, "verified",
-                                            download_error="")
+            matched = []
+            if not _nd_scanning(nd_user, nd_pass):
+                for idx, track in outstanding:
+                    try:
+                        song = nd_track_match(
+                            track.get("artist", ""), track.get("title", ""),
+                            track.get("mbid", ""), nd_user, nd_pass, retry=False)
+                    except Exception as e:
+                        print(f"  placement verify: Navidrome check failed: {e}")
+                        song = None
+                    if song is not None:
+                        matched.append(song)
+                        _set_review_track_state(group_id, idx, "verified",
+                                                download_error="")
+            if matched and not announced:
+                # The first pass that sees the new tracks is when a client can
+                # show them. Later passes only confirm stragglers.
+                announced = True
+                if not _placed_track_indexes(group_id):
+                    _refresh_group_counts_after_fill(group_id)
+                with _review_lock:
+                    group = _find_review_group(group_id) or {}
+                    g_artist, g_album = group.get("artist", ""), group.get("album", "")
+                _announce_album_indexed("", "", group_id, matched,
+                                        artist=g_artist, album=g_album)
             if time.time() >= deadline:
                 break
-            time.sleep(PLACEMENT_VERIFY_INTERVAL)
+            time.sleep(_placement_verify_delay(started))
         stranded = _placed_track_indexes(group_id)
         for idx, track in stranded:
             # Back to pending, not failed: nothing is known to be broken, the
@@ -1713,7 +1780,8 @@ def _album_group_for_release(release_mbid: str) -> tuple:
     return "", None
 
 def _start_album_fill_verification(release_mbid: str, result: dict,
-                                   artist: str = "") -> None:
+                                   artist: str = "", rgid: str = "",
+                                   album: str = "") -> None:
     """Confirm a placed album actually reached Navidrome, then flip to `verified`.
 
     The group-scoped _verify_placement_worker cannot do this job: an artist-page
@@ -1740,23 +1808,31 @@ def _start_album_fill_verification(release_mbid: str, result: dict,
                 return
             nd_user = user.get("navidrome_user", "")
             nd_pass = user.get("navidrome_password", "")
-            deadline = time.time() + ALBUM_FILL_VERIFY_TIMEOUT
+            started = time.time()
+            deadline = started + ALBUM_FILL_VERIFY_TIMEOUT
             while True:
-                seen = 0
-                for row in probes:
-                    try:
-                        if nd_track_present(artist, row.get("title", ""),
-                                            row.get("recording_mbid", ""),
-                                            nd_user, nd_pass):
-                            seen += 1
-                    except Exception as e:
-                        print(f"  album fill verify: Navidrome check failed: {e}")
-                if seen:
-                    _album_fill_set(release_mbid, "verified", verifiedTracks=seen)
+                matched = []
+                if not _nd_scanning(nd_user, nd_pass):
+                    for row in probes:
+                        try:
+                            song = nd_track_match(artist, row.get("title", ""),
+                                                  row.get("recording_mbid", ""),
+                                                  nd_user, nd_pass, retry=False)
+                        except Exception as e:
+                            print(f"  album fill verify: Navidrome check failed: {e}")
+                            song = None
+                        if song is not None:
+                            matched.append(song)
+                if matched:
+                    _album_fill_set(release_mbid, "verified", verifiedTracks=len(matched),
+                                    ndAlbumIds=_album_ids_of(matched))
+                    _announce_album_indexed(
+                        release_mbid, rgid or _album_fill_get(release_mbid).get("rgid", ""),
+                        "", matched, artist=artist, album=album)
                     return
                 if time.time() >= deadline:
                     break
-                time.sleep(ALBUM_FILL_VERIFY_INTERVAL)
+                time.sleep(_placement_verify_delay(started))
             # Placed but never indexed. Not a failure of the fill — say exactly
             # that rather than claiming success or inventing an error.
             _album_fill_set(release_mbid, "placed",
@@ -1822,6 +1898,9 @@ def _album_fill_view(release_mbid: str) -> dict:
         "attempts": int(entry.get("attempts") or 0),
         "groupId": entry.get("groupId", "") or gid,
         "taskId": entry.get("taskId", ""),
+        # Set once the verifier has seen the album in Navidrome. The polling
+        # client syncs exactly these instead of pulling its whole library.
+        "ndAlbumIds": list(entry.get("ndAlbumIds") or []),
         "updatedAt": entry.get("updated_at", 0),
     }
     if ag:
@@ -1844,23 +1923,39 @@ def _album_fill_view(release_mbid: str) -> dict:
     return view
 
 def _notify_hub_library_change(release_mbid: str, rgid: str = "",
-                               artist: str = "", album: str = "") -> None:
+                               artist: str = "", album: str = "",
+                               event: str = "albumPlaced",
+                               nd_album_ids: list | None = None,
+                               nd_artist_id: str = "",
+                               row: dict | None = None) -> None:
     """Tell the navi-connect hub an album just landed, so it can fan the news out
     to whichever clients are connected.
 
     Fire-and-forget on its own thread: this is called from the placement path,
     which the user is waiting on, and the hub is optional infrastructure that may
     well be down. Nothing reads the response.
+
+    Two events: `albumPlaced` (files are in the library folder, Navidrome has not
+    scanned them yet) and `albumIndexed` (Navidrome has them). Only the second
+    carries `nd_album_ids` and the updated discography `row`, which is what lets a
+    client fetch the one album instead of re-syncing its library.
     """
-    if not HUB_NOTIFY_URL or not HUB_NOTIFY_TOKEN or not release_mbid:
+    if not HUB_NOTIFY_URL or not HUB_NOTIFY_TOKEN or not (release_mbid or rgid or nd_album_ids):
         return
+    body = {"event": event, "release_mbid": release_mbid,
+            "rgid": rgid, "artist": artist, "album": album}
+    if nd_album_ids:
+        body["nd_album_ids"] = list(nd_album_ids)
+    if nd_artist_id:
+        body["nd_artist_id"] = nd_artist_id
+    if row:
+        body["row"] = row
 
     def _worker():
         try:
             requests.post(
                 f"{HUB_NOTIFY_URL}/lb/notify",
-                json={"event": "albumPlaced", "release_mbid": release_mbid,
-                      "rgid": rgid, "artist": artist, "album": album},
+                json=body,
                 headers={"Authorization": f"Bearer {HUB_NOTIFY_TOKEN}"},
                 timeout=5)
         except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
@@ -3359,18 +3454,34 @@ def nd_track_present(artist: str, title: str, mbid: str,
     title+artist text match — so libraries with untagged files (no MBIDs)
     are not undercounted.
     """
-    if mbid and _nd_search(nd_user, nd_pass, mbid, 1):
-        return True
+    return nd_track_match(artist, title, mbid, nd_user, nd_pass) is not None
+
+def nd_track_match(artist: str, title: str, mbid: str, nd_user: str, nd_pass: str,
+                   retry: bool = True) -> dict | None:
+    """The Navidrome song `nd_track_present` would accept, or None.
+
+    Returning the song rather than a bool hands the verifiers the album's
+    Navidrome id (`albumId`) for free — the handle every client needs to open or
+    sync the album, which otherwise waited on a 300 s album-index TTL.
+
+    `retry=False` skips `_nd_search`'s 3 s warm-up retry. A verifier polling a
+    scan that hasn't finished expects misses, and three probes each paying that
+    sleep turned a 2 s poll into an 18 s one.
+    """
+    if mbid:
+        hits = _nd_search(nd_user, nd_pass, mbid, 1, _retry=retry)
+        if hits:
+            return hits[0]
     title_q  = (title or "").lower().strip()
     artist_q = (artist or "").lower().strip()
     if not title_q:
-        return False
-    for song in _nd_search(nd_user, nd_pass, f"{title} {artist}".strip(), 10):
+        return None
+    for song in _nd_search(nd_user, nd_pass, f"{title} {artist}".strip(), 10, _retry=retry):
         st = song.get("title",  "").lower().strip()
         sa = song.get("artist", "").lower().strip()
         if st == title_q and (not artist_q or artist_q in sa or sa in artist_q):
-            return True
-    return False
+            return song
+    return None
 
 def nd_get_all_albums(nd_user: str, nd_pass: str, stats: dict = None) -> list:
     """Page through Navidrome getAlbumList2 and return all albums.
@@ -5054,6 +5165,37 @@ def _index_mark_release_present(rgid: str = "", group_id: str = "",
         print(f"  index: could not mark release present: {e}")
         return 0
 
+def _index_set_release_album_ids(rgid: str = "", group_id: str = "",
+                                 album_ids: list | None = None) -> list:
+    """Write the Navidrome album ids a verifier just observed. Returns wire rows.
+
+    The verifiers are the first code to KNOW these ids — they matched the placed
+    tracks in Navidrome — so they record them directly instead of leaving it to
+    `_index_backfill_present_album_ids`, which guesses by title against a 300 s
+    cached album index and so kept a landed album opening the download page for
+    up to five minutes. Only rows with no ids yet are written: a scan's own ids
+    for an `incomplete` album are at least as good. The rows come back either
+    way, for the notify.
+    """
+    if not rgid and not group_id:
+        return []
+    where, arg = ("rgid = ?", rgid) if rgid else ("group_id = ?", group_id)
+    try:
+        with _index_lock:
+            conn = _index_db()
+            with conn:
+                if album_ids:
+                    conn.execute(
+                        f"UPDATE release_groups SET nd_album_ids = ?, updated_at = ? "
+                        f"WHERE {where} AND (nd_album_ids = '' OR nd_album_ids = '[]')",
+                        (json.dumps(list(album_ids)), time.time(), arg))
+            rows = conn.execute(
+                f"SELECT * FROM release_groups WHERE {where}", (arg,)).fetchall()
+        return [_index_row_to_wire(r) for r in rows]
+    except Exception as e:  # noqa: BLE001 — bookkeeping must not fail a verification
+        print(f"  index: could not record Navidrome album ids: {e}")
+        return []
+
 def _index_upsert_release(artist_key: str, release: dict) -> bool:
     """Write one classified release-group row, replacing whatever was there.
 
@@ -5198,6 +5340,28 @@ def _index_artist_key_for_rgid(rgid: str, artist_mbid: str = "",
         print(f"  index: artist key lookup failed: {e}")
     return ""
 
+def _index_row_to_wire(r) -> dict:
+    """One `release_groups` row in the discography endpoint's release shape.
+
+    Shared by the page read and the `albumIndexed` notify, so a client patching
+    its copy from the notify gets exactly what a re-read would have returned.
+    """
+    try:
+        secondary = json.loads(r["secondary_types"] or "[]")
+    except (ValueError, IndexError, KeyError):
+        secondary = []
+    row = {"rgid": r["rgid"], "title": r["title"], "year": r["year"],
+           "primary_type": r["primary_type"], "secondary_types": secondary,
+           "effective_type": _effective_release_type(r["primary_type"], secondary),
+           "status": r["status"],
+           "match_method": r["match_method"], "match_score": r["match_score"]}
+    if r["status"] == "incomplete":
+        row.update(group_id=r["group_id"], present=r["present"], total=r["total"])
+    nd_ids = json.loads(r["nd_album_ids"] or "[]")
+    if nd_ids:
+        row["navidrome_album_ids"] = nd_ids
+    return row
+
 def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | None:
     """Stored discography for an artist, or None if not indexed. Shape matches
     the scan-task result so the frontend renders both identically."""
@@ -5217,23 +5381,7 @@ def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | N
         rg_rows = conn.execute(
             "SELECT * FROM release_groups WHERE artist_key = ? ORDER BY year, title",
             (artist["artist_key"],)).fetchall()
-    releases = []
-    for r in rg_rows:
-        try:
-            secondary = json.loads(r["secondary_types"] or "[]")
-        except (ValueError, IndexError, KeyError):
-            secondary = []
-        row = {"rgid": r["rgid"], "title": r["title"], "year": r["year"],
-               "primary_type": r["primary_type"], "secondary_types": secondary,
-               "effective_type": _effective_release_type(r["primary_type"], secondary),
-               "status": r["status"],
-               "match_method": r["match_method"], "match_score": r["match_score"]}
-        if r["status"] == "incomplete":
-            row.update(group_id=r["group_id"], present=r["present"], total=r["total"])
-        nd_ids = json.loads(r["nd_album_ids"] or "[]")
-        if nd_ids:
-            row["navidrome_album_ids"] = nd_ids
-        releases.append(row)
+    releases = [_index_row_to_wire(r) for r in rg_rows]
     scanned_at = float(artist["scanned_at"] or 0)
     stale = (time.time() - scanned_at > LB_BOT_INDEX_TTL_DAYS * 86400
              or int(artist["scan_version"] or 0) != INDEX_SCAN_VERSION)
@@ -8355,7 +8503,9 @@ async def _finalize_group(bot, ag_id: str):
             # ever turn "placed" into "it is really in your library".
             if not ag.get("review_group_id"):
                 _start_album_fill_verification(fill_mbid, result,
-                                               artist=ag.get("artist", ""))
+                                               artist=ag.get("artist", ""),
+                                               rgid=fill_rgid,
+                                               album=ag.get("album", ""))
         else:
             status = "failed"
             import_note = f"\n⚠️ Placement failed: {result['error']}"

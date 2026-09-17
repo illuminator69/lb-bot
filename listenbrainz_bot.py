@@ -1984,7 +1984,8 @@ def _notify_hub_library_change(release_mbid: str, rgid: str = "",
     carries `nd_album_ids` and the updated discography `row`, which is what lets a
     client fetch the one album instead of re-syncing its library.
     """
-    if not HUB_NOTIFY_URL or not HUB_NOTIFY_TOKEN or not (release_mbid or rgid or nd_album_ids):
+    if not HUB_NOTIFY_URL or not HUB_NOTIFY_TOKEN or not (
+            release_mbid or rgid or nd_album_ids or nd_artist_id):
         return
     body = {"event": event, "release_mbid": release_mbid,
             "rgid": rgid, "artist": artist, "album": album}
@@ -2625,7 +2626,25 @@ def _mbz_cache_key(path: str, params: dict) -> str:
     items = sorted((params or {}).items())
     return path + "?" + "&".join(f"{k}={v}" for k, v in items)
 
-def mbz_get(path: str, params: dict = None) -> dict:
+class MusicBrainzUnavailable(RuntimeError):
+    """MusicBrainz did not answer a request whose answer cannot be guessed."""
+
+# A strict caller (a discography scan someone asked for) retries a transient
+# failure after these pauses before giving up out loud.
+MBZ_STRICT_RETRY_BACKOFF = (3.0, 10.0)
+
+def _mbz_error_text(e: Exception) -> str:
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None):
+        return f"HTTP {resp.status_code}"
+    name = type(e).__name__
+    if "Timeout" in name:
+        return "timed out"
+    if "ConnectionError" in name:
+        return "connection failed"
+    return name
+
+def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
     """
     Rate-limited (1/sec) MusicBrainz request with a persistent result cache.
 
@@ -2639,47 +2658,67 @@ def mbz_get(path: str, params: dict = None) -> dict:
     scan forever. A 503/timeout means MusicBrainz is busy, which is temporary:
     those get a short cooldown in _mbz_fail_until and are never written to the
     durable cache, so a bad afternoon can't poison it.
+
+    `strict=True` is for a caller that cannot treat {} as an answer. A
+    non-strict failure is indistinguishable from "MusicBrainz has nothing", and
+    for an artist's release-group browse that was read as "this artist has no
+    releases": the stored discography was replaced by an empty one, and every
+    rescan inside the five-minute cooldown "succeeded" instantly with nothing,
+    never having asked. Strict ignores the cooldown (someone asked), retries
+    after MBZ_STRICT_RETRY_BACKOFF, and raises MusicBrainzUnavailable with the
+    reason instead of returning {}.
     """
     global _mbz_last_req
     key    = _mbz_cache_key(path, params)
     cached = _mbz_cache.get(key)
     if cached is not None:
         return cached
-    if time.time() < _mbz_fail_until.get(key, 0):
+    if not strict and time.time() < _mbz_fail_until.get(key, 0):
         return {}
-    with _mbz_lock:
-        # Re-check: a thread that queued behind an identical request should use
-        # its answer rather than spend another second of the budget on it.
-        cached = _mbz_cache.get(key)
-        if cached is not None:
-            return cached
-        if time.time() < _mbz_fail_until.get(key, 0):
-            return {}
-        wait = 1.0 - (time.time() - _mbz_last_req)
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            r = _http.get(
-                f"{MBZ_API}/{path}",
-                params={"fmt": "json", **(params or {})},
-                headers={"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"},
-                timeout=10,
-            )
-            _mbz_last_req = time.time()
-            status = r.status_code
-            if status in MBZ_PERMANENT_FAIL_STATUSES:
-                print(f"  MBZ {status} [{path}] — caching as unresolvable")
-                _mbz_cache_put(key, {})
+    last_error = ""
+    for pause in (0.0,) + (MBZ_STRICT_RETRY_BACKOFF if strict else ()):
+        if pause:
+            # Outside the lock: a backoff must not stall every other caller.
+            time.sleep(pause)
+        with _mbz_lock:
+            # Re-check: a thread that queued behind an identical request should use
+            # its answer rather than spend another second of the budget on it.
+            cached = _mbz_cache.get(key)
+            if cached is not None:
+                return cached
+            if not strict and time.time() < _mbz_fail_until.get(key, 0):
                 return {}
-            r.raise_for_status()
-            data = r.json()
-            if data:
-                _mbz_cache_put(key, data)
-            return data
-        except Exception as e:
-            print(f"  MBZ error [{path}]: {e}")
-            _mbz_fail_until[key] = time.time() + MBZ_FAIL_COOLDOWN
-            return {}
+            wait = 1.0 - (time.time() - _mbz_last_req)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                r = _http.get(
+                    f"{MBZ_API}/{path}",
+                    params={"fmt": "json", **(params or {})},
+                    headers={"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"},
+                    timeout=10,
+                )
+                _mbz_last_req = time.time()
+                status = r.status_code
+                if status in MBZ_PERMANENT_FAIL_STATUSES:
+                    print(f"  MBZ {status} [{path}] — caching as unresolvable")
+                    _mbz_cache_put(key, {})
+                    return {}
+                r.raise_for_status()
+                data = r.json()
+                if data:
+                    _mbz_cache_put(key, data)
+                _mbz_fail_until.pop(key, None)
+                return data
+            except Exception as e:
+                # A failed request still spent the budget: pace the retry after it.
+                _mbz_last_req = time.time()
+                last_error = _mbz_error_text(e)
+                print(f"  MBZ error [{path}]: {e}")
+                _mbz_fail_until[key] = time.time() + MBZ_FAIL_COOLDOWN
+    if strict:
+        raise MusicBrainzUnavailable(f"MusicBrainz did not answer ({last_error})")
+    return {}
 
 def mbz_best_release(recording_mbid: str) -> dict:
     """
@@ -2926,7 +2965,8 @@ def _effective_release_type(primary: str, secondary: list) -> str:
 def mbz_artist_release_groups(artist_mbid: str, *,
                               types: tuple = ("album", "ep", "single"),
                               exclude_secondary: set = None,
-                              limit_pages: int = 10) -> list:
+                              limit_pages: int = 10,
+                              strict: bool = False) -> list:
     """
     Paginated browse of an artist's release-groups (release-group?artist=...).
     Release-groups already dedupe regional/format pressings of the same work, so
@@ -2940,6 +2980,10 @@ def mbz_artist_release_groups(artist_mbid: str, *,
 
     Returns [{rgid, title, primary_type, secondary_types, year, first_release_date}]
     sorted by first_release_date.
+
+    `strict=True` raises MusicBrainzUnavailable rather than returning a short
+    list: a page that failed mid-walk is not the end of the discography, and a
+    scan storing it would delete every release past that page.
     """
     exclude = ARTIST_DISCOGRAPHY_EXCLUDE_DEFAULT if exclude_secondary is None else exclude_secondary
     out, offset, page_size = [], 0, 100
@@ -2949,7 +2993,11 @@ def mbz_artist_release_groups(artist_mbid: str, *,
             "type":   "|".join(types),
             "limit":  str(page_size),
             "offset": str(offset),
-        })
+        }, strict=strict)
+        if strict and "release-groups" not in data:
+            # A permanent 4xx, cached as {}: nothing to list, and not "no releases".
+            raise MusicBrainzUnavailable(
+                "MusicBrainz returned no release list for this artist id")
         rgs = data.get("release-groups", [])
         if not rgs:
             break
@@ -4731,7 +4779,9 @@ def build_artist_discography(artist_mbid: str, artist_name: str,
     Returns {"artist_mbid", "artist_name", "releases": [...], "review_groups": [...]}
     where review_groups is the "incomplete" subset, ready for _merge_review_groups.
     """
-    rgs = mbz_artist_release_groups(artist_mbid)
+    # Strict: a MusicBrainz failure must fail the scan, never read as an artist
+    # with no releases (see mbz_get).
+    rgs = mbz_artist_release_groups(artist_mbid, strict=True)
 
     # Not-owned browse (MusicBrainz search picks): the caller already knows the
     # user has nothing by this artist, so skip the whole-library album fetch
@@ -7680,29 +7730,75 @@ def _resolve_local_path(remote_filename: str) -> str | None:
 # Download completion polling (Feature 3)
 # ---------------------------------------------------------------------------
 
-def _slskd_cancel(username: str, filename: str):
-    """Best-effort cancel/remove of a single slskd transfer."""
+def _slskd_basename(filename: str) -> str:
+    return filename.replace("\\", "/").rstrip("/").split("/")[-1].lower()
+
+def _slskd_find_transfer_id(username: str, filename: str,
+                            downloads: list | None = None) -> str:
+    """slskd's id for one of our transfers, looked up by peer and file.
+
+    slskd addresses a transfer by the GUID it minted at enqueue, never by its
+    filename. Exact path first, then the basename — slskd reports the remote
+    path, which does not always match what we enqueued byte for byte.
+    """
+    if downloads is None:
+        downloads = _slskd_fetch_all_downloads()
+    base = _slskd_basename(filename)
+    fallback = ""
+    for dl in downloads:
+        if dl.get("_username", "") != username or not dl.get("id"):
+            continue
+        if dl.get("filename", "") == filename:
+            return str(dl["id"])
+        if not fallback and _slskd_basename(dl.get("filename", "")) == base:
+            fallback = str(dl["id"])
+    return fallback
+
+def _slskd_cancel(username: str, filename: str, transfer_id: str = "",
+                  downloads: list | None = None) -> bool:
+    """Cancel one slskd transfer. Returns whether slskd accepted the cancel.
+
+    This used to DELETE `.../downloads/<user>/<filename>` and never read the
+    answer. slskd's route takes the transfer's **id**, so every cancel was a
+    404 nobody saw: cancelling an album in a client stopped lb-bot tracking it
+    while slskd went on downloading every file, and the stall watchdog's
+    "cancel" never cancelled anything either.
+    """
     import urllib.parse
+    tid = transfer_id or _slskd_find_transfer_id(username, filename, downloads)
+    if not tid:
+        print(f"  slskd cancel: no transfer found for {username} / "
+              f"{_slskd_basename(filename)}")
+        return False
     try:
-        _http.delete(
+        r = _http.delete(
             f"{SLSKD_URL}/api/v0/transfers/downloads/"
             f"{urllib.parse.quote(username, safe='')}/"
-            f"{urllib.parse.quote(filename, safe='')}",
+            f"{urllib.parse.quote(tid, safe='')}",
             headers=_slskd_headers(), timeout=10)
+        if r.status_code >= 400:
+            print(f"  slskd cancel failed ({r.status_code}) for {username} / "
+                  f"{_slskd_basename(filename)}: {r.text[:200]}")
+            return False
+        return True
     except Exception as e:
         print(f"  slskd cancel error: {e}")
+        return False
 
 def _abandon_group_downloads(ag_id: str):
     """Drop all still-pending transfers belonging to an album group."""
-    for key in [k for k, v in pending_downloads.items()
-                if v.get("album_group_id") == ag_id]:
+    keys = [k for k, v in pending_downloads.items()
+            if v.get("album_group_id") == ag_id]
+    # One transfer listing for the whole album, not one per file.
+    downloads = _slskd_fetch_all_downloads() if keys else []
+    for key in keys:
         username, filename = key
         info = pending_downloads.get(key, {})
         if info.get("repair_job_id"):
             _repair_update_download(info.get("repair_job_id", ""), username, filename,
                                     "cancelled", "abandoned pending transfer",
                                     raw_state="Cancelled")
-        _slskd_cancel(username, filename)
+        _slskd_cancel(username, filename, info.get("transfer_id", ""), downloads)
         pending_downloads.pop(key, None)
 
 def _retry_file_from_alt_source(ag: dict, ag_id: str, info: dict,
@@ -8754,6 +8850,8 @@ async def _poll_downloads_once(token_to_app: dict):
             track   = info["track"]
             percent = _slskd_transfer_percent(dl)
             info["latest_state"] = state
+            if dl.get("id"):
+                info["transfer_id"] = str(dl["id"])
             info["percent"] = percent
             info["updated_at"] = time.time()
             info["raw_transfer"] = {
@@ -8812,7 +8910,8 @@ async def _poll_downloads_once(token_to_app: dict):
                     # Flagged so the Cancelled state this produces is failed over,
                     # not read as the user cancelling the whole album in slskd.
                     info["_watchdog_cancelled"] = True
-                    await asyncio.to_thread(_slskd_cancel, username, filename)
+                    await asyncio.to_thread(_slskd_cancel, username, filename,
+                                            str(dl.get("id") or ""), downloads)
                     info["_stall_at"] = now  # prevent re-trigger before Cancelled state arrives
 
             if _slskd_succeeded(state):
@@ -12171,16 +12270,77 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
     _task_finish(task_id, f"Queued {ok}/{total} file(s)" if ok else "Could not queue album",
                  "" if ok else "Could not queue album")
 
+# The last scan of each artist, keyed both ways a client asks (`mb:<mbid>`,
+# `nd:<id>`). In memory: it only has to outlive the page that is waiting on it.
+# Before this a client had no way to see a scan fail — it polled the index,
+# found nothing new, and showed "No releases match this filter".
+_artist_scans: dict = {}
+_artist_scans_lock = threading.Lock()
+ARTIST_SCANS_MAX = 500
+
+def _artist_scan_keys(mbid: str = "", nd_id: str = "") -> list:
+    return [k for k in ((f"mb:{mbid}" if mbid else ""),
+                        (f"nd:{nd_id}" if nd_id else "")) if k]
+
+def _artist_scan_set(mbid: str, nd_id: str, **fields) -> None:
+    with _artist_scans_lock:
+        for key in _artist_scan_keys(mbid, nd_id):
+            _artist_scans.pop(key, None)  # re-insert: newest last, for eviction
+            _artist_scans[key] = dict(fields, updated_at=time.time())
+        while len(_artist_scans) > ARTIST_SCANS_MAX:
+            _artist_scans.pop(next(iter(_artist_scans)))
+
+def _artist_scan_get(mbid: str = "", nd_id: str = "") -> dict | None:
+    """The newest scan either key knows about, in wire shape, or None."""
+    with _artist_scans_lock:
+        found = [_artist_scans[k] for k in _artist_scan_keys(mbid, nd_id)
+                 if k in _artist_scans]
+    if not found:
+        return None
+    scan = max(found, key=lambda r: r.get("updated_at", 0))
+    return {"state": scan.get("state", ""), "error": scan.get("error", ""),
+            "taskId": scan.get("task_id", ""),
+            "startedAt": scan.get("started_at", 0),
+            "finishedAt": scan.get("finished_at", 0)}
+
 def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
                              user: dict, nd_artist_id: str = "",
                              skip_library: bool = False) -> None:
     def _progress(done, total, artist="", album=""):
         _task_update(task_id, done=done, total=total,
                      current=f"{artist} - {album}".strip(" -"))
-    result = build_artist_discography(
-        artist_mbid, artist_name,
-        user["navidrome_user"], user["navidrome_password"], progress=_progress,
-        skip_library=skip_library)
+    started = time.time()
+    _artist_scan_set(artist_mbid, nd_artist_id, state="running",
+                     task_id=task_id, started_at=started)
+
+    def _failed(message: str) -> None:
+        print(f"  discography scan for {artist_name} failed: {message}")
+        _artist_scan_set(artist_mbid, nd_artist_id, state="failed", error=message,
+                         task_id=task_id, started_at=started,
+                         finished_at=time.time())
+        _task_finish(task_id, error=message)
+        _notify_hub_library_change("", event="artistScanned",
+                                   artist=artist_name, nd_artist_id=nd_artist_id)
+
+    try:
+        result = build_artist_discography(
+            artist_mbid, artist_name,
+            user["navidrome_user"], user["navidrome_password"], progress=_progress,
+            skip_library=skip_library)
+    except MusicBrainzUnavailable as e:
+        _failed(f"{e} — the stored discography was kept; try again in a minute")
+        return
+    except Exception as e:  # noqa: BLE001 — reported to the client, not swallowed
+        _failed(f"Scan failed: {e}")
+        return
+    if not result["releases"]:
+        stored = _index_get_artist(artist_mbid, nd_artist_id)
+        if stored and stored.get("releases"):
+            # MusicBrainz answered, with nothing. Overwriting a real discography
+            # with that is never the safer mistake.
+            _failed(f"MusicBrainz listed no releases for this artist; kept the "
+                    f"{len(stored['releases'])} stored")
+            return
     if result["review_groups"]:
         # Union, never replace: a single-artist scan must not wipe the gaps
         # accumulated from other artists / full-library scans.
@@ -12193,7 +12353,12 @@ def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
                f"{counts.get('incomplete', 0)} incomplete, "
                f"{counts.get('missing', 0)} missing, "
                f"{counts.get('untagged', 0)} untagged")
+    _artist_scan_set(artist_mbid, nd_artist_id, state="done", task_id=task_id,
+                     started_at=started, finished_at=time.time())
     _task_finish(task_id, summary, result=result)
+    # Clears the hub's cached discography, so the client's re-read sees this scan.
+    _notify_hub_library_change("", event="artistScanned",
+                               artist=artist_name, nd_artist_id=nd_artist_id)
 
 def _task_cancelled(task_id: str) -> bool:
     """Read one task's status directly.
@@ -15644,9 +15809,11 @@ def start_web_dashboard() -> None:
         # SELECT) unless there is such a row, and never asks MusicBrainz.
         _index_backfill_present_album_ids(_index_existing_artist_key(mbid, nd_id))
         stored = _index_get_artist(mbid, nd_id)
+        scan = _artist_scan_get(mbid, nd_id)
+        extra = {"scan": scan} if scan else {}
         if not stored:
-            return jsonify({"indexed": False})
-        return jsonify({"indexed": True, **stored})
+            return jsonify({"indexed": False, **extra})
+        return jsonify({"indexed": True, **stored, **extra})
 
     @app.post("/api/artist/discography")
     def api_artist_discography():
@@ -15662,6 +15829,11 @@ def start_web_dashboard() -> None:
         # `mb:` ids come from the MusicBrainz search (artists not in the
         # library), so there's nothing to match against — skip the library fetch.
         skip_library = bool(data.get("external")) or nd_id.startswith("mb:")
+        running = _artist_scan_get(mbid, nd_id)
+        if running and running["state"] == "running":
+            # Pressing Rescan again while one runs queues nothing new; it used to
+            # start another walk sharing the same one-request-a-second budget.
+            return jsonify({"ok": True, "task_id": running["taskId"], "running": True})
         task_id = _task_run(
             "artist-discography",
             f"Scan discography: {name}",

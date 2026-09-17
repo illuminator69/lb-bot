@@ -1509,7 +1509,8 @@ class AlbumReviewTests(unittest.TestCase):
         # transfer_failed legitimately schedules its one auto-retry; a cancel never may.
         retry = ((lambda *a, **k: self.fail("a cancelled fill must never auto-retry"))
                  if forbid_auto_retry else (lambda *a, **k: None))
-        for name, value in (("_slskd_cancel", lambda u, f: cancels.append((u, f))),
+        for name, value in (("_slskd_cancel", lambda u, f, *a, **k: cancels.append((u, f))),
+                            ("_slskd_fetch_all_downloads", lambda: []),
                             ("_save_state", lambda *a, **k: None),
                             ("_schedule_album_fill_retry", retry)):
             patcher = patch.object(bot, name, value)
@@ -1528,6 +1529,30 @@ class AlbumReviewTests(unittest.TestCase):
                 "album_group_id": "ag1", "token": "tok", "chat_id": "chat",
                 "track": {"artist": "Artist", "title": f"T{n}"}, "candidates": [],
                 "queued_at": time.time() - 3600}
+
+    def test_slskd_cancel_addresses_the_transfer_by_id(self):
+        """slskd's DELETE takes the transfer GUID. Sending the filename was a
+        silent 404, so a cancelled album went on downloading in slskd."""
+        calls = []
+
+        class _Resp:
+            status_code = 204
+            text = ""
+
+        listing = [{"_username": "peer", "id": "guid-1",
+                    "filename": "@@x\Music\Album\01 Song.flac"}]
+        with patch.object(bot._http, "delete",
+                          lambda url, **k: calls.append(url) or _Resp()),                 patch.object(bot, "_slskd_fetch_all_downloads", lambda: listing):
+            # Enqueued under a different path prefix: matched by basename.
+            self.assertTrue(bot._slskd_cancel("peer", "Album\01 Song.flac"))
+            self.assertTrue(calls[-1].endswith("/downloads/peer/guid-1"))
+            # A known id skips the lookup entirely.
+            self.assertTrue(bot._slskd_cancel("peer", "whatever", "guid-9", []))
+            self.assertTrue(calls[-1].endswith("/downloads/peer/guid-9"))
+            # Nothing to address: reported, not pretended.
+            self.assertFalse(bot._slskd_cancel("other", "Album\01 Song.flac"))
+            _Resp.status_code = 404
+            self.assertFalse(bot._slskd_cancel("peer", "x", "guid-1", []))
 
     def test_cancel_stops_an_in_flight_album_and_offers_retry(self):
         """There was no cancel at all: a slow download stopped in slskd left every
@@ -1752,6 +1777,97 @@ class AlbumReviewTests(unittest.TestCase):
             bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
 
         self.addCleanup(restore)
+
+    def test_strict_mbz_get_retries_then_raises_instead_of_answering_empty(self):
+        """A failed browse used to come back as {}, which a scan read as "no
+        releases" — and inside the cooldown it came back {} without asking."""
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise type("ReadTimeout", (Exception,), {})("slow")
+
+        key = bot._mbz_cache_key("release-group", {"artist": "strict-a"})
+        self.addCleanup(bot._mbz_fail_until.pop, key, None)
+        with patch.object(bot._http, "get", boom), patch.object(bot.time, "sleep", lambda s: None):
+            with self.assertRaises(bot.MusicBrainzUnavailable) as ctx:
+                bot.mbz_get("release-group", {"artist": "strict-a"}, strict=True)
+            self.assertIn("timed out", str(ctx.exception))
+            self.assertEqual(len(calls), 1 + len(bot.MBZ_STRICT_RETRY_BACKOFF))
+            # Non-strict keeps its old contract: cooldown, {} and no request.
+            self.assertEqual(bot.mbz_get("release-group", {"artist": "strict-a"}), {})
+            self.assertEqual(len(calls), 1 + len(bot.MBZ_STRICT_RETRY_BACKOFF))
+            # ...but a strict caller asks again despite the cooldown.
+            with self.assertRaises(bot.MusicBrainzUnavailable):
+                bot.mbz_get("release-group", {"artist": "strict-a"}, strict=True)
+
+    def test_strict_browse_refuses_a_discography_cut_short(self):
+        page = [{"id": f"rg{n}", "title": f"T{n}", "primary-type": "Album"} for n in range(100)]
+
+        def fake_get(path, params=None, strict=False):
+            if params.get("offset") == "0":
+                return {"release-groups": page, "release-group-count": 150}
+            if strict:
+                raise bot.MusicBrainzUnavailable("MusicBrainz did not answer (HTTP 503)")
+            return {}
+
+        with patch.object(bot, "mbz_get", fake_get):
+            self.assertEqual(len(bot.mbz_artist_release_groups("a")), 100)
+            with self.assertRaises(bot.MusicBrainzUnavailable):
+                bot.mbz_artist_release_groups("a", strict=True)
+
+    def _scan_harness(self):
+        self._index_file()
+        bot._index_store_artist({"artist_mbid": "art-1", "artist_name": "Artist",
+                                 "releases": [{"rgid": "rg-a", "title": "A", "status": "complete"},
+                                              {"rgid": "rg-b", "title": "B", "status": "missing"}]},
+                                nd_artist_id="nd-1")
+        finished, notes = [], []
+        self.addCleanup(bot._artist_scans.clear)
+        for name, value in (("_task_update", lambda *a, **k: None),
+                            ("_task_finish", lambda tid, summary="", error="", **k:
+                                finished.append((summary, error))),
+                            ("_notify_hub_library_change", lambda *a, **k: notes.append(k))):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return finished, notes
+
+    def test_a_failed_scan_keeps_the_stored_discography_and_says_why(self):
+        """The scan stored whatever came back, so a MusicBrainz hiccup emptied the
+        artist's discography, and nothing told the client why."""
+        finished, notes = self._scan_harness()
+        user = {"navidrome_user": "u", "navidrome_password": "p"}
+
+        def fail(*a, **k):
+            raise bot.MusicBrainzUnavailable("MusicBrainz did not answer (HTTP 503)")
+
+        with patch.object(bot, "build_artist_discography", fail):
+            bot._artist_discography_task("t1", "art-1", "Artist", user, "nd-1")
+        self.assertEqual(len(bot._index_get_artist("art-1", "nd-1")["releases"]), 2)
+        self.assertIn("HTTP 503", finished[-1][1])
+        scan = bot._artist_scan_get("", "nd-1")
+        self.assertEqual(scan["state"], "failed")
+        self.assertIn("HTTP 503", scan["error"])
+        self.assertEqual(notes[-1].get("event"), "artistScanned")
+        self.assertEqual(notes[-1].get("nd_artist_id"), "nd-1")
+
+        # MusicBrainz answering with nothing must not wipe a real discography either.
+        empty = {"artist_mbid": "art-1", "artist_name": "Artist",
+                 "releases": [], "review_groups": []}
+        with patch.object(bot, "build_artist_discography", lambda *a, **k: empty):
+            bot._artist_discography_task("t2", "art-1", "Artist", user, "nd-1")
+        self.assertEqual(len(bot._index_get_artist("art-1", "nd-1")["releases"]), 2)
+        self.assertEqual(bot._artist_scan_get("art-1", "")["state"], "failed")
+
+        # A good scan replaces it and says done.
+        good = {"artist_mbid": "art-1", "artist_name": "Artist", "review_groups": [],
+                "releases": [{"rgid": "rg-c", "title": "C", "status": "missing"}]}
+        with patch.object(bot, "build_artist_discography", lambda *a, **k: good):
+            bot._artist_discography_task("t3", "art-1", "Artist", user, "nd-1")
+        self.assertEqual([r["rgid"] for r in bot._index_get_artist("art-1", "nd-1")["releases"]],
+                         ["rg-c"])
+        self.assertEqual(bot._artist_scan_get("art-1", "nd-1")["state"], "done")
 
     def test_mark_release_present_inserts_when_there_is_no_row(self):
         """It was UPDATE-only, so a download of a release the artist's index

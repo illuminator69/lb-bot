@@ -16,3 +16,8 @@ web/node_modules/
 .codex-*/
 .vscode/
 .idea/
+
+# Mock album art from the UI design round — referenced by nothing, and third-party
+# cover images don't belong in the published tree.
+covers/
+.thumbnail

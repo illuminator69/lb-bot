@@ -5038,5 +5038,841 @@ class AlbumLookupOwnershipTests(unittest.TestCase):
                          "the search itself, and nothing more")
         self.assertEqual(called[0][0], "release-group")
 
+
+class DeezerBrowseOwnershipTests(unittest.TestCase):
+    """The Deezer browse rows mark ownership by name, conservatively.
+
+    Deezer publishes no MBIDs, so every resolution here is a name match against
+    the library index. That is precisely the case where a guess is worse than a
+    blank: a chart row wrongly badged "in library" sends the tap to an album
+    that is not there, and one wrongly badged unowned offers to download a
+    record already on disk — the same pair of mistakes `/api/album/lookup` and
+    the Fresh tab each paid for once.
+
+    The other thing these defend is the budget. A browse row must never take
+    `_mbz_lock`: it is the discography scanner's whole 1 req/sec allowance, and
+    a Discover screen that queued behind it would render when the scan finished.
+    """
+
+    CHART = {
+        "albums": [
+            {"deezerId": "1", "title": "Owned Record", "artist": "Band",
+             "imageUrl": "https://dz/1.jpg", "recordType": "album"},
+            {"deezerId": "2", "title": "Known But Missing", "artist": "Band",
+             "imageUrl": "https://dz/2.jpg", "recordType": "album"},
+            {"deezerId": "3", "title": "Never Heard Of", "artist": "Stranger",
+             "imageUrl": "https://dz/3.jpg", "recordType": "album"},
+        ],
+        "artists": [
+            {"deezerId": "10", "name": "Band", "imageUrl": "https://dz/a.jpg"},
+            {"deezerId": "11", "name": "Stranger", "imageUrl": "https://dz/b.jpg"},
+        ],
+    }
+    DIRECTORY = {
+        "band|owned record": {"rgid": "rg-owned", "status": "complete",
+                              "albumId": "nd-42", "artistMbid": "mb-band",
+                              "artistName": "Band"},
+        "band|known but missing": {"rgid": "rg-missing", "status": "missing",
+                                   "albumId": "", "artistMbid": "mb-band",
+                                   "artistName": "Band"},
+    }
+    ROWS = [{"id": "nd1", "name": "Band", "mbid": "mb-band"}]
+
+    @contextlib.contextmanager
+    def _stack(self, directory=None, rows=None):
+        with patch("listenbrainz_bot.deezer_chart", return_value=self.CHART), \
+             patch("listenbrainz_bot._index_release_group_directory",
+                   return_value=self.DIRECTORY if directory is None else directory), \
+             patch("listenbrainz_bot._artist_index_rows",
+                   return_value=self.ROWS if rows is None else rows), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids",
+                   return_value={"mb-band"}):
+            yield
+
+    def _marked(self):
+        with self._stack():
+            return bot._deezer_chart_marked(20)
+
+    def test_an_owned_album_names_the_navidrome_album_to_open(self):
+        by_id = {a["deezerId"]: a for a in self._marked()["albums"]}
+        self.assertTrue(by_id["1"]["releaseOwned"])
+        self.assertEqual(by_id["1"]["releaseAlbumId"], "nd-42")
+        self.assertEqual(by_id["1"]["rgid"], "rg-owned")
+
+    def test_a_known_but_missing_release_group_keeps_its_rgid(self):
+        """`missing` rows are the most useful rows in the directory: they give
+        an unowned tile a real release-group id, which is what the one-tap
+        acquire needs. Dropping them would leave the row un-actionable."""
+        by_id = {a["deezerId"]: a for a in self._marked()["albums"]}
+        self.assertFalse(by_id["2"]["releaseOwned"])
+        self.assertEqual(by_id["2"]["rgid"], "rg-missing")
+        self.assertEqual(by_id["2"]["releaseAlbumId"], "")
+
+    def test_an_unresolved_album_guesses_nothing(self):
+        by_id = {a["deezerId"]: a for a in self._marked()["albums"]}
+        self.assertFalse(by_id["3"]["releaseOwned"])
+        self.assertEqual(by_id["3"]["rgid"], "")
+        self.assertEqual(by_id["3"]["releaseAlbumId"], "")
+        # Deezer's own cover is the only art there is when no release-group
+        # resolved — the Archive is keyed by rgid and lb-bot's /api/cover by a
+        # Navidrome album id, so neither has anything to serve.
+        self.assertEqual(by_id["3"]["coverUrl"], "https://dz/3.jpg")
+
+    def test_a_resolved_album_prefers_the_cover_art_archive(self):
+        by_id = {a["deezerId"]: a for a in self._marked()["albums"]}
+        self.assertEqual(by_id["1"]["coverUrl"], bot.caa_front_url("rg-owned"))
+
+    def test_an_edition_suffix_still_matches_the_record_on_disk(self):
+        """`_fuzzy_album_text` strips "(Deluxe Edition)" and friends. For
+        *ownership* that conflation is correct — you hold the record — which is
+        why the fuzzy key is a fallback here and is not used anywhere that
+        picks a concrete release."""
+        chart = {"albums": [{"deezerId": "9", "title": "Owned Record (Deluxe Edition)",
+                             "artist": "Band", "imageUrl": ""}],
+                 "artists": []}
+        with patch("listenbrainz_bot.deezer_chart", return_value=chart), \
+             patch("listenbrainz_bot._index_release_group_directory",
+                   return_value=self.DIRECTORY), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()):
+            out = bot._deezer_chart_marked(20)
+        self.assertTrue(out["albums"][0]["releaseOwned"])
+        self.assertEqual(out["albums"][0]["rgid"], "rg-owned")
+
+    def test_artists_carry_the_owned_indexed_pair_the_similar_row_uses(self):
+        by_name = {a["name"]: a for a in self._marked()["artists"]}
+        self.assertTrue(by_name["Band"]["owned"])
+        self.assertTrue(by_name["Band"]["indexed"])
+        self.assertEqual(by_name["Band"]["artistId"], "nd1")
+        self.assertEqual(by_name["Band"]["mbid"], "mb-band")
+        self.assertFalse(by_name["Stranger"]["owned"])
+        self.assertEqual(by_name["Stranger"]["artistId"], "")
+        self.assertEqual(by_name["Stranger"]["mbid"], "")
+
+    def test_a_cold_index_degrades_to_no_badges_rather_than_raising(self):
+        with patch("listenbrainz_bot.deezer_chart", return_value=self.CHART), \
+             patch("listenbrainz_bot._index_release_group_directory", return_value={}), \
+             patch("listenbrainz_bot._artist_index_rows",
+                   side_effect=RuntimeError("no such column: artist_mbid")), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()):
+            out = bot._deezer_chart_marked(20)
+        self.assertEqual(len(out["albums"]), 3)
+        self.assertEqual(len(out["artists"]), 2)
+        self.assertTrue(all(not a["releaseOwned"] for a in out["albums"]))
+        self.assertTrue(all(not a["owned"] for a in out["artists"]))
+
+    def test_it_never_spends_the_musicbrainz_budget(self):
+        called = []
+        with self._stack(), \
+             patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}):
+            bot._deezer_chart_marked(20)
+        self.assertEqual(called, [], "a browse row must not touch MusicBrainz")
+
+    def test_the_editorial_row_marks_the_same_way(self):
+        editorial = {"albums": self.CHART["albums"], "section": "selection"}
+        called = []
+        with patch("listenbrainz_bot.deezer_editorial", return_value=editorial), \
+             patch("listenbrainz_bot._index_release_group_directory",
+                   return_value=self.DIRECTORY), \
+             patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}):
+            out = bot._deezer_editorial_marked(20)
+        self.assertEqual(out["section"], "selection")
+        self.assertTrue(out["albums"][0]["releaseOwned"])
+        self.assertEqual(called, [])
+
+    def test_the_related_row_resolves_the_deezer_id_from_the_name(self):
+        seen = {}
+
+        def fake_search(name):
+            seen["name"] = name
+            return "dz-99"
+
+        with patch("listenbrainz_bot.deezer_search_artist_id", side_effect=fake_search), \
+             patch("listenbrainz_bot.deezer_related_artists",
+                   return_value=[{"deezerId": "10", "name": "Band", "imageUrl": ""},
+                                 {"deezerId": "11", "name": "Stranger", "imageUrl": ""}]), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value={"mb-band"}):
+            out = bot._deezer_related_marked("", "Seed Artist", 20)
+        self.assertEqual(seen["name"], "Seed Artist")
+        self.assertEqual(out["because"], "Seed Artist")
+        self.assertEqual(out["sources"], ["Deezer"])
+        by_name = {a["name"]: a for a in out["artists"]}
+        self.assertTrue(by_name["Band"]["owned"])
+        self.assertFalse(by_name["Stranger"]["owned"])
+        # Deezer publishes no score, so rank is normalized into one — the same
+        # treatment `similar_artists` gives its two sources.
+        self.assertGreater(by_name["Band"]["score"], by_name["Stranger"]["score"])
+
+    def test_the_related_row_finds_the_name_from_an_mbid_without_musicbrainz(self):
+        called = []
+        with patch("listenbrainz_bot.deezer_search_artist_id", return_value="") as search, \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()), \
+             patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}):
+            out = bot._deezer_related_marked("mb-band", "", 20)
+        search.assert_called_once_with("Band")
+        self.assertEqual(out["artists"], [])
+        self.assertEqual(called, [])
+
+    def test_an_artist_deezer_does_not_know_yields_an_empty_row_not_a_wrong_one(self):
+        """`deezer_search_artist_id` is exact-match only on purpose: Deezer's
+        search happily answers a tribute band for a misspelling, and a near miss
+        is a whole shelf about the wrong artist."""
+        with patch("listenbrainz_bot.deezer_search_artist_id", return_value=""), \
+             patch("listenbrainz_bot.deezer_related_artists") as related, \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()):
+            out = bot._deezer_related_marked("", "Nobody At All", 20)
+        related.assert_not_called()
+        self.assertEqual(out["artists"], [])
+
+
+class ReleaseGroupDirectoryTests(unittest.TestCase):
+    """`_index_release_group_directory` against a real index DB, not a mock.
+
+    This is the map that lets a browse source with **no MBIDs at all** mark
+    ownership without a MusicBrainz request. `_index_owned_rgids` and
+    `_index_rgid_album_ids` both start from an rgid the caller already has; a
+    Deezer chart row has only "Artist" and "Title", so it needs the index keyed
+    the other way round — which means a real JOIN against `artists`, and a
+    mocked test would not have exercised it.
+    """
+
+    def _seed(self):
+        bot._index_ensure_artist("mb-band", artist_mbid="mb-band",
+                                 nd_artist_id="nd1", name="The Band")
+        bot._index_upsert_release("mb-band", {
+            "rgid": "rg-owned", "title": "Owned Record", "status": "complete",
+            "navidrome_album_ids": ["nd-42", "nd-43"]})
+        bot._index_upsert_release("mb-band", {
+            "rgid": "rg-missing", "title": "Known But Missing", "status": "missing",
+            "navidrome_album_ids": []})
+
+    def test_a_row_is_found_by_its_artist_and_title(self):
+        with isolated_review():
+            self._seed()
+            directory = bot._index_release_group_directory()
+        entry = directory["the band|owned record"]
+        self.assertEqual(entry["rgid"], "rg-owned")
+        self.assertEqual(entry["status"], "complete")
+        self.assertEqual(entry["artistMbid"], "mb-band")
+        # First id wins, as `_index_rgid_album_ids` does: a release-group held
+        # as several Navidrome albums has no one right answer.
+        self.assertEqual(entry["albumId"], "nd-42")
+
+    def test_a_missing_release_group_is_kept_and_keeps_its_rgid(self):
+        """These are the most useful rows here: an unowned tile still gets a
+        real release-group id, which is what the one-tap acquire needs."""
+        with isolated_review():
+            self._seed()
+            directory = bot._index_release_group_directory()
+        entry = directory["the band|known but missing"]
+        self.assertEqual(entry["rgid"], "rg-missing")
+        self.assertEqual(entry["status"], "missing")
+        self.assertEqual(entry["albumId"], "")
+
+    def test_an_edition_suffix_resolves_through_the_fuzzy_key(self):
+        with isolated_review():
+            self._seed()
+            directory = bot._index_release_group_directory()
+        self.assertIn("the band|owned record", directory)
+        self.assertEqual(
+            directory[f"{bot._fuzzy_album_text('The Band')}|"
+                      f"{bot._fuzzy_album_text('Owned Record (Deluxe Edition)')}"]["rgid"],
+            "rg-owned")
+
+    def test_an_artist_with_no_row_contributes_nothing(self):
+        """The JOIN is inner on purpose: a release-group whose artist row is
+        gone has no name to key on, and inventing one would mis-mark."""
+        with isolated_review():
+            bot._index_upsert_release("mb-orphan", {
+                "rgid": "rg-orphan", "title": "Orphan", "status": "complete"})
+            self.assertEqual(bot._index_release_group_directory(), {})
+
+    def test_a_broken_index_is_an_empty_map_not_a_raise(self):
+        with patch("listenbrainz_bot._index_db",
+                   side_effect=RuntimeError("no such table: release_groups")):
+            self.assertEqual(bot._index_release_group_directory(), {})
+
+
+class DeezerClientTests(unittest.TestCase):
+    """The transport: cache keying, Deezer's in-body errors, and the editorial
+    fallback."""
+
+    def setUp(self):
+        bot._deezer_cache.clear()
+        self.addCleanup(bot._deezer_cache.clear)
+
+    @staticmethod
+    def _response(payload, ok=True, status=200):
+        return types.SimpleNamespace(ok=ok, status_code=status, text=json.dumps(payload),
+                                     json=lambda: payload)
+
+    def test_a_second_call_is_served_from_the_cache(self):
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append(url)
+            return self._response({"data": [{"id": 1, "title": "T",
+                                             "artist": {"name": "A"}}]})
+
+        with patch.object(bot._http, "get", side_effect=fake_get):
+            bot._deezer_get("editorial/0/selection", {"limit": "5"})
+            bot._deezer_get("editorial/0/selection", {"limit": "5"})
+        self.assertEqual(len(calls), 1)
+
+    def test_an_error_inside_a_200_body_is_an_error(self):
+        """Deezer reports quota and bad-id failures *inside* a 200. Reading only
+        the status would cache "no rows" as the permanent answer."""
+        with patch.object(bot._http, "get",
+                          return_value=self._response({"error": {"message": "Quota limit exceeded"}})):
+            with self.assertRaises(bot.DeezerError):
+                bot._deezer_get("chart", {"limit": "5"})
+        self.assertEqual(bot._deezer_cache, {}, "a failure must not be cached")
+
+    def test_the_chart_keeps_only_what_ownership_can_be_marked_on(self):
+        payload = {
+            "albums": {"data": [{"id": 5, "title": "Rec", "artist": {"id": 7, "name": "A"},
+                                 "cover_medium": "u", "record_type": "album"}]},
+            "artists": {"data": [{"id": 7, "name": "A", "picture_medium": "p"}]},
+            "tracks": {"data": [{"id": 9, "title": "Song"}]},
+            "playlists": {"data": [{"id": 3, "title": "Mix"}]},
+        }
+        with patch.object(bot._http, "get", return_value=self._response(payload)):
+            out = bot.deezer_chart(10)
+        self.assertEqual(set(out), {"albums", "artists"})
+        self.assertEqual(out["albums"][0]["deezerId"], "5")
+        self.assertEqual(out["albums"][0]["artist"], "A")
+
+    def test_editorial_falls_back_when_the_selection_is_empty(self):
+        """An empty editorial row is indistinguishable from a broken one, so
+        `selection` coming back empty falls through to `releases` and the
+        answer says which one served it."""
+        seen = []
+
+        def fake_get(url, **kw):
+            seen.append(url)
+            if "selection" in url:
+                return self._response({"data": []})
+            return self._response({"data": [{"id": 1, "title": "New",
+                                             "artist": {"name": "A"}}]})
+
+        with patch.object(bot._http, "get", side_effect=fake_get):
+            out = bot.deezer_editorial(10)
+        self.assertEqual(out["section"], "releases")
+        self.assertEqual(len(out["albums"]), 1)
+        self.assertEqual(len(seen), 2)
+
+
+class MusicLinkParsingTests(unittest.TestCase):
+    """`_parse_music_link` — pure, so every provider form is testable without a
+    single request. Before this the module's only URL parser was
+    `spotify_playlist_id`, a `re.search` for `playlist/<id>`."""
+
+    CASES = [
+        ("https://musicbrainz.org/artist/f4a31f0a-51dd-4fa7-986d-3095c40c5ed9",
+         "musicbrainz", "artist", "f4a31f0a-51dd-4fa7-986d-3095c40c5ed9"),
+        ("https://musicbrainz.org/release-group/11111111-2222-3333-4444-555555555555",
+         "musicbrainz", "album", "11111111-2222-3333-4444-555555555555"),
+        ("https://musicbrainz.org/release/11111111-2222-3333-4444-555555555555",
+         "musicbrainz", "release", "11111111-2222-3333-4444-555555555555"),
+        ("https://musicbrainz.org/recording/11111111-2222-3333-4444-555555555555",
+         "musicbrainz", "track", "11111111-2222-3333-4444-555555555555"),
+        ("https://open.spotify.com/album/4m2880jivSbbyEGAKfITCa",
+         "spotify", "album", "4m2880jivSbbyEGAKfITCa"),
+        ("https://open.spotify.com/intl-de/track/2takcwOaAZWiXQijPHIx7B?si=abc",
+         "spotify", "track", "2takcwOaAZWiXQijPHIx7B"),
+        ("spotify:artist:4tZwfgrHOc3mvqYlEYSvVi",
+         "spotify", "artist", "4tZwfgrHOc3mvqYlEYSvVi"),
+        ("https://www.deezer.com/en/album/302127", "deezer", "album", "302127"),
+        ("https://www.deezer.com/artist/27", "deezer", "artist", "27"),
+        ("https://www.deezer.com/fr/track/3135556", "deezer", "track", "3135556"),
+        ("https://music.apple.com/us/album/random-access-memories/617154241",
+         "apple", "album", "617154241"),
+        ("https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+         "ytmusic", "track", "dQw4w9WgXcQ"),
+        ("https://youtu.be/dQw4w9WgXcQ", "ytmusic", "track", "dQw4w9WgXcQ"),
+        ("https://tidal.com/browse/album/77640617", "tidal", "album", "77640617"),
+        ("https://open.qobuz.com/album/0060254712345", "qobuz", "album", "0060254712345"),
+    ]
+
+    def test_every_provider_form_parses(self):
+        for url, provider, kind, ident in self.CASES:
+            with self.subTest(url=url):
+                parsed = bot._parse_music_link(url)
+                self.assertEqual(parsed["provider"], provider)
+                self.assertEqual(parsed["kind"], kind)
+                self.assertEqual(parsed["id"], ident)
+
+    def test_apple_keeps_the_slug_as_a_name_of_last_resort(self):
+        parsed = bot._parse_music_link(
+            "https://music.apple.com/us/album/random-access-memories/617154241")
+        self.assertEqual(parsed["slug"], "random-access-memories")
+
+    def test_something_that_is_not_a_music_link_is_unknown_not_an_error(self):
+        for url in ("", "hello", "https://example.com/album/1",
+                    "https://news.site/story/spotify-album-review"):
+            with self.subTest(url=url):
+                parsed = bot._parse_music_link(url)
+                self.assertEqual(parsed["provider"], "")
+                self.assertEqual(parsed["kind"], "unknown")
+
+    def test_a_page_title_splits_into_artist_and_title(self):
+        self.assertEqual(
+            bot._split_artist_title("Random Access Memories by Daft Punk on Apple Music"),
+            ("Daft Punk", "Random Access Memories"))
+        self.assertEqual(bot._split_artist_title("Daft Punk - Discovery | TIDAL"),
+                         ("Daft Punk", "Discovery"))
+        self.assertEqual(bot._split_artist_title("Just A Title"), ("", "Just A Title"))
+
+
+class ResolveLinkTests(unittest.TestCase):
+    """`resolve_music_link` — the three tiers, and the promise that a link it
+    cannot place is an answer rather than a 500."""
+
+    def test_a_musicbrainz_url_answers_without_a_single_request(self):
+        called = []
+        with patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}), \
+             patch.object(bot._http, "get",
+                          side_effect=AssertionError("no HTTP for a MusicBrainz URL")):
+            out = bot.resolve_music_link(
+                "https://musicbrainz.org/release-group/11111111-2222-3333-4444-555555555555")
+        self.assertEqual(out["kind"], "album")
+        self.assertEqual(out["rgid"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(out["confidence"], 1.0)
+        self.assertEqual(called, [])
+
+    def test_a_musicbrainz_release_url_resolves_up_to_its_release_group(self):
+        """The acquire path is release-group-shaped, so a concrete release has
+        to be lifted one level or the answer is unusable."""
+        with patch("listenbrainz_bot.mbz_release_group_of", return_value="rg-77"):
+            out = bot.resolve_music_link(
+                "https://musicbrainz.org/release/11111111-2222-3333-4444-555555555555")
+        self.assertEqual(out["kind"], "album")
+        self.assertEqual(out["rgid"], "rg-77")
+        self.assertEqual(out["mbid"], "11111111-2222-3333-4444-555555555555")
+
+    def test_a_deezer_album_link_resolves_through_deezers_own_api(self):
+        with patch("listenbrainz_bot.deezer_album",
+                   return_value={"title": "Discovery", "artist": {"name": "Daft Punk"}}), \
+             patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[{"rgid": "rg-disc", "title": "Discovery",
+                                  "artist": "Daft Punk", "primary_type": "album",
+                                  "year": "2001", "score": 100}]):
+            out = bot.resolve_music_link("https://www.deezer.com/en/album/302127")
+        self.assertEqual(out["kind"], "album")
+        self.assertEqual(out["provider"], "deezer")
+        self.assertEqual(out["rgid"], "rg-disc")
+        self.assertEqual(out["artist"], "Daft Punk")
+        # Capped below 1.0: the names are exact but MusicBrainz's match is not.
+        self.assertEqual(out["confidence"], 0.9)
+
+    def test_a_scraped_link_is_capped_lower_than_an_api_one(self):
+        """Apple, TIDAL, YouTube Music and Qobuz publish no free metadata API,
+        so their artist and title come out of a page title that a redesign
+        upstream breaks silently. `confidence` says so."""
+        with patch("listenbrainz_bot._fetch_page_head",
+                   return_value="<title>Discovery by Daft Punk on Apple Music</title>"), \
+             patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[{"rgid": "rg-disc", "title": "Discovery",
+                                  "artist": "Daft Punk", "primary_type": "album",
+                                  "year": "2001", "score": 100}]):
+            out = bot.resolve_music_link(
+                "https://music.apple.com/us/album/discovery/697194953")
+        self.assertEqual(out["rgid"], "rg-disc")
+        self.assertEqual(out["confidence"], 0.7)
+
+    def test_an_isrc_beats_a_text_search_for_a_track(self):
+        """An ISRC identifies the *recording*; a name is shared by every cover
+        version ever recorded. So the ISRC leg runs first and scores higher."""
+        searched = []
+        with patch("listenbrainz_bot.deezer_track",
+                   return_value={"title": "One More Time", "isrc": "GBDUW0000059",
+                                 "artist": {"name": "Daft Punk"},
+                                 "album": {"title": "Discovery"}}), \
+             patch("listenbrainz_bot._mbid_from_isrc", return_value="rec-1"), \
+             patch("listenbrainz_bot._mbid_from_search",
+                   side_effect=lambda *a: searched.append(a) or "rec-wrong"), \
+             patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[{"rgid": "rg-disc", "title": "Discovery",
+                                  "artist": "Daft Punk", "primary_type": "album",
+                                  "year": "2001", "score": 100}]):
+            out = bot.resolve_music_link("https://www.deezer.com/track/3135556")
+        self.assertEqual(out["kind"], "track")
+        self.assertEqual(out["mbid"], "rec-1")
+        self.assertEqual(out["rgid"], "rg-disc")
+        self.assertEqual(out["confidence"], 0.95)
+        self.assertEqual(searched, [], "the text search is the fallback, not the first try")
+
+    def test_a_provider_being_down_falls_back_to_the_page_rather_than_raising(self):
+        with patch("listenbrainz_bot.deezer_album",
+                   side_effect=bot.DeezerError("503")), \
+             patch("listenbrainz_bot._fetch_page_head",
+                   return_value="<title>Discovery by Daft Punk</title>"), \
+             patch("listenbrainz_bot.mbz_search_release_groups", return_value=[]):
+            out = bot.resolve_music_link("https://www.deezer.com/en/album/302127")
+        self.assertEqual(out["kind"], "album")
+        self.assertEqual(out["rgid"], "")
+        self.assertEqual(out["confidence"], 0.0)
+        self.assertTrue(out["reason"])
+
+    def test_a_failed_isrc_lookup_does_not_borrow_its_confidence(self):
+        """The ISRC merely *existing* says nothing. Caught live on 2026-09-23:
+        MusicBrainz 400'd the ISRC leg, the text search supplied the recording,
+        and the answer still claimed 0.95 — an exact-match score for a name
+        match."""
+        with patch("listenbrainz_bot.deezer_track",
+                   return_value={"title": "One More Time", "isrc": "GBDUW0000059",
+                                 "artist": {"name": "Daft Punk"},
+                                 "album": {"title": "Discovery"}}), \
+             patch("listenbrainz_bot._mbid_from_isrc", return_value=""), \
+             patch("listenbrainz_bot._mbid_from_search", return_value="rec-2"), \
+             patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[{"rgid": "rg-disc", "title": "Discovery",
+                                  "artist": "Daft Punk", "primary_type": "album",
+                                  "year": "2001", "score": 100}]):
+            out = bot.resolve_music_link("https://www.deezer.com/track/3135556")
+        self.assertEqual(out["mbid"], "rec-2")
+        self.assertLess(out["confidence"], 0.95)
+
+    def test_an_unrecognised_url_is_a_plain_answer(self):
+        out = bot.resolve_music_link("https://example.com/not-music")
+        self.assertEqual(out["kind"], "unknown")
+        self.assertEqual(out["confidence"], 0.0)
+        self.assertEqual(out["provider"], "")
+
+    def test_the_answer_always_carries_the_frozen_contract_keys(self):
+        """Four agents share this shape and only this shape; a branch that
+        omits a key makes a client's optional-chaining silently render blank."""
+        with patch("listenbrainz_bot.mbz_release_group_of", return_value=""):
+            answers = [
+                bot.resolve_music_link("nonsense"),
+                bot.resolve_music_link(
+                    "https://musicbrainz.org/artist/11111111-2222-3333-4444-555555555555"),
+                bot.resolve_music_link(
+                    "https://musicbrainz.org/release/11111111-2222-3333-4444-555555555555"),
+            ]
+        for answer in answers:
+            for key in ("kind", "mbid", "rgid", "artist", "title", "provider",
+                        "confidence"):
+                self.assertIn(key, answer)
+            self.assertIn(answer["kind"], ("artist", "album", "track", "unknown"))
+
+
+class ReleaseGroupSearchTests(unittest.TestCase):
+    """`_mbz_release_group_for` — fielded, because free text ranks the wrong record.
+
+    Measured against live MusicBrainz on 2026-09-23: the free-text query
+    "Daft Punk Discovery" scored *"Daft Punk's Discovery but it's in the SM64
+    Soundfont"* by Pignickel at 100 and returned it first, because term density
+    beats the record you meant. When the caller already knows which half is the
+    artist — which every `resolve-link` caller does — the artist belongs in a
+    field, as a constraint, not in the bag of words.
+    """
+
+    NOVELTY = {"rgid": "rg-novelty",
+               "title": "Daft Punk\u2019s Discovery but it\u2019s in the SM64 Soundfont",
+               "artist": "Pignickel", "primary_type": "album",
+               "year": "2021", "score": 100}
+    REAL = {"rgid": "rg-disc", "title": "Discovery", "artist": "Daft Punk",
+            "primary_type": "album", "year": "2001", "score": 92}
+
+    def test_the_artist_becomes_a_field_not_another_search_term(self):
+        queries = []
+        with patch("listenbrainz_bot.mbz_search_release_groups",
+                   side_effect=lambda q, n: queries.append(q) or [self.REAL]):
+            bot._mbz_release_group_for("Daft Punk", "Discovery")
+        self.assertEqual(len(queries), 1)
+        self.assertIn('releasegroup:"Discovery"', queries[0])
+        self.assertIn('artist:"Daft Punk"', queries[0])
+
+    def test_free_text_is_the_fallback_when_the_fielded_query_finds_nothing(self):
+        """A fielded query finds nothing at all when the store's spelling of the
+        artist and MusicBrainz's disagree, so free text has to stay reachable."""
+        queries = []
+
+        def fake(query, limit):
+            queries.append(query)
+            return [] if "releasegroup:" in query else [self.REAL]
+
+        with patch("listenbrainz_bot.mbz_search_release_groups", side_effect=fake):
+            out = bot._mbz_release_group_for("Daft Punk", "Discovery")
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(out[0]["rgid"], "rg-disc")
+
+    def test_the_record_that_matches_outranks_the_higher_scoring_novelty(self):
+        """MusicBrainz's own `score` cannot be trusted to do this — which is the
+        whole reason this function exists rather than a bare search call."""
+        with patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[self.NOVELTY, self.REAL]):
+            out = bot._mbz_release_group_for("Daft Punk", "Discovery")
+        self.assertEqual(out[0]["rgid"], "rg-disc")
+        self.assertEqual(out[1]["rgid"], "rg-novelty")
+
+    def test_a_title_with_a_quote_in_it_does_not_break_the_query(self):
+        queries = []
+        with patch("listenbrainz_bot.mbz_search_release_groups",
+                   side_effect=lambda q, n: queries.append(q) or []):
+            bot._mbz_release_group_for('The "Best" Of', 'Say "Hello"')
+        self.assertNotIn('"Say "Hello""', queries[0])
+
+    def test_no_title_is_no_search(self):
+        with patch("listenbrainz_bot.mbz_search_release_groups") as search:
+            self.assertEqual(bot._mbz_release_group_for("Daft Punk", ""), [])
+        search.assert_not_called()
+
+
+class WishlistTests(unittest.TestCase):
+    """The home `no_source` gets instead of an auto-retry.
+
+    `no_source` deliberately never auto-retries — lb-bot walks its entire ranked
+    source list before reporting it, so re-running the same search against the
+    same peers is the same failure. But "don't retry now" was argued for and
+    "forget about it" never was: Soulseek's population turns over on the scale
+    of days, so the retry worth running is a slow one against a list the user
+    curates.
+    """
+
+    def test_adding_is_idempotent_and_does_not_reset_the_clock(self):
+        """A double-tap must not re-search immediately. Re-adding something
+        already listed is not new information about who is sharing it."""
+        with isolated_review():
+            bot._wishlist_add("rg-1", "Band", "Record")
+            bot._wishlist_mark_tried("rg-1", "nobody sharing")
+            before = bot._wishlist_list()[0]
+            result = bot._wishlist_add("rg-1", "Band", "Record")
+            rows = bot._wishlist_list()
+            after = rows[0]
+        self.assertFalse(result["added"])
+        self.assertEqual(len(rows), 1, "re-adding must not make a second row")
+        self.assertEqual(after["lastTriedAt"], before["lastTriedAt"])
+        self.assertEqual(after["attempts"], 1)
+
+    def test_re_adding_fills_in_names_it_was_missing(self):
+        with isolated_review():
+            bot._wishlist_add("rg-1")
+            bot._wishlist_add("rg-1", "Band", "Record")
+            row = bot._wishlist_list()[0]
+            self.assertEqual(row["artist"], "Band")
+            self.assertEqual(row["title"], "Record")
+            # …and an add with no names does not blank the ones it has.
+            bot._wishlist_add("rg-1")
+            self.assertEqual(bot._wishlist_list()[0]["artist"], "Band")
+
+    def test_removing_reports_whether_there_was_anything_to_remove(self):
+        with isolated_review():
+            bot._wishlist_add("rg-1", "Band", "Record")
+            self.assertTrue(bot._wishlist_remove("rg-1")["removed"])
+            self.assertFalse(bot._wishlist_remove("rg-1")["removed"])
+            self.assertEqual(bot._wishlist_list(), [])
+
+    def test_an_rgid_is_required(self):
+        with isolated_review():
+            self.assertFalse(bot._wishlist_add("")["ok"])
+            self.assertFalse(bot._wishlist_remove("")["ok"])
+
+    def test_the_list_is_capped_and_evicts_the_stalest_claim(self):
+        with isolated_review(), \
+             patch("listenbrainz_bot.WISHLIST_MAX", 3):
+            for n in range(5):
+                bot._wishlist_add(f"rg-{n}", "Band", f"Record {n}")
+                time.sleep(0.001)
+            rgids = [r["rgid"] for r in bot._wishlist_list()]
+        self.assertEqual(len(rgids), 3)
+        self.assertEqual(set(rgids), {"rg-4", "rg-3", "rg-2"})
+
+    def test_only_rows_past_their_cooldown_are_due(self):
+        """Without a per-row cooldown, adding one row would re-search every row."""
+        with isolated_review():
+            bot._wishlist_add("rg-cold", "Band", "Cold")
+            bot._wishlist_add("rg-hot", "Band", "Hot")
+            bot._wishlist_mark_tried("rg-hot", "just tried")
+            due = {r["rgid"] for r in bot._wishlist_due()}
+        self.assertIn("rg-cold", due)
+        self.assertNotIn("rg-hot", due)
+
+    def test_a_landing_removes_the_row_and_tells_the_hub(self):
+        """A client showing the wishlist has no other way to learn that what it
+        is displaying is now in the library."""
+        notified = []
+        with isolated_review(), \
+             patch("listenbrainz_bot._notify_hub_library_change",
+                   side_effect=lambda *a, **k: notified.append(k)):
+            bot._wishlist_add("rg-1", "Band", "Record")
+            bot._wishlist_landed("rg-1", "Band", "Record")
+            self.assertEqual(bot._wishlist_list(), [])
+        self.assertEqual(len(notified), 1)
+        self.assertEqual(notified[0]["rgid"], "rg-1")
+
+    def test_a_landing_for_something_never_wished_for_says_nothing(self):
+        notified = []
+        with isolated_review(), \
+             patch("listenbrainz_bot._notify_hub_library_change",
+                   side_effect=lambda *a, **k: notified.append(k)):
+            bot._wishlist_landed("rg-never", "Band", "Record")
+        self.assertEqual(notified, [])
+
+    def test_a_retry_does_not_start_a_second_fill_for_the_same_release(self):
+        """The same guard `_schedule_album_fill_retry` keeps: if anything is
+        already filling this release, that is the answer."""
+        started = []
+        with isolated_review(), \
+             patch("listenbrainz_bot.mbz_resolve_album",
+                   return_value={"release_mbid": "rel-1", "artist": "Band",
+                                 "title": "Record", "total_tracks": 10}), \
+             patch("listenbrainz_bot._album_group_for_release",
+                   return_value=("ag-live", {})), \
+             patch("listenbrainz_bot._task_run",
+                   side_effect=lambda *a, **k: started.append(a)):
+            bot._wishlist_add("rg-1", "Band", "Record")
+            self.assertFalse(bot._wishlist_retry_one(bot._wishlist_list()[0]))
+        self.assertEqual(started, [])
+
+    def test_a_retry_records_why_it_could_not_run(self):
+        with isolated_review(), \
+             patch("listenbrainz_bot.mbz_resolve_album",
+                   side_effect=RuntimeError("503 Service Unavailable")):
+            bot._wishlist_add("rg-1", "Band", "Record")
+            self.assertFalse(bot._wishlist_retry_one(bot._wishlist_list()[0]))
+            row = bot._wishlist_list()[0]
+        self.assertEqual(row["attempts"], 1)
+        self.assertIn("MusicBrainz unavailable", row["lastReason"])
+
+
+class SourceFailoverTests(unittest.TestCase):
+    """The ranked-list walk, shared by `/api/gaps/<id>/fetch` and `_gap_auto_task`.
+
+    Until now the fetch route enqueued once and, on refusal, handed the client
+    the next candidate to click. But a refusal is the *normal* answer from a
+    peer whose free-slot flag went stale in the seconds since the search, so the
+    common case was a user clicking through four sources by hand to reach the
+    one that would have worked. One definition of the order, because the two
+    entry points disagreeing about it is how "auto picked a source manual
+    wouldn't" happens.
+    """
+
+    def test_the_chosen_source_is_tried_first(self):
+        self.assertEqual(bot._source_failover_order(5, 2)[0], 2)
+
+    def test_the_rest_follow_in_rank_order(self):
+        self.assertEqual(bot._source_failover_order(5, 2), [2, 0, 1, 3, 4])
+
+    def test_the_walk_is_bounded(self):
+        """By the seventh rejection the ranking itself is stale and a fresh
+        search is the better answer than an eighth peer from it."""
+        order = bot._source_failover_order(50, 0)
+        self.assertEqual(len(order), bot.SOURCE_FAILOVER_MAX)
+        self.assertEqual(order, list(range(bot.SOURCE_FAILOVER_MAX)))
+
+    def test_no_sources_is_an_empty_walk_not_an_index_error(self):
+        self.assertEqual(bot._source_failover_order(0, 0), [])
+
+    def test_an_out_of_range_start_is_clamped_rather_than_dropped(self):
+        self.assertEqual(bot._source_failover_order(3, 99)[0], 2)
+        self.assertEqual(sorted(bot._source_failover_order(3, -5)), [0, 1, 2])
+
+
+class AcoustIdVerificationTests(unittest.TestCase):
+    """The one identity check the rest of the module cannot make.
+
+    `_audio_signature`'s md5 is FLAC StreamInfo's hash of the *unencoded* audio:
+    it proves two files are the same encode of the same master and says nothing
+    at all about a different *recording*. A live take, a radio edit, a cover or
+    simply the wrong track under the right filename all have perfectly good,
+    perfectly different md5s and sail through. Closing that gap is what a
+    fingerprint is for — and what these defend is that it only ever speaks when
+    it has something positive to say.
+    """
+
+    def test_no_key_configured_means_no_opinion(self):
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", ""):
+            self.assertEqual(bot._acoustid_contradiction("/x.flac", "rec-1"), "")
+
+    def test_a_slot_with_no_recording_mbid_has_nothing_to_contradict(self):
+        """An untagged release, or a MusicBrainz entry without a recording id,
+        is not evidence that anything is wrong."""
+        called = []
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch("listenbrainz_bot._acoustid_recording_mbids",
+                   side_effect=lambda p: called.append(p) or (set(), 0.0)):
+            self.assertEqual(bot._acoustid_contradiction("/x.flac", ""), "")
+        self.assertEqual(called, [], "and it must not spend a lookup finding out")
+
+    def test_an_unknown_fingerprint_is_not_evidence(self):
+        """A guard that turns a working fill into a no-op because AcoustID has
+        never seen a rare pressing is worse than no guard."""
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch("listenbrainz_bot._acoustid_recording_mbids",
+                   return_value=(set(), 0.0)):
+            self.assertEqual(bot._acoustid_contradiction("/x.flac", "rec-1"), "")
+
+    def test_the_expected_recording_among_the_matches_is_no_objection(self):
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch("listenbrainz_bot._acoustid_recording_mbids",
+                   return_value=({"rec-1", "rec-2"}, 0.97)):
+            self.assertEqual(bot._acoustid_contradiction("/x.flac", "rec-1"), "")
+
+    def test_a_confident_different_recording_is_refused(self):
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch("listenbrainz_bot._acoustid_recording_mbids",
+                   return_value=({"rec-other"}, 0.95)):
+            reason = bot._acoustid_contradiction("/x.flac", "rec-1")
+        self.assertIn("different recording", reason)
+        self.assertIn("rec-1", reason)
+
+    def test_a_weak_match_is_discarded_before_it_can_reject_anything(self):
+        """Below `ACOUSTID_MIN_SCORE` the answer is treated as no opinion, not
+        as evidence against the file."""
+        payload = {"status": "ok", "results": [
+            {"score": 0.2, "recordings": [{"id": "rec-other"}]}]}
+        fake = types.SimpleNamespace(
+            fingerprint_file=lambda p: (200, b"fp"),
+            lookup=lambda *a, **k: payload)
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch.dict(sys.modules, {"acoustid": fake}):
+            mbids, score = bot._acoustid_recording_mbids("/x.flac")
+        self.assertEqual(mbids, set())
+        self.assertEqual(score, 0.0)
+
+    def test_a_missing_fpcalc_is_no_opinion_rather_than_an_exception(self):
+        def boom(_path):
+            raise OSError("fpcalc not found")
+
+        fake = types.SimpleNamespace(fingerprint_file=boom,
+                                     lookup=lambda *a, **k: {})
+        with patch("listenbrainz_bot.ACOUSTID_API_KEY", "key"), \
+             patch.dict(sys.modules, {"acoustid": fake}):
+            self.assertEqual(bot._acoustid_recording_mbids("/x.flac"), (set(), 0.0))
+
+    def test_a_rejection_is_remembered_against_the_peer_not_the_path(self):
+        """The file is about to be deleted or moved; what must not happen again
+        is fetching that same file from that same peer on the next attempt,
+        which is exactly what the ranked source list would otherwise do."""
+        with isolated_review():
+            bot._remember_download_origin("/downloads/x.flac", "peer1", "music\\x.flac")
+            self.assertTrue(bot._reject_source_file("/downloads/x.flac", "wrong take",
+                                                    expected="rec-1"))
+            self.assertTrue(bot._source_is_rejected("peer1", "music\\x.flac"))
+            self.assertFalse(bot._source_is_rejected("peer2", "music\\x.flac"))
+            self.assertFalse(bot._source_is_rejected("peer1", "music\\other.flac"))
+
+    def test_a_file_whose_provenance_was_lost_still_refuses_this_placement(self):
+        """In-memory provenance means a restart mid-cycle costs the peer memory.
+        The worst outcome is one more chance for one bad peer — never a wrong
+        file placed."""
+        with isolated_review():
+            self.assertFalse(bot._reject_source_file("/downloads/unknown.flac", "wrong"))
+
+    def test_a_broken_index_never_blocks_acquisition(self):
+        with patch("listenbrainz_bot._index_db",
+                   side_effect=RuntimeError("attempt to write a readonly database")):
+            self.assertFalse(bot._source_is_rejected("peer1", "x.flac"))
+
+
 if __name__ == "__main__":
     unittest.main()

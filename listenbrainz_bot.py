@@ -34,6 +34,7 @@ import sqlite3
 import tempfile
 import unicodedata
 import urllib.parse
+import html
 import contextlib
 import contextvars
 import concurrent.futures
@@ -2046,6 +2047,10 @@ def _start_album_fill_verification(release_mbid: str, result: dict,
                 if matched:
                     _album_fill_set(release_mbid, "verified", verifiedTracks=len(matched),
                                     ndAlbumIds=_album_ids_of(matched))
+                    # The record arrived, so "I still want this" is answered.
+                    # No-ops for anything that was never wished for.
+                    _wishlist_landed(rgid or _album_fill_get(release_mbid).get("rgid", ""),
+                                     artist, album)
                     _announce_album_indexed(
                         release_mbid, rgid or _album_fill_get(release_mbid).get("rgid", ""),
                         "", matched, artist=artist, album=album)
@@ -3364,6 +3369,458 @@ def _mbid_from_search(artist: str, title: str) -> str:
     return recs[0]["id"] if recs else ""
 
 # ---------------------------------------------------------------------------
+# Paste-a-link — POST /api/resolve-link
+#
+# One streaming-service URL in, MusicBrainz ids out, so a client can hand a
+# shared link straight to the acquire path it already has. Until this, the only
+# URL parser in the whole module was `spotify_playlist_id` — a `re.search` for
+# `playlist/<id>` — and the Telegram half had no plain-text message handler at
+# all, so `/spplaylist` was the only way a link could enter the system.
+#
+# Three tiers of resolution, and `confidence` is on the wire precisely because
+# they are not equally good:
+#
+#   1.0   a musicbrainz.org URL. The id *is* the answer; no network call.
+#   ~0.9  an API the provider publishes (Spotify's client-credentials
+#         endpoints, Deezer's open one). Artist and title are exact, so the
+#         remaining doubt is only MusicBrainz's own match.
+#   ~0.7  a scraped page title (Apple Music, YouTube Music, TIDAL, Qobuz).
+#         None of them publishes a free metadata API, so the artist and title
+#         come out of `<title>` / `og:` tags, and a redesign upstream breaks
+#         them silently. The cap says so rather than pretending otherwise.
+#
+# An ISRC beats all three when the provider gives one: it identifies the
+# *recording*, not a name that two records might share, which is why
+# `_mbid_from_isrc` is tried before `_mbid_from_search` on every track link.
+#
+# This route DOES spend the `_mbz_lock` budget — one or two searches. That is
+# fine and deliberate: it is a single user-initiated action on a link they just
+# pasted, exactly like `/api/album/lookup`. The browse rows in
+# `_deezer_chart_marked` are the ones that must never touch it.
+# ---------------------------------------------------------------------------
+
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+# (provider, kind, pattern). Order matters: the first match wins, so the more
+# specific host patterns come before the generic ones.
+_MUSIC_LINK_PATTERNS = [
+    ("musicbrainz", "artist", rf"musicbrainz\.org/artist/({_UUID_RE})"),
+    ("musicbrainz", "album",  rf"musicbrainz\.org/release-group/({_UUID_RE})"),
+    ("musicbrainz", "release", rf"musicbrainz\.org/release/({_UUID_RE})"),
+    ("musicbrainz", "track",  rf"musicbrainz\.org/recording/({_UUID_RE})"),
+
+    ("spotify", "album",  r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?album/|spotify:album:)([A-Za-z0-9]+)"),
+    ("spotify", "artist", r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?artist/|spotify:artist:)([A-Za-z0-9]+)"),
+    ("spotify", "track",  r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?track/|spotify:track:)([A-Za-z0-9]+)"),
+
+    ("deezer", "album",  r"deezer\.com/(?:[a-z]{2}/)?album/(\d+)"),
+    ("deezer", "artist", r"deezer\.com/(?:[a-z]{2}/)?artist/(\d+)"),
+    ("deezer", "track",  r"deezer\.com/(?:[a-z]{2}/)?track/(\d+)"),
+
+    # Apple puts a human-readable slug before the id, which is the artist or
+    # album name with the punctuation stripped — worth keeping as a fallback
+    # for when the page fetch fails.
+    ("apple", "album",  r"music\.apple\.com/[a-z]{2}/album/([^/]+)/(\d+)"),
+    ("apple", "artist", r"music\.apple\.com/[a-z]{2}/artist/([^/]+)/(\d+)"),
+
+    ("ytmusic", "track",    r"(?:music\.youtube\.com|(?:www\.)?youtube\.com)/watch\?(?:[^&]*&)*v=([A-Za-z0-9_-]{11})"),
+    ("ytmusic", "track",    r"youtu\.be/([A-Za-z0-9_-]{11})"),
+    ("ytmusic", "album",    r"music\.youtube\.com/playlist\?(?:[^&]*&)*list=([A-Za-z0-9_-]+)"),
+    ("ytmusic", "artist",   r"music\.youtube\.com/channel/([A-Za-z0-9_-]+)"),
+
+    ("tidal", "album",  r"tidal\.com/(?:browse/)?album/(\d+)"),
+    ("tidal", "artist", r"tidal\.com/(?:browse/)?artist/(\d+)"),
+    ("tidal", "track",  r"tidal\.com/(?:browse/)?track/(\d+)"),
+
+    ("qobuz", "album",  r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?album/(?:[^/]+/)?([A-Za-z0-9]+)"),
+    ("qobuz", "artist", r"qobuz\.com/(?:[a-z]{2}-[a-z]{2}/)?interpreter/(?:[^/]+/)?([A-Za-z0-9]+)"),
+]
+
+def _parse_music_link(url: str) -> dict:
+    """{provider, kind, id, slug} for a pasted URL — pure, no network.
+
+    `kind` here is the *URL's* kind, which is not quite the answer's: a
+    musicbrainz.org `/release/` URL parses as kind `release` and resolves to an
+    album, because a concrete release is an edition of a release-group and the
+    acquire path is release-group-shaped. Keeping the two apart makes this
+    function testable without a single request.
+    """
+    url = (url or "").strip()
+    if not url:
+        return {"provider": "", "kind": "unknown", "id": "", "slug": ""}
+    for provider, kind, pattern in _MUSIC_LINK_PATTERNS:
+        m = re.search(pattern, url)
+        if not m:
+            continue
+        groups = m.groups()
+        # Apple is the only two-group form: (slug, id).
+        if len(groups) == 2:
+            return {"provider": provider, "kind": kind,
+                    "id": groups[1], "slug": groups[0]}
+        return {"provider": provider, "kind": kind, "id": groups[0], "slug": ""}
+    return {"provider": "", "kind": "unknown", "id": "", "slug": ""}
+
+_PAGE_FETCH_MAX_BYTES = 262144      # the head of the document; titles are in it
+_PAGE_TITLE_SUFFIXES = (
+    " on Apple Music", " - Apple Music", " | Apple Music",
+    " on TIDAL", " | TIDAL", " - TIDAL",
+    " - YouTube Music", " - YouTube",
+    " | Qobuz", " - Qobuz",
+    " in High-Resolution Audio", " in high resolution audio",
+)
+
+def _fetch_page_head(url: str) -> str:
+    """The first `_PAGE_FETCH_MAX_BYTES` of a page, or "".
+
+    Capped and streamed rather than read whole: these are marketing pages that
+    routinely run past a megabyte, and everything this needs is in the `<head>`.
+    """
+    try:
+        r = _http.get(url, timeout=(5, 10), stream=True, headers={
+            "User-Agent": ("Mozilla/5.0 (compatible; listenbrainz-bot/1.0; "
+                           f"{MBZ_CONTACT})"),
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        if not r.ok:
+            return ""
+        chunks, total = [], 0
+        for chunk in r.iter_content(8192, decode_unicode=False):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= _PAGE_FETCH_MAX_BYTES:
+                break
+        r.close()
+        return b"".join(chunks).decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001 — a scrape is best-effort by definition
+        print(f"  resolve-link: page fetch failed for {url[:80]}: {e}")
+        return ""
+
+# Parentheticals a music video's title carries that a release's title does not.
+# Left in, they become part of the MusicBrainz query and it matches nothing.
+_VIDEO_NOISE_RE = re.compile(
+    r"[\(\[][^\)\]]*\b(official|video|audio|lyrics?|visuali[sz]er|remaster(?:ed)?"
+    r"|hd|hq|4k|8k|mv|m/?v|full album|explicit)\b[^\)\]]*[\)\]]",
+    re.I)
+
+def _split_artist_title(text: str, provider: str = "") -> tuple:
+    """(artist, title) out of a page title like "Album by Artist on Apple Music".
+
+    Every separator here is one a real store actually uses, checked against the
+    live pages on 2026-09-23:
+
+      Apple    `<title>` "Discovery by Daft Punk on Apple Music"   → " by "
+      TIDAL    `og:title` "U2 - Achtung Baby"                      → " - ", artist first
+      Qobuz    `og:title` "Discovery, Daft Punk - Qobuz"           → ", ", artist LAST
+
+    " by " is the only separator whose sides are unambiguous. The dash branch
+    guesses `artist - title`, which is the commoner of the two orders and is
+    part of why the caller caps a scraped answer's confidence at 0.7.
+
+    **The comma rule is Qobuz-only and must stay that way.** Album titles
+    contain commas all the time ("Songs of Love, Loss and Longing"), so
+    applying it generally would split a title in half and search for nonsense.
+    """
+    text = html.unescape((text or "").strip())
+    for suffix in _PAGE_TITLE_SUFFIXES:
+        if text.lower().endswith(suffix.lower()):
+            text = text[: -len(suffix)].strip()
+    text = text.strip(" |-–—·")
+    if not text:
+        return "", ""
+    if " by " in text:
+        title, _, artist = text.partition(" by ")
+        return artist.strip(), title.strip()
+    if provider == "qobuz" and ", " in text:
+        title, _, artist = text.rpartition(", ")
+        return artist.strip(), title.strip()
+    for sep in (" – ", " — ", " - "):
+        if sep in text:
+            artist, _, title = text.partition(sep)
+            return artist.strip(), title.strip()
+    return "", text
+
+def _clean_video_title(title: str, artist: str = "") -> str:
+    """A YouTube video title reduced to something MusicBrainz can match.
+
+    Two things are always in the way and never in the recording's title: the
+    uploader repeating the artist as a prefix ("Rick Astley - Never Gonna Give
+    You Up"), and the production tags ("(Official Video) (4K Remaster)").
+    Measured on the live oembed answer, leaving either in makes the search miss.
+    """
+    title = html.unescape((title or "").strip())
+    if artist:
+        low, alow = title.lower(), artist.lower()
+        for sep in (" - ", " – ", " — ", ": "):
+            if low.startswith(alow + sep):
+                title = title[len(artist) + len(sep):].strip()
+                break
+    title = _VIDEO_NOISE_RE.sub(" ", title)
+    return re.sub(r"\s{2,}", " ", title).strip(" -–—|·")
+
+def _scrape_link_names(url: str, parsed: dict) -> tuple:
+    """(artist, title) for a provider with no usable API.
+
+    YouTube is the one exception and takes the good path: its oembed endpoint
+    is public, needs no key, and answers `title` + `author_name` directly, so a
+    `watch?v=` link never needs the page at all.
+    """
+    provider = parsed.get("provider", "")
+    if provider == "ytmusic" and parsed.get("kind") == "track":
+        try:
+            r = _http.get("https://www.youtube.com/oembed",
+                          params={"url": f"https://www.youtube.com/watch?v={parsed['id']}",
+                                  "format": "json"},
+                          timeout=(5, 10))
+            if r.ok:
+                data = r.json()
+                author = str(data.get("author_name") or "").strip()
+                # Channel names on YouTube Music's auto-generated art tracks end
+                # in " - Topic"; that suffix is not part of the artist's name.
+                if author.endswith(" - Topic"):
+                    author = author[: -len(" - Topic")].strip()
+                title = str(data.get("title") or "").strip()
+                if author and title:
+                    cleaned = _clean_video_title(title, author)
+                    if cleaned:
+                        return author, cleaned
+                if title:
+                    return _split_artist_title(title, provider)
+        except Exception as e:  # noqa: BLE001
+            print(f"  resolve-link: youtube oembed failed: {e}")
+    body = _fetch_page_head(url)
+    if body:
+        for pattern in (r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+                        r"<title[^>]*>(.*?)</title>"):
+            m = re.search(pattern, body, re.I | re.S)
+            if m:
+                artist, title = _split_artist_title(m.group(1), provider)
+                if title:
+                    return artist, title
+    # Last resort: Apple's URL slug, which is the record's name with the
+    # punctuation turned into hyphens. No artist, but a title is enough to
+    # search on when the caller says so.
+    slug = parsed.get("slug", "")
+    if slug:
+        return "", slug.replace("-", " ").strip()
+    return "", ""
+
+def _provider_link_names(parsed: dict) -> tuple:
+    """(artist, title, album, isrc) from the provider's own API, where there is one."""
+    provider, kind, ident = parsed["provider"], parsed["kind"], parsed["id"]
+    if provider == "spotify":
+        headers = _spotify_auth_header()
+        path = {"album": "albums", "artist": "artists", "track": "tracks"}[kind]
+        r = _http.get(f"https://api.spotify.com/v1/{path}/{ident}",
+                      headers=headers, timeout=10)
+        if not r.ok:
+            raise SpotifyError(f"{r.status_code}: {r.text[:200]}")
+        data = r.json()
+        names = ", ".join(a.get("name", "") for a in (data.get("artists") or [])
+                          if a.get("name"))
+        if kind == "artist":
+            return data.get("name", ""), "", "", ""
+        album = ((data.get("album") or {}).get("name", "") if kind == "track"
+                 else data.get("name", ""))
+        isrc = ((data.get("external_ids") or {}).get("isrc", "")
+                if kind == "track" else "")
+        return names, data.get("name", ""), album, isrc
+    if provider == "deezer":
+        data = {"album": deezer_album, "artist": deezer_artist,
+                "track": deezer_track}[kind](ident)
+        artist = str(((data.get("artist") or {}).get("name")) or "").strip()
+        if kind == "artist":
+            return str(data.get("name") or "").strip(), "", "", ""
+        album = (str(((data.get("album") or {}).get("title")) or "").strip()
+                 if kind == "track" else str(data.get("title") or "").strip())
+        return (artist, str(data.get("title") or "").strip(), album,
+                str(data.get("isrc") or "").strip() if kind == "track" else "")
+    return "", "", "", ""
+
+def _lucene_quote(value: str) -> str:
+    """One Lucene phrase, safe to drop inside double quotes in an MB query."""
+    return (value or "").replace("\\", " ").replace('"', " ").strip()
+
+def _mbz_release_group_for(artist: str, title: str, limit: int = 5) -> list:
+    """Release-groups for a *known* artist and title, fielded rather than free-text.
+
+    `mbz_search_release_groups` concatenates everything into one free-text
+    query, which is right when all you have is what the user typed. It is wrong
+    when you already know which half is which, and measurably so: on
+    2026-09-23 "Daft Punk Discovery" scored
+    *"Daft Punk's Discovery but it's in the SM64 Soundfont"* by Pignickel at
+    100 and ranked it first, because term density beats the record you meant.
+    Fielding the query makes the artist a constraint instead of another word to
+    match.
+
+    Free text stays as the fallback, since a fielded query finds nothing at all
+    when the store's spelling of the artist and MusicBrainz's disagree.
+    Candidates whose title actually matches are floated to the front — the raw
+    `score` cannot be trusted to do it, which is the whole point of the change.
+    """
+    artist, title = (artist or "").strip(), (title or "").strip()
+    if not title:
+        return []
+    hits = []
+    if artist:
+        query = (f'releasegroup:"{_lucene_quote(title)}" '
+                 f'AND artist:"{_lucene_quote(artist)}"')
+        try:
+            hits = mbz_search_release_groups(query, limit)
+        except Exception as e:  # noqa: BLE001
+            print(f"  release-group fielded search failed: {e}")
+            hits = []
+    if not hits:
+        try:
+            hits = mbz_search_release_groups(f"{artist} {title}".strip(), limit)
+        except Exception as e:  # noqa: BLE001
+            print(f"  release-group search failed: {e}")
+            return []
+    wanted_title = _fuzzy_album_text(title)
+    wanted_artist = _norm_album_text(artist)
+
+    def _rank(c):
+        title_match = _fuzzy_album_text(c.get("title", "")) == wanted_title
+        artist_match = (not wanted_artist
+                        or _norm_album_text(c.get("artist", "")) == wanted_artist)
+        return (0 if (title_match and artist_match) else
+                1 if title_match else 2,
+                0 if c.get("primary_type") == "album" else 1,
+                -(c.get("score") or 0))
+
+    return sorted(hits, key=_rank)
+
+def _link_answer(kind: str = "unknown", provider: str = "", mbid: str = "",
+                 rgid: str = "", artist: str = "", title: str = "",
+                 confidence: float = 0.0, reason: str = "") -> dict:
+    """The §1.2 wire shape, built in one place so every branch agrees on it.
+
+    `reason` is additive and outside the frozen contract: a client that only
+    knows the contract ignores it, and one that shows it can say *why* a link
+    did not resolve instead of an empty card.
+    """
+    return {"kind": kind, "mbid": mbid, "rgid": rgid, "artist": artist,
+            "title": title, "provider": provider,
+            "confidence": round(max(0.0, min(1.0, float(confidence))), 2),
+            "reason": reason}
+
+def resolve_music_link(url: str) -> dict:
+    """A pasted streaming URL -> MusicBrainz ids. See the section header.
+
+    Never raises: a link that resolves to nothing is an ordinary answer with
+    `confidence: 0.0`, the same rule `strict=False` sets for the metadata
+    chain. A client renders "couldn't work out what this is", which is true and
+    actionable; a 500 is neither.
+    """
+    parsed = _parse_music_link(url)
+    provider, kind, ident = parsed["provider"], parsed["kind"], parsed["id"]
+    if not provider:
+        return _link_answer(reason="Not a music link we recognise")
+
+    # Tier 1 — a MusicBrainz URL already carries the answer.
+    if provider == "musicbrainz":
+        if kind == "artist":
+            return _link_answer("artist", provider, mbid=ident, confidence=1.0)
+        if kind == "album":
+            return _link_answer("album", provider, rgid=ident, confidence=1.0)
+        if kind == "track":
+            return _link_answer("track", provider, mbid=ident, confidence=1.0)
+        # A concrete release: the acquire path is release-group-shaped, so
+        # resolve it up one level. One cached entity lookup.
+        try:
+            rgid = mbz_release_group_of(ident)
+        except Exception as e:  # noqa: BLE001
+            print(f"  resolve-link: release->release-group failed: {e}")
+            rgid = ""
+        return _link_answer("album", provider, mbid=ident, rgid=rgid,
+                            confidence=1.0 if rgid else 0.5,
+                            reason="" if rgid else "MusicBrainz didn't name a "
+                                                   "release-group for this release")
+
+    # Tier 2/3 — get an artist and a title, from the provider or from the page.
+    isrc = ""
+    album_title = ""
+    scraped = False
+    try:
+        artist, title, album_title, isrc = _provider_link_names(parsed)
+    except Exception as e:  # noqa: BLE001 — a provider being down is an answer
+        print(f"  resolve-link: {provider} lookup failed: {e}")
+        artist, title = "", ""
+    if not (artist or title):
+        artist, title = _scrape_link_names(url, parsed)
+        album_title = album_title or (title if kind == "album" else "")
+        scraped = True
+    if not (artist or title):
+        return _link_answer(kind, provider,
+                            reason=f"Couldn't read the {provider} page")
+    ceiling = 0.7 if scraped else 0.9
+
+    if kind == "artist":
+        name = artist or title
+        try:
+            hits = mbz_search_artists(name, 3)
+        except Exception as e:  # noqa: BLE001
+            print(f"  resolve-link: artist search failed: {e}")
+            hits = []
+        if not hits:
+            return _link_answer("artist", provider, artist=name,
+                                reason="No MusicBrainz artist matched")
+        best = hits[0]
+        return _link_answer("artist", provider, mbid=best.get("mbid", ""),
+                            artist=best.get("name", "") or name,
+                            confidence=min(ceiling, (best.get("score") or 0) / 100.0))
+
+    # Album and track both want a release-group: it is what the acquire path
+    # takes, and for a track it is the record the track is on.
+    query_title = album_title or title
+    rgid = ""
+    rg_artist, rg_title = artist, query_title
+    rg_confidence = 0.0
+    if query_title:
+        # Fielded, not free text: we know which half is the artist, and the
+        # free-text form ranks a novelty remix above the record it remixes.
+        hits = _mbz_release_group_for(artist, query_title, 3)
+        if hits:
+            best = hits[0]
+            rgid = best.get("rgid", "")
+            rg_artist = best.get("artist", "") or artist
+            rg_title = best.get("title", "") or query_title
+            rg_confidence = min(ceiling, (best.get("score") or 0) / 100.0)
+
+    if kind == "album":
+        return _link_answer("album", provider, rgid=rgid, artist=rg_artist,
+                            title=rg_title, confidence=rg_confidence,
+                            reason="" if rgid else "No MusicBrainz release-group matched")
+
+    # A track. The ISRC identifies the recording exactly where the provider
+    # publishes one; the text search is the fallback and is worth much less.
+    recording = ""
+    by_isrc = False
+    if isrc:
+        try:
+            recording = _mbid_from_isrc(isrc)
+            by_isrc = bool(recording)
+        except Exception as e:  # noqa: BLE001
+            print(f"  resolve-link: ISRC lookup failed: {e}")
+    if not recording and artist and title:
+        try:
+            recording = _mbid_from_search(artist, title)
+        except Exception as e:  # noqa: BLE001
+            print(f"  resolve-link: recording search failed: {e}")
+    # `by_isrc`, not `isrc`. The ISRC merely *existing* says nothing: when the
+    # ISRC lookup comes back empty and the text search supplies the recording,
+    # the answer is a name match and must not be dressed as an exact one.
+    confidence = 0.95 if by_isrc else (
+        min(ceiling, rg_confidence) if recording else rg_confidence)
+    return _link_answer("track", provider, mbid=recording, rgid=rgid,
+                        artist=artist or rg_artist, title=title,
+                        confidence=confidence,
+                        reason="" if (recording or rgid)
+                               else "No MusicBrainz recording matched")
+
+# ---------------------------------------------------------------------------
 # ListenBrainz
 # ---------------------------------------------------------------------------
 
@@ -3591,6 +4048,204 @@ def similar_artists(artist_mbid: str, artist_name: str = "", limit: int = 20) ->
                  key=lambda e: (-len(set(e["sources"])), -e["score"], e["name"]))
     _similar_cache[key] = (time.time(), out)
     return out[:limit]
+# ---------------------------------------------------------------------------
+# Deezer — the browse source behind /api/deezer/chart, /api/deezer/editorial
+# and the third opinion on /api/artist/related.
+#
+# Free and unauthenticated: no key, no token refresh, no account. That is the
+# whole reason it is here rather than Spotify, whose browse endpoints all need
+# the client-credentials token and whose editorial ones need a *user* token.
+#
+# Three rules this client exists to keep:
+#
+# 1. **It never takes `_mbz_lock`.** That lock is the discography scanner's
+#    entire 1 req/sec budget, and `mbz_get` holds it across the pacing sleep.
+#    A browse row that queued behind it would render when the scan finished,
+#    which is not a browse row. Same rule, same reason, as `_similar_artists_marked`
+#    and `_wiki_get`. Resolution to MBIDs therefore happens against the *library
+#    index* (free, local) and never against MusicBrainz — see
+#    `_index_release_group_directory`.
+# 2. **Its cache is the Deezer fetch, not the ownership marking.** The payload
+#    is cached for `_DEEZER_TTL`; ownership is re-derived on every request,
+#    because a landed fill falsifies it. That split is why these routes can sit
+#    in the hub's `LB_LIBRARY_ROUTES` and be invalidated by a fill at all.
+# 3. **It shares `_http`**, so it gets the per-host pooled Session rather than
+#    opening a connection per row.
+#
+# Deezer's own limit is ~50 requests per 5 s per IP. A cold chart row costs one
+# request; nothing here fans out per row.
+# ---------------------------------------------------------------------------
+
+DEEZER_API = "https://api.deezer.com"
+_DEEZER_TTL = 6 * 3600          # the contract's cache for /lb/deezer/*
+_DEEZER_TIMEOUT = (10, 20)
+_deezer_cache: dict = {}        # "path?query" -> (ts, payload)
+_deezer_cache_lock = threading.Lock()
+
+class DeezerError(Exception):
+    """Deezer answered with an error, or did not answer at all."""
+
+def _deezer_get(path: str, params: dict = None, ttl: float = _DEEZER_TTL) -> dict:
+    """One cached GET against the public Deezer API.
+
+    Deezer reports its errors *inside* a 200 body (`{"error": {...}}`), so an
+    `ok` status is not enough — check the envelope, or a quota rejection reads
+    as an empty browse row forever once it is cached.
+    """
+    params = params or {}
+    key = path + "?" + urllib.parse.urlencode(sorted(params.items()))
+    now = time.time()
+    with _deezer_cache_lock:
+        hit = _deezer_cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    r = _http.get(f"{DEEZER_API}/{path.lstrip('/')}", params=params,
+                  headers={"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"},
+                  timeout=_DEEZER_TIMEOUT)
+    if not r.ok:
+        raise DeezerError(f"{r.status_code}: {r.text[:200]}")
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise DeezerError(f"unparseable response: {e}")
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        raise DeezerError(str(err.get("message") or err))
+    with _deezer_cache_lock:
+        _deezer_cache[key] = (now, data)
+    return data
+
+def _deezer_album_row(row: dict) -> dict:
+    """One Deezer album, in this module's vocabulary rather than Deezer's.
+
+    `deezerId` is carried through deliberately: it is the only stable identity
+    these rows have until something resolves them to a release-group, and
+    `POST /api/resolve-link` takes it straight back.
+    """
+    if not isinstance(row, dict):
+        return {}
+    artist = row.get("artist") or {}
+    return {
+        "deezerId": str(row.get("id") or ""),
+        "title": str(row.get("title") or ""),
+        "artist": str(artist.get("name") or ""),
+        "deezerArtistId": str(artist.get("id") or ""),
+        "recordType": str(row.get("record_type") or ""),
+        "link": str(row.get("link") or ""),
+        "imageUrl": str(row.get("cover_medium") or row.get("cover") or ""),
+        "position": int(row.get("position") or 0),
+    }
+
+def _deezer_artist_row(row: dict) -> dict:
+    """One Deezer artist, in this module's vocabulary."""
+    if not isinstance(row, dict):
+        return {}
+    return {
+        "deezerId": str(row.get("id") or ""),
+        "name": str(row.get("name") or ""),
+        "link": str(row.get("link") or ""),
+        "imageUrl": str(row.get("picture_medium") or row.get("picture") or ""),
+        "position": int(row.get("position") or 0),
+    }
+
+def deezer_chart(limit: int = 20) -> dict:
+    """Deezer's global chart: {albums: [...], artists: [...]}.
+
+    Tracks and playlists are in the same response and deliberately dropped —
+    every ownership signal in this module is release- or artist-level, and a
+    row nothing can mark is a row a client cannot act on.
+
+    Note the chart is geolocated by the *server's* IP, not the user's: run from
+    a French-routed host it is the French chart. There is no country parameter
+    on the open API, so this is a property of where lb-bot runs and not
+    something a client can ask to change.
+    """
+    data = _deezer_get("chart", {"limit": str(max(1, min(100, int(limit or 20))))})
+    albums = [_deezer_album_row(r) for r in ((data.get("albums") or {}).get("data") or [])]
+    artists = [_deezer_artist_row(r) for r in ((data.get("artists") or {}).get("data") or [])]
+    return {"albums": [a for a in albums if a.get("title")],
+            "artists": [a for a in artists if a.get("name")]}
+
+def deezer_editorial(limit: int = 20) -> dict:
+    """Deezer's own editorial album selection: {albums: [...], section: str}.
+
+    `editorial/0/selection` is the "albums the Deezer team picked this week"
+    list — the one that is actually editorial. `editorial/0/releases` (new
+    releases) is the fallback, because `selection` has returned an empty `data`
+    on some days and an empty editorial row is indistinguishable from a broken
+    one. `section` says which of the two answered, so a client is never guessing.
+    """
+    limit = max(1, min(100, int(limit or 20)))
+    for section in ("selection", "releases"):
+        try:
+            data = _deezer_get(f"editorial/0/{section}", {"limit": str(limit)})
+        except DeezerError as e:
+            print(f"  deezer editorial/{section} failed: {e}")
+            continue
+        rows = [_deezer_album_row(r) for r in (data.get("data") or [])]
+        rows = [r for r in rows if r.get("title")]
+        if rows:
+            # The editorial endpoints ignore `limit` — measured 2026-09-23, a
+            # request for 5 came back with 10 — so the cut happens here or the
+            # row silently ignores what the client asked for.
+            return {"albums": rows[:limit], "section": section}
+    return {"albums": [], "section": ""}
+
+def deezer_search_artist_id(name: str) -> str:
+    """Deezer's id for an artist named `name`, or "" — exact name match only.
+
+    Deliberately not fuzzy. This id decides whose related-artists row gets
+    rendered, and Deezer's search happily answers a tribute band for a
+    misspelling. A near miss here is a whole shelf about the wrong artist, so
+    "no row" is the better answer.
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    try:
+        data = _deezer_get("search/artist", {"q": name, "limit": "10"},
+                           ttl=_DEEZER_TTL)
+    except DeezerError as e:
+        print(f"  deezer artist search failed: {e}")
+        return ""
+    wanted = _norm_album_text(name)
+    for row in (data.get("data") or []):
+        if _norm_album_text(str((row or {}).get("name") or "")) == wanted:
+            return str(row.get("id") or "")
+    return ""
+
+def deezer_related_artists(deezer_artist_id: str, limit: int = 20) -> list:
+    """Deezer's related artists for one Deezer artist id."""
+    if not deezer_artist_id:
+        return []
+    try:
+        data = _deezer_get(f"artist/{deezer_artist_id}/related",
+                           {"limit": str(max(1, min(100, int(limit or 20))))})
+    except DeezerError as e:
+        print(f"  deezer related artists failed: {e}")
+        return []
+    rows = [_deezer_artist_row(r) for r in (data.get("data") or [])]
+    return [r for r in rows if r.get("name")]
+
+def deezer_album(deezer_album_id: str) -> dict:
+    """One Deezer album by id, for the paste-a-link resolver."""
+    if not deezer_album_id:
+        return {}
+    return _deezer_get(f"album/{deezer_album_id}")
+
+def deezer_artist(deezer_artist_id: str) -> dict:
+    """One Deezer artist by id, for the paste-a-link resolver."""
+    if not deezer_artist_id:
+        return {}
+    return _deezer_get(f"artist/{deezer_artist_id}")
+
+def deezer_track(deezer_track_id: str) -> dict:
+    """One Deezer track by id, for the paste-a-link resolver."""
+    if not deezer_track_id:
+        return {}
+    return _deezer_get(f"track/{deezer_track_id}")
+
+
 # MusicBrainz's reserved "Various Artists" special-purpose artist.
 _VARIOUS_ARTISTS_MBID = "89ad4ac3-39f7-470e-963a-56509c546377"
 
@@ -5310,6 +5965,37 @@ def _index_db():
               ON review_groups(origin);
             CREATE INDEX IF NOT EXISTS idx_review_groups_identity
               ON review_groups(identity);
+            -- "I still want this" — release-groups whose fill ended in
+            -- `no_source`, kept for the slow periodic re-search. See the
+            -- wishlist section for why `no_source` gets a wishlist rather than
+            -- the auto-retry the transient failure kinds get.
+            --
+            -- Keyed by release-group id, which is what both the acquire path
+            -- and the ownership index speak, so a landing can be recognised
+            -- without a name match. INDEX_SCAN_VERSION is deliberately NOT
+            -- bumped, for the same reason `meta` and `review_groups` record.
+            CREATE TABLE IF NOT EXISTS wishlist (
+              rgid          TEXT PRIMARY KEY,
+              artist        TEXT NOT NULL DEFAULT '',
+              title         TEXT NOT NULL DEFAULT '',
+              added_at      REAL NOT NULL DEFAULT 0,
+              last_tried_at REAL NOT NULL DEFAULT 0,
+              attempts      INTEGER NOT NULL DEFAULT 0,
+              last_reason   TEXT NOT NULL DEFAULT ''
+            );
+            -- (peer, filename) pairs an AcoustID fingerprint proved were the
+            -- wrong recording. Consulted at enqueue time so the ranked source
+            -- list never offers the same bad file twice. See
+            -- `_acoustid_verify_placement`.
+            CREATE TABLE IF NOT EXISTS rejected_sources (
+              username     TEXT NOT NULL,
+              filename     TEXT NOT NULL,
+              reason       TEXT NOT NULL DEFAULT '',
+              expected     TEXT NOT NULL DEFAULT '',
+              got          TEXT NOT NULL DEFAULT '',
+              rejected_at  REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY (username, filename)
+            );
             PRAGMA user_version = 1;
         """)
         # CREATE TABLE IF NOT EXISTS never adds a column to a DB that already
@@ -5485,6 +6171,270 @@ def _index_rgid_album_ids() -> dict:
     for album_id, rgid in _index_album_rgids().items():
         out.setdefault(rgid, album_id)
     return out
+
+def _index_release_group_directory() -> dict:
+    """"artist|album" (normalized) -> {rgid, status, albumId, artistMbid, artistName}.
+
+    The name-keyed view of the discography index, and the thing that lets a
+    browse source with **no MBIDs at all** — Deezer — mark ownership without
+    spending a single MusicBrainz request. `_index_owned_rgids` and
+    `_index_rgid_album_ids` both start from an rgid the caller already has;
+    a Deezer chart row has only "Artist" and "Title", so it needs the index
+    keyed the other way round.
+
+    Two keys per row, and the order matters:
+      - the exact normalized `artist|title` (`_norm_album_text`), tried first;
+      - the edition-stripped `_fuzzy_album_text` form, as a fallback, so
+        "Album (Deluxe Edition)" on Deezer still finds "Album" on disk. That
+        conflation is *correct* for ownership — you hold the record — and it is
+        deliberately not used for anything that picks a concrete release.
+
+    `missing` rows are kept rather than filtered. They are the most useful rows
+    here: a release-group the index knows about but the library lacks resolves
+    to a real rgid with `status == "missing"`, which is exactly what the
+    one-tap acquire needs. Ownership is read off `status`, never off presence
+    in this dict.
+
+    First row wins on a key collision, matching `_index_rgid_album_ids`: a
+    release-group held as several Navidrome albums has no one right answer and
+    any of them lands the user on the record they asked for.
+    """
+    out: dict = {}
+    try:
+        with _index_lock:
+            conn = _index_db()
+            rows = conn.execute(
+                "SELECT rg.rgid, rg.title, rg.status, rg.nd_album_ids, "
+                "       a.name AS artist_name, a.artist_mbid AS artist_mbid "
+                "FROM release_groups rg JOIN artists a "
+                "  ON a.artist_key = rg.artist_key "
+                "WHERE rg.rgid != '' AND rg.title != '' AND a.name != ''").fetchall()
+    except Exception as e:
+        print(f"  release-group directory unavailable: {e}")
+        return {}
+    fuzzy: dict = {}
+    for row in rows:
+        try:
+            album_ids = json.loads(row["nd_album_ids"] or "[]") or []
+        except Exception:
+            album_ids = []
+        entry = {
+            "rgid": row["rgid"],
+            "status": row["status"] or "missing",
+            "albumId": next((i for i in album_ids if i), ""),
+            "artistMbid": row["artist_mbid"] or "",
+            "artistName": row["artist_name"] or "",
+        }
+        artist_n = _norm_album_text(row["artist_name"])
+        title_n = _norm_album_text(row["title"])
+        if artist_n and title_n:
+            out.setdefault(f"{artist_n}|{title_n}", entry)
+        artist_f = _fuzzy_album_text(row["artist_name"])
+        title_f = _fuzzy_album_text(row["title"])
+        if artist_f and title_f:
+            fuzzy.setdefault(f"{artist_f}|{title_f}", entry)
+    for key, entry in fuzzy.items():
+        out.setdefault(key, entry)
+    return out
+
+# ---------------------------------------------------------------------------
+# The wishlist — the home for a `no_source` failure.
+#
+# `no_source` deliberately never auto-retries (`FILL_AUTO_RETRY_KINDS`), and
+# the reason is sound: lb-bot walks its *entire* ranked source list before
+# reporting it, so an automatic retry re-runs the identical search against the
+# identical peers and fails identically. The user asking again is the new
+# information.
+#
+# But "never retry" and "forget about it" are different policies, and only the
+# first one was ever argued for. Soulseek's population turns over on the scale
+# of days: a record nobody was sharing on Tuesday is routinely shared on
+# Friday. So the retry that is worth running is a *slow* one — hours, not
+# minutes — against a list the user curates, and that is this.
+#
+# Rows live in `library_index.db` beside `review_groups` and `meta`, for the
+# same reasons: it is durable, it is already the home of everything
+# release-group-keyed, and `missing_album_review.json` is the thing we are
+# trying to keep small. `INDEX_SCAN_VERSION` is deliberately NOT bumped — it
+# gates the discography matcher, and a new table is not a reason to rescan
+# every artist in the library.
+#
+# A landing fires `_notify_hub_library_change`, so a client with the downloads
+# view open finds out without polling — the same path a placement takes.
+# ---------------------------------------------------------------------------
+
+WISHLIST_MAX = 200
+# Hours, not minutes. See the header: the thing being waited on is Soulseek's
+# population changing, which it does on the scale of days.
+WISHLIST_RESEARCH_INTERVAL = float(os.environ.get("LB_BOT_WISHLIST_INTERVAL", str(6 * 3600)))
+# How long between re-searches of one row, independent of how often the sweep
+# itself runs. Without this, adding a row would re-search every row.
+WISHLIST_ROW_COOLDOWN = float(os.environ.get("LB_BOT_WISHLIST_COOLDOWN", str(12 * 3600)))
+
+def _wishlist_row_view(row) -> dict:
+    return {
+        "rgid": row["rgid"],
+        "artist": row["artist"],
+        "title": row["title"],
+        "addedAt": float(row["added_at"] or 0),
+        "lastTriedAt": float(row["last_tried_at"] or 0),
+        "attempts": int(row["attempts"] or 0),
+        "lastReason": row["last_reason"] or "",
+    }
+
+def _wishlist_list() -> list:
+    """Every wishlist row, newest first. [] on a broken index, never a raise."""
+    try:
+        with _index_lock:
+            rows = _index_db().execute(
+                "SELECT * FROM wishlist ORDER BY added_at DESC").fetchall()
+    except Exception as e:
+        print(f"  wishlist read failed: {e}")
+        return []
+    return [_wishlist_row_view(r) for r in rows]
+
+def _wishlist_add(rgid: str, artist: str = "", title: str = "") -> dict:
+    """Add one release-group. Idempotent — re-adding refreshes the names only.
+
+    Deliberately does not reset `attempts` or `last_tried_at`: re-adding
+    something already on the list is not new information about whether anybody
+    is sharing it, and zeroing the clock would make a double-tap re-search
+    immediately.
+    """
+    rgid = (rgid or "").strip()
+    if not rgid:
+        return {"ok": False, "error": "rgid is required"}
+    now = time.time()
+    try:
+        with _index_lock:
+            conn = _index_db()
+            existing = conn.execute(
+                "SELECT rgid FROM wishlist WHERE rgid = ?", (rgid,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE wishlist SET artist = COALESCE(NULLIF(?,''), artist), "
+                    "title = COALESCE(NULLIF(?,''), title) WHERE rgid = ?",
+                    (artist or "", title or "", rgid))
+            else:
+                conn.execute(
+                    "INSERT INTO wishlist (rgid, artist, title, added_at, "
+                    " last_tried_at, attempts, last_reason) VALUES (?,?,?,?,0,0,'')",
+                    (rgid, artist or "", title or "", now))
+                # Cap by age, like every other bounded collection here. The
+                # oldest row is the one whose "still want this" claim is
+                # stalest, and the user can always add it again.
+                conn.execute(
+                    "DELETE FROM wishlist WHERE rgid IN ("
+                    "  SELECT rgid FROM wishlist ORDER BY added_at DESC"
+                    "  LIMIT -1 OFFSET ?)", (WISHLIST_MAX,))
+            conn.commit()
+    except Exception as e:
+        print(f"  wishlist add failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "added": not existing, "rgid": rgid}
+
+def _wishlist_remove(rgid: str) -> dict:
+    rgid = (rgid or "").strip()
+    if not rgid:
+        return {"ok": False, "error": "rgid is required"}
+    try:
+        with _index_lock:
+            conn = _index_db()
+            cur = conn.execute("DELETE FROM wishlist WHERE rgid = ?", (rgid,))
+            conn.commit()
+    except Exception as e:
+        print(f"  wishlist remove failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "removed": cur.rowcount > 0, "rgid": rgid}
+
+def _wishlist_mark_tried(rgid: str, reason: str = "") -> None:
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute(
+                "UPDATE wishlist SET last_tried_at = ?, attempts = attempts + 1, "
+                "last_reason = ? WHERE rgid = ?",
+                (time.time(), (reason or "")[:200], rgid))
+            conn.commit()
+    except Exception as e:
+        print(f"  wishlist touch failed: {e}")
+
+def _wishlist_due(now: float = None) -> list:
+    """Rows whose per-row cooldown has expired, oldest attempt first."""
+    now = now if now is not None else time.time()
+    return [r for r in _wishlist_list()
+            if now - r["lastTriedAt"] >= WISHLIST_ROW_COOLDOWN]
+
+def _wishlist_retry_one(row: dict) -> bool:
+    """Re-run one wishlist row's fill. Returns whether a fill was started.
+
+    Reuses `_album_download_task` rather than reimplementing the search: the
+    whole point of the wishlist is that the *same* request is worth making
+    again later, so making a different one would defeat it.
+
+    Guarded exactly as `_schedule_album_fill_retry` is — if anything is already
+    filling this release, that is the answer and this does nothing.
+    """
+    rgid = row.get("rgid", "")
+    artist, title = row.get("artist", ""), row.get("title", "")
+    if not rgid:
+        return False
+    try:
+        resolved = mbz_resolve_album(rgid)
+    except Exception as e:  # noqa: BLE001
+        _wishlist_mark_tried(rgid, f"MusicBrainz unavailable: {e}")
+        return False
+    release_mbid = resolved.get("release_mbid", "")
+    if not release_mbid:
+        _wishlist_mark_tried(rgid, "MusicBrainz named no release for this group")
+        return False
+    gid, _ag = _album_group_for_release(release_mbid)
+    if gid or _running_album_download_task(release_mbid):
+        return False
+    artist = artist or resolved.get("artist", "")
+    title = title or resolved.get("title", "")
+    total = int(resolved.get("total_tracks") or 0)
+    _wishlist_mark_tried(rgid, "re-searching")
+    _task_run("album-download", f"Wishlist: {artist} - {title}",
+              lambda tid: _album_download_task(tid, release_mbid, artist, title,
+                                               total, None, rgid, ""),
+              total=total, release_mbid=release_mbid)
+    return True
+
+def _wishlist_landed(rgid: str, artist: str = "", title: str = "") -> None:
+    """A wishlist row's record arrived: drop it and tell the hub.
+
+    The notify is the point of doing this here rather than leaving the row to
+    age out. A client showing the wishlist has no other way to learn that the
+    thing it is displaying is now in the library.
+    """
+    if not rgid:
+        return
+    result = _wishlist_remove(rgid)
+    if result.get("removed"):
+        print(f"  wishlist: {artist} - {title} landed — removed from the wishlist")
+        _notify_hub_library_change("", rgid=rgid, artist=artist, album=title,
+                                   event="albumPlaced")
+
+def _wishlist_sweep_loop() -> None:
+    """The slow re-search. One row per pass, deliberately.
+
+    A source search fans out across the Soulseek network and takes the better
+    part of a minute (`SEARCH_TIMEOUT` is 75 s); running the whole wishlist at
+    once would saturate slskd and starve whatever the user is actually doing.
+    One row per pass at `WISHLIST_RESEARCH_INTERVAL` is a background errand,
+    which is what this is.
+    """
+    while True:
+        try:
+            time.sleep(WISHLIST_RESEARCH_INTERVAL)
+            due = _wishlist_due()
+            if not due:
+                continue
+            due.sort(key=lambda r: r["lastTriedAt"])
+            _wishlist_retry_one(due[0])
+        except Exception as e:  # noqa: BLE001 — a background errand never exits
+            print(f"  wishlist sweep failed: {e}")
 
 def _index_backfill_present_album_ids(artist_key: str) -> int:
     """Fill in `nd_album_ids` for this artist's `present` rows. Returns rows fixed.
@@ -7958,6 +8908,18 @@ def slskd_enqueue(username: str, file: dict,
                   target_release_mbid: str = "",
                   repair_job_id: str = "",
                   repair_track_id: str = "") -> bool:
+    # The single choke point every acquisition path goes through, which is why
+    # the rejected-source memory is consulted here and nowhere else. Without
+    # it, the ranked list hands back the same peer's same file on the next
+    # attempt and the fingerprint rejects it again, forever.
+    if _source_is_rejected(username, file.get("filename", "")):
+        print(f"  skipping @{username}'s {file.get('filename', '')}: "
+              f"a fingerprint already proved it is the wrong recording")
+        if repair_job_id:
+            _repair_update_download(
+                repair_job_id, username, file.get("filename", ""),
+                "error", "skipped: previously rejected by AcoustID")
+        return False
     try:
         download_record = {}
         if repair_job_id:
@@ -8810,6 +9772,23 @@ async def _switch_album_source(bot, ag_id: str):
         await _switch_album_source_inner(bot, ag_id, ag)
 
 async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
+    """Walk `alt_sources` until one peer accepts the album, or they run out.
+
+    Two things here are load-bearing and were not, until this was first wired
+    up to the watchdog:
+
+    * **A gap fill re-enqueues only its missing tracks, not the whole folder.**
+      `missing_tracks` on the group says which slots this fill is for; matching
+      against them is `slskd_enqueue_folder`'s own first step, and skipping it
+      meant a switched source fetched the entire album to fill two holes.
+    * **The review and repair linkage is carried through.** Without
+      `review_group_id` / `review_track_index`, a switched album downloads
+      correctly and the gap view never hears about it — every track sits on the
+      `failed` the poller wrote just before the switch, so the fill looks dead
+      while it is running, and `_finalize_group` has nothing to place against.
+    """
+    review_gid = ag.get("review_group_id", "")
+    missing = ag.get("missing_tracks") or []
     while ag.get("alt_sources"):
         fd       = ag["alt_sources"].pop(0)
         username = fd["username"]
@@ -8821,14 +9800,37 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
             full = fd["files"]
         if not full:
             continue
+        # A fill knows which slots it is for; a bare /album download does not
+        # and still wants the folder. `file_pairs` keeps a track beside each
+        # file so the enqueue can name the review row it belongs to.
+        if missing:
+            file_pairs = await asyncio.to_thread(
+                _album_file_pairs_for_missing_tracks, full, missing,
+                siblings=ag.get("siblings") or [])
+        else:
+            file_pairs = [(f, None) for f in full]
+        if not file_pairs:
+            continue
         # Reset counters and re-enqueue into the SAME group id
-        ag.update({"total": len(full), "completed": 0, "failed": 0,
+        ag.update({"total": len(file_pairs), "completed": 0, "failed": 0,
                    "source_user": username, "local_dirs": {}, "ts": time.time()})
         ok = 0
-        for f in full:
-            if slskd_enqueue(username, f, token=ag["token"], chat_id=ag["chat_id"],
-                             album_group_id=ag_id):
+        for f, track in file_pairs:
+            if slskd_enqueue(username, f, track=track,
+                             token=ag["token"], chat_id=ag["chat_id"],
+                             album_group_id=ag_id,
+                             review_group_id=review_gid,
+                             review_track_index=(track or {}).get("_review_track_index"),
+                             match_mode=ag.get("match_mode", "auto"),
+                             target_release_mbid=ag.get("target_release_mbid", ""),
+                             repair_job_id=(track or {}).get("repair_job_id", ""),
+                             repair_track_id=(track or {}).get("repair_track_id", "")):
                 ok += 1
+                if review_gid and track is not None:
+                    _set_review_track_state(
+                        review_gid, track.get("_review_track_index"), "queued",
+                        download_percent=0, download_state="Queued", error="",
+                        source_user=username, filename=f.get("filename", ""))
             else:
                 ag["failed"] += 1
         if ok:
@@ -9145,6 +10147,20 @@ def _deterministic_album_import(album_dir, release_mbid: str,
         """
         manual = os.path.normpath(path) in manual_paths
         sig = _audio_signature(path)
+        # The fingerprint check runs FIRST and is the one refusal that survives
+        # `manual` and `force_paths`, because it is the only one that asks
+        # about the audio's *identity* rather than about this album's contents.
+        # A user who picked a file by hand picked it from a filename too; the
+        # override they meant was "ignore the tags", not "place a different
+        # recording". It is also the only refusal that costs a network call, so
+        # it is gated on a slot MBID being present and on a key being
+        # configured — both of which are usually false and make it free.
+        if slot and not manual:
+            objection = _acoustid_contradiction(path, slot.get("recording_mbid", ""))
+            if objection:
+                _reject_source_file(path, objection,
+                                    expected=slot.get("recording_mbid", ""))
+                return objection
         if not sig:
             return ""
         if os.path.normpath(path) not in force_paths:
@@ -9817,6 +10833,10 @@ async def _poll_downloads_once(token_to_app: dict):
                 ag_id = info.get("album_group_id")
                 local_path = await asyncio.to_thread(_resolve_local_path, filename)
                 info["local_path"] = local_path or ""
+                # Placement happens later and on another thread, by then with
+                # only a path in hand. Record the provenance now so an AcoustID
+                # rejection can be remembered against the peer that served it.
+                _remember_download_origin(local_path or "", username, filename)
                 if repair_job_id:
                     _repair_update_download(repair_job_id, username, key[1],
                                             "complete", local_path=local_path or "",
@@ -9894,9 +10914,50 @@ async def _poll_downloads_once(token_to_app: dict):
                 del pending_downloads[key]
                 if ag_id and ag_id in pending_album_groups:
                     ag = pending_album_groups[ag_id]
-                    # If nothing has downloaded yet, the source is bad. Don't
-                    # auto-switch — abandon it and let the user pick the next
-                    # source manually (or retry a fresh search if none remain).
+                    # If nothing has downloaded yet, the source is bad.
+                    #
+                    # The watchdog has always failed a *file* over through
+                    # `info["candidates"]`, and never failed the *album* over
+                    # through the group's own ranked folder list — so a peer
+                    # that accepted the enqueue and then stalled ended the fill,
+                    # even with five ranked sources sitting unused on the group.
+                    # `_switch_album_source` has been the right tool for that
+                    # since it was written and was never called from anywhere.
+                    # It is now, before the give-up path below.
+                    if (ag["completed"] == 0 and not ag.get("switching")
+                            and ag.get("alt_sources")):
+                        await _switch_album_source(bot, ag_id)
+                        switched = (ag_id in pending_album_groups
+                                    and not pending_album_groups[ag_id].get("switching"))
+                        if switched:
+                            nxt = pending_album_groups[ag_id]
+                            print(f"  {ag.get('label', ag_id)}: @{username} failed "
+                                  f"({state}) — switched the album to "
+                                  f"@{nxt.get('source_user', '?')}")
+                            # Keep the ledger honest: a switch is not a failure,
+                            # and a client polling /api/album/status must not see
+                            # one flash past.
+                            _album_fill_set(
+                                ag.get("target_release_mbid") or ag.get("release_mbid", ""),
+                                "downloading",
+                                reason=f"Source @{username} failed ({state}) — "
+                                       f"retrying from @{nxt.get('source_user', '?')}")
+                            continue
+                        # Exhausted. `_switch_album_source` has already abandoned
+                        # the group, popped it and offered the user a fresh
+                        # search — but it records nothing in the fill ledger, and
+                        # its `switching` flag is still set, so neither branch
+                        # below would run. A fill that never reports failure
+                        # leaves every client polling `downloading` forever with
+                        # no retry to offer, which is the exact bug the abandon
+                        # path below exists to avoid. Record it here.
+                        _album_fill_fail(
+                            ag.get("target_release_mbid") or ag.get("release_mbid", ""),
+                            "transfer_failed",
+                            f"Every ranked source failed for {ag.get('label', '')} "
+                            f"(last: @{username}, {state})",
+                            retryable=True)
+                        continue
                     if ag["completed"] == 0 and not ag.get("switching"):
                         ag["switching"] = True
                         await asyncio.to_thread(_abandon_group_downloads, ag_id)
@@ -13523,10 +14584,11 @@ def _gap_auto_task(task_id: str, group_id: str) -> None:
     if not folders:
         _task_finish(task_id, error="No sources found on slskd")
         return
-    _task_update(task_id, total=len(folders))
+    order = _source_failover_order(len(folders), 0)
+    _task_update(task_id, total=len(order))
     last_msg = ""
-    for idx in range(len(folders)):
-        _task_update(task_id, done=idx,
+    for attempt, idx in enumerate(order):
+        _task_update(task_id, done=attempt,
                      current=f"Trying source #{idx + 1} of {len(folders)}")
         # One attempt per lock hold: each enqueue talks to slskd, and the
         # whole UI reads through this lock.
@@ -13545,7 +14607,11 @@ def _gap_auto_task(task_id: str, group_id: str) -> None:
             return
         last_msg = enq.get("message", "enqueue failed")
     _save_review_state()
-    _task_finish(task_id, error=f"Every source rejected the request ({last_msg})")
+    # "the sources we tried", not "every source": the walk is capped at
+    # SOURCE_FAILOVER_MAX, so there may well be more in the list.
+    _task_finish(task_id,
+                 error=f"{len(order)} of {len(folders)} source(s) rejected the "
+                       f"request ({last_msg})")
 
 def _live_transfer_track_indexes(group_id: str) -> set:
     """Review-track indexes of this group that have a real in-flight transfer.
@@ -13846,6 +14912,182 @@ def _audio_file_tags(path: str) -> dict:
         tags["duration"] = float(info.length)
     return tags
 
+# ---------------------------------------------------------------------------
+# AcoustID / Chromaprint — the one identity check the rest of this module cannot make.
+#
+# Everything else that asks "is this the right file?" reads tags or filenames,
+# and a Soulseek file's tags are whatever a stranger typed. `_audio_signature`
+# is the one exception and it is deliberately narrow: FLAC's StreamInfo md5 is
+# an MD5 of the *unencoded* audio, so it proves two files are the same encode
+# of the same master. It says nothing whatsoever about a *different* recording
+# — a live take, a radio edit, a cover, or simply the wrong track with the
+# right filename all have different md5s and sail straight through.
+#
+# That gap is exactly what a fingerprint closes: Chromaprint hashes the audio
+# itself, and AcoustID maps that hash to the MusicBrainz recording ids people
+# have submitted for it. So this answers "is this audio the recording the
+# tracklist slot says it is", which is the question the placement guard has
+# always wanted to ask and never could.
+#
+# Two things keep it honest:
+#
+#   * **Silence is not evidence.** An unknown fingerprint, a missing `fpcalc`,
+#     a down AcoustID, no configured key — every one of those returns "no
+#     opinion" and placement proceeds exactly as before. A guard that turns a
+#     working fill into a no-op because a binary is missing is worse than no
+#     guard. Only a *positive* contradiction — AcoustID confidently naming
+#     recordings, none of which is the expected one — rejects.
+#   * **A rejection is remembered against the peer, not the path.** The file is
+#     about to be deleted or moved; what must not happen again is fetching that
+#     same file from that same peer on the next attempt, which is what the
+#     ranked source list would otherwise do. `rejected_sources` is consulted in
+#     `slskd_enqueue`, the single choke point every acquisition path goes
+#     through.
+#
+# Needs `ACOUSTID_API_KEY` and the `fpcalc` binary (Debian:
+# `libchromaprint-tools`, installed in the Dockerfile).
+# ---------------------------------------------------------------------------
+
+ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
+# AcoustID's own confidence that the submitted fingerprint matches the cluster.
+# Below this the answer is treated as "no opinion" rather than as evidence
+# against the file — a weak match on a rare pressing must not reject it.
+ACOUSTID_MIN_SCORE = float(os.environ.get("ACOUSTID_MIN_SCORE", "0.6"))
+ACOUSTID_TIMEOUT = 15
+_acoustid_unavailable = [""]     # one-shot reason, so the log says it once
+
+def _acoustid_recording_mbids(path: str) -> tuple:
+    """(set of recording MBIDs, best score) for one file — ({}, 0.0) for "no opinion".
+
+    Never raises. Every failure mode here (no key, no `fpcalc`, an unfingerprintable
+    file, AcoustID down or rate-limiting us) is indistinguishable from "this
+    recording is not in the database", and all of them must mean the same thing
+    to the caller: no evidence either way.
+    """
+    if not ACOUSTID_API_KEY or not path:
+        return set(), 0.0
+    try:
+        import acoustid
+    except Exception as e:
+        if _acoustid_unavailable[0] != "import":
+            _acoustid_unavailable[0] = "import"
+            print(f"  acoustid: pyacoustid not installed — verification off ({e})")
+        return set(), 0.0
+    try:
+        duration, fingerprint = acoustid.fingerprint_file(path)
+    except Exception as e:  # NoBackendError, FingerprintGenerationError, OSError…
+        if _acoustid_unavailable[0] != "fpcalc":
+            _acoustid_unavailable[0] = "fpcalc"
+            print(f"  acoustid: could not fingerprint ({e}) — is fpcalc installed?")
+        return set(), 0.0
+    try:
+        data = acoustid.lookup(ACOUSTID_API_KEY, fingerprint, duration,
+                               meta="recordingids", timeout=ACOUSTID_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 — a down AcoustID is "no opinion"
+        print(f"  acoustid: lookup failed: {e}")
+        return set(), 0.0
+    if (data or {}).get("status") != "ok":
+        return set(), 0.0
+    mbids: set = set()
+    best = 0.0
+    for result in (data.get("results") or []):
+        score = float(result.get("score") or 0.0)
+        if score < ACOUSTID_MIN_SCORE:
+            continue
+        best = max(best, score)
+        for rec in (result.get("recordings") or []):
+            if rec.get("id"):
+                mbids.add(rec["id"])
+    return mbids, best
+
+def _acoustid_contradiction(path: str, expected_mbid: str) -> str:
+    """Why the fingerprint says this file is the wrong recording — "" for "no objection".
+
+    `expected_mbid` empty means there is nothing to contradict, so there is no
+    check to run: a slot with no recording MBID (an untagged release, a
+    MusicBrainz entry without one) is not evidence that anything is wrong.
+    """
+    if not ACOUSTID_API_KEY or not expected_mbid:
+        return ""
+    mbids, score = _acoustid_recording_mbids(path)
+    if not mbids:
+        return ""
+    if expected_mbid in mbids:
+        return ""
+    return (f"AcoustID identifies this audio as a different recording "
+            f"(confidence {score:.2f}) — it is not {expected_mbid}")
+
+# Local path -> where the file came from, so a rejection can be remembered
+# against the peer rather than against a path that is about to stop existing.
+#
+# Deliberately in memory only. The window it has to survive is one
+# download→finalize cycle, which is minutes; a restart in the middle of that
+# loses the file's provenance and the worst outcome is that one bad peer gets
+# one more chance. Persisting it would mean another collection in the state
+# file for no durability that matters.
+_download_origin: dict = {}
+_download_origin_lock = threading.Lock()
+_DOWNLOAD_ORIGIN_MAX = 500
+
+def _remember_download_origin(local_path: str, username: str, filename: str) -> None:
+    if not local_path or not username:
+        return
+    with _download_origin_lock:
+        _download_origin[os.path.normpath(local_path)] = {
+            "username": username, "filename": filename, "ts": time.time()}
+        if len(_download_origin) > _DOWNLOAD_ORIGIN_MAX:
+            for key, _ in sorted(_download_origin.items(),
+                                 key=lambda kv: kv[1]["ts"]
+                                 )[:len(_download_origin) - _DOWNLOAD_ORIGIN_MAX]:
+                _download_origin.pop(key, None)
+
+def _download_origin_of(local_path: str) -> dict:
+    if not local_path:
+        return {}
+    with _download_origin_lock:
+        return dict(_download_origin.get(os.path.normpath(local_path)) or {})
+
+def _reject_source_file(local_path: str, reason: str, expected: str = "",
+                        got: str = "") -> bool:
+    """Remember that this peer's copy of this file is the wrong recording.
+
+    Returns whether anything was recorded — a file whose provenance we lost
+    (see `_download_origin`) can still be refused for this placement, it just
+    cannot be refused for the next one.
+    """
+    origin = _download_origin_of(local_path)
+    if not origin.get("username"):
+        return False
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute(
+                "INSERT OR REPLACE INTO rejected_sources "
+                "(username, filename, reason, expected, got, rejected_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (origin["username"], origin.get("filename", ""), reason[:300],
+                 expected, got, time.time()))
+            conn.commit()
+    except Exception as e:
+        print(f"  rejected-source memory write failed: {e}")
+        return False
+    print(f"  rejected @{origin['username']}'s {origin.get('filename', '')}: {reason}")
+    return True
+
+def _source_is_rejected(username: str, filename: str) -> bool:
+    """Has a fingerprint already proved this peer's copy of this file wrong?"""
+    if not username or not filename:
+        return False
+    try:
+        with _index_lock:
+            row = _index_db().execute(
+                "SELECT reason FROM rejected_sources "
+                "WHERE username = ? AND filename = ?",
+                (username, filename)).fetchone()
+    except Exception:
+        return False           # a broken index must never block acquisition
+    return row is not None
+
 def _audio_signature(path: str) -> dict:
     """Identity of the *audio* in a file, independent of what its tags claim.
 
@@ -13857,6 +15099,14 @@ def _audio_signature(path: str) -> dict:
     FLAC carries `md5_signature`, an MD5 of the *unencoded* audio, in its
     StreamInfo block: exact identity, free, no decoding. `_audio_file_tags` opens
     files with `easy=True`, which hides StreamInfo, hence a second reader here.
+
+    **Know what that md5 proves.** It identifies the *audio stream*, so it
+    catches a different **encode** of the same master — the case this guard was
+    written for, two copies of one song in one album. It can never catch a
+    different **recording**: a live take, a radio edit, a remaster or simply the
+    wrong track under the right filename all have perfectly good, perfectly
+    different md5s and pass. Closing that gap needs a fingerprint, which is what
+    `_acoustid_contradiction` is for.
 
     Everything is best-effort — `{}` on any failure, and every caller must
     degrade to its old behaviour rather than block on a missing signature.
@@ -14774,6 +16024,150 @@ def _similar_artists_marked(artist_mbid: str, artist_name: str = "",
             "because": artist_name or artist_mbid,
             "sources": ["ListenBrainz"] + (["Last.fm"] if LASTFM_API_KEY else [])}
 
+# ---------------------------------------------------------------------------
+# Deezer rows, marked with this library's ownership vocabulary.
+#
+# The vocabulary is the existing one, not a new one — artist rows carry
+# `owned` + `artistId` + `indexed`, release rows carry `releaseOwned` +
+# `releaseAlbumId` + `coverUrl`. See `_similar_artists_marked` and
+# `_album_lookup_marked`, which these mirror field for field so a client can
+# render a Deezer row with the component it already has.
+#
+# **Marking is conservative by construction.** Deezer has no MBIDs, so every
+# resolution here is by name against the library index. That is exactly the
+# case where a guess is worse than a blank: an unresolved row is `owned: false`
+# with no id and no rgid, never a plausible-looking one. A client that gets no
+# rgid falls back to the free-text `/api/album/lookup` on tap — one MusicBrainz
+# search, for the one row the user actually chose, instead of a row-by-row fan
+# out that would spend the scanner's whole budget on a shelf nobody tapped.
+# ---------------------------------------------------------------------------
+
+def _library_artist_maps() -> tuple:
+    """(id_by_mbid, id_by_name, mbid_by_name, indexed_mbids) from the library.
+
+    Hoisted out of the three marking helpers below because each of them needs
+    the same four and `_artist_index_rows` is a Navidrome index walk. Failure
+    is not fatal anywhere it is used — a stale index DB degrades a row to "no
+    badges", never to a 500 on a browse screen.
+    """
+    id_by_mbid: dict = {}
+    id_by_name: dict = {}
+    mbid_by_name: dict = {}
+    indexed_mbids: set = set()
+    try:
+        for a in _artist_index_rows():
+            name = (a.get("name") or "").strip().lower()
+            if a.get("mbid"):
+                id_by_mbid[a["mbid"]] = a.get("id", "")
+                if name:
+                    mbid_by_name.setdefault(name, a["mbid"])
+            if name:
+                id_by_name.setdefault(name, a.get("id", ""))
+        indexed_mbids = _index_indexed_artist_mbids()
+    except Exception as e:
+        print(f"  deezer: ownership enrichment unavailable: {e}")
+    return id_by_mbid, id_by_name, mbid_by_name, indexed_mbids
+
+def _mark_deezer_artist(row: dict, id_by_name: dict, mbid_by_name: dict,
+                        indexed_mbids: set) -> dict:
+    """One Deezer artist row in `_similar_artists_marked`'s shape."""
+    name = (row.get("name") or "").strip()
+    key = name.lower()
+    mbid = mbid_by_name.get(key, "")
+    artist_id = id_by_name.get(key, "")
+    return {
+        "mbid": mbid,
+        "name": name,
+        "deezerId": row.get("deezerId", ""),
+        "imageUrl": row.get("imageUrl", ""),
+        "owned": bool(artist_id),
+        "artistId": artist_id,
+        "indexed": bool(mbid and mbid in indexed_mbids),
+    }
+
+def _mark_deezer_album(row: dict, directory: dict) -> dict:
+    """One Deezer album row in `_album_lookup_marked`'s release-level shape.
+
+    `rgid` may be empty and that is a real state, not a failure: it means the
+    discography index has never seen this record, so there is nothing local to
+    resolve it against. `releaseOwned` is read off the index row's `status` —
+    anything but `missing` is on disk, the same rule `_index_owned_rgids` uses.
+    """
+    artist = (row.get("artist") or "").strip()
+    title = (row.get("title") or "").strip()
+    entry = (directory.get(f"{_norm_album_text(artist)}|{_norm_album_text(title)}")
+             or directory.get(f"{_fuzzy_album_text(artist)}|{_fuzzy_album_text(title)}")
+             or {})
+    rgid = entry.get("rgid", "")
+    owned = bool(rgid) and entry.get("status", "missing") != "missing"
+    out = dict(row)
+    out["rgid"] = rgid
+    out["releaseOwned"] = owned
+    out["releaseAlbumId"] = entry.get("albumId", "") if owned else ""
+    # Cover art: the Archive's front when we resolved a release-group, else
+    # Deezer's own cover. lb-bot's `/api/cover` is Navidrome art keyed by a
+    # Navidrome album id, so it has nothing to serve for either case.
+    out["coverUrl"] = caa_front_url(rgid) if rgid else row.get("imageUrl", "")
+    return out
+
+def _deezer_chart_marked(limit: int = 20) -> dict:
+    """`GET /api/deezer/chart` — Deezer's global chart, ownership-marked."""
+    chart = deezer_chart(limit)
+    directory = _index_release_group_directory()
+    _id_by_mbid, id_by_name, mbid_by_name, indexed = _library_artist_maps()
+    return {
+        "albums": [_mark_deezer_album(a, directory) for a in chart["albums"]],
+        "artists": [_mark_deezer_artist(a, id_by_name, mbid_by_name, indexed)
+                    for a in chart["artists"]],
+        "source": "Deezer",
+        "sources": ["Deezer"],
+    }
+
+def _deezer_editorial_marked(limit: int = 20) -> dict:
+    """`GET /api/deezer/editorial` — Deezer's editorial albums, ownership-marked."""
+    editorial = deezer_editorial(limit)
+    directory = _index_release_group_directory()
+    return {
+        "albums": [_mark_deezer_album(a, directory) for a in editorial["albums"]],
+        "section": editorial["section"],
+        "source": "Deezer",
+        "sources": ["Deezer"],
+    }
+
+def _deezer_related_marked(artist_mbid: str, artist_name: str = "",
+                           limit: int = 20) -> dict:
+    """`GET /api/artist/related` — Deezer as a *third* similarity source.
+
+    `/api/artist/similar` merges ListenBrainz with Last.fm; this is deliberately
+    separate rather than a third leg of that merge, for two reasons. Deezer is
+    keyed by its own artist id and needs a search to get there, which is a
+    second request the similar row must not start paying; and the two answer
+    different questions well enough that a client may want to show both. The
+    marking is identical, so a client renders them with one component.
+
+    Resolution order for the Deezer artist id: the caller's `name`, else the
+    name the library index holds for `mbid`. Neither costs a MusicBrainz call.
+    """
+    name = (artist_name or "").strip()
+    id_by_mbid, id_by_name, mbid_by_name, indexed = _library_artist_maps()
+    if not name and artist_mbid:
+        for row in _artist_index_rows():
+            if row.get("mbid") == artist_mbid:
+                name = (row.get("name") or "").strip()
+                break
+    deezer_id = deezer_search_artist_id(name)
+    rows = deezer_related_artists(deezer_id, limit) if deezer_id else []
+    artists = [_mark_deezer_artist(r, id_by_name, mbid_by_name, indexed)
+               for r in rows[:limit]]
+    # Rank position is the only score Deezer publishes, so normalize to it —
+    # the same treatment `similar_artists` gives its two sources.
+    for rank, row in enumerate(artists):
+        row["score"] = round(1.0 - (rank / max(1, len(artists))), 4)
+        row["sources"] = ["deezer"]
+    return {"artists": artists,
+            "because": name or artist_mbid,
+            "sources": ["Deezer"]}
+
 def _similar_albums_for_artist(artist_mbid: str, artist_name: str,
                                exclude_rgid: str = "", limit: int = 6) -> list:
     """One album per similar artist, drawn from the user's own library.
@@ -15660,6 +17054,32 @@ def _approve_pending_missing_tracks(group: dict) -> int:
         changed += 1
     return changed
 
+# How far the automatic walk down the ranked source list goes before it hands
+# back to the user. Search-time peer state (free slot, queue length, online)
+# rots within seconds, so the first few rejections are routine and mean "try the
+# next one"; by the seventh the ranking itself is stale and a fresh search is
+# the better answer. Matches the alt-source cap `_enqueue_group_source` already
+# carries into `slskd_enqueue_folder`.
+SOURCE_FAILOVER_MAX = 6
+# Wall-clock ceiling for the synchronous fetch route's walk. Each attempt is an
+# slskd enqueue with a 30 s timeout, so an uncapped walk could hold the request
+# — and `_review_lock` with it — for minutes. The lock is released between
+# attempts, but the *client* still needs an answer.
+SOURCE_FAILOVER_DEADLINE = float(os.environ.get("LB_BOT_SOURCE_FAILOVER_DEADLINE", "45"))
+
+def _source_failover_order(folder_count: int, start_index: int) -> list:
+    """The source indexes to try: the chosen one first, then the rest by rank.
+
+    One definition shared by the two entry points that walk the list — the
+    `/api/gaps/<id>/fetch` route and `_gap_auto_task` — because they disagreeing
+    about it is how "auto picked a source manual wouldn't" happens.
+    """
+    if folder_count <= 0:
+        return []
+    start_index = max(0, min(int(start_index or 0), folder_count - 1))
+    order = [start_index] + [i for i in range(folder_count) if i != start_index]
+    return order[:SOURCE_FAILOVER_MAX]
+
 def _next_source_view(group: dict, after_index: int) -> dict | None:
     folders = (group.get("source_results") or {}).get("folders") or []
     nxt = after_index + 1
@@ -16216,16 +17636,58 @@ def start_web_dashboard() -> None:
                    or _create_or_update_repair_job_from_group(group))
             op = _operation_create("select_source", "Queueing selected source",
                                    (job or {}).get("id", ""))
-            result = _enqueue_group_source(group, idx)
-            _operation_finish(op["id"], bool(result.get("ok")),
-                              result.get("message", "Source queued"),
+            order = _source_failover_order(len(folders), idx)
+            result = _enqueue_group_source(group, order[0])
+            tried = 1
+
+        # The walk continues OUTSIDE the lock, one attempt per re-acquisition.
+        # Until now this route stopped on the first refusal and handed the
+        # client `nextSource` to click — but a rejection is the *normal* answer
+        # from a peer whose free-slot flag went stale in the seconds since the
+        # search, so the common case was a user clicking through four sources by
+        # hand to reach the one that would have worked. `_gap_auto_task` has
+        # walked the list since it was written; this is the same walk.
+        #
+        # Re-acquiring per attempt rather than holding the lock across all of
+        # them is the discipline `_gap_auto_task` already keeps, and for the same
+        # reason: each enqueue is a 30 s-timeout slskd call and the whole UI
+        # polls through this lock.
+        deadline = time.time() + SOURCE_FAILOVER_DEADLINE
+        last_index = order[0]
+        for nxt in order[1:]:
+            if result.get("ok") or time.time() >= deadline:
+                break
+            with _review_lock:
+                group = _find_review_group(group_id)
+                if not group:
+                    break
+                result = _enqueue_group_source(group, nxt)
+            last_index = nxt
+            tried += 1
+
+        with _review_lock:
+            group = _find_review_group(group_id)
+            if not group:
+                # The op was opened before the walk; leaving it running would
+                # pin a spinner in every client's operation list forever.
+                _operation_finish(op["id"], False, "Group disappeared mid-fetch")
+                return jsonify(_api_error_payload("not_found", "Group not found")), 404
+            message = result.get("message", "Source queued")
+            if result.get("ok") and tried > 1:
+                message = f"{message} (source #{last_index + 1} of {len(folders)})"
+            _operation_finish(op["id"], bool(result.get("ok")), message,
                               result.get("message", ""))
             if result.get("ok"):
-                payload = _with_operation({"ok": True, "gap": _gap_detail_view(group)}, op)
+                payload = _with_operation({"ok": True, "triedSources": tried,
+                                           "sourceIndex": last_index,
+                                           "gap": _gap_detail_view(group)}, op)
             else:
                 payload = _with_operation(_api_error_payload(
-                    "enqueue_failed", result.get("message", "Enqueue failed"),
-                    next_source=_next_source_view(group, idx)), op)
+                    "enqueue_failed",
+                    f"{tried} source(s) rejected the request "
+                    f"({result.get('message', 'enqueue failed')})",
+                    next_source=_next_source_view(group, last_index)), op)
+                payload["triedSources"] = tried
         _save_review_state()
         _save_state()
         return jsonify(payload), (200 if payload.get("ok") else 400)
@@ -16965,6 +18427,99 @@ def start_web_dashboard() -> None:
         except (TypeError, ValueError):
             limit = 20
         return jsonify(_similar_artists_marked(artist_mbid, artist_name, limit))
+
+    @app.get("/api/artist/related")
+    def api_artist_related():
+        """Deezer's related artists — a *third* similarity source, kept apart
+        from `/api/artist/similar` rather than merged into it.
+
+        Two reasons it is its own route. Deezer is keyed by its own artist id
+        and needs a search to reach one, which is a second request the similar
+        row must not start paying for every caller; and the two lists disagree
+        often enough that a client may reasonably want both. The ownership
+        marking is identical (`owned` + `artistId` + `indexed`), so one
+        component renders either."""
+        artist_mbid = request.args.get("mbid", "").strip()
+        artist_name = request.args.get("name", "").strip()
+        if not artist_mbid and not artist_name:
+            return jsonify({"error": "mbid or name is required"}), 400
+        try:
+            limit = max(1, min(40, int(request.args.get("limit", 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        return jsonify(_deezer_related_marked(artist_mbid, artist_name, limit))
+
+    @app.get("/api/deezer/chart")
+    def api_deezer_chart():
+        """Deezer's global chart, ownership-marked. Free and unauthenticated.
+
+        Cached for 6 h at the *Deezer* layer only — ownership is re-derived per
+        request, because a landed fill falsifies it. That is what lets this sit
+        in the hub's `LB_LIBRARY_ROUTES` and be invalidated by a fill."""
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            return jsonify(_deezer_chart_marked(limit))
+        except DeezerError as e:
+            return jsonify({"error": f"Deezer unavailable: {e}"}), 502
+
+    @app.get("/api/deezer/editorial")
+    def api_deezer_editorial():
+        """Deezer's own editorial album selection, ownership-marked."""
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            return jsonify(_deezer_editorial_marked(limit))
+        except DeezerError as e:
+            return jsonify({"error": f"Deezer unavailable: {e}"}), 502
+
+    @app.post("/api/resolve-link")
+    def api_resolve_link():
+        """A pasted streaming URL -> MusicBrainz ids. See `resolve_music_link`.
+
+        A URL we cannot place is a 200 with `kind: "unknown"` and
+        `confidence: 0.0`, not an error: "this isn't a music link I know" is an
+        answer the client can render, and the paste box would otherwise show a
+        failure card for every stray clipboard."""
+        data = request.get_json(silent=True) or {}
+        url = str(data.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+        return jsonify(resolve_music_link(url))
+
+    @app.get("/api/wishlist")
+    def api_wishlist():
+        """Release-groups whose fill ended in `no_source`, kept for the slow
+        re-search. See the wishlist section for why that failure kind gets a
+        list instead of the auto-retry the transient kinds get."""
+        rows = _wishlist_list()
+        return jsonify({"wishlist": rows, "total": len(rows),
+                        "intervalSeconds": WISHLIST_RESEARCH_INTERVAL,
+                        "cooldownSeconds": WISHLIST_ROW_COOLDOWN})
+
+    @app.post("/api/wishlist")
+    def api_wishlist_add():
+        data = request.get_json(silent=True) or {}
+        result = _wishlist_add(str(data.get("rgid") or ""),
+                               str(data.get("artist") or ""),
+                               str(data.get("title") or ""))
+        if not result.get("ok"):
+            return jsonify(_api_error_payload(
+                "wishlist_add_failed", result.get("error", "Could not add"))), 400
+        return jsonify({**result, "wishlist": _wishlist_list()})
+
+    @app.post("/api/wishlist/remove")
+    def api_wishlist_remove():
+        data = request.get_json(silent=True) or {}
+        result = _wishlist_remove(str(data.get("rgid") or ""))
+        if not result.get("ok"):
+            return jsonify(_api_error_payload(
+                "wishlist_remove_failed", result.get("error", "Could not remove"))), 400
+        return jsonify({**result, "wishlist": _wishlist_list()})
 
     @app.get("/api/fresh-releases")
     def api_fresh_releases():
@@ -17930,6 +19485,11 @@ def start_web_dashboard() -> None:
         app.run(host=WEB_UI_HOST, port=WEB_UI_PORT, threaded=True, use_reloader=False)
 
     threading.Thread(target=_run, daemon=True, name="album-review-web").start()
+    # The wishlist's slow re-search. Started here rather than at import so a
+    # process running only the Telegram half doesn't grow a background thread
+    # whose results nothing would surface.
+    threading.Thread(target=_wishlist_sweep_loop, daemon=True,
+                     name="wishlist-sweep").start()
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)

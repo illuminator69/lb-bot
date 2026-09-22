@@ -22,8 +22,8 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** **32 errors, 0 failures** (248 tests as of 2026-09-22 — the total drifts as
-tests are added, so check the 32/0, not the count). The errors are all stale beets tests kept
+**Test baseline:** **32 errors, 0 failures** (319 tests as of 2026-09-23 — the total drifts as
+tests are added, so check the 32/0, not the count; all 32 are in `AlbumReviewTests`). The errors are all stale beets tests kept
 from before the beets removal (see Decision below). Anything *else* failing is yours.
 
 **Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
@@ -90,6 +90,19 @@ in-memory review is intact, the JSON half still writes), but nothing about the
 review survives a restart until this is fixed. Fix on the
 host once: `chown -R 99:100 /mnt/user/appdata/lb-bot` (and `/mnt/user/Music` if
 placement into pre-existing album folders fails).
+
+New environment variables, all optional and all degrading to "feature off"
+rather than to an error:
+
+| var | default | what it gates |
+|---|---|---|
+| `ACOUSTID_API_KEY` | unset | fingerprint verification at placement. Unset = "no opinion", placement unchanged. Needs `fpcalc` too. |
+| `ACOUSTID_MIN_SCORE` | `0.6` | below this an AcoustID answer is no opinion, not evidence against the file |
+| `LB_BOT_WISHLIST_INTERVAL` | `21600` (6 h) | how often the wishlist sweep wakes |
+| `LB_BOT_WISHLIST_COOLDOWN` | `43200` (12 h) | how long before one wishlist row is re-searched |
+| `LB_BOT_SOURCE_FAILOVER_DEADLINE` | `45` | wall-clock ceiling on the fetch route's walk down the ranked source list |
+
+Deezer needs no configuration at all — the browse API is open.
 
 `LB_BOT_UMASK` (default `002` in compose) is applied by the bot itself via
 `os.umask()` at import. The image is `python:3.11-slim` with a bare `python`
@@ -275,6 +288,196 @@ are collapsed to one row per person, because MusicBrainz states one relation per
 instrument and per stint, so a four-piece came back with the bassist four times.
 Recording-level relations are deliberately **not** requested for credits: they
 multiply the response by the tracklist for a section nobody reads per-track.
+
+### Deezer browse — `GET /api/deezer/chart`, `/api/deezer/editorial`, `/api/artist/related`
+
+The browse half of Track C. Deezer is free and unauthenticated — no key, no
+token refresh, no account — which is the whole reason it is here and Spotify is
+not: Spotify's browse endpoints all need the client-credentials token and its
+editorial ones need a *user* token.
+
+Three rules the client (`_deezer_get` and friends) exists to keep:
+
+1. **It never takes `_mbz_lock`.** That lock is the discography scanner's entire
+   1 req/sec budget and `mbz_get` holds it across the pacing sleep, so a browse
+   row that queued behind it would render when the scan finished. Same rule and
+   same reason as `_similar_artists_marked` and `_wiki_get`. **Resolution to
+   MBIDs therefore happens against the library index and never against
+   MusicBrainz** — see `_index_release_group_directory`, the name-keyed view of
+   `release_groups` that exists precisely because a Deezer row has only
+   "Artist" and "Title" where every other caller already has an rgid.
+2. **The 6 h cache is on the Deezer fetch, not on the ownership marking.**
+   Ownership is re-derived per request, because a landed fill falsifies it.
+   That split is what lets these routes sit in the hub's `LB_LIBRARY_ROUTES`
+   and be invalidated by a fill at all.
+3. **Marking is conservative.** Deezer publishes no MBIDs, so every resolution
+   is a name match — exactly the case where a guess is worse than a blank. An
+   unresolved row is `owned: false` with no id and no rgid, never a plausible
+   one, and the client falls back to `/api/album/lookup` on tap: one
+   MusicBrainz search for the one row the user chose, instead of a per-row fan
+   out that would spend the whole budget on a shelf nobody touched.
+
+The vocabulary is the existing one — artist rows carry `owned` + `artistId` +
+`indexed`, release rows carry `releaseOwned` + `releaseAlbumId` + `coverUrl` —
+so a client renders a Deezer row with the component it already has.
+
+Two things measured against the live API on 2026-09-23 and easy to get wrong:
+
+- **The editorial endpoints ignore `limit`.** A request for 5 came back with 10,
+  so `deezer_editorial` cuts client-side. `editorial/0/selection` is the real
+  editorial list and `editorial/0/releases` is the fallback, because `selection`
+  has come back empty and an empty editorial row is indistinguishable from a
+  broken one. `section` on the answer says which served it.
+- **The chart is geolocated by the *server's* IP**, not the user's. Run from a
+  French-routed host it is the French chart, and the open API has no country
+  parameter, so this is a property of where lb-bot runs.
+
+`deezer_search_artist_id` is **exact name match only**, deliberately: Deezer's
+search happily answers a tribute band for a misspelling, and a near miss here is
+not one wrong row but a whole shelf about the wrong artist.
+
+### Paste-a-link — `POST /api/resolve-link`
+
+One streaming URL in, MusicBrainz ids out. Before this the only URL parser in
+the module was `spotify_playlist_id`, a `re.search` for `playlist/<id>`.
+
+Three tiers, and `confidence` is on the wire precisely because they are not
+equally good:
+
+| conf | how | providers |
+|---|---|---|
+| 1.0 | the id *is* the answer, no network call | musicbrainz.org |
+| ~0.9 | the provider's own API | Spotify (client credentials), Deezer |
+| ~0.7 | a scraped `<title>` / `og:title` | Apple Music, YouTube Music, TIDAL, Qobuz |
+
+An ISRC beats all three where the provider publishes one, because it identifies
+the *recording* rather than a name two records might share. **`confidence` keys
+off whether the ISRC leg actually answered, not off the ISRC existing** — that
+distinction was a live bug: MusicBrainz 400'd the ISRC lookup, the text search
+supplied the recording, and the answer still claimed 0.95.
+
+This route *does* spend the `_mbz_lock` budget, one or two searches, and that is
+fine: it is a single user-initiated action on a link the user just pasted,
+exactly like `/api/album/lookup`. The browse rows above are the ones that must
+never touch it.
+
+**Search MusicBrainz fielded, not free-text, whenever you already know which
+half is the artist.** `_mbz_release_group_for` exists for this. Measured
+2026-09-23: the free-text query `Daft Punk Discovery` scored *"Daft Punk's
+Discovery but it's in the SM64 Soundfont"* by Pignickel at 100 and returned it
+first, because term density beats the record you meant. Free text stays as the
+fallback, since a fielded query finds nothing when the store's spelling of the
+artist and MusicBrainz's disagree.
+
+Page-title formats, checked live on 2026-09-23 — they differ and a redesign
+upstream breaks them silently, which is what the 0.7 cap is saying:
+
+| store | tag | shape |
+|---|---|---|
+| Apple | `<title>` | `Discovery by Daft Punk on Apple Music` |
+| TIDAL | `og:title` | `U2 - Achtung Baby` (artist first) |
+| Qobuz | `og:title` | `Discovery, Daft Punk - Qobuz` (**artist last**) |
+| YouTube | oembed | `author_name` + a title needing the artist prefix and `(Official Video)` stripped |
+
+The comma rule is **Qobuz-only and must stay that way**: album titles contain
+commas all the time, and applying it generally splits a title in half.
+
+There is still **no Telegram plain-text handler** — `/spplaylist` remains the
+only command that takes a link. The route is the deliverable; the paste UI is
+each client's.
+
+### Acquisition reliability
+
+Three pieces, and the first two fix failures that looked like the feature
+working.
+
+**1. The ranked source list is actually walked.** `_source_failover_order` is
+the one definition of "which sources, in what order", shared by
+`/api/gaps/<id>/fetch` and `_gap_auto_task` — the two disagreeing about it is
+how "auto picked a source manual wouldn't" happens. The fetch route used to
+enqueue once and, on refusal, hand the client `nextSource` to click; but a
+refusal is the *normal* answer from a peer whose free-slot flag went stale in
+the seconds since the search, so the common case was a user clicking through
+four sources by hand to reach one that worked. The walk is bounded by
+`SOURCE_FAILOVER_MAX` (6) and, in the synchronous route, by
+`SOURCE_FAILOVER_DEADLINE` — and it **re-acquires `_review_lock` per attempt**
+rather than holding it across all of them, because each enqueue is a 30 s-timeout
+slskd call and the whole UI polls through that lock.
+
+**2. The stall watchdog now fails the *album* over, not just the file.** It has
+always walked `info["candidates"]` for one file and never touched the group's
+own ranked folder list, so a peer that accepted the enqueue and then stalled
+ended the fill with five ranked sources sitting unused on the group.
+`_switch_album_source` has been the right tool for that since it was written
+and **was never called from anywhere**; it is now, before the give-up path.
+Two things had to be fixed in it first, both of which are why it presumably was
+never wired up:
+
+- it re-enqueued the **whole folder**, ignoring `missing_tracks` — so a switched
+  source fetched a whole album to fill two holes;
+- it dropped the **review and repair linkage**, so a switched album downloaded
+  correctly while every track sat on the `failed` the poller had just written.
+
+On exhaustion it pops the group and prompts but records nothing in the fill
+ledger, and its `switching` flag is still set — so neither branch below it would
+run and the fill would never report failure, which leaves every client polling
+`downloading` forever with no retry to offer. The watchdog records that failure
+explicitly.
+
+**3. AcoustID/Chromaprint verification** (`ACOUSTID_API_KEY` + the `fpcalc`
+binary, `libchromaprint-tools` in the Dockerfile). This is the one identity
+check nothing else here can make. `_audio_signature`'s md5 is FLAC StreamInfo's
+hash of the *unencoded* audio: it proves two files are the same **encode** of
+the same master and says nothing at all about a different **recording** — a live
+take, a radio edit, a cover or simply the wrong track under the right filename
+all have perfectly good, perfectly different md5s and sail through.
+
+It hooks into `_reject_reason` inside `_deterministic_album_import` and is the
+only refusal there that survives `manual_pairs` and `skip_audio_guard_for`: a
+user who picked a file by hand picked it from a filename too, and the override
+they meant was "ignore the tags", not "place a different recording".
+
+**Silence is never evidence.** No key, no `fpcalc`, an unknown fingerprint, a
+down AcoustID — every one returns "no opinion" and placement proceeds exactly as
+before. Only a positive contradiction rejects, and only above
+`ACOUSTID_MIN_SCORE`. A guard that turns a working fill into a no-op because a
+binary is missing is worse than no guard.
+
+A rejection is remembered against **the peer, not the path** (`rejected_sources`
+in `library_index.db`), because the file is about to be deleted or moved and
+what must not happen again is re-fetching it from the same peer. `slskd_enqueue`
+is the single choke point every acquisition path goes through, so that is where
+the memory is consulted. `_download_origin` maps a local path back to its peer
+and is deliberately in memory only: the window it must survive is one
+download→finalize cycle, and a restart in the middle costs one bad peer one more
+chance, never a wrong file placed.
+
+### The wishlist — `GET/POST /api/wishlist`, `POST /api/wishlist/remove`
+
+Where a `no_source` failure goes. `no_source` deliberately never auto-retries
+(`FILL_AUTO_RETRY_KINDS`) and the reason is sound: lb-bot walks its entire
+ranked source list before reporting it, so an automatic retry re-runs the
+identical search against the identical peers. But *"don't retry now"* and
+*"forget about it"* are different policies and only the first was ever argued
+for — Soulseek's population turns over on the scale of days, so the retry worth
+running is a **slow** one (`WISHLIST_RESEARCH_INTERVAL`, 6 h; per row
+`WISHLIST_ROW_COOLDOWN`, 12 h) against a list the user curates.
+
+Rows are a `wishlist` table in `library_index.db`, beside `review_groups` and
+`meta` and for the same reasons; `INDEX_SCAN_VERSION` is deliberately **not**
+bumped. Keyed by release-group id, so a landing is recognised without a name
+match: a verified fill calls `_wishlist_landed`, which drops the row and fires
+`_notify_hub_library_change` — a client showing the wishlist has no other way to
+learn that what it is displaying is now in the library.
+
+The sweep does **one row per pass** on purpose: a source search fans out across
+Soulseek and takes the better part of a minute (`SEARCH_TIMEOUT` is 75 s), so
+running the whole list at once would saturate slskd and starve whatever the user
+is actually doing.
+
+Adding is idempotent and **does not reset `last_tried_at` or `attempts`** —
+re-adding something already listed is not new information about who is sharing
+it, and zeroing the clock would make a double-tap re-search immediately.
 
 ### The album review — origins, and why it lives in SQLite
 

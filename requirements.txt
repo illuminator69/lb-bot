@@ -9,3 +9,9 @@ mutagen==1.47.0
 # Ships as wheels, so no build step is added to the image. The code falls back
 # to difflib if it is missing rather than failing to import.
 rapidfuzz==3.14.5
+# pyacoustid — Chromaprint fingerprinting, so placement can tell a *different
+# recording* from a different encode of the same one (FLAC's StreamInfo md5
+# catches only the latter). Needs the `fpcalc` binary, which the Dockerfile
+# installs as libchromaprint-tools; without either, verification reports "no
+# opinion" and placement behaves exactly as it did before.
+pyacoustid==1.3.0

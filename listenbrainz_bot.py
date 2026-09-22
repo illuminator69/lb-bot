@@ -3675,14 +3675,22 @@ def _nd_search(nd_user, nd_pass, query, song_count=5, _retry=True) -> list:
         print(f"  Navidrome error: {e}")
         return []
 
-def nd_has_track(track: dict, nd_user: str, nd_pass: str) -> bool:
+def nd_has_track(track: dict, nd_user: str, nd_pass: str,
+                 retry: bool = True) -> bool:
+    """Is this playlist track in Navidrome?
+
+    `retry=False` for bulk callers whose caller has already established that the
+    search index is serving (see `_nd_index_is_warm`). Every absent track
+    otherwise pays `_nd_search`'s 3 s warm-up retry on both probes — and absent
+    is the answer these loops exist to find.
+    """
     title  = track.get("title") or ""
     artist = track.get("artist") or ""
     label  = f"{artist} - {title}"
 
     # Stage 1: exact MBID match (Navidrome v0.57+ detects UUID queries directly)
     if track.get("mbid"):
-        songs = _nd_search(nd_user, nd_pass, track["mbid"], 1)
+        songs = _nd_search(nd_user, nd_pass, track["mbid"], 1, _retry=retry)
         if songs:
             print(f"    + MBID match: {label}")
             return True
@@ -3690,7 +3698,7 @@ def nd_has_track(track: dict, nd_user: str, nd_pass: str) -> bool:
     # Stage 2: title + artist text search with strict validation
     title_q  = title.lower().strip()
     artist_q = artist.lower().strip()
-    songs    = _nd_search(nd_user, nd_pass, f"{title} {artist}", 10)
+    songs    = _nd_search(nd_user, nd_pass, f"{title} {artist}", 10, _retry=retry)
     for song in songs:
         st = song.get("title",  "").lower().strip()
         sa = song.get("artist", "").lower().strip()
@@ -3720,13 +3728,60 @@ def nd_find_duplicate(track: dict, nd_user: str, nd_pass: str) -> dict | None:
     return None
 
 def nd_track_present(artist: str, title: str, mbid: str,
-                     nd_user: str, nd_pass: str) -> bool:
+                     nd_user: str, nd_pass: str, retry: bool = True) -> bool:
     """
     Is this track present in Navidrome? MBID match first, then a validated
     title+artist text match — so libraries with untagged files (no MBIDs)
     are not undercounted.
+
+    `retry=False` for bulk callers — see `_nd_index_is_warm`. A miss is the
+    *expected* answer when scanning for gaps, and paying `_nd_search`'s 3 s
+    warm-up retry on each one (twice per search, since a missing track misses
+    both the MBID and the text probe) costs ~6 s per absent track.
     """
-    return nd_track_match(artist, title, mbid, nd_user, nd_pass) is not None
+    return nd_track_match(artist, title, mbid, nd_user, nd_pass,
+                          retry=retry) is not None
+
+def _nd_index_is_warm(nd_user: str, nd_pass: str) -> bool:
+    """One probe to tell "the search index is still building" from "you simply
+    do not own this track".
+
+    `_nd_search` retries once after 3 s whenever a search comes back empty,
+    because a warming or rebuilding index answers nothing for everything. That
+    is right for a one-off lookup and badly wrong for a bulk scan, where most
+    answers are legitimately empty: the scan pays the sleep for every track it
+    is there to discover is missing.
+
+    So ask Navidrome for an album it definitely has, then search for it by name.
+    A hit means the index is serving and every later miss is a real miss. No
+    hit means it is still building, so the retries stay on and the scan is slow
+    but correct.
+
+    **Not a fixed query string.** The first version of this probed for "a" and
+    got zero hits against a perfectly warm index — Navidrome does not match
+    single-character searches — which would have quietly left the slow path on
+    forever. Derive the term from the library and the probe can't rot.
+    """
+    try:
+        params = {**_nd_auth_params(nd_user, nd_pass),
+                  "type": "random", "size": "1"}
+        r = _http.get(f"{NAVIDROME_URL}/rest/getAlbumList2",
+                      params=params, timeout=5)
+        albums = (r.json().get("subsonic-response", {})
+                          .get("albumList2", {})
+                          .get("album", []) or [])
+    except Exception as e:
+        # Can't tell — assume cold, which costs time rather than correctness.
+        print(f"  Navidrome warm-up probe failed: {e}")
+        return False
+    if not albums:
+        # Nothing in the library at all: every miss is honest, and retrying
+        # each one would buy nothing.
+        return True
+    term = (albums[0].get("name") or albums[0].get("artist") or "").strip()
+    if not term:
+        return False
+    return bool(_nd_search(nd_user, nd_pass, term, 1, _retry=False))
 
 def nd_track_match(artist: str, title: str, mbid: str, nd_user: str, nd_pass: str,
                    retry: bool = True) -> dict | None:
@@ -6705,18 +6760,35 @@ def group_missing_by_album(tracks: list, nd_user: str, nd_pass: str,
     qualified_mbids = set()
     skipped_full    = []
 
+    # One probe decides whether every later miss can be trusted, instead of each
+    # one paying _nd_search's 3 s warm-up retry. See _nd_index_is_warm.
+    retry_misses = not _nd_index_is_warm(nd_user, nd_pass)
+    if retry_misses:
+        print("  Navidrome search returned nothing for a broad probe — treating "
+              "the index as cold and re-checking every miss (this is slow)")
+    # Cache per scan: the same recording turns up in more than one candidate
+    # release, and each lookup is two Navidrome searches.
+    seen = {}
+
+    def _present(artist: str, track: dict) -> bool:
+        key = (artist, track.get("mbid") or "", track.get("title") or "")
+        if key not in seen:
+            seen[key] = nd_track_present(artist, track["title"], track["mbid"],
+                                         nd_user, nd_pass,
+                                         retry=retry_misses)
+        return seen[key]
+
     for rel_id, group in release_map.items():
         rel_tracks            = mbz_release_tracks(rel_id)
         group["total_tracks"] = len(rel_tracks)
 
-        # Count how many tracks from this release are already in Navidrome.
+        # Which tracks of this release Navidrome already has. Resolved once:
+        # the present count and the missing list are two readings of the same
+        # answer, and asking twice doubled the cost of the whole scan.
         # MBID match first, then validated title+artist text match, so an
         # untagged library is not wrongly treated as missing the album.
-        present = sum(
-            1 for rt in rel_tracks
-            if nd_track_present(group["artist"], rt["title"], rt["mbid"],
-                                nd_user, nd_pass)
-        )
+        here = [_present(group["artist"], rt) for rt in rel_tracks]
+        present = sum(1 for ok in here if ok)
         group["present_count"] = present
 
         if present >= group["total_tracks"] > 0:
@@ -6733,9 +6805,7 @@ def group_missing_by_album(tracks: list, nd_user: str, nd_pass: str,
                 "mbid": rt["mbid"],
                 "position": rt.get("position", 0),
             }
-            for rt in rel_tracks
-            if not nd_track_present(group["artist"], rt["title"], rt["mbid"],
-                                    nd_user, nd_pass)
+            for rt, ok in zip(rel_tracks, here) if not ok
         ]
 
         album_groups.append(group)
@@ -9987,10 +10057,20 @@ def find_incomplete_albums(nd_user: str, nd_pass: str, progress=None) -> list:
 def _nd_wait_ready(nd_user: str, nd_pass: str,
                     max_wait: int = 60, interval: int = 5) -> bool:
     """
-    Wait until Navidrome's search index is responsive.
-    Polls with a benign single-character query; returns True when results come
-    back (index is warm), or False after max_wait seconds.
-    A single-char query reliably returns results on a non-empty library.
+    Wait until Navidrome's search index is responsive. Returns True once it
+    answers, False after max_wait seconds.
+
+    **It polls on `status == "ok"`, not on getting results.** This used to poll
+    with the single character "a" and claim in its own docstring that "a
+    single-char query reliably returns results on a non-empty library" — which
+    is false: measured 2026-09-22 against a 4,249-album library, `query="a"`
+    returns zero songs, because Navidrome does not match single-character
+    queries. The `if songs:` branch below was therefore dead, and readiness has
+    always actually been decided by the status field.
+
+    Left polling on status, which is the check that was really running and is
+    the more robust one anyway. **Do not "fix" this by trusting a fixed query
+    string** — use `_nd_index_is_warm`, which derives its term from the library.
     """
     deadline = time.time() + max_wait
     attempt  = 0
@@ -9999,7 +10079,9 @@ def _nd_wait_ready(nd_user: str, nd_pass: str,
         try:
             r = _http.get(f"{NAVIDROME_URL}/rest/search3", params={
                 **_nd_auth_params(nd_user, nd_pass),
-                "query": "a", "songCount": "1",
+                # Deliberately narrow: this asks "is the server answering
+                # search3 at all", and the answer is the status, not the hits.
+                "query": "navidrome-readiness-probe", "songCount": "1",
                 "albumCount": "0", "artistCount": "0",
             }, timeout=5)
             resp  = r.json().get("subsonic-response", {})
@@ -10028,6 +10110,10 @@ def scan_user(user: dict) -> list:
 
     print(f"\n=== Scanning for {lbz_user} ===")
     _nd_wait_ready(nd_user, nd_pass)
+    # Readiness is established once, here, rather than re-litigated by a 3 s
+    # sleep on every track that turns out to be missing — which is most of them,
+    # this being a scan for missing tracks.
+    retry_misses = not _nd_index_is_warm(nd_user, nd_pass)
     playlist_ids = lbz_get_playlist_ids(lbz_user, sources)  # raises LBZError on API failure
     if not playlist_ids:
         # Genuinely no matching playlists (the request succeeded) — nothing to do.
@@ -10045,7 +10131,7 @@ def scan_user(user: dict) -> list:
                 continue
             seen.add(key)
             print(f"  Checking: {track['artist']} - {track['title']}")
-            if not nd_has_track(track, nd_user, nd_pass):
+            if not nd_has_track(track, nd_user, nd_pass, retry=retry_misses):
                 all_missing.append(track)
 
     # Only reached on a fully successful scan — safe to record for the throttle.
@@ -11657,6 +11743,7 @@ async def spplaylist_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def _check_missing(tracks: list, nd_user: str, nd_pass: str) -> list:
     """Run nd_has_track for each track, return those not in Navidrome."""
+    retry_misses = not _nd_index_is_warm(nd_user, nd_pass)
     missing = []
     seen    = set()
     for track in tracks:
@@ -11665,7 +11752,7 @@ def _check_missing(tracks: list, nd_user: str, nd_pass: str) -> list:
         if key in seen:
             continue
         seen.add(key)
-        if not nd_has_track(track, nd_user, nd_pass):
+        if not nd_has_track(track, nd_user, nd_pass, retry=retry_misses):
             missing.append(track)
     return missing
 
@@ -12910,7 +12997,7 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
         was = {g.get("id") for g in current}
         kept = [g for g in current if _review_group_origin(g) != origin]
         by_identity = {_review_group_identity(g): g for g in kept}
-        fresh = []
+        fresh, folded = [], []
         for group in merged:
             existing = by_identity.get(_review_group_identity(group))
             if existing is not None:
@@ -12919,6 +13006,7 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
                 # canonical_album_id and `extra`; a playlist group carries none
                 # of them). Contribute the tracks, not a duplicate tile.
                 _fold_missing_tracks(existing, group)
+                folded.append(existing)
                 continue
             fresh.append(group)
         _review_state.update({
@@ -12930,11 +13018,14 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
             _review_state["fuzzy"] = fuzzy
         after = len(_review_state["groups"])
         gone = was - {g.get("id") for g in _review_state["groups"]}
-    # Both halves: the rows to rewrite, and the rows to delete. A group this
-    # origin no longer lists is marked too — the flusher deletes any marked id
-    # that is no longer live, and without this its row outlived the review and
-    # came back on the next restart.
-    _mark_review_groups_dirty(kept + fresh)
+    # Only what actually changed: this origin's rows, the other-origin rows a
+    # fold touched, and the ids to delete. Marking all of `kept` would make a
+    # 5-album playlist scan rewrite every one of the library's ~3000 rows.
+    # `gone` matters as much as the writes — the flusher deletes any marked id
+    # that is no longer live, and without it a dropped group's row outlived the
+    # review and came back on the next restart.
+    _mark_review_groups_dirty(fresh)
+    _mark_review_groups_dirty(folded)
     _mark_review_groups_dirty(gone)
     _web_log(f"{origin} scan: {len(new_groups)} group(s) in, "
              f"{len(fresh)} new row(s); review {before} -> {after} group(s)")

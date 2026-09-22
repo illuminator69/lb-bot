@@ -22,7 +22,7 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** 230 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
+**Test baseline:** 241 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
 from before the beets removal (see Decision below). Anything *else* failing is yours.
 
 **Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
@@ -303,6 +303,52 @@ of the review file, and `/api/tasks` served all of it — past the hub's 4 MB
 `PROXY_MAX_RESPONSE`, which answers 502 `tooLarge`. `result` is now stripped from
 the on-disk state and from the collection-wide snapshot; only `/api/tasks/<id>`
 serves it, deep-copied, because the SPA's Artist panel polls that one task for it.
+
+### Why a playlist scan was taking 40 minutes
+
+`group_missing_by_album` is O(tracks in the matched *releases*), not O(missing
+tracks): 33 playlist tracks resolved to 16 albums totalling ~180 tracks. Measured
+on the live stack 2026-09-22 it ran at **~13 s per track**. Two causes, both
+there since the first commit, neither of them a rate limit:
+
+1. **`nd_track_present` was evaluated twice for every track** — once to count how
+   many are present, once to build the missing list. Same arguments, same answer.
+2. **Every miss paid `_nd_search`'s 3 s warm-up retry, twice.** That retry exists
+   because a warming or rebuilding Navidrome index answers nothing for
+   everything. In a gap scan a miss is the *expected* answer, and a missing track
+   misses both the MBID probe and the text probe — so 6 s per absent track,
+   doubled by (1).
+
+The tell is in the timings: releases where some tracks *were* present ran at
+~10 s/track against ~13 s for the 0-present ones, because a hit returns before
+the sleep. This is also why the scan feels fast on a playlist you mostly own and
+crawls on one you do not — **the more gaps it finds, the slower it gets**.
+
+Fixed by resolving presence once per track into a list the count and the missing
+list both read, and by probing the index once up front (`_nd_index_is_warm`):
+ask Navidrome for a random album it definitely has, then search for it by name.
+A hit means the index is serving, so every later miss is real and the scan runs
+`retry=False`; no hit means it is still building and the slow, correct path
+stays. Per missing track: 8 Navidrome requests and 12 s of `sleep` become 2
+requests and none.
+
+The same tax was in `scan_user`'s own loop (`nd_has_track`) and in
+`_check_missing` (the Spotify path), so both take the flag too. Measured end to
+end on the live stack, one playlist, 96 tracks / 33 missing / 31 release groups:
+
+| phase | before | after |
+|---|---|---|
+| `scan_user` track check | 213 s | 12.7 s |
+| `group_missing_by_album` | 75+ min (killed unfinished) | 46.6 s |
+| whole scan | never observed finishing | **60 s** |
+
+**The probe term must come from the library.** The first version searched for
+`"a"` and got zero hits against a perfectly warm index — Navidrome does not
+match single-character queries — so it would have reported "cold" forever and
+the fix would have been a silent no-op. Caught only by running it against the
+live server.
+
+**Don't reintroduce the retry on a bulk path.** A one-off lookup should keep it.
 
 ## The goal (confirmed spec)
 

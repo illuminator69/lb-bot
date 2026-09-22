@@ -437,6 +437,203 @@ class AlbumReviewTests(unittest.TestCase):
             bot._save_review_state(urgent=True)
             self.assertEqual(bot._review_groups_count(), 0)
 
+    def test_a_scan_only_rewrites_rows_it_changed(self):
+        """A five-album playlist scan must not rewrite the library's ~3000
+        rows just because it keeps them."""
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            bot._replace_review_groups(
+                "library",
+                [self._origin_group(f"lib{i}", "library", album=f"L{i}",
+                                    canonical_mbid=f"rel{i}") for i in range(50)],
+                "x")
+            bot._save_review_state(urgent=True)
+            with bot._review_lock:
+                bot._review_dirty_groups.clear()
+
+            bot._replace_review_groups(
+                "playlist",
+                [self._origin_group("pl1", "playlist", artist="P", album="Q",
+                                    canonical_mbid="plrel")], "x")
+            # The one new playlist row, and nothing else.
+            self.assertEqual(bot._review_dirty_groups, {"pl1"})
+
+    def test_a_fold_marks_the_row_it_changed(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            lib = self._origin_group("lib0", "library", canonical_mbid="rel-1")
+            bot._replace_review_groups("library", [lib], "x")
+            bot._save_review_state(urgent=True)
+            with bot._review_lock:
+                bot._review_dirty_groups.clear()
+
+            incoming = self._origin_group("pl1", "playlist", canonical_mbid="rel-1")
+            incoming["missing_tracks"] = [{"mbid": "t2", "title": "Two"}]
+            bot._replace_review_groups("playlist", [incoming], "x")
+            # Folded into lib0, so lib0 is what has to be rewritten.
+            self.assertEqual(bot._review_dirty_groups, {"lib0"})
+            bot._save_review_state(urgent=True)
+            bot._index_conn.close(); bot._index_conn = None
+            with bot._review_lock:
+                bot._review_state = bot._empty_review_state()
+            bot._load_review_state()
+            self.assertEqual(
+                [t["title"] for t in bot._review_state["groups"][0]["missing_tracks"]],
+                ["Two"])
+
+    # ---- playlist-scan grouping cost ------------------------------------
+    #
+    # Measured on the live stack 2026-09-22: ~13 s per track, for ~180 tracks
+    # across 16 albums — a 40-minute playlist scan. Two compounding causes,
+    # both present since the first commit, neither a rate limit:
+    # nd_track_present was evaluated twice for every track, and each miss paid
+    # _nd_search's 3 s warm-up retry on both the MBID and the text probe.
+
+    @staticmethod
+    def _rel(n):
+        return [{"title": f"T{i}", "mbid": f"m{i}", "position": i}
+                for i in range(1, n + 1)]
+
+    def test_warm_probe_asks_for_something_the_library_actually_has(self):
+        """The first version probed for "a" and got zero hits against a warm
+        index — Navidrome does not match single-character searches — which
+        would have left the slow path on forever with nothing to show for it.
+        The term has to come from the library."""
+        searched = []
+
+        class _Resp:
+            @staticmethod
+            def json():
+                return {"subsonic-response": {"albumList2": {
+                    "album": [{"name": "Megapearl", "artist": "Reggie Pearl"}]}}}
+
+        def fake_search(u, p, query, count=5, _retry=True):
+            searched.append(query)
+            return [{"title": "x"}] if query == "Megapearl" else []
+
+        with patch.object(bot._http, "get", lambda *a, **k: _Resp()), \
+             patch.object(bot, "_nd_search", fake_search):
+            self.assertTrue(bot._nd_index_is_warm("u", "p"))
+        self.assertEqual(searched, ["Megapearl"])
+
+    def test_warm_probe_reports_cold_when_the_index_answers_nothing(self):
+        class _Resp:
+            @staticmethod
+            def json():
+                return {"subsonic-response": {"albumList2": {
+                    "album": [{"name": "Megapearl"}]}}}
+
+        with patch.object(bot._http, "get", lambda *a, **k: _Resp()), \
+             patch.object(bot, "_nd_search", lambda *a, **k: []):
+            self.assertFalse(bot._nd_index_is_warm("u", "p"))
+
+    def test_warm_probe_on_an_empty_library_does_not_ask_for_retries(self):
+        """No albums means every miss is honest; retrying each one buys
+        nothing but 3 s."""
+        class _Resp:
+            @staticmethod
+            def json():
+                return {"subsonic-response": {"albumList2": {}}}
+
+        with patch.object(bot._http, "get", lambda *a, **k: _Resp()):
+            self.assertTrue(bot._nd_index_is_warm("u", "p"))
+
+    def test_warm_probe_failure_keeps_the_slow_correct_path(self):
+        def boom(*a, **k):
+            raise RuntimeError("connection refused")
+
+        with patch.object(bot._http, "get", boom):
+            self.assertFalse(bot._nd_index_is_warm("u", "p"))
+
+    def test_grouping_asks_navidrome_once_per_track(self):
+        calls = []
+
+        def fake_present(artist, title, mbid, nd_user, nd_pass, retry=True):
+            calls.append((title, retry))
+            return False
+
+        tracks = [{"artist": "A", "title": "T1", "mbid": "m1"}]
+        with patch.object(bot, "mbz_best_release",
+                          lambda mbid: {"id": "rel1", "title": "Alb"}), \
+             patch.object(bot, "mbz_release_tracks", lambda rid: self._rel(10)), \
+             patch.object(bot, "_nd_index_is_warm", lambda u, p: True), \
+             patch.object(bot, "nd_track_present", fake_present):
+            groups, solo = bot.group_missing_by_album(tracks, "u", "p")
+
+        # Ten tracks, ten lookups — not twenty.
+        self.assertEqual(len(calls), 10)
+        # And a warm index means no miss pays the 3 s warm-up retry.
+        self.assertTrue(all(retry is False for _, retry in calls))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["missing_tracks"]), 10)
+        self.assertEqual(groups[0]["present_count"], 0)
+
+    def test_grouping_keeps_retrying_when_the_index_looks_cold(self):
+        """The retry exists for a warming index. If the probe finds nothing,
+        misses are untrustworthy and the slow path is the correct one."""
+        seen = []
+
+        def fake_present(artist, title, mbid, nd_user, nd_pass, retry=True):
+            seen.append(retry)
+            return False
+
+        with patch.object(bot, "mbz_best_release",
+                          lambda mbid: {"id": "rel1", "title": "Alb"}), \
+             patch.object(bot, "mbz_release_tracks", lambda rid: self._rel(2)), \
+             patch.object(bot, "_nd_index_is_warm", lambda u, p: False), \
+             patch.object(bot, "nd_track_present", fake_present):
+            bot.group_missing_by_album([{"artist": "A", "title": "T1",
+                                         "mbid": "m1"}], "u", "p")
+        self.assertTrue(all(retry is True for retry in seen))
+
+    def test_grouping_reuses_a_lookup_across_releases(self):
+        calls = []
+
+        def fake_present(artist, title, mbid, nd_user, nd_pass, retry=True):
+            calls.append(title)
+            return False
+
+        # Two playlist tracks resolving to two different releases that share a
+        # recording — the shared track must be looked up once.
+        rel_of = {"m1": "relA", "m2": "relB"}
+        tracks = [{"artist": "A", "title": "T1", "mbid": "m1"},
+                  {"artist": "A", "title": "T2", "mbid": "m2"}]
+        with patch.object(bot, "mbz_best_release",
+                          lambda mbid: {"id": rel_of[mbid], "title": "Alb"}), \
+             patch.object(bot, "mbz_release_tracks", lambda rid: self._rel(3)), \
+             patch.object(bot, "_nd_index_is_warm", lambda u, p: True), \
+             patch.object(bot, "nd_track_present", fake_present):
+            bot.group_missing_by_album(tracks, "u", "p")
+        # Two releases of the same three tracks: three lookups, not six.
+        self.assertEqual(len(calls), 3)
+
+    def test_a_present_track_is_not_reported_missing(self):
+        """The refactor reads the present count and the missing list off one
+        answer — they must still disagree in the right direction."""
+        def fake_present(artist, title, mbid, nd_user, nd_pass, retry=True):
+            return title in ("T1", "T2")
+
+        with patch.object(bot, "mbz_best_release",
+                          lambda mbid: {"id": "rel1", "title": "Alb"}), \
+             patch.object(bot, "mbz_release_tracks", lambda rid: self._rel(4)), \
+             patch.object(bot, "_nd_index_is_warm", lambda u, p: True), \
+             patch.object(bot, "nd_track_present", fake_present):
+            groups, _ = bot.group_missing_by_album(
+                [{"artist": "A", "title": "T1", "mbid": "m1"}], "u", "p")
+        self.assertEqual(groups[0]["present_count"], 2)
+        self.assertEqual(groups[0]["total_tracks"], 4)
+        self.assertEqual([t["title"] for t in groups[0]["missing_tracks"]],
+                         ["T3", "T4"])
+
+    def test_a_fully_present_album_is_skipped(self):
+        with patch.object(bot, "mbz_best_release",
+                          lambda mbid: {"id": "rel1", "title": "Alb"}), \
+             patch.object(bot, "mbz_release_tracks", lambda rid: self._rel(3)), \
+             patch.object(bot, "_nd_index_is_warm", lambda u, p: True), \
+             patch.object(bot, "nd_track_present",
+                          lambda *a, **k: True):
+            groups, _ = bot.group_missing_by_album(
+                [{"artist": "A", "title": "T1", "mbid": "m1"}], "u", "p")
+        self.assertEqual(groups, [])
+
     def test_gaps_view_counts_per_origin(self):
         with isolated_review(), patch.object(bot, "repair_jobs", {}):
             with bot._review_lock:

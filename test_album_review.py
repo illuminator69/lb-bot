@@ -1,5 +1,6 @@
 import os
 import tempfile
+import textwrap
 import sys
 import types
 import unittest
@@ -2734,7 +2735,6 @@ class AlbumReviewTests(unittest.TestCase):
     def test_move_does_not_inherit_source_mtime_or_mode(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
-        import shutil as _shutil
 
         src_dir = os.path.join(tmp, "downloads")
         dst_dir = os.path.join(tmp, "music")
@@ -2749,14 +2749,20 @@ class AlbumReviewTests(unittest.TestCase):
         os.chmod(src, 0o600)
 
         dest = os.path.join(dst_dir, "01 - track.flac")
-        _shutil.move(src, dest, copy_function=_shutil.copyfile)
-        bot._touch(dest)
+        # Go through the real placement helper. Doing the move inline here is what
+        # made this test vacuous for so long: on Windows /downloads and /music were
+        # different volumes, so the copy happened to reset the mode and the
+        # assertion passed without _place_file's explicit chmod ever being
+        # exercised. Inside one filesystem shutil.move is an os.rename, which keeps
+        # mode 0o600 — so the chmod is the only thing that can make this pass.
+        bot._place_file(src, dest)
 
+        self.assertFalse(os.path.exists(src), "the source must be gone after a move")
         self.assertGreater(os.path.getmtime(dest), stale,
                            "placed file must look modified now, not at download time")
         if os.name == "posix":
-            self.assertNotEqual(os.stat(dest).st_mode & 0o777, 0o600,
-                                "placed file must not inherit the source's mode")
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o664,
+                             "placed file must carry the library's mode, not the source's")
 
     def test_touch_survives_a_missing_path(self):
         # A failed touch must never fail an otherwise-good placement.
@@ -3860,6 +3866,378 @@ class MatcherTests(unittest.TestCase):
         hit, basis, _ = bot._best_file_match(track, files, set())
         self.assertEqual(hit["filename"], "01 - Alpha.flac")
         self.assertEqual(basis, "exact")
+
+
+class EditorialMetadataTests(unittest.TestCase):
+    """The MusicBrainz -> Wikidata -> Wikipedia chain, its caches, and the
+    additive `meta` table migration."""
+
+    def setUp(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        self.db_path = os.path.join(td, "index.db")
+        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
+        bot.LIBRARY_INDEX_FILE = self.db_path
+        bot._index_conn = None
+
+        def restore():
+            try:
+                if bot._index_conn is not None:
+                    bot._index_conn.close()
+            except Exception:
+                pass
+            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
+
+        self.addCleanup(restore)
+        bot._wiki_cache.clear()
+        self.addCleanup(bot._wiki_cache.clear)
+
+    # -- the resolution chain ------------------------------------------------
+
+    URL_RELS = {
+        "name": "Radiohead",
+        "disambiguation": "",
+        "type": "Group",
+        "country": "GB",
+        "relations": [
+            {"type": "wikidata",
+             "url": {"resource": "https://www.wikidata.org/wiki/Q45188"}},
+            {"type": "official homepage",
+             "url": {"resource": "https://radiohead.com/"}},
+            {"type": "not a link type we render",
+             "url": {"resource": "https://example.invalid/"}},
+        ],
+    }
+
+    def _wiki_responses(self, *, has_article=True, description="English rock band"):
+        """A _wiki_get stand-in that answers both Wikimedia endpoints."""
+        def fake(url, params):
+            if params.get("action") == "wbgetentities":
+                ent = {"descriptions": {}, "sitelinks": {}}
+                if description:
+                    ent["descriptions"] = {"en": {"value": description}}
+                if has_article:
+                    ent["sitelinks"] = {"enwiki": {"title": "Radiohead"}}
+                return {"entities": {"Q45188": ent}}
+            if params.get("action") == "query":
+                if not has_article:
+                    return {"query": {"pages": {"-1": {"missing": ""}}}}
+                return {"query": {"pages": {"1": {
+                    "title": "Radiohead",
+                    "extract": "Radiohead are an English rock band.\n"
+                               "== Career ==\n"
+                               "They formed in 1985.\n",
+                    "thumbnail": {"source": "https://upload.example/rh.jpg"},
+                }}}}
+            return {}
+        return fake
+
+    def test_full_chain_returns_text_attribution_and_links(self):
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=self._wiki_responses()):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            meta = bot.meta_for_artist("a-mbid")
+        self.assertEqual(meta["summary"], "Radiohead are an English rock band.")
+        # Section headings must not survive into the prose.
+        self.assertEqual(meta["paragraphs"],
+                         ["Radiohead are an English rock band.", "They formed in 1985."])
+        self.assertEqual(meta["wikidataDescription"], "English rock band")
+        self.assertEqual(meta["wikidataQid"], "Q45188")
+        self.assertEqual(meta["source"]["name"], "Wikipedia")
+        self.assertEqual(meta["source"]["license"], "CC BY-SA 4.0")
+        self.assertIn("en.wikipedia.org/wiki/Radiohead", meta["source"]["url"])
+        self.assertEqual(meta["imageUrl"], "https://upload.example/rh.jpg")
+        # Only known url-rel types are rendered, official site first.
+        self.assertEqual([l["type"] for l in meta["links"]],
+                         ["official homepage", "wikidata"])
+
+    def test_wikidata_description_survives_a_missing_article(self):
+        """A3: the one-liner is the whole point — it exists for entities that
+        have no Wikipedia article at all."""
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get",
+                   side_effect=self._wiki_responses(has_article=False)):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            meta = bot.meta_for_artist("a-mbid")
+        self.assertEqual(meta["summary"], "")
+        self.assertEqual(meta["paragraphs"], [])
+        self.assertEqual(meta["wikidataDescription"], "English rock band")
+        self.assertEqual(meta["source"], {})
+
+    def test_a_bare_wikipedia_url_rel_is_used_when_wikidata_is_absent(self):
+        rels = {"name": "X", "relations": [
+            {"type": "wikipedia",
+             "url": {"resource": "https://en.wikipedia.org/wiki/Some_Band"}}]}
+        seen = {}
+
+        def fake_wiki(url, params):
+            seen.update(params)
+            return {"query": {"pages": {"1": {
+                "title": "Some Band", "extract": "A band.\n"}}}}
+
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=fake_wiki):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                rels if params and params.get("inc") == "url-rels" else {})
+            meta = bot.meta_for_artist("a-mbid")
+        self.assertEqual(seen.get("titles"), "Some Band")
+        self.assertEqual(meta["summary"], "A band.")
+
+    def test_no_wikipedia_article_answers_empty_rather_than_raising(self):
+        with patch("listenbrainz_bot.mbz_get", return_value={}), \
+             patch("listenbrainz_bot._wiki_get", return_value={}):
+            meta = bot.meta_for_artist("obscure-mbid")
+        self.assertEqual(meta["summary"], "")
+        self.assertEqual(meta["paragraphs"], [])
+        self.assertEqual(meta["links"], [])
+        self.assertEqual(meta["mbid"], "obscure-mbid")
+
+    def test_paragraphs_are_capped_for_the_hub_response_ceiling(self):
+        long_extract = "\n".join(f"Paragraph {i}." for i in range(30))
+
+        def fake_wiki(url, params):
+            if params.get("action") == "wbgetentities":
+                return {"entities": {"Q45188": {
+                    "sitelinks": {"enwiki": {"title": "T"}}, "descriptions": {}}}}
+            return {"query": {"pages": {"1": {"title": "T",
+                                              "extract": long_extract}}}}
+
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=fake_wiki):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            meta = bot.meta_for_artist("a-mbid")
+        self.assertEqual(len(meta["paragraphs"]), bot.META_MAX_PARAGRAPHS)
+
+    # -- relations and credits ----------------------------------------------
+
+    def test_artist_relations_are_bucketed_and_name_the_other_end(self):
+        rels_by_inc = {
+            "url-rels": self.URL_RELS,
+            "artist-rels": {"relations": [
+                {"type": "member of band", "direction": "backward",
+                 "begin": "1985-01-01", "ended": False,
+                 "artist": {"id": "m1", "name": "Thom Yorke"}},
+                {"type": "collaboration",
+                 "artist": {"id": "c1", "name": "Atoms for Peace"}},
+                {"type": "wikidata", "artist": {"id": "x", "name": "Ignored"}},
+            ]},
+        }
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=self._wiki_responses()):
+            mbz.side_effect = lambda path, params=None, **kw: rels_by_inc.get(
+                (params or {}).get("inc", ""), {})
+            meta = bot.meta_for_artist("a-mbid")
+        self.assertEqual([m["name"] for m in meta["relations"]["members"]],
+                         ["Thom Yorke"])
+        self.assertEqual(meta["relations"]["members"][0]["begin"], "1985")
+        self.assertEqual([r["name"] for r in meta["relations"]["related"]],
+                         ["Atoms for Peace"])
+
+    def test_band_members_are_collapsed_to_one_row_each(self):
+        """MusicBrainz states one relation per instrument and per stint, so a
+        live run showed "Colin Greenwood" four times in a row."""
+        rels_by_inc = {
+            "url-rels": self.URL_RELS,
+            "artist-rels": {"relations": [
+                {"type": "member of band", "begin": "1991", "end": "1995",
+                 "ended": True, "attributes": ["bass guitar"],
+                 "artist": {"id": "m1", "name": "Colin Greenwood"}},
+                {"type": "member of band", "begin": "1985", "ended": False,
+                 "attributes": ["keyboard"],
+                 "artist": {"id": "m1", "name": "Colin Greenwood"}},
+                {"type": "member of band", "begin": "1985", "ended": False,
+                 "attributes": ["guitar"],
+                 "artist": {"id": "m2", "name": "Jonny Greenwood"}},
+            ]},
+        }
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=self._wiki_responses()):
+            mbz.side_effect = lambda path, params=None, **kw: rels_by_inc.get(
+                (params or {}).get("inc", ""), {})
+            members = bot.meta_for_artist("a-mbid")["relations"]["members"]
+        self.assertEqual([m["name"] for m in members],
+                         ["Colin Greenwood", "Jonny Greenwood"])
+        colin = members[0]
+        self.assertEqual(colin["attributes"], ["bass guitar", "keyboard"])
+        # Earliest stint wins, and an open one means they have not left.
+        self.assertEqual(colin["begin"], "1985")
+        self.assertFalse(colin["ended"])
+        self.assertEqual(colin["end"], "")
+
+    def test_links_are_capped_per_label(self):
+        """A well-tagged artist carries a purchase relation per storefront; a
+        live run rendered five identical `Buy` chips in a row.
+
+        Capped on the *label*, not the relation type: `free streaming` and
+        `streaming` are two types sharing one label, and a per-type cap still
+        let `Stream` through four times."""
+        rels = {"name": "X", "relations": [
+            {"type": "purchase for download",
+             "url": {"resource": f"https://shop{i}.example/"}}
+            for i in range(5)
+        ] + [
+            {"type": "free streaming", "url": {"resource": "https://s1.example/"}},
+            {"type": "free streaming", "url": {"resource": "https://s2.example/"}},
+            {"type": "streaming", "url": {"resource": "https://s3.example/"}},
+        ] + [
+            {"type": "official homepage", "url": {"resource": "https://x.example/"}},
+            # The same URL stated twice must also collapse.
+            {"type": "discogs", "url": {"resource": "https://discogs.example/x"}},
+            {"type": "discogs", "url": {"resource": "https://discogs.example/x"}},
+        ]}
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", return_value={}):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                rels if params and params.get("inc") == "url-rels" else {})
+            links = bot.meta_for_artist("a-mbid")["links"]
+        self.assertEqual(
+            [l["label"] for l in links],
+            ["Official site", "Discogs", "Buy", "Buy", "Stream", "Stream"])
+
+    def test_album_credits_collapse_roles_per_person(self):
+        release_rels = {"relations": [
+            {"type": "producer", "artist": {"id": "p1", "name": "Nigel Godrich"}},
+            {"type": "engineer", "artist": {"id": "p1", "name": "Nigel Godrich"}},
+            {"type": "recording", "artist": {"id": "", "name": ""}},
+        ]}
+
+        def fake_mbz(path, params=None, **kw):
+            if path.startswith("release-group/"):
+                return {"title": "OK Computer", "relations": [],
+                        "first-release-date": "1997-05-21"}
+            if path.startswith("release/"):
+                return release_rels
+            return {}
+
+        with patch("listenbrainz_bot.mbz_get", side_effect=fake_mbz), \
+             patch("listenbrainz_bot._wiki_get", return_value={}):
+            meta = bot.meta_for_album("rg-1", release_mbid="rel-1")
+        self.assertEqual(meta["credits"],
+                         [{"mbid": "p1", "name": "Nigel Godrich",
+                           "roles": ["producer", "engineer"]}])
+        self.assertEqual(meta["title"], "OK Computer")
+        self.assertEqual(meta["firstReleased"], "1997-05-21")
+
+    def test_album_credits_failure_degrades_to_empty(self):
+        def fake_mbz(path, params=None, **kw):
+            if path.startswith("release-group/"):
+                return {"title": "T", "relations": []}
+            raise RuntimeError("MusicBrainz is having a bad afternoon")
+
+        with patch("listenbrainz_bot.mbz_get", side_effect=fake_mbz), \
+             patch("listenbrainz_bot._wiki_get", return_value={}):
+            meta = bot.meta_for_album("rg-1")
+        self.assertEqual(meta["credits"], [])
+        self.assertEqual(meta["title"], "T")
+
+    # -- caching -------------------------------------------------------------
+
+    def test_a_hit_is_cached_and_the_second_call_asks_nobody(self):
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get",
+                   side_effect=self._wiki_responses()) as wiki:
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            first = bot.meta_for_artist("a-mbid")
+            calls_after_first = (mbz.call_count, wiki.call_count)
+            second = bot.meta_for_artist("a-mbid")
+            self.assertEqual((mbz.call_count, wiki.call_count), calls_after_first)
+        self.assertEqual(first["summary"], second["summary"])
+
+    def test_refresh_bypasses_the_cache(self):
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=self._wiki_responses()):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            bot.meta_for_artist("a-mbid")
+            before = mbz.call_count
+            bot.meta_for_artist("a-mbid", refresh=True)
+            self.assertGreater(mbz.call_count, before)
+
+    def test_a_miss_is_cached_too_but_expires_sooner(self):
+        """"No article" must not cost a MusicBrainz second on every page open —
+        and must still be re-asked well before a hit would be."""
+        with patch("listenbrainz_bot.mbz_get", return_value={}) as mbz, \
+             patch("listenbrainz_bot._wiki_get", return_value={}):
+            bot.meta_for_artist("obscure")
+            self.assertEqual(mbz.call_count, 2)   # url-rels + artist-rels
+            bot.meta_for_artist("obscure")
+            self.assertEqual(mbz.call_count, 2)   # served from the negative cache
+
+        conn = bot._index_db()
+        row = conn.execute(
+            "SELECT ok, fetched_at FROM meta WHERE kind='artist' AND mbid='obscure'"
+        ).fetchone()
+        self.assertEqual(row["ok"], 0)
+        # Age it past the negative TTL but well inside the positive one.
+        aged = time.time() - (bot.META_TTL_EMPTY + 60)
+        self.assertLess(bot.META_TTL_EMPTY + 60, bot.META_TTL_OK)
+        conn.execute("UPDATE meta SET fetched_at = ? WHERE mbid = 'obscure'", (aged,))
+        conn.commit()
+        self.assertIsNone(bot._meta_cache_read("artist", "obscure"))
+
+    def test_a_hit_survives_past_the_negative_ttl(self):
+        with patch("listenbrainz_bot.mbz_get") as mbz, \
+             patch("listenbrainz_bot._wiki_get", side_effect=self._wiki_responses()):
+            mbz.side_effect = lambda path, params=None, **kw: (
+                self.URL_RELS if params and params.get("inc") == "url-rels" else {})
+            bot.meta_for_artist("a-mbid")
+        conn = bot._index_db()
+        conn.execute("UPDATE meta SET fetched_at = ?",
+                     (time.time() - (bot.META_TTL_EMPTY + 60),))
+        conn.commit()
+        self.assertIsNotNone(bot._meta_cache_read("artist", "a-mbid"))
+
+    # -- migration -----------------------------------------------------------
+
+    def test_meta_table_is_added_to_an_existing_index_db(self):
+        """The additive migration on a DB built before the meta table existed —
+        and INDEX_SCAN_VERSION is not what gates it, so no rescan is forced."""
+        import sqlite3
+        old = sqlite3.connect(self.db_path)
+        old.executescript("""
+            CREATE TABLE artists (
+              artist_key TEXT PRIMARY KEY, artist_mbid TEXT NOT NULL DEFAULT '',
+              nd_artist_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
+              scanned_at REAL NOT NULL DEFAULT 0,
+              scan_version INTEGER NOT NULL DEFAULT 1);
+            INSERT INTO artists (artist_key, name, scan_version)
+              VALUES ('nd:1', 'Pre-existing', 2);
+        """)
+        old.commit()
+        old.close()
+        bot._index_conn = None
+
+        conn = bot._index_db()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("meta", tables)
+        # The pre-existing rows, and their scan_version, are untouched.
+        row = conn.execute("SELECT name, scan_version FROM artists").fetchone()
+        self.assertEqual((row["name"], row["scan_version"]), ("Pre-existing", 2))
+
+        bot._meta_cache_write("artist", "m1", {"summary": "hi"}, True)
+        self.assertEqual(bot._meta_cache_read("artist", "m1"), {"summary": "hi"})
+
+    def test_wiki_get_never_touches_the_musicbrainz_rate_limit_budget(self):
+        """Constraint that will bite if ignored: `_mbz_lock` is a hard global
+        1 req/sec that is the discography scanner's entire budget. Two Wikimedia
+        calls behind it would cost every artist page two scan-seconds."""
+        import ast
+        import inspect
+        src = inspect.getsource(bot._wiki_get)
+        tree = ast.parse(textwrap.dedent(src))
+        # The docstring explains the rule and names both, so assert against the
+        # body rather than the source text.
+        body = ast.get_docstring(tree.body[0], clean=False)
+        code = textwrap.dedent(src).replace(body or "", "")
+        self.assertNotIn("_mbz_lock", code)
+        self.assertNotIn("mbz_get(", code)
+        self.assertIn("User-Agent", code)
 
 
 if __name__ == "__main__":

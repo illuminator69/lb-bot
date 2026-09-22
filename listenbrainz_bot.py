@@ -3693,6 +3693,33 @@ def _touch(path: str) -> bool:
         print(f"  touch failed for {path}: {e}")
         return False
 
+def _place_file(src: str, dest: str) -> None:
+    """Move a downloaded file into the library, leaving it owned by the library's
+    conventions rather than the downloader's.
+
+    Three steps, none of them optional:
+
+    - `copy_function=copyfile`, not the default `copy2`: `/downloads` and `/music`
+      are separate mounts, so this move is always a copy, and `copy2`'s `copystat`
+      would stamp slskd's mode bits and mtime onto the new file — defeating the
+      umask and leaving the track looking as old as its download. `copyfile`
+      creates it fresh instead.
+    - An explicit `chmod`, because a *same-filesystem* move is an `os.rename`,
+      which preserves the source mtime **and mode** whatever `copy_function` says
+      — slskd writes 0644/0444, so without this the placed track is read-only to
+      the users group. This is also the only step that holds on a dev box, where
+      both paths are usually on one filesystem.
+    - `_touch`, so the track carries a current mtime for Navidrome's
+      newest-by-modtime sort.
+
+    Raises whatever `shutil.move` raises; the chmod and touch are best-effort."""
+    shutil.move(src, dest, copy_function=shutil.copyfile)
+    try:
+        os.chmod(dest, 0o664)
+    except Exception as e:
+        print(f"  chmod failed for {dest}: {e}")
+    _touch(dest)
+
 def _norm_album_text(value: str) -> str:
     value = (value or "").lower()
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
@@ -4980,6 +5007,24 @@ def _index_db():
               mbids       TEXT NOT NULL DEFAULT '',
               scanned_at  REAL NOT NULL DEFAULT 0
             );
+            -- Editorial metadata (Wikipedia/Wikidata lead text, MusicBrainz
+            -- credits/relations/links) per entity. A separate additive table
+            -- rather than columns on release_groups, because it is also keyed
+            -- by artist mbid and by release-groups the library does not own.
+            -- INDEX_SCAN_VERSION is deliberately NOT bumped for this: it gates
+            -- the discography matcher, and bumping it forces a full rescan of
+            -- every artist for a cache that can simply be cold.
+            -- `payload` is the whole wire response as JSON; `ok` distinguishes
+            -- "we looked and there is nothing" (a legitimate, cacheable answer
+            -- on a shorter TTL) from a real hit.
+            CREATE TABLE IF NOT EXISTS meta (
+              kind        TEXT NOT NULL,          -- 'artist' | 'album'
+              mbid        TEXT NOT NULL,          -- artist mbid, or release-group mbid
+              payload     TEXT NOT NULL DEFAULT '{}',
+              ok          INTEGER NOT NULL DEFAULT 0,
+              fetched_at  REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY (kind, mbid)
+            );
             PRAGMA user_version = 1;
         """)
         # CREATE TABLE IF NOT EXISTS never adds a column to a DB that already
@@ -5489,6 +5534,448 @@ def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | N
 # those are statements of intent, not claims about the library.
 _STALE_ON_RESCAN_DECISIONS = ("placed", "queued", "downloading", "verified",
                               "navidrome_pending", "navidrome_verified")
+
+# ---------------------------------------------------------------------------
+# EDITORIAL METADATA  (artist/album "About", credits, relations, links)
+# ---------------------------------------------------------------------------
+# Resolution chain, per entity:
+#   MusicBrainz  artist/{mbid}?inc=url-rels   (or release-group/{rgid})
+#     -> the `wikidata` url-relation -> a Q-id
+#     -> Wikidata wbgetentities props=sitelinks|descriptions
+#          -> the one-line description ("English rock band formed in 1985")
+#          -> the enwiki page title
+#     -> Wikipedia action=query prop=extracts -> the real, full-length text
+# Plus, off the same url-rels, the external-links row for free.
+#
+# Why here and not as a Navidrome metadata-agent plugin: this also has to serve
+# the *virtual* artist/album pages for releases that are not in Navidrome at
+# all, and a Navidrome agent by definition only knows about the library.
+
+WIKIDATA_API   = "https://www.wikidata.org/w/api.php"
+WIKI_LANG      = "en"
+# Wikimedia's ToS requires a descriptive User-Agent with a contact; requests
+# with a generic/absent one are rate-limited or refused outright.
+WIKI_USER_AGENT = f"listenbrainz-bot/1.0 (navi-connect; {MBZ_CONTACT or 'no-contact-configured'})"
+WIKI_LICENSE   = "CC BY-SA 4.0"
+# The hub proxies /lb/meta/* with PROXY_MAX_RESPONSE = 4 MB and answers an
+# oversize body with 502 tooLarge, which is correct but user-visible. A long
+# Wikipedia article trivially exceeds a sane payload, so cap server-side.
+META_MAX_PARAGRAPHS = 6
+META_MAX_CHARS      = 12000
+META_MAX_CREDITS    = 60
+META_MAX_RELATIONS  = 40
+META_MAX_LINKS      = 16
+# A hit is durable (articles change slowly). A miss is cached too — "this
+# artist has no Wikipedia article" is a legitimate answer and must not cost a
+# MusicBrainz second on every page open — but on a shorter TTL, so an article
+# written next month is picked up without a manual purge.
+META_TTL_OK    = 30 * 86400
+META_TTL_EMPTY = 7 * 86400
+
+_wiki_cache: dict = {}         # "url?sortedparams" -> response json (process-lifetime)
+_WIKI_CACHE_MAX = 512
+
+def _wiki_get(url: str, params: dict) -> dict:
+    """GET a Wikimedia API endpoint.
+
+    Deliberately NOT routed through `mbz_get`. That function holds `_mbz_lock`
+    across a hard global 1 req/sec sleep, which is the discography scanner's
+    entire budget — putting two Wikimedia calls behind it would make every
+    artist page open steal two seconds of scan throughput for a service that
+    does not ask for that pacing. This has its own cache and its own Session
+    (`_http` pools per host), and a failure is never fatal: no article is a
+    normal outcome here, so everything returns {}.
+    """
+    key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    hit = _wiki_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        r = _http.get(url, params={**params, "format": "json"},
+                      headers={"User-Agent": WIKI_USER_AGENT}, timeout=10)
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception as e:
+        print(f"  wiki error [{url}]: {e}")
+        return {}
+    if len(_wiki_cache) >= _WIKI_CACHE_MAX:
+        _wiki_cache.pop(next(iter(_wiki_cache)))
+    _wiki_cache[key] = data
+    return data
+
+# url-rel types worth showing as a links row, in display order. Anything not
+# listed is dropped rather than rendered as a raw type name.
+_META_LINK_TYPES = {
+    "official homepage": "Official site",
+    "wikipedia":         "Wikipedia",
+    "wikidata":          "Wikidata",
+    "bandcamp":          "Bandcamp",
+    "discogs":           "Discogs",
+    "allmusic":          "AllMusic",
+    "last.fm":           "Last.fm",
+    "youtube":           "YouTube",
+    "soundcloud":        "SoundCloud",
+    "purchase for download": "Buy",
+    "free streaming":    "Stream",
+    "streaming":         "Stream",
+}
+_META_LINK_ORDER = list(_META_LINK_TYPES)
+
+# Per *label*, not per relation type. A well-tagged artist carries a
+# "purchase for download" relation per storefront, which rendered as five
+# identical `Buy` chips in a row — the links row is a way out of the app, not a
+# directory. Keyed on the label because two distinct types (`free streaming`
+# and `streaming`) share one, so a per-type cap still let `Stream` through four
+# times; that is what a live run against Radiohead actually showed.
+META_MAX_LINKS_PER_LABEL = 2
+
+def _meta_links_from_rels(relations: list) -> list:
+    """[{type, label, url}] from MusicBrainz url-relations, de-duplicated.
+
+    De-duplicated twice over: by URL (the same link can be stated by more than
+    one relation), and then capped per *label*, because several distinct URLs —
+    and even several distinct relation types — can share one, and a row of
+    identical chips reads as a bug.
+    """
+    seen, out = set(), []
+    per_label: dict = {}
+    for rel in relations or []:
+        rtype = (rel.get("type") or "").lower()
+        label = _META_LINK_TYPES.get(rtype)
+        if not label:
+            continue
+        url = ((rel.get("url") or {}).get("resource") or "").strip()
+        if not url or url in seen:
+            continue
+        if per_label.get(label, 0) >= META_MAX_LINKS_PER_LABEL:
+            continue
+        seen.add(url)
+        per_label[label] = per_label.get(label, 0) + 1
+        out.append({"type": rtype, "label": label, "url": url})
+    out.sort(key=lambda l: _META_LINK_ORDER.index(l["type"]))
+    return out[:META_MAX_LINKS]
+
+def _wikidata_qid_from_rels(relations: list) -> str:
+    for rel in relations or []:
+        if (rel.get("type") or "").lower() != "wikidata":
+            continue
+        url = ((rel.get("url") or {}).get("resource") or "")
+        qid = url.rstrip("/").rsplit("/", 1)[-1]
+        if qid.startswith("Q"):
+            return qid
+    return ""
+
+def _wikipedia_title_from_rels(relations: list) -> str:
+    """Fallback when there is no wikidata relation: some entities still carry a
+    direct `wikipedia` url-rel (the older convention MusicBrainz migrated away
+    from, so it survives mostly on entities nobody has touched since)."""
+    for rel in relations or []:
+        if (rel.get("type") or "").lower() != "wikipedia":
+            continue
+        url = ((rel.get("url") or {}).get("resource") or "")
+        if f"//{WIKI_LANG}.wikipedia.org/wiki/" not in url:
+            continue
+        title = url.rsplit("/wiki/", 1)[-1]
+        if title:
+            return urllib.parse.unquote(title).replace("_", " ")
+    return ""
+
+def _wikidata_lookup(qid: str) -> dict:
+    """{description, title} — the one-line Wikidata description (A3, present
+    even for entities with no article at all) and the enwiki page title."""
+    if not qid:
+        return {}
+    data = _wiki_get(WIKIDATA_API, {
+        "action": "wbgetentities", "ids": qid,
+        "props": "sitelinks|descriptions",
+        "languages": WIKI_LANG, "sitefilter": f"{WIKI_LANG}wiki",
+    })
+    ent = ((data.get("entities") or {}).get(qid) or {})
+    desc = ((ent.get("descriptions") or {}).get(WIKI_LANG) or {}).get("value", "")
+    title = ((ent.get("sitelinks") or {}).get(f"{WIKI_LANG}wiki") or {}).get("title", "")
+    return {"description": desc, "title": title}
+
+def _wikipedia_extract(title: str) -> dict:
+    """{summary, paragraphs[], url, imageUrl} for an article title.
+
+    One request: plain-text extract plus the page thumbnail. `redirects=1` so a
+    Wikidata sitelink pointing at a redirect still resolves.
+    """
+    if not title:
+        return {}
+    data = _wiki_get(f"https://{WIKI_LANG}.wikipedia.org/w/api.php", {
+        "action": "query", "prop": "extracts|pageimages", "redirects": "1",
+        "explaintext": "1", "exsectionformat": "plain",
+        "piprop": "thumbnail", "pithumbsize": "500",
+        "titles": title,
+    })
+    pages = ((data.get("query") or {}).get("pages") or {})
+    page = next((p for p in pages.values() if "missing" not in p), None)
+    if not page:
+        return {}
+    text = (page.get("extract") or "").strip()
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    # Section headings survive as bare lines in an explaintext extract; the
+    # About panel wants prose, not an orphaned "== Career ==".
+    paragraphs = [p for p in paragraphs if not p.startswith("=")]
+    paragraphs = paragraphs[:META_MAX_PARAGRAPHS]
+    total = 0
+    capped = []
+    for p in paragraphs:
+        if total + len(p) > META_MAX_CHARS:
+            break
+        capped.append(p)
+        total += len(p)
+    resolved = page.get("title") or title
+    return {
+        "summary":    capped[0] if capped else "",
+        "paragraphs": capped,
+        "url":        f"https://{WIKI_LANG}.wikipedia.org/wiki/"
+                      + urllib.parse.quote(resolved.replace(" ", "_")),
+        "imageUrl":   ((page.get("thumbnail") or {}).get("source") or ""),
+        "title":      resolved,
+    }
+
+def _meta_text_from_rels(relations: list) -> dict:
+    """The Wikidata -> Wikipedia half of the chain, shared by artist and album."""
+    qid   = _wikidata_qid_from_rels(relations)
+    wd    = _wikidata_lookup(qid)
+    title = wd.get("title") or _wikipedia_title_from_rels(relations)
+    wp    = _wikipedia_extract(title)
+    out = {
+        "wikidataQid":         qid,
+        "wikidataDescription": wd.get("description", ""),
+        "summary":             wp.get("summary", ""),
+        "paragraphs":          wp.get("paragraphs", []),
+        "imageUrl":            wp.get("imageUrl", ""),
+        "source":              {},
+    }
+    if wp.get("url"):
+        out["source"] = {"name": "Wikipedia", "url": wp["url"],
+                         "license": WIKI_LICENSE, "title": wp.get("title", "")}
+    return out
+
+# MusicBrainz artist-artist relation types worth surfacing, mapped to the
+# section a client files them under (A5).
+_META_ARTIST_REL_GROUPS = {
+    "member of band":    "members",
+    "founder":           "members",
+    "collaboration":     "related",
+    "subgroup":          "related",
+    "supporting musician": "related",
+    "is person":         "related",
+    "artist rename":     "related",
+}
+
+def _meta_artist_relations(mbid: str) -> dict:
+    """{members: [...], related: [...]} — the band-members / side-projects graph.
+
+    MusicBrainz states the relation from the *other* side depending on
+    direction, so `direction` decides whether a row means "X is in this band"
+    or "this artist is in X"; both are useful, and both name the other end.
+    """
+    data = mbz_get(f"artist/{mbid}", {"inc": "artist-rels"})
+    out = {"members": [], "related": []}
+    # MusicBrainz states one relation per instrument and per period, so a
+    # four-piece band comes back as a dozen rows and the bass player appears
+    # four times in a row. Collapse to one entry per person, merging the
+    # instrument attributes and widening the date range across their stints.
+    by_person: dict = {}
+    for rel in (data.get("relations") or []):
+        bucket = _META_ARTIST_REL_GROUPS.get((rel.get("type") or "").lower())
+        if not bucket:
+            continue
+        other = rel.get("artist") or {}
+        name = other.get("name") or ""
+        if not name:
+            continue
+        key = (bucket, other.get("id") or name.lower())
+        begin = (rel.get("begin") or "")[:4]
+        end   = (rel.get("end") or "")[:4]
+        attrs = [a for a in (rel.get("attributes") or []) if isinstance(a, str)]
+        row = by_person.get(key)
+        if row is None:
+            if len(out[bucket]) >= META_MAX_RELATIONS:
+                continue
+            row = {
+                "mbid":      other.get("id", ""),
+                "name":      name,
+                "type":      rel.get("type", ""),
+                "direction": rel.get("direction", ""),
+                "begin":     begin,
+                "end":       end,
+                # False the moment any stint is still open: someone who left one
+                # line-up and is in the current one has not "ended".
+                "ended":     bool(rel.get("ended")),
+                "attributes": list(attrs),
+            }
+            by_person[key] = row
+            out[bucket].append(row)
+            continue
+        if begin and (not row["begin"] or begin < row["begin"]):
+            row["begin"] = begin
+        if row["ended"] and not rel.get("ended"):
+            row["ended"] = False
+            row["end"] = ""
+        elif end and row["ended"] and end > row["end"]:
+            row["end"] = end
+        for attr in attrs:
+            if attr not in row["attributes"]:
+                row["attributes"].append(attr)
+    return out
+
+def _meta_release_credits(release_mbid: str) -> list:
+    """[{name, mbid, roles[]}] — producers, engineers, writers, performers.
+
+    One request, `inc=artist-rels work-rels`. Recording-level relations are
+    deliberately NOT requested: they multiply the response by the tracklist and
+    a release with 20 tracks routinely lands in the megabytes, which is the
+    hub's 4 MB ceiling for a section nobody reads per-track.
+    """
+    if not release_mbid:
+        return []
+    data = mbz_get(f"release/{release_mbid}", {"inc": "artist-rels work-rels"})
+    by_artist: dict = {}
+    for rel in (data.get("relations") or []):
+        artist = rel.get("artist") or {}
+        name = artist.get("name") or ""
+        if not name:
+            continue
+        role = (rel.get("type") or "").strip()
+        if not role:
+            continue
+        key = artist.get("id") or name.lower()
+        row = by_artist.setdefault(key, {"mbid": artist.get("id", ""),
+                                         "name": name, "roles": []})
+        if role not in row["roles"]:
+            row["roles"].append(role)
+    return list(by_artist.values())[:META_MAX_CREDITS]
+
+def _meta_wants_refresh() -> bool:
+    """`?refresh=1` on a meta route bypasses the SQLite cache for that entity.
+
+    Flask is imported lazily inside the web server function, so `request` is
+    not available at module scope — and this is also called from non-request
+    code paths, where "no refresh" is the only sane answer.
+    """
+    try:
+        from flask import request, has_request_context
+        if not has_request_context():
+            return False
+        return request.args.get("refresh", "") in ("1", "true", "yes")
+    except Exception:
+        return False
+
+def _meta_cache_read(kind: str, mbid: str) -> dict | None:
+    """The stored payload if it is still inside its TTL, else None."""
+    with _index_lock:
+        conn = _index_db()
+        row = conn.execute(
+            "SELECT payload, ok, fetched_at FROM meta WHERE kind = ? AND mbid = ?",
+            (kind, mbid)).fetchone()
+    if not row:
+        return None
+    ttl = META_TTL_OK if row["ok"] else META_TTL_EMPTY
+    if time.time() - (row["fetched_at"] or 0) > ttl:
+        return None
+    try:
+        return json.loads(row["payload"])
+    except Exception:
+        return None
+
+def _meta_cache_write(kind: str, mbid: str, payload: dict, ok: bool) -> None:
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute(
+                "INSERT INTO meta (kind, mbid, payload, ok, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, mbid) DO UPDATE SET "
+                "payload = excluded.payload, ok = excluded.ok, "
+                "fetched_at = excluded.fetched_at",
+                (kind, mbid, json.dumps(payload), 1 if ok else 0, time.time()))
+            conn.commit()
+    except Exception as e:
+        # A cache that cannot be written is a slow page, not a broken one.
+        print(f"  meta: cache write failed for {kind}/{mbid}: {e}")
+
+def _meta_has_content(payload: dict) -> bool:
+    return bool(payload.get("summary") or payload.get("wikidataDescription")
+                or payload.get("links") or payload.get("credits")
+                or (payload.get("relations") or {}).get("members")
+                or (payload.get("relations") or {}).get("related"))
+
+def meta_for_artist(mbid: str, refresh: bool = False) -> dict:
+    """Editorial metadata for one MusicBrainz artist.
+
+    NOTE on the MusicBrainz leg: `inc=url-rels` is a *different* cache key from
+    the discography path's `inc=releases artist-credits media`, which means it
+    also has its own five-minute `_mbz_fail_until` memory. A failure here does
+    not poison the scanner and a scanner failure does not poison this — but it
+    also means "MusicBrainz just answered me" is no guarantee this call will be
+    tried rather than short-circuited. `strict=False` is correct regardless:
+    "no article" is a legitimate answer and must not raise.
+    """
+    if not mbid:
+        return {}
+    if not refresh:
+        cached = _meta_cache_read("artist", mbid)
+        if cached is not None:
+            return cached
+    data = mbz_get(f"artist/{mbid}", {"inc": "url-rels"})
+    rels = data.get("relations") or []
+    payload = _meta_text_from_rels(rels)
+    payload.update({
+        "mbid":           mbid,
+        "name":           data.get("name", ""),
+        "disambiguation": data.get("disambiguation", ""),
+        "type":           data.get("type", ""),
+        "country":        data.get("country", ""),
+        "links":          _meta_links_from_rels(rels),
+    })
+    try:
+        payload["relations"] = _meta_artist_relations(mbid)
+    except Exception as e:
+        print(f"  meta: artist relations unavailable for {mbid}: {e}")
+        payload["relations"] = {"members": [], "related": []}
+    _meta_cache_write("artist", mbid, payload, _meta_has_content(payload))
+    return payload
+
+def meta_for_album(rgid: str, release_mbid: str = "", refresh: bool = False) -> dict:
+    """Editorial metadata for one MusicBrainz release-group.
+
+    `release_mbid` short-circuits the credits leg's release resolution when the
+    caller already knows the concrete release (the download picker does). Left
+    empty, `mbz_resolve_album` picks the canonical one — which costs two more
+    rate-limited MusicBrainz seconds, so the cached answer matters here.
+    """
+    if not rgid:
+        return {}
+    if not refresh:
+        cached = _meta_cache_read("album", rgid)
+        if cached is not None:
+            return cached
+    data = mbz_get(f"release-group/{rgid}", {"inc": "url-rels artist-credits"})
+    rels = data.get("relations") or []
+    payload = _meta_text_from_rels(rels)
+    payload.update({
+        "rgid":         rgid,
+        "title":        data.get("title", ""),
+        "artist":       _artist_credit_str(data.get("artist-credit")) or "",
+        "firstReleased": data.get("first-release-date", ""),
+        "primaryType":  data.get("primary-type", ""),
+        "links":        _meta_links_from_rels(rels),
+    })
+    try:
+        rel_mbid = release_mbid or (mbz_resolve_album(rgid) or {}).get("release_mbid", "")
+        payload["releaseMbid"] = rel_mbid
+        payload["credits"] = _meta_release_credits(rel_mbid)
+    except Exception as e:
+        print(f"  meta: album credits unavailable for {rgid}: {e}")
+        payload.setdefault("releaseMbid", "")
+        payload["credits"] = []
+    _meta_cache_write("album", rgid, payload, _meta_has_content(payload))
+    return payload
 
 def _inherited_decision(previous: dict, fallback: str = "pending") -> str:
     decision = previous.get("decision", fallback) or fallback
@@ -8295,21 +8782,9 @@ def _deterministic_album_import(album_dir, release_mbid: str,
             stem, dot_ext = os.path.splitext(dest)
             dest = f"{stem}_new{dot_ext}"
         try:
-            # copy_function=copyfile, not the default copy2: /downloads and
-            # /music are separate mounts, so this move is always a copy, and
-            # copy2's copystat would stamp slskd's mode bits and mtime onto the
-            # new file — defeating the umask and leaving the track looking as
-            # old as its download. copyfile creates it fresh instead.
-            shutil.move(path, dest, copy_function=shutil.copyfile)
-            # Explicit, because a same-filesystem move is an os.rename, which
-            # preserves the source mtime *and mode* whatever the copy_function
-            # says — slskd writes 0644/0444, so without this the placed track is
-            # read-only to the users group.
-            try:
-                os.chmod(dest, 0o664)
-            except Exception as e:
-                print(f"  _deterministic_album_import chmod {dest}: {e}")
-            _touch(dest)
+            # Move + mode + mtime in one place — see _place_file for why each
+            # step is load-bearing.
+            _place_file(path, dest)
             # Keep the destination index current so a second copy of this song in
             # the same batch is refused rather than filed alongside it.
             if _dest_sigs["built"]:
@@ -15685,6 +16160,58 @@ def start_web_dashboard() -> None:
                         "presenceKnown": True,
                         "present": sum(1 for t in tracks if t["present"]),
                         "total": len(tracks)})
+
+    @app.get("/api/meta/artist")
+    def api_meta_artist():
+        """Editorial "About" for an artist: full Wikipedia text with
+        attribution, the Wikidata one-liner, band members / side projects, and
+        an external-links row.
+
+        Serves owned artists and the virtual `mb:<mbid>` pages alike — the
+        whole reason this lives in lb-bot rather than in a Navidrome metadata
+        agent, which by definition only knows the library.
+
+        `name` is a convenience for a caller holding no MBID (Navidrome does
+        not always carry one); it costs one extra MusicBrainz search and the
+        first hit wins, so a client that *has* an MBID should always send it.
+        """
+        mbid = request.args.get("mbid", "").strip()
+        name = request.args.get("name", "").strip()
+        if not mbid and not name:
+            return jsonify({"error": "mbid or name is required"}), 400
+        resolved_by = "mbid"
+        if not mbid:
+            candidates = mbz_search_artists(name, 1)
+            if not candidates:
+                # Not an error: an artist MusicBrainz has never heard of has no
+                # editorial metadata, and the client renders nothing.
+                return jsonify({"mbid": "", "name": name, "summary": "",
+                                "paragraphs": [], "links": [], "found": False})
+            mbid = candidates[0].get("mbid", "")
+            resolved_by = "name"
+        payload = dict(meta_for_artist(mbid, refresh=_meta_wants_refresh()))
+        payload["found"] = bool(payload.get("summary")
+                                or payload.get("wikidataDescription"))
+        payload["resolvedBy"] = resolved_by
+        return jsonify(payload)
+
+    @app.get("/api/meta/album")
+    def api_meta_album():
+        """Editorial "About" + credits for a release-group.
+
+        `release_mbid` is optional and only skips the canonical-release
+        resolution the credits leg would otherwise pay two MusicBrainz seconds
+        for; pass it when the caller already knows the concrete release.
+        """
+        rgid = request.args.get("rgid", "").strip()
+        if not rgid:
+            return jsonify({"error": "rgid is required"}), 400
+        payload = dict(meta_for_album(
+            rgid, release_mbid=request.args.get("release_mbid", "").strip(),
+            refresh=_meta_wants_refresh()))
+        payload["found"] = bool(payload.get("summary")
+                                or payload.get("wikidataDescription"))
+        return jsonify(payload)
 
     @app.get("/api/album/similar")
     def api_album_similar():

@@ -3,6 +3,40 @@
 Context for working on this repo with Claude Code. Read this before touching the
 gap-fill / repair pipeline.
 
+## Local dev environment (this workstation, since 2026-09-20)
+
+The repo moved off the Windows box; it now lives at
+`/home/ilya/Documents/navi-connect+lb-bot/Lb-bot-missing`, a sibling of `navi-connect/` and
+`navi-connect-publish/lb-bot/` (the publish clone). Node and pip are dnf-installed system-wide;
+**this project's Python deps are not** — they live in `.venv`, because Fedora's
+`python3-telegram-bot` is 22.8 against our pinned 21.10:
+
+```bash
+.venv/bin/python listenbrainz_bot.py            # deps from requirements.txt, Python 3.14
+.venv/bin/python -m unittest test_album_review  # suite; see the baseline below
+cd web && npm ci && npm run build               # SPA → web/dist (system Node 24, npm not pnpm)
+
+./deploy.sh status                              # what is actually running on the NAS
+./deploy.sh dev                                 # this tree onto the NAS in ~1 min (see Deployment)
+```
+
+Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
+
+**Test baseline:** 197 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
+from before the beets removal (see Decision below). Anything *else* failing is yours.
+
+**Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
+step is load-bearing — read its docstring before changing the placement path. It was extracted
+from `_deterministic_album_import` on 2026-09-20 because
+`test_move_does_not_inherit_source_mtime_or_mode` was re-implementing the move inline and so never
+exercised the chmod: on Windows `/downloads` and `/music` were different volumes, the copy reset
+the mode by accident, and the test passed. On Linux, with both paths on one filesystem,
+`shutil.move` is an `os.rename` that preserves the source's `0o600` — which is exactly the
+production bug the chmod exists to prevent (slskd writes 0644/0444; without it the placed track is
+read-only to the users group).
+
+Line endings: the tree is LF and the repo is `core.autocrlf=input`. Don't reintroduce CRLF.
+
 ## What this is
 
 A single-file Python bot (`listenbrainz_bot.py`, ~10.3k lines) that fills gaps in a
@@ -22,7 +56,9 @@ self-hosted music library. It exposes a Telegram bot **and** a Flask web UI
 
 ### Runtime / Docker
 
-`docker-compose.yml` mounts (host → container):
+`docker-compose.yml` in this repo is **reference only** — nothing runs it (see
+Deployment below). It documents the mounts the live container gets
+(host → container):
 - `/mnt/user/appdata/beets/` → `/beets`
 - `/mnt/user/appdata/lb-bot` → `/config`
 - `/mnt/user/appdata/slskd/downloads` → `/downloads`  (`SLSKD_DOWNLOAD_DIR`)
@@ -48,6 +84,74 @@ placement into pre-existing album folders fails).
 `os.umask()` at import. The image is `python:3.11-slim` with a bare `python`
 CMD — there is no s6/linuxserver init, so a bare `UMASK` var would do nothing.
 
+### Deployment
+
+The live container is **`lb-bot-lb-bot-1`**, started by Unraid's **Compose Manager**
+plugin from its own project dir on the NAS:
+
+```
+/boot/config/plugins/compose.manager/projects/lb-bot/
+    compose.yaml            image: ghcr.io/illuminator69/lb-bot:latest
+    compose.override.yaml   plugin-managed UI labels
+    .env                    the credentials — the only place they live
+```
+
+That `compose.yaml` is near-identical to the repo's, except it pulls the published
+image instead of building. **The repo's `docker-compose.yml` is not what runs**, so
+don't "fix" it to match the NAS, and don't add a local `.env` — compose reads the
+NAS-side one.
+
+The path from an edit here to a running container:
+
+```
+Lb-bot-missing  --release-->  navi-connect-publish/lb-bot  --push main-->  GH Actions
+     (this repo)                 (curated subset, public)                      |
+Unraid Compose Manager  <--pull--  ghcr.io/illuminator69/lb-bot:latest  <-------+
+```
+
+`.github/workflows/docker.yml` lives **only in the publish clone**, not here. It fires
+on push to `main` and tags `:latest` plus `:sha-<short>`, and takes 35–60 s.
+
+That build is where a release stalls, so check it with `./deploy.sh ci` before pulling. Note
+that "the newest run is green" does **not** mean there is anything to pull — the newest run
+is usually the *last* release, and pulling on it silently re-pulls the running image. `ci`
+therefore compares the run's commit against the deployed image's
+`org.opencontainers.image.revision` and says which of the two you are looking at.
+
+`./deploy.sh` drives all of it from the workstation over SSH (host alias `unraid`,
+configured in `~/.ssh/config`; a `unraid` docker context points at its daemon):
+
+| command | does |
+|---|---|
+| `check` / `status` | SSH + remote daemon reachable; running image, its revision and build date |
+| `dev` | builds **this tree** straight onto the NAS daemon under the GHCR tag and recreates the container — ~1 min, skips git/CI entirely |
+| `release` | copies the published file set into the publish clone, then stops — you review, commit and push |
+| `ci` | GHCR build status, compared against what is actually deployed (needs `gh`, logged in) |
+| `pull` | NAS pulls the released image and recreates (also the way to undo a `dev` build) |
+| `logs` / `restart` / `shell` | against the live container |
+
+`dev` is the fast iteration loop; it leaves an **unreleased** image running, so finish with
+`release` + `pull` for anything that should outlive the session.
+
+Two things that make this work, both easy to break:
+
+- **`.dockerignore` must stay tight.** The build context is shipped to the NAS on every
+  `dev` build — and to GitHub on every CI build. Without it, it is ~152 MB (`.venv`,
+  `web/node_modules`, `.git`, design bundles); with it, ~375 kB.
+- **Compose on the NAS is driven over plain `ssh`, not the docker context.** `-f` resolves
+  the compose file *and its `.env`* client-side, and both live on the NAS.
+
+`release` only overwrites files the publish clone already tracks, so the `SESSION-*` /
+`PLAN-*` notes and `design_handoff_lb_bot_frontend/` never leak into the public repo; a new
+source file is reported rather than published silently, so adding one stays deliberate.
+
+**`README.md` and `docs/` in the clone are the clone's own, and `release` skips them.** The
+public README is a curated front page — description, one screenshot, a two-command quick start
+and links — with the architecture, deployment and status notes split into `docs/` there on
+2026-09-22. This tree's `README.md` is the long internal version and always has been: the two
+diverged by ~100 lines and a straight copy would have quietly reverted the public one. Edit the
+public docs in the clone, and don't "fix" the divergence by syncing them.
+
 ### AudioMuse-AI
 
 The bot does **not** call AudioMuse. AudioMuse is run on its own schedule; the
@@ -63,6 +167,63 @@ asks Navidrome for `getAlbumList2?type=newest`) never sees it. With the flag,
 `newest` sorts by `album.updated_at` = *newest* file mtime, which placement now
 stamps to now — so a filled album ranks as recently-added and AudioMuse's
 recent-albums analysis picks it up on its next run.
+
+### Editorial metadata — `GET /api/meta/artist`, `GET /api/meta/album`
+
+The "About" the clients show for an artist or an album: real, attributed,
+full-length text plus credits, relations and external links. Both are
+whitelisted on the hub as `/lb/meta/*`.
+
+**Resolution chain, per entity.** MusicBrainz `?inc=url-rels` → the `wikidata`
+relation → Wikidata `wbgetentities` (`props=sitelinks|descriptions`) → the enwiki
+title and the one-line description → Wikipedia `action=query&prop=extracts`.
+A bare `wikipedia` url-rel is the fallback for entities that predate the Wikidata
+migration. On top of that: `artist?inc=artist-rels` for band members and side
+projects, and `release?inc=artist-rels work-rels` for producer/engineer/writer
+credits. The external-links row falls out of the url-rels already fetched.
+
+It lives here rather than in a Navidrome metadata-agent plugin **because it also
+has to serve the virtual `mb:<mbid>` pages** — an agent by definition only knows
+about releases in the library.
+
+Four constraints that will bite if ignored:
+
+1. **Wikimedia is never routed through `mbz_get`.** That function holds
+   `_mbz_lock` across a hard global 1 req/sec sleep, which is the discography
+   scanner's entire budget; putting two Wikimedia calls behind it would make
+   every artist page cost two scan-seconds. `_wiki_get` has its own cache, its
+   own Session (`_http` pools per host), and the descriptive `User-Agent`
+   Wikimedia's ToS requires.
+2. **The MusicBrainz leg does spend that budget** — one `url-rels` request per
+   entity. Durably cached in `mbz_cache.json`, so it is one-time per entity, but
+   a cold artist page can queue behind a running scan. Keep it to one request.
+3. **`strict=False`, and mind the per-key failure memory.** "No Wikipedia
+   article" is a legitimate answer and a blank result must not raise. But
+   `mbz_get` caches failures against the exact `path?params` key, so
+   `inc=url-rels` carries a *separate* five-minute `MBZ_FAIL_COOLDOWN` memory
+   from the discography path's `inc=releases artist-credits media` — the same
+   trap `SESSION-2026-09-06-fresh-tab-followups` records.
+4. **Cached in SQLite, not another JSON.** An additive `meta(kind, mbid, payload,
+   ok, fetched_at)` table in `library_index.db`, created alongside the existing
+   schema. Positive TTL 30 days, negative 7 so a newly-written article is picked
+   up without a manual purge; `ok` is what distinguishes "we looked and there is
+   nothing" from a hit. **`INDEX_SCAN_VERSION` is deliberately not bumped** — it
+   gates the discography matcher, and bumping it would force a full library
+   rescan for a cache that can simply be cold. `?refresh=1` bypasses the cache
+   for one entity.
+
+Everything is capped server-side (`META_MAX_PARAGRAPHS`, `META_MAX_CHARS`,
+`META_MAX_CREDITS`, `META_MAX_RELATIONS`, `META_MAX_LINKS`): a long Wikipedia
+article otherwise runs past the hub's 4 MB `PROXY_MAX_RESPONSE`, which is
+answered 502 `tooLarge` — correct, but user-visible. Two further caps came out of
+a live run rather than theory: links are capped **per label**
+(`META_MAX_LINKS_PER_LABEL` — two relation types can share one, so a per-type
+cap still let `Stream` through four times), because a well-tagged artist carries
+a purchase relation per storefront and rendered five identical `Buy` chips; and band members
+are collapsed to one row per person, because MusicBrainz states one relation per
+instrument and per stint, so a four-piece came back with the bassist four times.
+Recording-level relations are deliberately **not** requested for credits: they
+multiply the response by the tracklist for a section nobody reads per-track.
 
 ## The goal (confirmed spec)
 

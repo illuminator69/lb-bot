@@ -4932,5 +4932,111 @@ class EditorialMetadataTests(unittest.TestCase):
         self.assertIn("User-Agent", code)
 
 
+
+class AlbumLookupOwnershipTests(unittest.TestCase):
+    """`/api/album/lookup` marks ownership; it does not filter on it.
+
+    The route was MusicBrainz's ranking and nothing else, which is right for the
+    SPA's own Library panel — that is a download form. Put the same rows in a
+    client's search box and the unanswered question becomes a wrong answer: a
+    row captioned "not in your library" about a record the library holds, whose
+    tap opens a download page for an album already on disk. That is the Fresh
+    tab's `releaseAlbumId` bug and the similar-albums shelf's bug, twice paid
+    for. These tests defend the pair of fields that answer it, and the promise
+    that adding them costs no MusicBrainz request.
+    """
+
+    CANDIDATES = [
+        {"rgid": "rg-single", "title": "A Single", "artist": "Band",
+         "primary_type": "single", "year": "2001", "score": 100},
+        {"rgid": "rg-owned", "title": "Owned Record", "artist": "Band",
+         "primary_type": "album", "year": "1999", "score": 90},
+        {"rgid": "rg-unowned", "title": "Stranger", "artist": "Band",
+         "primary_type": "album", "year": "2004", "score": 95},
+    ]
+
+    def _looked_up(self, **kw):
+        with patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[dict(c) for c in self.CANDIDATES]), \
+             patch("listenbrainz_bot._index_owned_rgids",
+                   return_value=kw.get("owned", {"rg-owned"})), \
+             patch("listenbrainz_bot._index_rgid_album_ids",
+                   return_value=kw.get("album_ids", {"rg-owned": "nd-42"})):
+            return bot._album_lookup_marked(kw.get("q", "band owned record"))
+
+    def test_an_owned_release_group_names_the_album_to_open(self):
+        by_rgid = {c["rgid"]: c for c in self._looked_up()}
+        self.assertTrue(by_rgid["rg-owned"]["releaseOwned"])
+        # The id is the whole point: without it a client has only the virtual
+        # album page's redirect, which cannot fire for an album lb-bot filled
+        # itself until the present-row backfill has run.
+        self.assertEqual(by_rgid["rg-owned"]["releaseAlbumId"], "nd-42")
+
+    def test_an_unowned_candidate_survives_and_names_no_album(self):
+        out = self._looked_up()
+        by_rgid = {c["rgid"]: c for c in out}
+        self.assertEqual(len(out), 3,
+                         "every candidate must survive — this route marks, "
+                         "it does not filter")
+        self.assertFalse(by_rgid["rg-unowned"]["releaseOwned"])
+        self.assertEqual(by_rgid["rg-unowned"]["releaseAlbumId"], "")
+
+    def test_an_owned_row_with_no_resolved_album_id_stays_owned(self):
+        """`_index_owned_rgids` counts any non-`missing` row, and a row lb-bot
+        flipped to `present` at placement carries no Navidrome ids until the
+        backfill resolves them. Owned with nowhere to send the tap is a real
+        state — it must not read as unowned, which would offer to fetch a record
+        already on disk."""
+        by_rgid = {c["rgid"]: c for c in self._looked_up(album_ids={})}
+        self.assertTrue(by_rgid["rg-owned"]["releaseOwned"])
+        self.assertEqual(by_rgid["rg-owned"]["releaseAlbumId"], "")
+
+    def test_albums_still_sort_ahead_of_singles(self):
+        """The sort moved out of the route and into the helper; the SPA's
+        Library panel auto-selects `candidates[0]`, so changing it would change
+        which record that form is pointed at."""
+        self.assertEqual([c["rgid"] for c in self._looked_up()],
+                         ["rg-unowned", "rg-owned", "rg-single"])
+
+    def test_the_existing_keys_are_untouched(self):
+        """`primary_type` is snake_case and out of step with the rest of the
+        API, but `web/src/panels/Library.jsx` reads it. This is additive."""
+        first = self._looked_up()[0]
+        for key in ("rgid", "title", "artist", "primary_type", "year", "score"):
+            self.assertIn(key, first)
+        self.assertEqual(first["primary_type"], "album")
+
+    def test_cover_art_comes_from_the_archive_not_from_navidrome(self):
+        """lb-bot's own `/api/cover` is Navidrome art keyed by a Navidrome album
+        id, so it has nothing to serve for a release the library lacks."""
+        by_rgid = {c["rgid"]: c for c in self._looked_up()}
+        self.assertEqual(by_rgid["rg-unowned"]["coverUrl"],
+                         bot.caa_front_url("rg-unowned"))
+
+    def test_a_cold_index_degrades_to_no_badges_rather_than_raising(self):
+        with patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=[dict(c) for c in self.CANDIDATES]), \
+             patch("listenbrainz_bot._index_owned_rgids",
+                   side_effect=RuntimeError("no such table: release_groups")), \
+             patch("listenbrainz_bot._index_rgid_album_ids", return_value={}):
+            out = bot._album_lookup_marked("band")
+        self.assertEqual(len(out), 3)
+        self.assertTrue(all(not c["releaseOwned"] and not c["releaseAlbumId"]
+                            for c in out))
+
+    def test_marking_spends_no_extra_musicbrainz_budget(self):
+        """This route always cost one search against the process-wide 1 req/sec
+        `_mbz_lock`, shared with any running discography scan. Ownership is read
+        from the library index, so it must still cost exactly that one."""
+        called = []
+        with patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}), \
+             patch("listenbrainz_bot._index_owned_rgids", return_value=set()), \
+             patch("listenbrainz_bot._index_rgid_album_ids", return_value={}):
+            bot._album_lookup_marked("band")
+        self.assertEqual(len(called), 1,
+                         "the search itself, and nothing more")
+        self.assertEqual(called[0][0], "release-group")
+
 if __name__ == "__main__":
     unittest.main()

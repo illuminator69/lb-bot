@@ -187,6 +187,38 @@ asks Navidrome for `getAlbumList2?type=newest`) never sees it. With the flag,
 stamps to now — so a filled album ranks as recently-added and AudioMuse's
 recent-albums analysis picks it up on its next run.
 
+### `GET /api/album/lookup` answers ownership, not just a ranking
+
+Free-text MusicBrainz album search, and until 2026-09-23 that was all it was —
+right for this repo's own SPA, where the Library panel is a download form and
+every candidate is something to fetch. It is wrong the moment a *client's search
+box* renders the same rows: "not in your library" said about a record the library
+holds sends the tap to a download page for an album already on disk. That is the
+Fresh tab's `releaseAlbumId` bug and the similar-albums shelf's bug, each paid
+for once.
+
+So `_album_lookup_marked` adds, per candidate, the same release-level pair
+`/api/fresh-releases` established — `releaseOwned` and the `releaseAlbumId`
+behind it — plus a `coverUrl` from the Cover Art Archive (this repo's own
+`/api/cover` is Navidrome art keyed by a Navidrome album id, so it has nothing to
+serve for a release the library lacks). Three things about it:
+
+- **It marks; it does not filter.** Ownership is by release-group id, which is
+  exact, so a client can safely render an owned hit as a library row. The sister
+  rule on `/api/artist/lookup` — never drop a row on ownership — exists because
+  *that* match would be by name, which hides the right artist when two share one.
+- **`releaseAlbumId` may be empty on an owned row.** `_index_owned_rgids` counts
+  any non-`missing` row, and a row flipped to `present` at placement carries no
+  Navidrome ids until `_index_backfill_present_album_ids` runs. Owned with
+  nowhere to send the tap is a real state, not an unowned one.
+- **Marking costs no MusicBrainz request** — both maps come from the library
+  index — so the route's `_mbz_lock` exposure is still the one search it always
+  had. A test asserts exactly one `mbz_get`, because that is the property a
+  careless refactor would quietly lose.
+
+The existing keys are untouched, `primary_type`'s snake_case included: this
+module's own SPA reads them at `web/src/panels/Library.jsx`.
+
 ### Editorial metadata — `GET /api/meta/artist`, `GET /api/meta/album`
 
 The "About" the clients show for an artist or an album: real, attributed,

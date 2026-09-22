@@ -14643,6 +14643,66 @@ def _artist_index_rows() -> list:
 # shelf is "more of what you already have", not a shopping list.
 _SIMILAR_ALBUM_STATUS_RANK = {"complete": 0, "incomplete": 1, "untagged": 2}
 
+def _album_lookup_marked(query: str, limit: int = 8) -> list:
+    """MusicBrainz album search with ownership marked rather than left unanswered.
+
+    `mbz_search_release_groups` returns MusicBrainz's own ranking and knows
+    nothing about this library, which is right for lb-bot's own SPA — that is a
+    download form, and everything on it is a candidate to fetch. It is wrong for
+    a client's search box, where telling the two apart is most of the point: a
+    row captioned "not in your library" about a record the library holds sends
+    the tap to a download page for an album already on disk. That exact mistake
+    has been paid for twice here, on the Fresh tab and on the similar-albums
+    shelf, and both times the fix was this pair of fields.
+
+    So each candidate additionally carries, in the vocabulary
+    `/api/fresh-releases` established:
+      - `releaseOwned`: this release-group is on disk, per the library index.
+      - `releaseAlbumId`: the Navidrome album id behind it, so a row badged
+        "in library" opens the *library* album directly instead of relying on
+        the virtual album page's redirect — which cannot fire for an album
+        lb-bot filled itself until the present-row backfill has run.
+      - `coverUrl`: the Cover Art Archive front. lb-bot's own `/api/cover` is
+        Navidrome art keyed by a Navidrome album id, so it has nothing to say
+        about a release the library lacks.
+
+    Note these are *release-group* rows, so the fields are the release-level
+    pair. `owned` on the other two routes is the **artist**-level bool (on
+    `/api/fresh-releases` it is an explicit alias for `artistOwned`), and reusing
+    that name here would put two different questions under one key.
+
+    The existing keys are untouched, `primary_type`'s snake_case included — the
+    SPA's Library panel reads them and this is purely additive.
+
+    Ownership marking costs **no** MusicBrainz request: both maps come from the
+    library index. This route's `_mbz_lock` exposure stays the one search it
+    always had.
+    """
+    candidates = mbz_search_release_groups(query.replace(" - ", " "), limit)
+    candidates.sort(key=lambda c: (0 if c["primary_type"] == "album" else 1,
+                                   -c["score"]))
+
+    # Best-effort, exactly as on the Fresh feed and the similar-artists row: a
+    # stale index DB degrades to "no badges", never to a 500 on a search box.
+    owned_rgids: set = set()
+    album_id_by_rgid: dict = {}
+    try:
+        owned_rgids = _index_owned_rgids()
+        album_id_by_rgid = _index_rgid_album_ids()
+    except Exception as e:
+        print(f"  album/lookup: ownership enrichment unavailable: {e}")
+
+    out = []
+    for c in candidates:
+        rgid = c.get("rgid") or ""
+        owned = bool(rgid and rgid in owned_rgids)
+        row = dict(c)
+        row["releaseOwned"] = owned
+        row["releaseAlbumId"] = album_id_by_rgid.get(rgid, "") if owned else ""
+        row["coverUrl"] = caa_front_url(rgid) if rgid else ""
+        out.append(row)
+    return out
+
 def _similar_artists_marked(artist_mbid: str, artist_name: str = "",
                             limit: int = 20) -> dict:
     """`similar_artists` with ownership marked rather than filtered out.
@@ -16444,12 +16504,15 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/album/lookup")
     def api_album_lookup():
+        """Free-text album search, with each candidate marked owned or not.
+
+        The ranking is MusicBrainz's; the badges are this library's. See
+        `_album_lookup_marked` for why they are release-level fields and why the
+        existing snake_case keys are left alone."""
         query = request.args.get("q", "").strip()
         if not query:
             return jsonify({"error": "q is required"}), 400
-        candidates = mbz_search_release_groups(query.replace(" - ", " "), 8)
-        candidates.sort(key=lambda c: (0 if c["primary_type"] == "album" else 1, -c["score"]))
-        return jsonify({"candidates": candidates})
+        return jsonify({"candidates": _album_lookup_marked(query)})
 
     @app.get("/api/album/releases")
     def api_album_releases():

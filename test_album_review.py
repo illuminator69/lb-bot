@@ -1,3 +1,4 @@
+import contextlib
 import os
 import tempfile
 import textwrap
@@ -29,6 +30,40 @@ sys.modules.setdefault("telegram", telegram_stub)
 sys.modules.setdefault("telegram.ext", telegram_ext_stub)
 
 import listenbrainz_bot as bot
+
+
+@contextlib.contextmanager
+def isolated_review():
+    """An empty review with its own JSON file and its own library_index.db.
+
+    Review groups are rows in library_index.db, so a test that exercises the
+    review's persistence needs both redirected — otherwise it writes into
+    /config (absent here, so the group write fails) or into the real index.
+    Yields the temp dir.
+    """
+    old_file = bot.REVIEW_FILE
+    old_index, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
+    old_state = bot._review_snapshot()
+    with tempfile.TemporaryDirectory() as td:
+        bot.REVIEW_FILE = os.path.join(td, "review.json")
+        bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
+        bot._index_conn = None
+        with bot._review_lock:
+            bot._review_state = bot._empty_review_state()
+            bot._review_dirty_groups.clear()
+        bot._review_dirty.clear()
+        try:
+            yield td
+        finally:
+            if bot._index_conn is not None:
+                bot._index_conn.close()
+            bot._index_conn = old_conn
+            bot.REVIEW_FILE = old_file
+            bot.LIBRARY_INDEX_FILE = old_index
+            bot._review_dirty.clear()
+            with bot._review_lock:
+                bot._review_state = old_state
+                bot._review_dirty_groups.clear()
 
 
 class AlbumReviewTests(unittest.TestCase):
@@ -79,26 +114,98 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertFalse(preview["ok"])
         self.assertIn("outside /music", preview["blocked"][0])
 
-    def test_review_json_round_trip(self):
-        old_file = bot.REVIEW_FILE
-        old_state = bot._review_snapshot()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                bot.REVIEW_FILE = os.path.join(td, "review.json")
-                with bot._review_lock:
-                    bot._review_state = bot._empty_review_state()
-                    bot._review_state["groups"] = [{"id": "g1", "missing_tracks": []}]
-                # urgent: ordinary saves are coalesced by the background flusher,
-                # so a round-trip assertion has to ask for the synchronous write.
-                bot._save_review_state(urgent=True)
-                with bot._review_lock:
-                    bot._review_state = bot._empty_review_state()
-                bot._load_review_state()
-                self.assertEqual(bot._review_snapshot()["groups"][0]["id"], "g1")
-        finally:
-            bot.REVIEW_FILE = old_file
+    def test_review_round_trip(self):
+        """A group survives a save/restart: rows out of SQLite, the rest out of
+        the JSON. The two halves have to come back together."""
+        with isolated_review():
             with bot._review_lock:
-                bot._review_state = old_state
+                bot._review_state["groups"] = [
+                    {"id": "g1", "artist": "A", "album": "B", "missing_tracks": []}]
+                bot._review_state["searches"] = {"s1": {"id": "s1"}}
+            bot._mark_review_groups_dirty(bot._review_state["groups"])
+            # urgent: ordinary saves are coalesced by the background flusher,
+            # so a round-trip assertion has to ask for the synchronous write.
+            bot._save_review_state(urgent=True)
+            with bot._review_lock:
+                bot._review_state = bot._empty_review_state()
+            bot._load_review_state()
+            self.assertEqual(bot._review_snapshot()["groups"][0]["id"], "g1")
+            self.assertIn("s1", bot._review_snapshot()["searches"])
+
+    def test_groups_are_rows_not_json(self):
+        """The JSON file carries no groups at all — that 18 MB blob, rewritten
+        whole every couple of seconds, is what gave every group one blast
+        radius when a scan replaced the list wrongly."""
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [
+                    {"id": "g1", "artist": "A", "album": "B", "missing_tracks": []}]
+            bot._mark_review_groups_dirty(bot._review_state["groups"])
+            bot._save_review_state(urgent=True)
+            with open(bot.REVIEW_FILE, encoding="utf-8") as fh:
+                on_disk = json.load(fh)
+            self.assertNotIn("groups", on_disk)
+            self.assertNotIn("duplicate_groups", on_disk)
+            self.assertEqual(bot._review_groups_count(), 1)
+
+    def test_a_finished_scan_payload_is_not_written_to_disk(self):
+        """A completed artist-discography task carries its whole scan result —
+        12 MB for one prolific artist, 17.6 MB across the 109 of them in the
+        live file. It is a hand-off to one polling browser tab, so it must not
+        be rewritten to disk forever, nor ride the collection-wide
+        /api/tasks response past the hub's 4 MB cap."""
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["tasks"] = {
+                    "t1": {"id": "t1", "kind": "artist-discography",
+                           "status": "complete", "summary": "done",
+                           "result": {"releases": [{"rgid": "x"}] * 100}},
+                    "t2": {"id": "t2", "kind": "source-search",
+                           "status": "complete"},
+                }
+            on_disk = bot._review_state_for_disk()
+            self.assertNotIn("result", on_disk["tasks"]["t1"])
+            self.assertEqual(on_disk["tasks"]["t1"]["summary"], "done")
+            self.assertNotIn("result", bot._tasks_snapshot()["t1"])
+            # The live row keeps it, and the single-task read still serves it.
+            self.assertIn("result", bot._review_state["tasks"]["t1"])
+            served = bot._tasks_snapshot(include_result=True)["t1"]
+            self.assertEqual(len(served["result"]["releases"]), 100)
+            # ...as a copy: a caller must not reach back into live state.
+            served["result"]["releases"].clear()
+            self.assertEqual(
+                len(bot._review_state["tasks"]["t1"]["result"]["releases"]), 100)
+
+    def test_migration_from_a_pre_sqlite_review_file_runs_once(self):
+        """A review file written before 2026-09-22 carries its groups inline.
+        They are imported once and the key is dropped from the file, so a review
+        the user has since emptied is not refilled on the next restart."""
+        with isolated_review():
+            legacy = dict(bot._empty_review_state())
+            legacy["groups"] = [{"id": "old1", "artist": "A", "album": "B",
+                                 "group_type": "incomplete", "missing_tracks": []}]
+            legacy["duplicate_groups"] = [{"id": "dup1", "artist": "C", "album": "D",
+                                           "group_type": "duplicate"}]
+            with open(bot.REVIEW_FILE, "w", encoding="utf-8") as fh:
+                json.dump(legacy, fh)
+
+            bot._load_review_state()
+            self.assertEqual([g["id"] for g in bot._review_state["groups"]], ["old1"])
+            self.assertEqual([g["id"] for g in bot._review_state["duplicate_groups"]],
+                             ["dup1"])
+            self.assertEqual(bot._review_group_origin(bot._review_state["groups"][0]),
+                             "library")
+            self.assertEqual(bot._review_groups_count(), 2)
+
+            # Restart with the review deliberately emptied.
+            with bot._review_lock:
+                bot._review_state["groups"] = []
+                bot._review_state["duplicate_groups"] = []
+            bot._mark_review_groups_dirty(["old1", "dup1"])
+            bot._save_review_state(urgent=True)
+            bot._load_review_state()
+            self.assertEqual(bot._review_state["groups"], [])
+            self.assertEqual(bot._review_groups_count(), 0)
 
     def test_review_save_is_coalesced_but_stamps_immediately(self):
         """An ordinary save defers the write; updated_at and the memo do not defer.
@@ -108,39 +215,32 @@ class AlbumReviewTests(unittest.TestCase):
         mutation time rather than flush time, so it stays eager — as does
         dropping the per-request snapshot memo.
         """
-        old_file = bot.REVIEW_FILE
-        old_state = bot._review_snapshot()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                bot.REVIEW_FILE = os.path.join(td, "review.json")
-                with bot._review_lock:
-                    bot._review_state = bot._empty_review_state()
-                    bot._review_state["groups"] = [{"id": "g9", "missing_tracks": []}]
-                bot._review_dirty.clear()
-
-                # No flusher thread: prove the deferral without racing it.
-                with patch.object(bot, "_ensure_review_flusher", lambda: None):
-                    bot._save_review_state()
-
-                self.assertTrue(bot._review_dirty.is_set(),
-                                "an ordinary save must mark the state dirty")
-                self.assertFalse(os.path.exists(bot.REVIEW_FILE),
-                                 "an ordinary save must not write synchronously")
-                self.assertGreater(bot._review_state["updated_at"], 0,
-                                   "updated_at must be stamped eagerly")
-
-                # The flusher's body writes it, and clears the flag first so a
-                # mutation arriving mid-dump is not dropped.
-                bot._review_dirty.clear()
-                bot._review_flush_now()
-                self.assertTrue(os.path.exists(bot.REVIEW_FILE))
-                with open(bot.REVIEW_FILE, encoding="utf-8") as fh:
-                    self.assertEqual(json.load(fh)["groups"][0]["id"], "g9")
-        finally:
-            bot.REVIEW_FILE = old_file
-            bot._review_dirty.clear()
+        with isolated_review():
             with bot._review_lock:
-                bot._review_state = old_state
+                bot._review_state["groups"] = [
+                    {"id": "g9", "artist": "A", "album": "B", "missing_tracks": []}]
+            bot._mark_review_groups_dirty(bot._review_state["groups"])
+            bot._review_dirty.clear()
+
+            # No flusher thread: prove the deferral without racing it.
+            with patch.object(bot, "_ensure_review_flusher", lambda: None):
+                bot._save_review_state()
+
+            self.assertTrue(bot._review_dirty.is_set(),
+                            "an ordinary save must mark the state dirty")
+            self.assertFalse(os.path.exists(bot.REVIEW_FILE),
+                             "an ordinary save must not write synchronously")
+            self.assertEqual(bot._review_groups_count(), 0,
+                             "an ordinary save must not write the group row either")
+            self.assertGreater(bot._review_state["updated_at"], 0,
+                               "updated_at must be stamped eagerly")
+
+            # The flusher's body writes it, and clears the flag first so a
+            # mutation arriving mid-dump is not dropped.
+            bot._review_dirty.clear()
+            bot._review_flush_now()
+            self.assertTrue(os.path.exists(bot.REVIEW_FILE))
+            self.assertEqual(bot._review_groups_count(), 1)
 
     def test_review_snapshot_is_a_copy_not_a_reference(self):
         """The read path releases _review_lock before parsing, and must still
@@ -160,6 +260,199 @@ class AlbumReviewTests(unittest.TestCase):
         finally:
             with bot._review_lock:
                 bot._review_state = old_state
+
+    # ---- origin-scoped scans -------------------------------------------
+    #
+    # The bug these exist for: on 2026-09-20 a ListenBrainz playlist scan
+    # replaced the whole review list with its own 97 groups, dropping a
+    # ~3000-group library review. _store_review_groups documented that as
+    # intentional ("callers are full-library rebuilds where groups is the
+    # complete truth"), which was true of scan-all and of neither other caller.
+
+    @staticmethod
+    def _origin_group(gid, origin, artist="A", album="B", **extra):
+        g = {"id": gid, "origin": origin, "artist": artist, "album": album,
+             "artist_key": artist.lower(), "album_key": album.lower(),
+             "canonical_album_id": "", "canonical_mbid": "", "merge_mode": "",
+             "match_mode": "auto", "missing_tracks": [], "messages": []}
+        g.update(extra)
+        return g
+
+    def test_playlist_scan_does_not_touch_library_groups(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            with bot._review_lock:
+                bot._review_state["groups"] = [
+                    self._origin_group(f"lib{i}", "library", album=f"Album {i}")
+                    for i in range(3)]
+            bot._replace_review_groups(
+                "playlist", [self._origin_group("pl1", "playlist", artist="P", album="Q")],
+                "Playlist scan found 1 missing track(s)")
+            groups = bot._review_state["groups"]
+            self.assertEqual([g["id"] for g in groups],
+                             ["lib0", "lib1", "lib2", "pl1"])
+
+    def test_library_scan_does_not_touch_playlist_groups(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            with bot._review_lock:
+                bot._review_state["groups"] = [
+                    self._origin_group("pl1", "playlist", artist="P", album="Q"),
+                    self._origin_group("lib0", "library", album="Stale"),
+                ]
+            bot._replace_review_groups(
+                "library", [self._origin_group("lib1", "library", album="Fresh")],
+                "Found 1 album review group(s)")
+            groups = bot._review_state["groups"]
+            # The playlist row survives; the library row this scan did NOT
+            # re-find is gone, which is what replace-within-an-origin means.
+            self.assertEqual([g["id"] for g in groups], ["pl1", "lib1"])
+
+    def test_a_scan_replaces_only_its_own_origin_repeatedly(self):
+        """Two playlist scans in a row leave one playlist row, not two."""
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            for album in ("First", "Second"):
+                bot._replace_review_groups(
+                    "playlist", [self._origin_group("pl", "playlist", album=album)], "x")
+            self.assertEqual([g["album"] for g in bot._review_state["groups"]],
+                             ["Second"])
+
+    def test_a_playlist_album_the_library_already_lists_folds_in(self):
+        """Group ids are built per origin, so the same album reached two ways
+        has two ids. Without folding, the rail shows it twice."""
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            lib = self._origin_group("lib0", "library", canonical_mbid="rel-1")
+            lib["missing_tracks"] = [{"mbid": "t1", "title": "One",
+                                      "decision": "approved"}]
+            with bot._review_lock:
+                bot._review_state["groups"] = [lib]
+            incoming = self._origin_group("pl1", "playlist", canonical_mbid="rel-1")
+            incoming["missing_tracks"] = [{"mbid": "t1", "title": "One"},
+                                          {"mbid": "t2", "title": "Two"}]
+            bot._replace_review_groups("playlist", [incoming], "x")
+
+            groups = bot._review_state["groups"]
+            self.assertEqual([g["id"] for g in groups], ["lib0"])
+            self.assertEqual([t["title"] for t in groups[0]["missing_tracks"]],
+                             ["One", "Two"])
+            # The track the library group already had keeps the user's decision.
+            self.assertEqual(groups[0]["missing_tracks"][0]["decision"], "approved")
+
+    def test_an_active_repair_job_survives_a_library_scan_as_one_row(self):
+        """_merge_review_groups appends a group for every active repair job, so
+        a library scan both keeps the existing repair row and re-synthesizes
+        one. They must collapse — two rows for one album is the thing origin
+        folding exists to prevent."""
+        job = {"id": "job1", "group_id": "rg1", "artist": "A", "album": "B",
+               "status": "needs_review", "tracks": [], "downloads": [],
+               "source_pools": [], "file_matches": [], "import_attempts": [],
+               "verification": {}, "messages": [], "created_at": 1,
+               "updated_at": 1, "canonical_album_id": "",
+               "canonical_release_mbid": ""}
+        with isolated_review(), patch.object(bot, "repair_jobs", {"job1": job}):
+            bot._replace_review_groups("library", [], "x")
+            first = list(bot._review_state["groups"])
+            self.assertEqual([g["id"] for g in first], ["rg1"])
+            self.assertEqual(bot._review_group_origin(first[0]), "repair")
+
+            # A second library scan must not add a second row for it.
+            bot._replace_review_groups(
+                "library", [self._origin_group("lib0", "library", album="L")], "x")
+            ids = [g["id"] for g in bot._review_state["groups"]]
+            self.assertEqual(sorted(ids), ["lib0", "rg1"])
+
+    def test_a_scan_carries_the_hidden_decision_across(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            with bot._review_lock:
+                bot._review_state["groups"] = [
+                    self._origin_group("lib0", "library", hidden=True)]
+            bot._replace_review_groups(
+                "library", [self._origin_group("lib0", "library")], "x")
+            self.assertTrue(bot._review_state["groups"][0]["hidden"])
+
+    def test_a_library_scan_keeps_stored_searches(self):
+        """scan-all used to rebuild the state from _empty_review_state() and
+        re-attach tasks/operations by hand — `searches` was not on that list."""
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            with bot._review_lock:
+                bot._review_state["searches"] = {"s1": {"id": "s1", "query": "q"}}
+            bot._replace_review_groups("library", [], "x")
+            self.assertIn("s1", bot._review_state["searches"])
+
+    def test_origin_is_inferred_for_groups_that_predate_the_field(self):
+        infer = bot._review_group_origin
+        self.assertEqual(infer({"group_type": "incomplete"}), "library")
+        self.assertEqual(infer({"group_type": "duplicate"}), "library")
+        self.assertEqual(infer({"group_type": "playlist"}), "playlist")
+        self.assertEqual(infer({"group_type": "spotify"}), "spotify")
+        self.assertEqual(infer({"group_type": "repair_job"}), "repair")
+        self.assertEqual(infer({"group_type": "tracks",
+                                "last_action": "spotify"}), "spotify")
+        # An explicit field always wins over the inference.
+        self.assertEqual(infer({"group_type": "incomplete",
+                                "origin": "playlist"}), "playlist")
+
+    def test_finding_a_group_marks_it_for_the_next_flush(self):
+        """Every mutation site gets its group from _find_review_group and
+        modifies it in place, so that fetch is what has to mark it."""
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [self._origin_group("g1", "library")]
+                bot._review_dirty_groups.clear()
+            group = bot._find_review_group("g1")
+            group["hidden"] = True
+            self.assertIn("g1", bot._review_dirty_groups)
+            bot._save_review_state(urgent=True)
+
+            with bot._review_lock:
+                bot._review_state = bot._empty_review_state()
+            bot._load_review_state()
+            self.assertTrue(bot._review_state["groups"][0]["hidden"])
+
+    def test_groups_survive_closing_the_database(self):
+        """A real restart drops the SQLite connection too. WAL means the bytes
+        are only in -wal until then, so reopening is the honest round trip."""
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            bot._replace_review_groups(
+                "library", [self._origin_group("lib0", "library", album="Kept")], "x")
+            bot._find_review_group("lib0")["hidden"] = True
+            bot._save_review_state(urgent=True)
+
+            bot._index_conn.close()
+            bot._index_conn = None
+            with bot._review_lock:
+                bot._review_state = bot._empty_review_state()
+            bot._load_review_state()
+
+            groups = bot._review_state["groups"]
+            self.assertEqual([g["album"] for g in groups], ["Kept"])
+            self.assertTrue(groups[0]["hidden"])
+            self.assertEqual(groups[0]["origin"], "library")
+
+    def test_a_group_dropped_from_the_review_loses_its_row(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            bot._replace_review_groups(
+                "library", [self._origin_group("lib0", "library")], "x")
+            bot._save_review_state(urgent=True)
+            self.assertEqual(bot._review_groups_count(), 1)
+            bot._replace_review_groups("library", [], "x")
+            bot._save_review_state(urgent=True)
+            self.assertEqual(bot._review_groups_count(), 0)
+
+    def test_gaps_view_counts_per_origin(self):
+        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+            with bot._review_lock:
+                bot._review_state["groups"] = [
+                    self._origin_group("lib0", "library", album="L0"),
+                    self._origin_group("lib1", "library", album="L1"),
+                    self._origin_group("pl1", "playlist", album="P1"),
+                ]
+            with patch.object(bot, "_nd_album_artist_map", lambda: {}):
+                view = bot._gaps_view()
+                self.assertEqual(view["origins"], {"library": 2, "playlist": 1})
+                self.assertEqual(view["counts"]["all"], 3)
+                only = bot._gaps_view(origin_filter="playlist")
+                self.assertEqual([i["id"] for i in only["items"]], ["pl1"])
+                # Counts stay whole-corpus so the chips can show every total.
+                self.assertEqual(only["counts"]["all"], 3)
 
     def test_union_review_groups_preserves_dedups_and_carries_fields(self):
         old_file = bot.REVIEW_FILE
@@ -532,15 +825,10 @@ class AlbumReviewTests(unittest.TestCase):
         with bot._source_search_claim("g1") as again:
             self.assertTrue(again)
 
-    def test_disk_state_drops_the_slskd_file_payload(self):
+    def test_stored_group_drops_the_slskd_file_payload(self):
         group = self._source_group(time.time())
         group["source_results"]["folders"][0]["_expanded"] = [{"filename": "x.flac"}]
-        bot._review_state["groups"] = [group]
-        try:
-            on_disk = bot._review_state_for_disk()
-        finally:
-            bot._review_state["groups"] = []
-        fd = on_disk["groups"][0]["source_results"]["folders"][0]
+        fd = bot._review_group_for_disk(group)["source_results"]["folders"][0]
         self.assertNotIn("files", fd)
         self.assertNotIn("_expanded", fd)
         # Ranking metadata survives, and the live object is untouched.
@@ -2723,15 +3011,12 @@ class AlbumReviewTests(unittest.TestCase):
             bot.SLSKD_API_KEY = old_key
             bot._review_state = old_review
 
-    def test_operations_survive_store_review_groups(self):
-        old_review = bot._review_state
-        try:
-            bot._review_state = bot._empty_review_state()
+    def test_operations_survive_a_scan_replacing_its_origin(self):
+        with isolated_review():
             op = bot._operation_create("scan", "Scanning")
-            bot._store_review_groups([], "done")
+            with patch.object(bot, "repair_jobs", {}):
+                bot._replace_review_groups("library", [], "done")
             self.assertIn(op["id"], bot._review_state["operations"])
-        finally:
-            bot._review_state = old_review
 
     def test_move_does_not_inherit_source_mtime_or_mode(self):
         tmp = tempfile.mkdtemp()

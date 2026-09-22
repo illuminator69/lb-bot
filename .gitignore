@@ -1,10 +1,21 @@
 # Runtime / state — not source
 *.blb
+.env
+
+# Written at runtime, next to STATE_FILE. They all land in this directory when
+# LB_BOT_STATE / LB_BOT_REVIEW_FILE / LB_BOT_LIBRARY_INDEX are unset, which is
+# what happens whenever the bot is run straight out of the tree rather than in
+# the container (where they live in /config).
 lb_bot_state.json
 missing_album_review.json
+prefs.json
+mbz_cache.json
+library_index.db
+library_index.db-wal
+library_index.db-shm
+
 __pycache__/
 *.pyc
-.env
 
 # Frontend build output — produced in Docker, not committed
 web/dist/

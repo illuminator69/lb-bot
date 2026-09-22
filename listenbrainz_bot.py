@@ -390,6 +390,25 @@ _review_dirty = threading.Event()
 _review_flush_thread = None
 _review_flush_guard = threading.Lock()
 
+# Review *groups* are rows in library_index.db, not part of the JSON blob, so a
+# flush writes only the ones that changed. Ids land here; the flusher drains
+# them. Guarded by _review_lock, like the state itself.
+#
+# Over-marking is deliberate and cheap (one small row write). Under-marking is a
+# mutation that silently never reaches disk, so every path that hands out a
+# group to be modified marks it — above all _find_review_group, which is how all
+# ~54 of its callers get one.
+_review_dirty_groups: set = set()
+
+def _mark_review_groups_dirty(groups) -> None:
+    if isinstance(groups, dict):
+        groups = [groups]
+    with _review_lock:
+        for group in groups or []:
+            gid = (group or {}).get("id") if isinstance(group, dict) else group
+            if gid:
+                _review_dirty_groups.add(gid)
+
 _uid_counter = 0
 _atomic_write_locks = {}
 _atomic_write_locks_guard = threading.Lock()
@@ -647,6 +666,45 @@ def _web_event_line(entry) -> str:
         return f"{entry.get('ts', '')}  {entry.get('msg', '')}"
     return str(entry)
 
+# Which scan is authoritative for a review group. A scan replaces only its own
+# origin, because that is the only set it actually knows the truth about: a
+# playlist scan knows what that playlist needs and nothing whatsoever about the
+# rest of the library. Replacing all of them is what collapsed a ~3000-group
+# library review into 97 on 2026-09-20.
+REVIEW_ORIGINS = ("library", "playlist", "spotify", "duplicate", "repair")
+
+def _review_group_origin(group: dict) -> str:
+    """This group's origin, inferred when it predates the field.
+
+    Groups written before 2026-09-22 have no `origin`, so every read path has to
+    be able to derive one. `group_type` gets most of the way there; the loose-
+    track groups say only "tracks" and carry their scan in `last_action`.
+    """
+    origin = (group.get("origin") or "").strip()
+    if origin:
+        return origin
+    group_type = group.get("group_type") or ""
+    if group_type in ("playlist", "spotify"):
+        return group_type
+    if group_type == "repair_job":
+        return "repair"
+    if group_type == "tracks":
+        return group.get("last_action") or "playlist"
+    # "incomplete", and a bare "duplicate" from a full-library scan, are both
+    # library rows — the duplicates *scan* keeps its own list.
+    return "library"
+
+def _review_group_identity(group: dict) -> str:
+    """A key for "the same album", stable across origins.
+
+    Group ids are not: a playlist group is sha1("playlist|<release>|<artist>|<album>")
+    while a library group is sha1("<group_type>|<artist_key>|<album_key>|<ids>"),
+    so the same owned-but-incomplete album reached two ways has two ids. Without
+    this, unioning the origins renders it twice.
+    """
+    return (group.get("canonical_mbid") or "").strip() or \
+        f"{group.get('artist_key', '')}|{group.get('album_key', '')}"
+
 def _empty_review_state() -> dict:
     return {
         "version": 1,
@@ -670,64 +728,149 @@ def _empty_review_state() -> dict:
     }
 
 def _load_review_state() -> None:
+    """Restore the review: the JSON half from REVIEW_FILE, groups from SQLite.
+
+    Groups moved into library_index.db on 2026-09-22. A file written before that
+    still carries them inline, so the first start after the upgrade imports them
+    and rewrites the file without them.
+
+    The file's own shape is what says which era it is from — a `groups` key with
+    content means pre-migration — so there is no marker to get out of sync, and
+    the import is one-way for free: once the key is gone there is nothing left
+    to re-import, so a review the user has since emptied stays empty.
+    """
     global _review_state
-    if not REVIEW_FILE or not os.path.exists(REVIEW_FILE):
-        return
-    try:
-        with open(REVIEW_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            raise ValueError("review file root is not an object")
-        with _review_lock:
-            base = _empty_review_state()
-            base.update(data)
-            base.setdefault("groups", [])
-            base.setdefault("duplicate_groups", [])
-            base.setdefault("tasks", {})
-            base.setdefault("searches", {})
-            base.setdefault("operations", {})
-            # Source results are not persisted with their file payload (see
-            # _review_state_for_disk), so a restored list can rank and enqueue
-            # nothing. Drop it and let the album ask for a fresh search rather
-            # than showing sources that turn out to be empty.
+    data = {}
+    if REVIEW_FILE and os.path.exists(REVIEW_FILE):
+        try:
+            with open(REVIEW_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("review file root is not an object")
+        except Exception as e:
+            print(f"  review state load failed: {e}")
+            data = {}
+
+    with _review_lock:
+        base = _empty_review_state()
+        base.update(data)
+        base.setdefault("tasks", {})
+        base.setdefault("searches", {})
+        base.setdefault("operations", {})
+
+        base.setdefault("groups", [])
+        base.setdefault("duplicate_groups", [])
+        imported = len(base["groups"]) + len(base["duplicate_groups"])
+        if imported:
+            # Pre-migration file: what it carries inline is the corpus, and the
+            # import below hands it to the table. Backfill `origin` once, here,
+            # so every later path reads the field directly instead of
+            # re-deriving it; rows out of SQLite already carry it as a column.
             for group in base["groups"]:
-                if (group.get("source_results") or {}).get("folders"):
-                    group.pop("source_results", None)
-            # Threads do not survive a process/container restart. Never let a
-            # persisted "running" flag permanently block the next scan.
-            if base.get("status") == "running":
-                base["status"] = "error"
-                base["message"] = "Previous scan was interrupted by an app restart; it can be started again."
-            now = time.time()
-            for task in base["tasks"].values():
-                if task.get("status") == "running":
-                    task.update({
-                        "status": "error",
-                        "error": "Interrupted by an app restart",
-                        "summary": "Interrupted by an app restart",
-                        "finished_at": now,
-                        "percent": 100,
-                    })
-            for operation in base["operations"].values():
-                if operation.get("status") in ("queued", "running"):
-                    operation.update({
-                        "status": "error",
-                        "error": "Interrupted by an app restart",
-                        "updated_at": now,
-                    })
-            _review_state = base
-        print(f"  review state restored from {REVIEW_FILE} "
-              f"({len(_review_state.get('groups', []))} group(s))")
+                group["origin"] = _review_group_origin(group)
+            for group in base["duplicate_groups"]:
+                group["origin"] = "duplicate"
+        else:
+            try:
+                base["groups"], base["duplicate_groups"] = _review_groups_load()
+            except Exception as e:
+                print(f"  review groups load failed: {e}")
+                base["groups"], base["duplicate_groups"] = [], []
+
+        # Source results are not persisted with their file payload (see
+        # _review_group_for_disk), so a restored list can rank and enqueue
+        # nothing. Drop it and let the album ask for a fresh search rather
+        # than showing sources that turn out to be empty.
+        for group in base["groups"] + base["duplicate_groups"]:
+            if (group.get("source_results") or {}).get("folders"):
+                group.pop("source_results", None)
+
+        # Threads do not survive a process/container restart. Never let a
+        # persisted "running" flag permanently block the next scan.
+        if base.get("status") == "running":
+            base["status"] = "error"
+            base["message"] = "Previous scan was interrupted by an app restart; it can be started again."
+        now = time.time()
+        for task in base["tasks"].values():
+            if task.get("status") == "running":
+                task.update({
+                    "status": "error",
+                    "error": "Interrupted by an app restart",
+                    "summary": "Interrupted by an app restart",
+                    "finished_at": now,
+                    "percent": 100,
+                })
+        for operation in base["operations"].values():
+            if operation.get("status") in ("queued", "running"):
+                operation.update({
+                    "status": "error",
+                    "error": "Interrupted by an app restart",
+                    "updated_at": now,
+                })
+        _review_state = base
+
+    if imported:
+        # Rows first, and only then the file that no longer carries them: if the
+        # row write fails we leave the JSON exactly as it was, so the next start
+        # tries the same migration again rather than losing the corpus.
+        _mark_review_groups_dirty(
+            _review_state["groups"] + _review_state["duplicate_groups"])
+        _review_flush_groups()
+        with _review_lock:
+            still_marked = bool(_review_dirty_groups)
+        if still_marked:
+            print(f"  review group migration failed; keeping {REVIEW_FILE} as it is")
+            return
+        print(f"  review groups migrated into {LIBRARY_INDEX_FILE} "
+              f"({imported} group(s))")
+        _review_flush_now()
+    n_groups = len(_review_state.get("groups", []))
+    n_dups = len(_review_state.get("duplicate_groups", []))
+    if n_groups or n_dups or data:
+        print(f"  review state restored ({n_groups} group(s), "
+              f"{n_dups} duplicate group(s))")
+
+def _review_flush_groups() -> None:
+    """Write the groups marked since the last flush to library_index.db.
+
+    The marked set and a snapshot of what is live are taken together under
+    _review_lock; the SQLite write happens outside it, under _index_lock. A
+    mutation arriving in between re-marks the id for the next round.
+    """
+    with _review_lock:
+        dirty = set(_review_dirty_groups)
+        if not dirty:
+            return
+        _review_dirty_groups.clear()
+        # Serialize here, under the lock. The finished tuples are immutable, so
+        # the SQLite write below is safe outside it — the same reasoning
+        # _review_flush_now applies to its one dump-to-string.
+        writes, seen = [], set()
+        for key in ("groups", "duplicate_groups"):
+            for group in _review_state.get(key) or []:
+                gid = group.get("id")
+                if gid in dirty and gid not in seen:
+                    seen.add(gid)
+                    writes.append(_review_group_row(group))
+        # Marked but no longer live: a scan dropped it, or the user deleted it.
+        drops = [gid for gid in dirty if gid not in seen]
+    try:
+        _review_groups_write(writes, drops)
     except Exception as e:
-        print(f"  review state load failed: {e}")
+        # Put them back: an unwritten group must stay marked, or the mutation
+        # is lost at the next restart with nothing to say so.
+        with _review_lock:
+            _review_dirty_groups.update(dirty)
+        print(f"  review group save failed: {e}")
 
 def _review_flush_now() -> None:
-    """Serialize the review state and write it, holding _review_lock only to dump.
+    """Persist the review: changed groups as rows, the rest as one JSON file.
 
     One dump to a string under the lock *is* the snapshot: nothing can mutate a
     str, so the fsync happens safely outside. The file is machine-only, so
     indent/sort_keys buy nothing and roughly double the bytes written.
     """
+    _review_flush_groups()
     if not REVIEW_FILE:
         return
     try:
@@ -855,26 +998,47 @@ def _install_shutdown_flush() -> None:
 # saves. A restart drops them, which SOURCE_RESULTS_TTL already implies.
 _SOURCE_FOLDER_TRANSIENT = ("files", "_expanded", "_claimed")
 
-def _review_state_for_disk() -> dict:
-    """The review state without the per-search slskd payload.
+def _review_group_for_disk(group: dict) -> dict:
+    """One group without the transient half of its slskd source results.
 
     Shallow copies along the one path that needs rewriting, so this stays
-    cheap — the whole point is to write less, not to deep-copy first. Caller
-    must hold _review_lock.
+    cheap — the whole point is to write less, not to deep-copy first.
     """
-    groups = []
-    for group in _review_state.get("groups", []) or []:
-        src = group.get("source_results") or {}
-        folders = src.get("folders") or []
-        if not folders:
-            groups.append(group)
-            continue
-        thin = dict(group)
-        thin["source_results"] = dict(src, folders=[
-            {k: v for k, v in fd.items() if k not in _SOURCE_FOLDER_TRANSIENT}
-            for fd in folders])
-        groups.append(thin)
-    return dict(_review_state, groups=groups)
+    src = group.get("source_results") or {}
+    folders = src.get("folders") or []
+    if not folders:
+        return group
+    thin = dict(group)
+    thin["source_results"] = dict(src, folders=[
+        {k: v for k, v in fd.items() if k not in _SOURCE_FOLDER_TRANSIENT}
+        for fd in folders])
+    return thin
+
+def _review_state_for_disk() -> dict:
+    """The JSON half of the review state: everything except the groups.
+
+    Groups are rows in library_index.db (see _review_groups_write), so they are
+    dropped here rather than serialized. That is what took this file from ~18 MB
+    to a few hundred KB of tasks, searches, operations and duplicate-file
+    results — all of them small, and all genuinely per-session.
+
+    A finished task's `result` goes the same way. It is the hand-off from a
+    background scan to the one browser tab polling for it — 109 completed
+    artist-discography tasks accounted for 17.6 MB of an 18 MB file, rewritten
+    in full every couple of seconds, for a payload no restart can still deliver
+    to anybody. Stripped here rather than at _task_finish, because until the
+    process ends the poller is real and the payload is live.
+
+    Caller must hold _review_lock.
+    """
+    state = {k: v for k, v in _review_state.items()
+             if k not in ("groups", "duplicate_groups")}
+    tasks = state.get("tasks") or {}
+    if any("result" in task for task in tasks.values()):
+        state["tasks"] = {tid: ({k: v for k, v in task.items() if k != "result"}
+                                if "result" in task else task)
+                          for tid, task in tasks.items()}
+    return state
 
 def _request_scope():
     """Flask's per-request `g`, or None outside a request.
@@ -895,7 +1059,7 @@ def _invalidate_review_snapshot() -> None:
         scope.__dict__.pop("_lb_review_list_snap", None)
         scope.__dict__.pop("_lb_tasks_snap", None)
 
-def _tasks_snapshot() -> dict:
+def _tasks_snapshot(include_result: bool = False) -> dict:
     """Just the task rows, copied — never the whole review state.
 
     `/api/tasks/<id>` is what the SPA polls while a scan or a download runs, and
@@ -906,22 +1070,29 @@ def _tasks_snapshot() -> dict:
     A per-task `dict()` is a complete copy here, not a shortcut: a task row is
     flat scalars (`_task_create`), and the only keys any caller stamps on top of
     it are `group_id`, `release_mbid`, `skip_library` and `total` — all scalars
-    too. **If a nested value is ever added to a task row, this has to become a
-    deep copy**, or a caller could reach back into live state through it.
+    too.
 
-    Same reasoning as `_running_album_download_task` and `_review_list_snapshot`:
-    read the narrow thing under the lock rather than copying everything and
-    discarding 99% of it.
+    `result` is the one exception, and it is why `include_result` exists. A
+    finished artist-discography task carries its whole scan payload there (12 MB
+    for The Beach Boys), so leaving it in a collection-wide snapshot made
+    `/api/tasks` a 17 MB response — past the hub's 4 MB PROXY_MAX_RESPONSE,
+    which answers 502 `tooLarge`. Only `/api/tasks/<id>` needs it, so only that
+    route asks, and it takes the deep copy this docstring has always demanded
+    for a nested value.
     """
     scope = _request_scope()
-    if scope is not None:
+    if scope is not None and not include_result:
         snap = scope.__dict__.get("_lb_tasks_snap")
         if snap is not None:
             return snap
     with _review_lock:
-        snap = {tid: dict(task)
+        snap = {tid: {k: v for k, v in task.items() if k != "result"}
                 for tid, task in (_review_state.get("tasks") or {}).items()}
-    if scope is not None:
+        if include_result:
+            for tid, task in (_review_state.get("tasks") or {}).items():
+                if "result" in task:
+                    snap[tid]["result"] = json.loads(json.dumps(task["result"]))
+    if scope is not None and not include_result:
         scope.__dict__["_lb_tasks_snap"] = snap
     return snap
 
@@ -972,13 +1143,21 @@ def _review_snapshot() -> dict:
 # shows up as a wrong status badge, not an error.
 _GAP_LIST_GROUP_FIELDS = ("id", "canonical_album_id", "artist", "album",
                           "present", "total", "extra", "updated_at",
-                          "hidden", "status")
+                          "hidden", "status", "origin")
 
 def _review_list_snapshot() -> dict:
     """A small copy of the review state carrying only what the list views read.
 
     _gaps_view and _summary_view together render a few scalars per group, and
     used to pay a whole-state deep copy under _review_lock for the privilege.
+
+    Deliberately still read from the in-memory list, not from the review_groups
+    table, even though every field here is now a column. SQLite lags the live
+    state by up to REVIEW_FLUSH_INT, and this is the 2 s poll behind the gap
+    rail: reading the table would make hiding an album, or approving a track,
+    take a couple of seconds to show up in the very list you did it from. The
+    projection below is what made this path cheap (2.8 ms against a 234 ms full
+    copy) and it stays cheap regardless of where the rows live.
     """
     scope = _request_scope()
     if scope is not None:
@@ -2045,6 +2224,7 @@ def _review_group_from_repair_job(job: dict) -> dict:
     return {
         "id": job.get("group_id", job.get("id", "")),
         "group_type": "repair_job",
+        "origin": "repair",
         "artist": job.get("artist", ""),
         "album": job.get("album", ""),
         "artist_key": _norm_album_text(job.get("artist", "")),
@@ -4520,7 +4700,7 @@ def _missing_for_album_records(records: list, canonical_mbid: str,
     }
 
 def _make_review_group(records: list, group_type: str = "duplicate",
-                       canonical_mbid: str = "") -> dict:
+                       canonical_mbid: str = "", origin: str = "library") -> dict:
     records = sorted(records, key=lambda r: (-(int(r.get("songCount") or 0)), r["name"]))
     canonical = records[0]
     artist_key, album_key = _album_group_key({
@@ -4539,6 +4719,10 @@ def _make_review_group(records: list, group_type: str = "duplicate",
     return {
         "id": gid,
         "group_type": group_type,
+        # Which scan owns this row. Not the same thing as group_type: a
+        # full-library scan emits group_type "duplicate" for a multi-record
+        # album and still files it under `groups`, so only the caller knows.
+        "origin": origin,
         "artist": canonical["artist"],
         "album": canonical["name"],
         "artist_key": artist_key,
@@ -4590,7 +4774,7 @@ def build_duplicate_album_review(nd_user: str, nd_pass: str,
             for rec in records:
                 if rec.get("id"):
                     records_out[rec["id"]] = rec
-        groups.append(_make_review_group(records, "duplicate"))
+        groups.append(_make_review_group(records, "duplicate", origin="duplicate"))
     groups.sort(key=lambda g: (g["artist"].lower(), g["album"].lower()))
     return groups
 
@@ -5025,6 +5209,52 @@ def _index_db():
               fetched_at  REAL NOT NULL DEFAULT 0,
               PRIMARY KEY (kind, mbid)
             );
+            -- The album-review working set: one row per group, replacing the
+            -- `groups` list inside missing_album_review.json. That file was a
+            -- single ~18 MB blob rewritten whole every couple of seconds, which
+            -- made every group share one blast radius — a scan with wrong
+            -- replace semantics took all ~3000 of them with it on 2026-09-20.
+            --
+            -- `origin` is which scan owns the row (see REVIEW_ORIGINS); a scan
+            -- deletes and rewrites only its own. `identity` is "the same album"
+            -- across origins, since ids are built per origin.
+            --
+            -- The scalar columns are exactly what the gap *list* renders
+            -- (_GAP_LIST_GROUP_FIELDS) so the 2 s poll never parses `payload`,
+            -- which carries the whole group including every peer's file
+            -- listing. Keep the two in sync.
+            --
+            -- INDEX_SCAN_VERSION is deliberately NOT bumped, for the same
+            -- reason the `meta` table records: it gates the discography
+            -- matcher, and bumping it would force a full rescan of every
+            -- artist for a table that migrates itself.
+            CREATE TABLE IF NOT EXISTS review_groups (
+              id            TEXT PRIMARY KEY,
+              origin        TEXT NOT NULL DEFAULT 'library',
+              identity      TEXT NOT NULL DEFAULT '',
+              artist        TEXT NOT NULL DEFAULT '',
+              album         TEXT NOT NULL DEFAULT '',
+              artist_key    TEXT NOT NULL DEFAULT '',
+              album_key     TEXT NOT NULL DEFAULT '',
+              status        TEXT NOT NULL DEFAULT '',
+              hidden        INTEGER NOT NULL DEFAULT 0,
+              present       INTEGER NOT NULL DEFAULT 0,
+              total         INTEGER NOT NULL DEFAULT 0,
+              extra         INTEGER NOT NULL DEFAULT 0,
+              canonical_album_id TEXT NOT NULL DEFAULT '',
+              updated_at    REAL NOT NULL DEFAULT 0,
+              -- Denormalized for the list view: the only non-scalars _album_view
+              -- reads off a group are the per-track decisions, the match-item
+              -- statuses and how many albums the group covers.
+              decisions      TEXT NOT NULL DEFAULT '[]',
+              match_statuses TEXT NOT NULL DEFAULT '[]',
+              albums_count   INTEGER NOT NULL DEFAULT 0,
+              payload        TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_groups_origin
+              ON review_groups(origin);
+            CREATE INDEX IF NOT EXISTS idx_review_groups_identity
+              ON review_groups(identity);
             PRAGMA user_version = 1;
         """)
         # CREATE TABLE IF NOT EXISTS never adds a column to a DB that already
@@ -5041,6 +5271,98 @@ def _index_db():
 
 def _index_artist_key(artist_mbid: str = "", nd_artist_id: str = "") -> str:
     return artist_mbid or (f"nd:{nd_artist_id}" if nd_artist_id else "")
+
+# ---------------------------------------------------------------------------
+# Review groups in SQLite. The in-memory model is unchanged — callers still get
+# a live dict out of _find_review_group, mutate it in place and call
+# _save_review_state() — but the flush writes marked rows instead of rewriting
+# one multi-megabyte JSON blob.
+# ---------------------------------------------------------------------------
+
+def _review_group_row(group: dict) -> tuple:
+    """A group flattened into its table row. Order matches _REVIEW_GROUP_COLS."""
+    return (
+        group.get("id", ""),
+        _review_group_origin(group),
+        _review_group_identity(group),
+        group.get("artist", ""),
+        group.get("album", ""),
+        group.get("artist_key", ""),
+        group.get("album_key", ""),
+        group.get("status", ""),
+        1 if group.get("hidden") else 0,
+        int(group.get("present") or 0),
+        int(group.get("total") or 0),
+        int(group.get("extra") or 0),
+        group.get("canonical_album_id", ""),
+        float(group.get("updated_at") or 0),
+        json.dumps([t.get("decision", "pending")
+                    for t in (group.get("missing_tracks") or [])]),
+        json.dumps([(m or {}).get("status")
+                    for m in (group.get("match_items") or [])]),
+        len(group.get("albums") or []),
+        json.dumps(_review_group_for_disk(group)),
+    )
+
+_REVIEW_GROUP_COLS = (
+    "id, origin, identity, artist, album, artist_key, album_key, status, "
+    "hidden, present, total, extra, canonical_album_id, updated_at, "
+    "decisions, match_statuses, albums_count, payload")
+# Derived, not written out: a column added to one list and not the other is a
+# silent column/value mismatch at INSERT time.
+_REVIEW_GROUP_PLACEHOLDERS = ",".join("?" * (_REVIEW_GROUP_COLS.count(",") + 1))
+
+def _review_groups_write(writes: list, drops: list) -> None:
+    """Persist prepared rows and drop the ids that are no longer in the review.
+
+    Takes finished tuples rather than group dicts on purpose: a group must be
+    serialized under _review_lock (a row built from a dict another thread is
+    mutating can raise mid-dump), while the SQLite write wants that lock
+    released. See _review_flush_groups, which does the split.
+    """
+    if not writes and not drops:
+        return
+    with _index_lock:
+        conn = _index_db()
+        if writes:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO review_groups ({_REVIEW_GROUP_COLS}) "
+                f"VALUES ({_REVIEW_GROUP_PLACEHOLDERS})", writes)
+        if drops:
+            conn.executemany("DELETE FROM review_groups WHERE id = ?",
+                             [(gid,) for gid in drops])
+        conn.commit()
+
+def _review_groups_load() -> tuple:
+    """Every stored group, as (groups, duplicate_groups).
+
+    Ordered by artist/album, which is the order a full-library scan produces
+    (build_all_incomplete_album_review sorts on exactly that), so a restart does
+    not reshuffle the rail. Groups a playlist scan appended lose their append
+    position and sort in with the rest, which is what the origin chips are for.
+    """
+    with _index_lock:
+        conn = _index_db()
+        rows = conn.execute(
+            "SELECT origin, payload FROM review_groups "
+            "ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE").fetchall()
+    groups, duplicates = [], []
+    for row in rows:
+        try:
+            group = json.loads(row["payload"])
+        except Exception:
+            continue
+        if not isinstance(group, dict) or not group.get("id"):
+            continue
+        group["origin"] = row["origin"] or _review_group_origin(group)
+        (duplicates if group["origin"] == "duplicate" else groups).append(group)
+    return groups, duplicates
+
+def _review_groups_count() -> int:
+    with _index_lock:
+        conn = _index_db()
+        return int(conn.execute(
+            "SELECT COUNT(*) AS n FROM review_groups").fetchone()["n"])
 
 def _index_owned_rgids() -> set:
     """Release-group MBIDs the library already holds (fully or partly), drawn
@@ -5985,7 +6307,12 @@ def _inherited_decision(previous: dict, fallback: str = "pending") -> str:
 
 def _merge_review_groups(new_groups: list, source_key: str = "groups",
                          include_jobs: bool = True) -> list:
-    old = {g.get("id"): g for g in _review_snapshot().get(source_key, [])}
+    # Read the live list under the lock rather than via _review_snapshot():
+    # groups are rows in library_index.db now and no longer ride in the JSON
+    # state, so the snapshot does not carry them. Only ids and a handful of
+    # fields are read out of `old`, and nothing here mutates it.
+    with _review_lock:
+        old = {g.get("id"): g for g in (_review_state.get(source_key) or [])}
     seen = set()
     for group in new_groups:
         seen.add(group.get("id"))
@@ -6024,13 +6351,24 @@ def _merge_review_groups(new_groups: list, source_key: str = "groups",
     return new_groups
 
 def _find_review_group(group_id: str) -> dict | None:
-    # Duplicate-scan groups live in their own list but share the same group
-    # actions (canonical pick, retag/merge, hide), so look in both.
+    """The live, mutable group with this id, marked for the next flush.
+
+    Duplicate-scan groups live in their own list but share the same group
+    actions (canonical pick, retag/merge, hide), so look in both.
+
+    **Marking here is what persists every mutation.** Callers get the real dict
+    and modify it in place, then call _save_review_state(); since groups became
+    SQLite rows that flush writes only what is marked. Marking on the way out
+    covers all ~54 callers at one site. A caller that only reads costs one
+    redundant row write, which is the cheaper mistake by far.
+    """
     for group in _review_state.get("groups", []):
         if group.get("id") == group_id:
+            _mark_review_groups_dirty(group)
             return group
     for group in _review_state.get("duplicate_groups", []):
         if group.get("id") == group_id:
+            _mark_review_groups_dirty(group)
             return group
     return None
 
@@ -11618,7 +11956,7 @@ class _ScanCancelled(BaseException):
 
 def _scan_review_worker(fuzzy: bool, task_id: str = "", scan_all: bool = False,
                         deep: bool = False) -> None:
-    global _review_state, _active_review_scan_task_id
+    global _active_review_scan_task_id
     user = _default_web_user()
     if not user:
         return
@@ -11652,30 +11990,14 @@ def _scan_review_worker(fuzzy: bool, task_id: str = "", scan_all: bool = False,
             groups = build_all_incomplete_album_review(
                 user["navidrome_user"], user["navidrome_password"],
                 fuzzy=fuzzy, progress=_progress)
-            groups = _merge_review_groups(groups)
-            with _review_lock:
-                tasks = _review_state.get("tasks", {})
-                operations = _review_state.get("operations", {})
-                duplicate_groups = _review_state.get("duplicate_groups", [])
-                duplicate_files = _review_state.get("duplicate_files", [])
-                # This scan does not recompute duplicate files, so the list is
-                # carried over — with its stats and timestamp, so the UI can
-                # say how old it is instead of implying it is fresh.
-                duplicate_file_stats = _review_state.get("duplicate_file_stats", {})
-                duplicate_files_scanned_at = _review_state.get("duplicate_files_scanned_at", 0)
-                _review_state = _empty_review_state()
-                _review_state.update({
-                    "status": "complete",
-                    "message": f"Found {len(groups)} album review group(s)",
-                    "fuzzy": fuzzy,
-                    "groups": groups,
-                    "duplicate_groups": duplicate_groups,
-                    "duplicate_files": duplicate_files,
-                    "duplicate_file_stats": duplicate_file_stats,
-                    "duplicate_files_scanned_at": duplicate_files_scanned_at,
-                    "tasks": tasks,
-                    "operations": operations,
-                })
+            # Replaces the library origin only. It used to rebuild the state
+            # from _empty_review_state() and re-attach tasks/operations and the
+            # duplicate-file fields by hand, which both wiped every other
+            # origin's groups and — because `searches` was not on that
+            # re-attach list — silently discarded stored slskd searches.
+            _replace_review_groups(
+                "library", groups,
+                f"Found {len(groups)} album review group(s)", fuzzy=fuzzy)
             summary = f"Found {len(groups)} album review group(s)"
         else:
             # Duplicates get their own list: a duplicates scan must not reset
@@ -11687,8 +12009,15 @@ def _scan_review_worker(fuzzy: bool, task_id: str = "", scan_all: bool = False,
                 cancel=_cancel, records_out=phase_one_records)
             groups = _merge_review_groups(groups, source_key="duplicate_groups",
                                           include_jobs=False)
+            for group in groups:
+                group["origin"] = "duplicate"
             with _review_lock:
+                gone = ({g.get("id") for g in _review_state.get("duplicate_groups") or []}
+                        - {g.get("id") for g in groups})
                 _review_state["duplicate_groups"] = groups
+            _mark_review_groups_dirty(groups)
+            _mark_review_groups_dirty(gone)
+            with _review_lock:
                 _review_state["message"] = (
                     f"Found {len(groups)} duplicate album group(s) — "
                     "checking for duplicate files")
@@ -12492,6 +12821,7 @@ def _review_group_from_album_download(group: dict, source: str) -> dict:
     return {
         "id": gid,
         "group_type": source,
+        "origin": source,
         "artist": artist,
         "album": album,
         "artist_key": _norm_album_text(artist),
@@ -12511,13 +12841,17 @@ def _review_group_from_album_download(group: dict, source: str) -> dict:
         "messages": [],
     }
 
-def _union_review_groups(new_groups: list) -> None:
+def _union_review_groups(new_groups: list, origin: str = "library") -> None:
     """
     Merge scan output into _review_state["groups"] WITHOUT discarding groups
-    the scan didn't cover. Single-artist scans must use this; full-library
-    rebuilds use _store_review_groups (replace semantics) because their list
-    is the complete truth. De-dups identical ids inside new_groups, updates
-    existing groups in place (order preserved) and appends genuinely new ones.
+    the scan didn't cover. Used where the scan covers one artist or one release
+    and so is authoritative for nothing else. De-dups identical ids inside
+    new_groups, updates existing groups in place (order preserved) and appends
+    genuinely new ones.
+
+    A scan that IS authoritative for its whole origin — playlist, Spotify, the
+    full-library scan — wants _replace_review_groups instead, so that an album
+    which has since been completed stops being listed.
     """
     deduped, seen = [], set()
     for g in new_groups:
@@ -12525,6 +12859,7 @@ def _union_review_groups(new_groups: list) -> None:
         if gid in seen:
             continue
         seen.add(gid)
+        g.setdefault("origin", origin)
         deduped.append(g)
     merged = _merge_review_groups(deduped)
     with _review_lock:
@@ -12532,26 +12867,77 @@ def _union_review_groups(new_groups: list) -> None:
         out = [by_id.pop(g.get("id"), g) for g in _review_state.get("groups", []) or []]
         out.extend(by_id.values())
         _review_state["groups"] = out
+    _mark_review_groups_dirty(merged)
     _save_review_state()
 
-def _store_review_groups(groups: list, message: str, fuzzy: bool = None) -> None:
-    # REPLACE semantics by design: callers are full-library rebuilds
-    # (scan-all / playlist / Spotify) where `groups` is the complete truth.
-    # Single-artist scans must union via _union_review_groups instead.
+def _fold_missing_tracks(into: dict, extra: dict) -> None:
+    """Add `extra`'s missing tracks to `into`, keyed the way a rescan keys them.
+
+    (mbid, title) is what _merge_review_groups already uses to carry a decision
+    across a rescan, so a track folded in here and a track re-found by the next
+    scan collapse onto the same row rather than doubling up.
+    """
+    have = {(t.get("mbid"), t.get("title")) for t in into.get("missing_tracks") or []}
+    for track in extra.get("missing_tracks") or []:
+        key = (track.get("mbid"), track.get("title"))
+        if key in have:
+            continue
+        have.add(key)
+        into.setdefault("missing_tracks", []).append(dict(track))
+        into["updated_at"] = time.time()
+
+def _replace_review_groups(origin: str, new_groups: list, message: str,
+                           fuzzy: bool = None) -> None:
+    """Replace only the groups `origin` is authoritative for.
+
+    This used to be _store_review_groups, which replaced the *whole* list for
+    every caller. Its docstring claimed all three callers were "full-library
+    rebuilds where groups is the complete truth"; that was true only of scan-all.
+    A ListenBrainz playlist scan ran on 2026-09-20 and left the review holding
+    its own 97 groups in place of ~3000, with no error and no way back — the
+    library index was untouched, but the review is what every gap view reads.
+
+    Groups from the other origins are kept, in order. An incoming group for an
+    album another origin already holds is folded into that album instead of
+    becoming a second row (see _review_group_identity).
+    """
+    for group in new_groups:
+        group["origin"] = origin
+    merged = _merge_review_groups(new_groups)
     with _review_lock:
-        tasks = _review_state.get("tasks", {})
-        searches = _review_state.get("searches", {})
-        operations = _review_state.get("operations", {})
+        current = _review_state.get("groups", []) or []
+        before = len(current)
+        was = {g.get("id") for g in current}
+        kept = [g for g in current if _review_group_origin(g) != origin]
+        by_identity = {_review_group_identity(g): g for g in kept}
+        fresh = []
+        for group in merged:
+            existing = by_identity.get(_review_group_identity(group))
+            if existing is not None:
+                # Another origin already has this album, and its row is the
+                # richer one (a library group carries `albums`,
+                # canonical_album_id and `extra`; a playlist group carries none
+                # of them). Contribute the tracks, not a duplicate tile.
+                _fold_missing_tracks(existing, group)
+                continue
+            fresh.append(group)
         _review_state.update({
             "status": "complete",
             "message": message,
-            "groups": _merge_review_groups(groups),
-            "tasks": tasks,
-            "searches": searches,
-            "operations": operations,
+            "groups": kept + fresh,
         })
         if fuzzy is not None:
             _review_state["fuzzy"] = fuzzy
+        after = len(_review_state["groups"])
+        gone = was - {g.get("id") for g in _review_state["groups"]}
+    # Both halves: the rows to rewrite, and the rows to delete. A group this
+    # origin no longer lists is marked too — the flusher deletes any marked id
+    # that is no longer live, and without this its row outlived the review and
+    # came back on the next restart.
+    _mark_review_groups_dirty(kept + fresh)
+    _mark_review_groups_dirty(gone)
+    _web_log(f"{origin} scan: {len(new_groups)} group(s) in, "
+             f"{len(fresh)} new row(s); review {before} -> {after} group(s)")
     _save_review_state()
 
 def _playlist_scan_task(task_id: str) -> None:
@@ -12559,7 +12945,7 @@ def _playlist_scan_task(task_id: str) -> None:
     _task_update(task_id, current="ListenBrainz playlists")
     missing = scan_user(user)
     if not missing:
-        _store_review_groups([], "Playlist scan found no missing tracks")
+        _replace_review_groups("playlist", [], "Playlist scan found no missing tracks")
         _task_finish(task_id, "No missing tracks")
         return
     nd_user, nd_pass = user["navidrome_user"], user["navidrome_password"]
@@ -12573,6 +12959,7 @@ def _playlist_scan_task(task_id: str) -> None:
         review_groups.append({
             "id": hashlib.sha1(f"playlist|solo|{time.time()}".encode("utf-8")).hexdigest()[:16],
             "group_type": "tracks",
+            "origin": "playlist",
             "artist": "Loose tracks",
             "album": "Playlist tracks",
             "artist_key": "loose tracks",
@@ -12591,7 +12978,8 @@ def _playlist_scan_task(task_id: str) -> None:
             "last_action": "playlist",
             "messages": [],
         })
-    _store_review_groups(review_groups, f"Playlist scan found {len(missing)} missing track(s)")
+    _replace_review_groups("playlist", review_groups,
+                           f"Playlist scan found {len(missing)} missing track(s)")
     _task_finish(task_id, f"Found {len(missing)} missing track(s)")
 
 def _spotify_scan_task(task_id: str, playlist: str) -> None:
@@ -12608,6 +12996,7 @@ def _spotify_scan_task(task_id: str, playlist: str) -> None:
         groups.append({
             "id": hashlib.sha1(f"spotify|solo|{playlist}".encode("utf-8")).hexdigest()[:16],
             "group_type": "tracks",
+            "origin": "spotify",
             "artist": "Loose tracks",
             "album": "Spotify tracks",
             "artist_key": "loose tracks",
@@ -12626,7 +13015,8 @@ def _spotify_scan_task(task_id: str, playlist: str) -> None:
             "last_action": "spotify",
             "messages": [],
         })
-    _store_review_groups(groups, f"Spotify scan found {len(missing)} missing track(s)")
+    _replace_review_groups("spotify", groups,
+                           f"Spotify scan found {len(missing)} missing track(s)")
     _task_finish(task_id, f"Found {len(missing)} missing track(s)")
 
 def _search_task(task_id: str, query: str) -> None:
@@ -14434,9 +14824,14 @@ def _source_view(summary: dict) -> dict:
         "score": summary.get("score", 0),
     }
 
-def _gaps_view(status_filter: str = "") -> dict:
+def _gaps_view(status_filter: str = "", origin_filter: str = "") -> dict:
     snap = _review_list_snapshot()
     counts = {"needs": 0, "working": 0, "done": 0, "all": 0}
+    # Since a scan replaces only its own origin, a playlist's handful of albums
+    # now lands among the library's thousands. Counting them per origin is what
+    # lets the UI offer "just what this scan found" — which is the affordance
+    # the old whole-list replace gave by wiping everything else.
+    origins = {}
     wanted = _GAP_FILTER_STATUSES.get(status_filter or "", None)
     artist_map = _nd_album_artist_map()
     searching = _groups_with_running_source_search()
@@ -14444,7 +14839,10 @@ def _gaps_view(status_filter: str = "") -> dict:
     for group in snap.get("groups", []) or []:
         if group.get("hidden"):
             continue
+        origin = _review_group_origin(group)
+        origins[origin] = origins.get(origin, 0) + 1
         view = _album_view(group, artist_map)
+        view["origin"] = origin
         # So the rail says which album is mid-search — the whole point of
         # letting a search run while you look at a different album.
         view["searching"] = view["id"] in searching
@@ -14454,10 +14852,13 @@ def _gaps_view(status_filter: str = "") -> dict:
                 counts[key] += 1
         if wanted is not None and view["status"] not in wanted:
             continue
+        if origin_filter and origin != origin_filter:
+            continue
         items.append(view)
     return {
         "items": items,
         "counts": counts,
+        "origins": origins,
         "scanStatus": snap.get("status", ""),
         "scanMessage": snap.get("message", ""),
         "scanTask": _active_scan_task_view(snap),
@@ -15324,7 +15725,9 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/tasks/<task_id>")
     def api_task(task_id):
-        task = _tasks_snapshot().get(task_id)
+        # The only caller that wants `result`: the Artist panel polls this one
+        # task to pick up a finished discography scan's payload.
+        task = _tasks_snapshot(include_result=True).get(task_id)
         if not task:
             return jsonify({"error": "Task not found"}), 404
         return jsonify(task)
@@ -15358,7 +15761,8 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/gaps")
     def api_gaps():
-        return jsonify(_gaps_view(request.args.get("filter", "")))
+        return jsonify(_gaps_view(request.args.get("filter", ""),
+                                  request.args.get("origin", "")))
 
     @app.get("/api/gaps/<group_id>")
     def api_gap_detail(group_id):

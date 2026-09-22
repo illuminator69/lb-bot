@@ -22,7 +22,7 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** 197 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
+**Test baseline:** 230 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
 from before the beets removal (see Decision below). Anything *else* failing is yours.
 
 **Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
@@ -76,7 +76,12 @@ left behind (the SQLite index `/config/library_index.db`, `lb_bot_state.json`,
 `missing_album_review.json`, and any album folders under `/music`) stay
 root-owned — the umask only governs *new* files, and the container can't chown
 what root owns. Until they're fixed, writes fail: the index DB surfaces this as
-"Discography scan failed / attempt to write a readonly database". Fix on the
+"Discography scan failed / attempt to write a readonly database" — and since
+2026-09-22 the **album review lives in that DB too**, so the same permission
+problem also costs every group mutation on restart, logged as `review group save
+failed: ...` once per flush. It degrades safely (ids stay marked for retry, the
+in-memory review is intact, the JSON half still writes), but nothing about the
+review survives a restart until this is fixed. Fix on the
 host once: `chown -R 99:100 /mnt/user/appdata/lb-bot` (and `/mnt/user/Music` if
 placement into pre-existing album folders fails).
 
@@ -144,6 +149,14 @@ Two things that make this work, both easy to break:
 `release` only overwrites files the publish clone already tracks, so the `SESSION-*` /
 `PLAN-*` notes and `design_handoff_lb_bot_frontend/` never leak into the public repo; a new
 source file is reported rather than published silently, so adding one stays deliberate.
+
+`release` also skips **`.gitignore`** and **`docker-compose.yml`** (added 2026-09-22).
+Before that it copied both over the clone's, which un-ignored `.claude/` and `covers/`
+in the public repo and reverted the compose file from the GHCR image to
+`image: lb-bot:local` — twice in one day, each time undone by hand after the fact.
+The two `.gitignore`s are now kept byte-identical as well, so even an unskipped copy
+would be a no-op. `deploy.sh` and `.dockerignore` are tracked here now too; they were
+untracked, which meant the deployment path had no version control at all.
 
 **`README.md` and `docs/` in the clone are the clone's own, and `release` skips them.** The
 public README is a curated front page — description, one screenshot, a two-command quick start
@@ -224,6 +237,72 @@ are collapsed to one row per person, because MusicBrainz states one relation per
 instrument and per stint, so a four-piece came back with the bassist four times.
 Recording-level relations are deliberately **not** requested for credits: they
 multiply the response by the tracklist for a section nobody reads per-track.
+
+### The album review — origins, and why it lives in SQLite
+
+The review is the working set behind Fill Gaps: one *group* per album that needs
+something, carrying the user's decisions (hidden/skip, approved tracks, chosen
+source) and the download state. It is **not** the same thing as the library index
+— `library_index.db`'s `release_groups` is the durable catalogue of what exists
+and what is missing (68k rows); the review is the much smaller list of work items
+layered on top.
+
+**Every group has an `origin`, and a scan replaces only its own.** Values are in
+`REVIEW_ORIGINS`: `library` (the full scan-all, the single-artist scan, a release
+refresh), `playlist`, `spotify`, `duplicate`, `repair`. `_replace_review_groups`
+is the entry point; `_union_review_groups` is for a scan that covers one artist or
+one release and so is authoritative for nothing else.
+
+This is the fix for a real data loss. Until 2026-09-22 the entry point was
+`_store_review_groups`, which replaced the **whole** list, with a comment stating
+that was fine because "callers are full-library rebuilds where `groups` is the
+complete truth". That was true of scan-all and of neither other caller. On
+2026-09-20 a ListenBrainz playlist scan therefore replaced a ~3000-group library
+review with its own 97, silently and with no way back — `gaps.needs` went from
+~3000 to 78 and stayed there. Nothing in the UI or the logs said a thing. If you
+add a scan, give it an origin and use `_replace_review_groups`; if it only covers
+part of a set, union instead.
+
+Group **ids are per-origin** (`sha1("playlist|<release>|<artist>|<album>")` vs
+`sha1("<group_type>|<artist_key>|<album_key>|<ids>")`), so the same
+owned-but-incomplete album reached two ways has two ids. `_review_group_identity`
+— release MBID, else `artist_key|album_key` — is what collapses them; an incoming
+group whose identity another origin already holds folds its missing tracks into
+that row rather than becoming a second tile. The richer row wins, which is always
+the library one (it alone carries `albums`, `canonical_album_id` and `extra`).
+
+**Groups are rows in `library_index.db`, not JSON.** The `review_groups` table
+holds one row per group: the payload plus the scalar columns the gap list renders
+(keep them in sync with `_GAP_LIST_GROUP_FIELDS`). `INDEX_SCAN_VERSION` is
+deliberately not bumped for it, for the same reason the `meta` table records.
+
+- `_find_review_group` hands out the **live** dict and marks it dirty on the way
+  out. That single site is what persists all ~54 mutation callers, which get a
+  group, change it in place and call `_save_review_state()`. Over-marking costs
+  one small row write; under-marking is a change that silently never lands.
+- The flusher serializes marked rows **under `_review_lock`** and writes them
+  under `_index_lock` — never the other way round, and never serializing outside
+  the lock, or a concurrent mutation can raise mid-dump.
+- A group dropped from the review must be marked too; the flusher deletes any
+  marked id that is no longer live.
+
+`missing_album_review.json` keeps only the small, per-session remainder — status,
+tasks, searches, operations, duplicate-file results. Migration is one-way and
+self-describing: a file with a `groups` key is pre-migration, gets imported, and
+is rewritten without it, so there is no marker to get out of sync and a review the
+user has since emptied is not refilled on the next restart.
+
+On the live 3075-group review this took `missing_album_review.json` from
+**28.8 MB to 176 KB**, and one album's mutation from a ~490 ms whole-blob dump
+plus a 28.8 MB fsync, every two seconds, to a **2.1 ms** row write.
+
+**Don't put a big nested payload on a task row.** `_tasks_snapshot`'s docstring
+has always said task rows are flat scalars; `result` broke that. One finished
+artist-discography task carried a 12 MB scan payload, 109 of them came to 17.6 MB
+of the review file, and `/api/tasks` served all of it — past the hub's 4 MB
+`PROXY_MAX_RESPONSE`, which answers 502 `tooLarge`. `result` is now stripped from
+the on-disk state and from the collection-wide snapshot; only `/api/tasks/<id>`
+serves it, deep-copied, because the SPA's Artist panel polls that one task for it.
 
 ## The goal (confirmed spec)
 

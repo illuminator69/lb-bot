@@ -7,6 +7,16 @@ import { Badge, Chip, EmptyState, EMPTY_SOURCE_FILTERS, filterSources, Pager, Pr
 
 const SOURCES_PER_PAGE = 4
 
+// Which scan put an album in the review. Ordered widest-first, so the library's
+// own gaps stay the default reading of the list.
+const ORIGIN_ORDER = ['library', 'playlist', 'spotify', 'repair']
+const ORIGIN_LABELS = {
+  library: 'Library scan',
+  playlist: 'Playlists',
+  spotify: 'Spotify',
+  repair: 'Repairs',
+}
+
 // "45s" / "3m" / "2h" for a unix timestamp, or '' if there isn't one.
 function relativeAge(ts) {
   if (!ts) return ''
@@ -642,17 +652,44 @@ export default function FillGaps() {
     return () => clearTimeout(t)
   }, [draftSearch, gapSearch, dispatch])
 
+  // Which scan an album came from. A scan now replaces only its own origin
+  // instead of the whole list, so a playlist's handful of albums lands among
+  // the library's thousands — this is how you get back to just what it found.
+  // Local state, not a route param: it is a way of reading the list, not a
+  // place worth deep-linking to.
+  const [gapOrigin, setGapOrigin] = useState('')
+
   const items = useMemo(() => {
     let rows = gaps?.items || []
     if (gapFilter === 'needs') rows = rows.filter(g => ['ready', 'picking', 'failed'].includes(g.status))
     if (gapFilter === 'working') rows = rows.filter(g => g.status === 'downloading')
     if (gapFilter === 'done') rows = rows.filter(g => g.status === 'complete')
+    if (gapOrigin) rows = rows.filter(g => (g.origin || 'library') === gapOrigin)
     const q = gapSearch.toLowerCase().trim()
     if (q) rows = rows.filter(g => g.artist.toLowerCase().includes(q) || g.album.toLowerCase().includes(q))
     return rows
-  }, [gaps, gapFilter, gapSearch])
+  }, [gaps, gapFilter, gapOrigin, gapSearch])
 
-  const counts = gaps?.counts || {}
+  // Whole-corpus counts, except when an origin is selected — then the status
+  // chips count within it, or picking "Playlists" leaves "Needs you · 3055"
+  // sitting above five albums.
+  const counts = useMemo(() => {
+    if (!gapOrigin) return gaps?.counts || {}
+    const rows = (gaps?.items || []).filter(g => (g.origin || 'library') === gapOrigin)
+    return {
+      all: rows.length,
+      needs: rows.filter(g => ['ready', 'picking', 'failed'].includes(g.status)).length,
+      working: rows.filter(g => g.status === 'downloading').length,
+      done: rows.filter(g => g.status === 'complete').length,
+    }
+  }, [gaps, gapOrigin])
+  const origins = gaps?.origins || {}
+  // Only worth the row when there is something to tell apart.
+  const originChips = Object.keys(origins).length > 1
+    ? [['', 'All sources', gaps?.counts?.all ?? 0],
+       ...ORIGIN_ORDER.filter(k => origins[k])
+                      .map(k => [k, ORIGIN_LABELS[k] || k, origins[k]])]
+    : []
   // The rail as it looked on the previous render. Read below to work out where
   // a departed cursor *was*; written in an effect, so during the render where
   // `items` changed it still holds the old order.
@@ -826,6 +863,14 @@ export default function FillGaps() {
                 onClick={() => dispatch({ type: 'SET_GAP_FILTER', filter: k })}>{label}</Chip>
             ))}
           </div>
+          {originChips.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {originChips.map(([k, label, count]) => (
+                <Chip key={k || 'all'} active={gapOrigin === k} count={count}
+                  onClick={() => setGapOrigin(k)}>{label}</Chip>
+              ))}
+            </div>
+          )}
           {scanBar && <div className="mt-3">{scanBar}</div>}
         </div>
         <div ref={railRef} className="review-list queue-list px-2.5 py-1" role="listbox" aria-label="Albums with gaps">

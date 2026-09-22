@@ -4398,6 +4398,70 @@ class SimilarAlbumsArtistResolutionTests(unittest.TestCase):
                       "index — ListenBrainz answers nothing for a bare name")
 
 
+class SimilarAlbumRoutingTests(unittest.TestCase):
+    """Every row of the similar-albums shelf is an album the library HOLDS.
+
+    `_SIMILAR_ALBUM_STATUS_RANK` excludes `missing` by construction, so a row
+    that does not carry its Navidrome album id sends the client to the virtual
+    album page — which offers to *download* a record already on disk. The Fresh
+    feed carries `releaseAlbumId` for exactly this reason; this shelf did not.
+    """
+
+    CAND = [{"mbid": "mb-sim", "name": "Similar Act", "score": 1.0,
+             "sources": ["listenbrainz"]}]
+    ROWS = [{"id": "nd-sim", "name": "Similar Act", "mbid": "mb-sim"}]
+
+    def _shelf(self, releases, rgid_map=None):
+        indexed = {"artist_mbid": "mb-sim", "artist_name": "Similar Act",
+                   "releases": releases}
+        with patch("listenbrainz_bot.similar_artists", return_value=self.CAND), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_get_artist", return_value=indexed), \
+             patch("listenbrainz_bot._index_rgid_album_ids",
+                   return_value=rgid_map if rgid_map is not None else {}):
+            return bot._similar_albums_for_artist("mb-seed", "Seed")
+
+    def test_the_row_carries_the_navidrome_album_id(self):
+        out = self._shelf([{"rgid": "rg1", "title": "A Record", "year": "2001",
+                            "status": "complete",
+                            "navidrome_album_ids": ["nd-album-1"]}])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["albumId"], "nd-album-1",
+                         "a tap on an owned album must open the album, not its "
+                         "download page")
+
+    def test_a_row_without_ids_falls_back_to_the_rgid_map(self):
+        """`_index_mark_release_present` leaves `nd_album_ids` alone, so a row
+        filled by lb-bot itself can reach here empty."""
+        out = self._shelf([{"rgid": "rg2", "title": "B Record", "year": "2002",
+                            "status": "complete"}],
+                          rgid_map={"rg2": "nd-album-2"})
+        self.assertEqual(out[0]["albumId"], "nd-album-2")
+
+    def test_an_unresolvable_row_keeps_an_empty_id_rather_than_failing(self):
+        out = self._shelf([{"rgid": "rg3", "title": "C Record", "year": "2003",
+                            "status": "complete"}], rgid_map={})
+        self.assertEqual(out[0]["albumId"], "")
+
+    def test_the_rgid_map_is_never_built_when_no_row_needs_it(self):
+        """It is a full-table scan, and it used to run on every call — including
+        calls that return nothing, which is what broke the suite: the map was
+        built before the early return, against an index DB the test never had.
+        """
+        calls = []
+        indexed = {"artist_mbid": "mb-sim", "artist_name": "Similar Act",
+                   "releases": [{"rgid": "rg1", "title": "A", "year": "2001",
+                                 "status": "complete",
+                                 "navidrome_album_ids": ["nd-1"]}]}
+        with patch("listenbrainz_bot.similar_artists", return_value=self.CAND), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_get_artist", return_value=indexed), \
+             patch("listenbrainz_bot._index_rgid_album_ids",
+                   side_effect=lambda: calls.append(1) or {}):
+            bot._similar_albums_for_artist("mb-seed", "Seed")
+        self.assertEqual(calls, [])
+
+
 class SimilarArtistsMarkedTests(unittest.TestCase):
     """`/api/artist/similar` marks ownership; it does not filter on it.
 

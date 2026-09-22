@@ -14728,6 +14728,9 @@ def _similar_albums_for_artist(artist_mbid: str, artist_name: str,
     an error — the shelf simply doesn't render.
     """
     similar = similar_artists(artist_mbid, artist_name, limit=40)
+    # Built lazily and at most once: it is a full-table scan, and the common row
+    # already carries its ids from the backfill, so most calls never need it.
+    rgid_album_ids = None
     if not similar:
         return []
 
@@ -14761,14 +14764,41 @@ def _similar_albums_for_artist(artist_mbid: str, artist_name: str,
         if not pick:
             continue
         rel = pick[1]
+        rgid = rel.get("rgid", "")
+        # The Navidrome album id, so a tap opens the record rather than a page
+        # offering to acquire it. EVERY row on this shelf is an album the
+        # library already holds — `_SIMILAR_ALBUM_STATUS_RANK` excludes
+        # `missing` by construction — so a client holding only an rgid has to
+        # route through the virtual album page and hope its redirect resolves,
+        # which is exactly how a fully-owned album opened its own download page.
+        # `/api/fresh-releases` carries the same fix as `releaseAlbumId`; this
+        # shelf never got it, and needs it more, because here it is every row.
+        #
+        # `_index_get_artist` backfills `navidrome_album_ids` on read, so the
+        # row usually carries them; the rgid map is the fallback for a row whose
+        # backfill found nothing (Navidrome genuinely may not have scanned yet).
+        album_ids = rel.get("navidrome_album_ids") or []
+        album_id = album_ids[0] if album_ids else ""
+        if not album_id and rgid:
+            if rgid_album_ids is None:
+                try:
+                    rgid_album_ids = _index_rgid_album_ids()
+                except Exception as e:
+                    # Best-effort, like the Fresh feed's badges: no id means the
+                    # tile routes through the virtual page as it always did,
+                    # which is a worse answer but never an error.
+                    print(f"  album/similar: rgid->album map unavailable: {e}")
+                    rgid_album_ids = {}
+            album_id = rgid_album_ids.get(rgid, "")
         out.append({
             "artistId": owned["id"],
             "artist": owned["name"],
-            "rgid": rel.get("rgid", ""),
+            "rgid": rgid,
             "title": rel.get("title", ""),
             "year": rel.get("year", ""),
             "status": rel.get("status", ""),
-            "coverUrl": caa_front_url(rel.get("rgid", ""), 250),
+            "albumId": album_id,
+            "coverUrl": caa_front_url(rgid, 250),
             "because": artist_name,
             "sources": sorted(set(cand.get("sources") or [])),
         })

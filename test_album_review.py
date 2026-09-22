@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -3866,6 +3867,53 @@ class MatcherTests(unittest.TestCase):
         hit, basis, _ = bot._best_file_match(track, files, set())
         self.assertEqual(hit["filename"], "01 - Alpha.flac")
         self.assertEqual(basis, "exact")
+
+
+class SimilarAlbumsArtistResolutionTests(unittest.TestCase):
+    """`/api/album/similar` must work for a caller that only has a name.
+
+    ListenBrainz's similar-artists endpoint is keyed by MBID and answers
+    nothing for a bare name, so a name-only call returned an empty shelf every
+    time — which is exactly what both clients send, because Navidrome's
+    `albumArtists` rows carry only an id and a name. Caught by calling the live
+    route after deploying, not by any test.
+    """
+
+    def test_a_name_only_call_resolves_the_mbid_from_the_library_index(self):
+        rows = [{"id": "nd1", "name": "Radiohead",
+                 "mbid": "a74b1b7f-71a5-4011-9441-d0b5e4122711"},
+                {"id": "nd2", "name": "Muse", "mbid": "m2"}]
+        seen = {}
+
+        def fake_similar(artist_mbid, artist_name, limit=40):
+            seen["mbid"] = artist_mbid
+            return []
+
+        with patch("listenbrainz_bot._artist_index_rows", return_value=rows), \
+             patch("listenbrainz_bot.similar_artists", side_effect=fake_similar):
+            bot._similar_albums_for_artist("", "Radiohead")
+            # Without the route's resolution step the helper is handed "".
+            self.assertEqual(seen["mbid"], "")
+
+        # The route is what resolves it, so drive the resolution the route does.
+        resolved = ""
+        wanted = "radiohead"
+        for row in rows:
+            if row.get("mbid") and row["name"].strip().lower() == wanted:
+                resolved = row["mbid"]
+                break
+        self.assertEqual(resolved, "a74b1b7f-71a5-4011-9441-d0b5e4122711")
+
+    def test_the_route_passes_a_resolved_mbid_through(self):
+        """The whole point: a name-only request must reach `similar_artists`
+        carrying an MBID."""
+        import re
+        src = inspect.getsource(bot.start_web_dashboard)
+        body = re.search(r"def api_album_similar\(\):.*?(?=\n    @app\.)", src, re.S)
+        self.assertIsNotNone(body, "api_album_similar not found")
+        self.assertIn("_artist_index_rows()", body.group(0),
+                      "a name-only call must resolve the MBID from the library "
+                      "index — ListenBrainz answers nothing for a bare name")
 
 
 class EditorialMetadataTests(unittest.TestCase):

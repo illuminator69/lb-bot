@@ -16226,6 +16226,24 @@ def start_web_dashboard() -> None:
         artist_name = request.args.get("artist_name", "").strip()
         if not artist_mbid and not artist_name:
             return jsonify({"error": "artist_mbid or artist_name is required"}), 400
+        # Resolve the MBID from the library index when the caller only has a
+        # name. This is not a nicety: `similar_artists` asks ListenBrainz, whose
+        # similar-artists endpoint is keyed by MBID and answers *nothing* for a
+        # bare name — so a name-only call returned an empty shelf every time,
+        # which is what both clients were sending. Feishin's album page has no
+        # artist MBID to send (Navidrome's `albumArtists` rows carry only an id
+        # and a name), so resolving it here is the fix that works for every
+        # caller rather than one per client.
+        #
+        # The Navidrome artist index is already cached and already carries the
+        # MBIDs, so this costs no MusicBrainz request and cannot pick a
+        # different artist than the one whose page you are on.
+        if not artist_mbid and artist_name:
+            wanted = artist_name.strip().lower()
+            for row in _artist_index_rows():
+                if row.get("mbid") and (row.get("name") or "").strip().lower() == wanted:
+                    artist_mbid = row["mbid"]
+                    break
         try:
             limit = max(1, min(12, int(request.args.get("limit", 6))))
         except (TypeError, ValueError):

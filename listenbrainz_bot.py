@@ -5432,6 +5432,22 @@ def _index_owned_rgids() -> set:
             "WHERE status != 'missing' AND rgid != ''").fetchall()
     return {r["rgid"] for r in rows}
 
+def _index_indexed_artist_mbids() -> set:
+    """Artist MBIDs whose discography this index has actually walked.
+
+    `_index_owned_rgids` answers "is this record on disk"; this answers the
+    other half — "does lb-bot know what this artist released". A similar-artist
+    row needs both, because owning an artist and being able to show what you are
+    missing from them are different facts, and the client renders them
+    differently. One query rather than one `_index_get_artist` per candidate:
+    the list is up to 40 long and each of those takes `_index_lock`.
+    """
+    with _index_lock:
+        conn = _index_db()
+        rows = conn.execute(
+            "SELECT DISTINCT artist_mbid FROM artists WHERE artist_mbid != ''").fetchall()
+    return {r["artist_mbid"] for r in rows}
+
 def _index_album_rgids() -> dict:
     """Navidrome album id -> release-group MBID, for whatever is indexed.
 
@@ -14627,6 +14643,77 @@ def _artist_index_rows() -> list:
 # shelf is "more of what you already have", not a shopping list.
 _SIMILAR_ALBUM_STATUS_RANK = {"complete": 0, "incomplete": 1, "untagged": 2}
 
+def _similar_artists_marked(artist_mbid: str, artist_name: str = "",
+                            limit: int = 20) -> dict:
+    """`similar_artists` with ownership marked rather than filtered out.
+
+    `_similar_albums_for_artist` below drops every candidate the library does
+    not already hold, deliberately — that shelf is "more of what you already
+    have", not a shopping list. This is the other reading of the same merge, and
+    it is what a Discover row needs: the unowned candidates are the point, so
+    ownership becomes two fields instead of a filter.
+
+    The two signals are kept apart for the same reason `/api/fresh-releases`
+    keeps its two apart:
+      - `owned` (+`artistId`): this artist is in the library.
+      - `indexed`: lb-bot has walked their discography, so "what am I missing
+        from them" is answerable without starting a scan first.
+    An artist can be owned but un-indexed, and the client renders that
+    differently from either extreme.
+
+    Deliberately free of MusicBrainz. `similar_artists` never calls `mbz_get`,
+    and the name->MBID resolution reads the cached Navidrome artist index, so
+    this never takes `_mbz_lock` — the process-wide 1 req/sec budget a running
+    discography scan is already spending. A Discover screen that blocked on that
+    lock would be a Discover screen that renders when the scan finishes.
+    """
+    # ListenBrainz's similar-artists endpoint is MBID-keyed and answers nothing
+    # for a bare name. The Navidrome artist index already carries the MBIDs, so
+    # resolving here costs no MusicBrainz request — same step, same reason, as
+    # api_album_similar.
+    if not artist_mbid and artist_name:
+        wanted = artist_name.strip().lower()
+        for row in _artist_index_rows():
+            if row.get("mbid") and (row.get("name") or "").strip().lower() == wanted:
+                artist_mbid = row["mbid"]
+                break
+
+    candidates = similar_artists(artist_mbid, artist_name, limit=limit)
+
+    # Best-effort layer, exactly as on the Fresh feed: a stale index DB or a
+    # Navidrome hiccup degrades to "no badges" rather than sinking the row.
+    id_by_mbid: dict = {}
+    id_by_name: dict = {}
+    indexed_mbids: set = set()
+    try:
+        for a in _artist_index_rows():
+            if a.get("mbid"):
+                id_by_mbid[a["mbid"]] = a.get("id", "")
+            name = (a.get("name") or "").strip().lower()
+            if name:
+                id_by_name.setdefault(name, a.get("id", ""))
+        indexed_mbids = _index_indexed_artist_mbids()
+    except Exception as e:
+        print(f"  artist/similar: ownership enrichment unavailable: {e}")
+
+    artists = []
+    for c in candidates:
+        mbid = c.get("mbid") or ""
+        name = (c.get("name") or "").strip()
+        artist_id = id_by_mbid.get(mbid) or id_by_name.get(name.lower(), "")
+        artists.append({
+            "mbid": mbid,
+            "name": name,
+            "score": round(float(c.get("score") or 0.0), 4),
+            "sources": c.get("sources") or [],
+            "owned": bool(artist_id),
+            "artistId": artist_id,
+            "indexed": bool(mbid and mbid in indexed_mbids),
+        })
+    return {"artists": artists,
+            "because": artist_name or artist_mbid,
+            "sources": ["ListenBrainz"] + (["Last.fm"] if LASTFM_API_KEY else [])}
+
 def _similar_albums_for_artist(artist_mbid: str, artist_name: str,
                                exclude_rgid: str = "", limit: int = 6) -> list:
     """One album per similar artist, drawn from the user's own library.
@@ -16763,6 +16850,28 @@ def start_web_dashboard() -> None:
             return jsonify({"error": "q is required"}), 400
         candidates = mbz_search_artists(query, 8)
         return jsonify({"candidates": candidates})
+
+    @app.get("/api/artist/similar")
+    def api_artist_similar():
+        """Artists similar to one you listen to, owned and unowned alike.
+
+        The merge behind this (ListenBrainz Labs, cross-checked with Last.fm
+        when a key is configured) has always produced unowned candidates with
+        real MBIDs. `/api/album/similar` throws them away on purpose — that
+        shelf is "more of what you already have". This route is the other
+        reading of the same data: it *marks* ownership instead of filtering on
+        it, so a Discover row can show who you are missing and link each one to
+        its `mb:<mbid>` page.
+        """
+        artist_mbid = request.args.get("mbid", "").strip()
+        artist_name = request.args.get("name", "").strip()
+        if not artist_mbid and not artist_name:
+            return jsonify({"error": "mbid or name is required"}), 400
+        try:
+            limit = max(1, min(40, int(request.args.get("limit", 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        return jsonify(_similar_artists_marked(artist_mbid, artist_name, limit))
 
     @app.get("/api/fresh-releases")
     def api_fresh_releases():

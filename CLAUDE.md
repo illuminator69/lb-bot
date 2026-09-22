@@ -22,7 +22,8 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** 241 tests, **32 errors, 0 failures**. The errors are all stale beets tests kept
+**Test baseline:** **32 errors, 0 failures** (248 tests as of 2026-09-22 — the total drifts as
+tests are added, so check the 32/0, not the count). The errors are all stale beets tests kept
 from before the beets removal (see Decision below). Anything *else* failing is yours.
 
 **Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
@@ -36,6 +37,11 @@ production bug the chmod exists to prevent (slskd writes 0644/0444; without it t
 read-only to the users group).
 
 Line endings: the tree is LF and the repo is `core.autocrlf=input`. Don't reintroduce CRLF.
+
+**`core.fileMode` is `false` here** — another Windows-migration leftover. Git ignores the
+executable bit on disk, so `git add` records a new script as `100644` however you chmod it, and
+a fresh clone gets a `deploy.sh` that answers "Permission denied". Adding an executable means
+`git update-index --chmod=+x <path>` as a separate step; check with `git ls-files -s <path>`.
 
 ## What this is
 

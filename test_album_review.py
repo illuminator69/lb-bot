@@ -4398,6 +4398,104 @@ class SimilarAlbumsArtistResolutionTests(unittest.TestCase):
                       "index — ListenBrainz answers nothing for a bare name")
 
 
+class SimilarArtistsMarkedTests(unittest.TestCase):
+    """`/api/artist/similar` marks ownership; it does not filter on it.
+
+    The merge has always produced unowned candidates with real MBIDs and
+    `_similar_albums_for_artist` has always thrown them away — that shelf is
+    "more of what you already have". The Discover row wants exactly the rows
+    that shelf discards, so the one thing these tests defend is that an unowned
+    candidate survives.
+    """
+
+    CANDIDATES = [
+        {"mbid": "mb-owned", "name": "Owned Indexed", "score": 1.5,
+         "sources": ["listenbrainz", "lastfm"]},
+        {"mbid": "mb-unowned", "name": "Stranger", "score": 1.2,
+         "sources": ["listenbrainz"]},
+        {"mbid": "mb-owned-cold", "name": "Owned Cold", "score": 0.9,
+         "sources": ["lastfm"]},
+    ]
+    ROWS = [{"id": "nd1", "name": "Owned Indexed", "mbid": "mb-owned"},
+            {"id": "nd2", "name": "Owned Cold", "mbid": "mb-owned-cold"}]
+
+    def _marked(self, **kw):
+        with patch("listenbrainz_bot.similar_artists", return_value=self.CANDIDATES), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids",
+                   return_value={"mb-owned"}):
+            return bot._similar_artists_marked(kw.get("mbid", "seed"),
+                                               kw.get("name", "Seed Artist"))
+
+    def test_an_unowned_candidate_survives(self):
+        out = self._marked()
+        by_name = {a["name"]: a for a in out["artists"]}
+        self.assertEqual(len(out["artists"]), 3,
+                         "every candidate must survive — this route marks, "
+                         "it does not filter")
+        self.assertFalse(by_name["Stranger"]["owned"])
+        self.assertEqual(by_name["Stranger"]["artistId"], "")
+
+    def test_owned_and_indexed_are_separate_facts(self):
+        by_name = {a["name"]: a for a in self._marked()["artists"]}
+        self.assertTrue(by_name["Owned Indexed"]["owned"])
+        self.assertTrue(by_name["Owned Indexed"]["indexed"])
+        self.assertEqual(by_name["Owned Indexed"]["artistId"], "nd1")
+        # Owned, but lb-bot has never walked their discography — "what am I
+        # missing from them" still needs a scan, and the client shows that
+        # differently from either extreme.
+        self.assertTrue(by_name["Owned Cold"]["owned"])
+        self.assertFalse(by_name["Owned Cold"]["indexed"])
+
+    def test_a_name_only_call_resolves_the_mbid_from_the_library_index(self):
+        """ListenBrainz is MBID-keyed and answers nothing for a bare name."""
+        seen = {}
+
+        def fake_similar(artist_mbid, artist_name, limit=20):
+            seen["mbid"] = artist_mbid
+            return []
+
+        with patch("listenbrainz_bot.similar_artists", side_effect=fake_similar), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()):
+            bot._similar_artists_marked("", "Owned Indexed")
+        self.assertEqual(seen["mbid"], "mb-owned")
+
+    def test_a_cold_index_degrades_to_no_badges_rather_than_raising(self):
+        with patch("listenbrainz_bot.similar_artists", return_value=self.CANDIDATES), \
+             patch("listenbrainz_bot._artist_index_rows",
+                   side_effect=RuntimeError("no such column: artist_mbid")), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()):
+            out = bot._similar_artists_marked("seed", "Seed Artist")
+        self.assertEqual(len(out["artists"]), 3)
+        self.assertTrue(all(not a["owned"] and not a["indexed"]
+                            for a in out["artists"]))
+
+    def test_the_seed_is_named_so_the_row_can_say_why(self):
+        self.assertEqual(self._marked()["because"], "Seed Artist")
+        self.assertIn("ListenBrainz", self._marked()["sources"])
+
+    def test_it_never_spends_the_musicbrainz_budget(self):
+        """The 1 req/sec `_mbz_lock` is shared with any running discography
+        scan. A Discover row that queued behind it would render when the scan
+        finished, which is not a discovery surface."""
+        called = []
+        with patch("listenbrainz_bot.similar_artists", return_value=self.CANDIDATES), \
+             patch("listenbrainz_bot._artist_index_rows", return_value=self.ROWS), \
+             patch("listenbrainz_bot._index_indexed_artist_mbids", return_value=set()), \
+             patch("listenbrainz_bot.mbz_get",
+                   side_effect=lambda *a, **k: called.append(a) or {}):
+            bot._similar_artists_marked("", "Owned Indexed")
+        self.assertEqual(called, [], "this route must not touch MusicBrainz")
+
+    def test_indexed_mbids_come_from_the_index_db(self):
+        with isolated_review():
+            bot._index_ensure_artist("mb-walked", artist_mbid="mb-walked",
+                                     nd_artist_id="nd9", name="Walked")
+            self.assertIn("mb-walked", bot._index_indexed_artist_mbids())
+            self.assertNotIn("mb-never", bot._index_indexed_artist_mbids())
+
+
 class EditorialMetadataTests(unittest.TestCase):
     """The MusicBrainz -> Wikidata -> Wikipedia chain, its caches, and the
     additive `meta` table migration."""

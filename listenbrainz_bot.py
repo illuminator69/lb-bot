@@ -4148,7 +4148,37 @@ def _deezer_artist_row(row: dict) -> dict:
         "position": int(row.get("position") or 0),
     }
 
-def deezer_chart(limit: int = 20) -> dict:
+def _deezer_genre_id(genre: str) -> str:
+    """A Deezer genre id, or "0" (All).
+
+    Digits only, and validated here rather than at the route, because it is
+    interpolated into the upstream path — every caller has to get this right and
+    exactly one of them should own the rule.
+    """
+    g = str(genre or "0").strip()
+    return g if g.isdigit() else "0"
+
+def deezer_genres() -> dict:
+    """`GET /genre` — the genres Deezer will serve a chart or an editorial for.
+
+    Offered as a list rather than hardcoded on the clients: the ids are Deezer's
+    and it has changed them before. Cached like every other Deezer read, which is
+    six hours and considerably shorter than this list actually moves.
+    """
+    data = _deezer_get("genre")
+    rows = []
+    for row in (data.get("data") or []):
+        name = str(row.get("name") or "")
+        if not name:
+            continue
+        rows.append({
+            "id": str(row.get("id") if row.get("id") is not None else ""),
+            "name": name,
+            "imageUrl": str(row.get("picture_medium") or row.get("picture") or ""),
+        })
+    return {"genres": [r for r in rows if r["id"]]}
+
+def deezer_chart(limit: int = 20, genre: str = "0") -> dict:
     """Deezer's global chart: {albums: [...], artists: [...]}.
 
     Tracks and playlists are in the same response and deliberately dropped —
@@ -4160,27 +4190,35 @@ def deezer_chart(limit: int = 20) -> dict:
     on the open API, so this is a property of where lb-bot runs and not
     something a client can ask to change.
     """
-    data = _deezer_get("chart", {"limit": str(max(1, min(100, int(limit or 20))))})
+    # `chart/0` is the global chart and is what `chart` alone resolves to, so a
+    # genre id simply selects a narrower one — no branch, and the cache key is
+    # already "path?query" so per-genre entries come free.
+    data = _deezer_get(f"chart/{_deezer_genre_id(genre)}",
+                       {"limit": str(max(1, min(100, int(limit or 20))))})
     albums = [_deezer_album_row(r) for r in ((data.get("albums") or {}).get("data") or [])]
     artists = [_deezer_artist_row(r) for r in ((data.get("artists") or {}).get("data") or [])]
     return {"albums": [a for a in albums if a.get("title")],
             "artists": [a for a in artists if a.get("name")]}
 
-def deezer_editorial(limit: int = 20) -> dict:
+def deezer_editorial(limit: int = 20, genre: str = "0") -> dict:
     """Deezer's own editorial album selection: {albums: [...], section: str}.
 
-    `editorial/0/selection` is the "albums the Deezer team picked this week"
-    list — the one that is actually editorial. `editorial/0/releases` (new
+    `editorial/<genre>/selection` is the "albums the Deezer team picked this
+    week" list — the one that is actually editorial. `.../releases` (new
     releases) is the fallback, because `selection` has returned an empty `data`
     on some days and an empty editorial row is indistinguishable from a broken
     one. `section` says which of the two answered, so a client is never guessing.
+
+    `genre` is a Deezer genre id; "0" is the whole catalogue and was the only
+    thing this ever asked for before.
     """
     limit = max(1, min(100, int(limit or 20)))
+    gid = _deezer_genre_id(genre)
     for section in ("selection", "releases"):
         try:
-            data = _deezer_get(f"editorial/0/{section}", {"limit": str(limit)})
+            data = _deezer_get(f"editorial/{gid}/{section}", {"limit": str(limit)})
         except DeezerError as e:
-            print(f"  deezer editorial/{section} failed: {e}")
+            print(f"  deezer editorial/{gid}/{section} failed: {e}")
             continue
         rows = [_deezer_album_row(r) for r in (data.get("data") or [])]
         rows = [r for r in rows if r.get("title")]
@@ -16110,26 +16148,35 @@ def _mark_deezer_album(row: dict, directory: dict) -> dict:
     out["coverUrl"] = caa_front_url(rgid) if rgid else row.get("imageUrl", "")
     return out
 
-def _deezer_chart_marked(limit: int = 20) -> dict:
-    """`GET /api/deezer/chart` — Deezer's global chart, ownership-marked."""
-    chart = deezer_chart(limit)
+def _deezer_chart_marked(limit: int = 20, genre: str = "0") -> dict:
+    """`GET /api/deezer/chart` — Deezer's chart, ownership-marked.
+
+    `genre` narrows it; "0" is the global chart. Note the chart is still
+    geolocated by THIS host's IP — Deezer's open API has no country parameter, so
+    genre is the only axis a client can actually choose.
+    """
+    chart = deezer_chart(limit, genre)
     directory = _index_release_group_directory()
     _id_by_mbid, id_by_name, mbid_by_name, indexed = _library_artist_maps()
     return {
         "albums": [_mark_deezer_album(a, directory) for a in chart["albums"]],
         "artists": [_mark_deezer_artist(a, id_by_name, mbid_by_name, indexed)
                     for a in chart["artists"]],
+        # Echoed so a client can tell which chart it is looking at, rather than
+        # assuming the one it asked for.
+        "genre": _deezer_genre_id(genre),
         "source": "Deezer",
         "sources": ["Deezer"],
     }
 
-def _deezer_editorial_marked(limit: int = 20) -> dict:
+def _deezer_editorial_marked(limit: int = 20, genre: str = "0") -> dict:
     """`GET /api/deezer/editorial` — Deezer's editorial albums, ownership-marked."""
-    editorial = deezer_editorial(limit)
+    editorial = deezer_editorial(limit, genre)
     directory = _index_release_group_directory()
     return {
         "albums": [_mark_deezer_album(a, directory) for a in editorial["albums"]],
         "section": editorial["section"],
+        "genre": _deezer_genre_id(genre),
         "source": "Deezer",
         "sources": ["Deezer"],
     }
@@ -18449,6 +18496,20 @@ def start_web_dashboard() -> None:
             limit = 20
         return jsonify(_deezer_related_marked(artist_mbid, artist_name, limit))
 
+    @app.get("/api/deezer/genres")
+    def api_deezer_genres():
+        """The genres `/api/deezer/chart` and `/api/deezer/editorial` accept.
+
+        Its own route rather than a hardcoded list on each client, because the ids
+        are Deezer's to change and there are two clients to keep in step. Nothing
+        here is ownership-marked, so unlike its two siblings this one is NOT
+        invalidated by a fill.
+        """
+        try:
+            return jsonify(deezer_genres())
+        except DeezerError as e:
+            return jsonify({"error": f"Deezer unavailable: {e}"}), 502
+
     @app.get("/api/deezer/chart")
     def api_deezer_chart():
         """Deezer's global chart, ownership-marked. Free and unauthenticated.
@@ -18461,7 +18522,7 @@ def start_web_dashboard() -> None:
         except (TypeError, ValueError):
             limit = 20
         try:
-            return jsonify(_deezer_chart_marked(limit))
+            return jsonify(_deezer_chart_marked(limit, request.args.get("genre", "0")))
         except DeezerError as e:
             return jsonify({"error": f"Deezer unavailable: {e}"}), 502
 
@@ -18473,7 +18534,7 @@ def start_web_dashboard() -> None:
         except (TypeError, ValueError):
             limit = 20
         try:
-            return jsonify(_deezer_editorial_marked(limit))
+            return jsonify(_deezer_editorial_marked(limit, request.args.get("genre", "0")))
         except DeezerError as e:
             return jsonify({"error": f"Deezer unavailable: {e}"}), 502
 

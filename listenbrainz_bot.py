@@ -3013,6 +3013,26 @@ def _artist_credit_str(ac_list) -> str:
         parts.append(ac.get("joinphrase", "") or "")
     return "".join(parts).strip()
 
+def _artist_credit_mbid(ac_list) -> str:
+    """The MBID of the FIRST credited artist, or "".
+
+    First, not merged: a client uses this to open an artist page, and a
+    collaboration has to land on somebody. The display string keeps the full
+    credit either way, so nothing is lost — this only decides whose page a tap
+    goes to, and the lead credit is the only defensible answer.
+
+    Costs no request. The caller already fetched the release-group with
+    `inc=artist-credits` for the display name, so the id is sitting in the same
+    payload; it was simply being dropped.
+    """
+    for ac in ac_list or []:
+        if isinstance(ac, str):
+            continue
+        mbid = (ac.get("artist") or {}).get("id") or ""
+        if mbid:
+            return mbid
+    return ""
+
 def mbz_search_release_groups(query: str, limit: int = 5) -> list:
     """
     Free-text search of MusicBrainz release-groups (albums).
@@ -18109,6 +18129,12 @@ def start_web_dashboard() -> None:
             "rgid": rgid,
             "title": data.get("title", ""),
             "artist": _artist_credit_str(data.get("artist-credit")) or "?",
+            # The lead credit's MBID. Additive, and free — it was already in this
+            # payload. Without it a client that arrived here without an artist
+            # MBID of its own (every Deezer browse row: Deezer has no MBIDs) can
+            # render the artist's NAME and have no way to open their page, which
+            # is also the only route to "scan this artist's discography".
+            "artistMbid": _artist_credit_mbid(data.get("artist-credit")),
             "coverUrl": caa_front_url(rgid, 250),
             # Carried so a caller can hand them straight back to
             # `/api/artist/release` as its MusicBrainz-outage override. The type

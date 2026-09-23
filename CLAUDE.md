@@ -232,6 +232,40 @@ serve for a release the library lacks). Three things about it:
 The existing keys are untouched, `primary_type`'s snake_case included: this
 module's own SPA reads them at `web/src/panels/Library.jsx`.
 
+**The ranking is MusicBrainz's text score, and a caller must not trust the order.**
+This route sorts albums before non-albums and then by score, and that score is
+about *text*. Measured 2026-09-23: `q=Daft Punk Discovery` returns "Daft Punk's
+Discovery but it's in the SM64 Soundfont" by Pignickel **first**, a second parody
+second, and the real `Discovery` third — because one title contains both search
+words and the other contains one. A client taking the first hit opened the parody
+for an album the user owned in full. `q` reaches MusicBrainz verbatim, so a
+**fielded** query is a different question and a much better one:
+`artist:"Daft Punk" AND releasegroup:"Discovery"` returns the right record first
+and no parodies at all. Nothing changed in this route; it is written down because
+the shape of the answer is easy to mistake for a ranking that already knows what
+you meant.
+
+**`ownership` here is index membership.** `_index_owned_rgids` covers only artists
+whose discography has been **scanned**, so an album the user owns by an unscanned
+artist is marked `releaseOwned: false` — correctly, for the question this module
+can answer, and misleadingly for the question a client is actually asking. A
+client with the whole library on hand should consult it *before* this route.
+
+### `GET /api/album/releases` also names the artist
+
+Variants and editions of a release-group, and — since 2026-09-23 — `artistMbid`.
+The route always fetched the release-group with `inc=artist-credits` to build the
+display credit and **dropped the id out of the same payload**.
+
+That mattered because of where an album page is reached from. A Deezer browse row
+carries no MBIDs at all, so a client arriving from one had the artist's *name* and
+no way to open their page — and the artist page is the only route to "scan this
+artist's discography", i.e. the thing most likely to be needed for exactly those
+albums. `_artist_credit_mbid` takes the **first** credited artist rather than
+merging: a tap has to land on somebody, the display credit still carries the whole
+thing, and the lead credit is the only defensible answer for a collaboration.
+Additive, and costs no MusicBrainz request.
+
 ### Editorial metadata — `GET /api/meta/artist`, `GET /api/meta/album`
 
 The "About" the clients show for an artist or an album: real, attributed,
@@ -289,7 +323,7 @@ instrument and per stint, so a four-piece came back with the bassist four times.
 Recording-level relations are deliberately **not** requested for credits: they
 multiply the response by the tracklist for a section nobody reads per-track.
 
-### Deezer browse — `GET /api/deezer/chart`, `/api/deezer/editorial`, `/api/artist/related`
+### Deezer browse — `GET /api/deezer/{chart,editorial,genres}`, `/api/artist/related`
 
 The browse half of Track C. Deezer is free and unauthenticated — no key, no
 token refresh, no account — which is the whole reason it is here and Spotify is
@@ -330,7 +364,18 @@ Two things measured against the live API on 2026-09-23 and easy to get wrong:
   broken one. `section` on the answer says which served it.
 - **The chart is geolocated by the *server's* IP**, not the user's. Run from a
   French-routed host it is the French chart, and the open API has no country
-  parameter, so this is a property of where lb-bot runs.
+  parameter, so this is a property of where lb-bot runs — and the reason a client
+  is offered a **genre** picker and never a country one. A per-country control
+  would silently do nothing.
+
+`chart` and `editorial` take a `genre`, and `GET /api/deezer/genres` serves the
+ids so the two clients do not each hardcode their own copy (the `MoodCharacter`
+mistake, which has already drifted once). `chart/0` is exactly what bare `chart`
+resolved to, so the default is byte-for-byte the old behaviour and a client that
+sends nothing keeps it. `_deezer_genre_id` is the **one** place the value is
+validated — digits or `"0"` — because it is interpolated into the upstream path,
+so a caller cannot reach anything but a genre. The six-hour cache already keys on
+`"path?query"`, so per-genre entries separate for free.
 
 `deezer_search_artist_id` is **exact name match only**, deliberately: Deezer's
 search happily answers a tribute band for a misspelling, and a near miss here is
@@ -452,6 +497,86 @@ and is deliberately in memory only: the window it must survive is one
 download→finalize cycle, and a restart in the middle costs one bad peer one more
 chance, never a wrong file placed.
 
+**4. A cancel is terminal, and refused-over.** `cancelled` is a ledger state of its
+own now (`_album_fill_set(..., "cancelled")`, `retryable: false`, no `failureKind`),
+not `failed` + `failureKind: "cancelled"` — a cancel is the user's verdict, not a
+failure, and both clients rendered the old shape with a Retry button. Three things
+make it stick:
+
+- **`_album_fill_set` refuses to write over a `cancelled` row** unless the caller
+  passes `begin=True`, which only `_album_fill_begin` (a genuinely new fill) does.
+  `_finalize_group`, the poller's failover branches and the verifier all used to
+  overwrite it — the row flipped cancelled → placed while the files landed anyway.
+- **`_cancel_album_fill` marks, detaches, then cancels — in that order, and the slskd
+  calls off the request thread.** `ag["cancelled"]` is set, the group is popped and
+  its transfers moved out of `pending_downloads` (`_detach_group_downloads`), all
+  cheap and synchronous, so the poller can no longer find anything to finalize; the
+  DELETEs (`_abandon_transfers_async`, with `?remove=true` so a retry does not
+  collide with a stale Cancelled row) run on a daemon thread. The route answers in
+  milliseconds — it used to run N × 10 s DELETEs on the event loop, behind the hub's
+  20 s timeout, so a twelve-file album could not be cancelled at all. Files already
+  on disk are left where slskd put them; the leftover-rescue view can place them.
+- **Placement claims the row atomically** (`_album_fill_transition(fill_mbid,
+  "placing", unless=("cancelled",))`) and the cancel route reads-and-writes under
+  the same lock, so whichever side moves first wins and the other finds out. A
+  cancel that arrives once the row says `placing` answers `cancelled: false` with
+  the status — the clients show "too late" rather than a row claiming a cancel
+  that did not happen. `_finalize_group` also checks `ag["cancelled"]` before
+  doing anything, the poller's success branch drops a file whose group is gone
+  instead of tagging it as a loose track, and `_switch_album_source_inner` checks
+  after every `await` so a cancel mid-failover stops the next peer's enqueue.
+
+`api_gap_cancel` mirrors all of this (`_gap_cancel`); it used to cancel by filename
+with a slskd listing per file, never pop the album group and write nothing, so the
+orphan sweep finalized — and placed — it minutes later. A cancel inside the 45 s
+auto-retry back-off is honoured too (`retryAt` on the row is what makes the row
+cancellable in that window; the retry worker checks the state before it fires).
+A user cancelling ONE file in slskd's UI no longer cancels the album: that file is
+counted lost with no failover, and the album is cancelled only when nothing has
+landed and every remaining file is Cancelled in the same listing.
+
+**5. Honest status, one clock, and a push.** Every counter a client reads off
+`/api/album/status` moves on a poller tick, so `DOWNLOAD_POLL_INT = 60` made the
+status up to a minute stale by construction while the bot's own SPA read slskd
+through a 3 s cache and looked live. The poller is adaptive now
+(`DOWNLOAD_POLL_ACTIVE_INT`, 5 s while any group or transfer is live, 60 s idle):
+one slskd listing per tick whatever the number of clients or rows watching, and
+the request path never touches slskd. What the view reports changed with it:
+
+- `done` is files **completed** — never completed+failed; `failed` sits beside it.
+- `percent` is byte-based when the transfers report sizes (`bytesDone`,
+  `bytesTotal`, `speedBps`, `activeFiles` are on the view, from the `raw_transfer`
+  the poller already stored and nothing read), and 100 on `placing`/`placed`/
+  `verified` — it used to read 0 on a placed album, because `done` was written
+  once at `queued` and never again. `_finalize_group` now writes the final counts.
+- `cancellable` is the one Cancel rule, stated by the server: `searching`, `queued`
+  or `downloading`, or a `failed` row whose `retryAt` is in the future.
+- `updatedAt` moves on transfer progress too (the poller stamps `ag["progress_at"]`),
+  and `serverTime` lets a client say "last checked Ns ago".
+- `attempts` counts fills **started** (`_album_fill_begin`), not failures, and the
+  one automatic retry is gated on `autoRetries` — it used to fire only on a row's
+  first failure ever. A new fill drops every per-fill field
+  (`_ALBUM_FILL_PER_FILL_FIELDS`) instead of merging over the old row.
+- `_sweep_album_fill_zombies` runs each tick: `searching`/`queued` with no group and
+  no task past `SEARCH_TIMEOUT + 60 s` → `transfer_failed`; `placing` with no group
+  past 15 min → `placement_failed`; `placed` past the verifier's deadline →
+  `verifyGaveUp`. The restore docstring used to promise this and nothing did it.
+- Gap-fill rows reach `verified` (`_album_fill_mark_group_verified` from the
+  review-group verifier); they used to sit on `placed` forever.
+
+`GET /api/fills?release_mbids=a,b&group_ids=g` answers every watched fill in one
+read (`_fills_view`; 32 each, album views minus the per-file list, gap summaries
+minus the sources), and **`_push_fill` POSTs `<hub>/lb/fill`** on every ledger
+transition and on throttled progress (≥ 5 points or ≥ 10 s, `_push_fill_progress`),
+coalesced on one worker thread. The hub relays it as a `fill` frame that touches
+nothing in its library caches — a landing is still `/lb/notify`. A wishlist
+landing is a `kind: "wishlist"` fill frame now rather than a second `albumPlaced`.
+`_wishlist_note_outcome` records how a re-search ended on the row, which used to say
+"re-searching" forever, and the automatic retry excludes the peer that just failed
+(`lastSource`) plus anything the user excluded. `album/download` takes `allowMp3`
+for the whole-album path — a `format_rejected` fill with no review group had
+`mp3WouldHelp` on the wire and no route that could act on it.
+
 ### The wishlist — `GET/POST /api/wishlist`, `POST /api/wishlist/remove`
 
 Where a `no_source` failure goes. `no_source` deliberately never auto-retries
@@ -466,9 +591,11 @@ running is a **slow** one (`WISHLIST_RESEARCH_INTERVAL`, 6 h; per row
 Rows are a `wishlist` table in `library_index.db`, beside `review_groups` and
 `meta` and for the same reasons; `INDEX_SCAN_VERSION` is deliberately **not**
 bumped. Keyed by release-group id, so a landing is recognised without a name
-match: a verified fill calls `_wishlist_landed`, which drops the row and fires
-`_notify_hub_library_change` — a client showing the wishlist has no other way to
-learn that what it is displaying is now in the library.
+match: a verified fill calls `_wishlist_landed`, which drops the row and pushes a
+`kind: "wishlist"` fill frame (`_push_enqueue`) — a client showing the wishlist has
+no other way to learn that what it is displaying is now in the library. Not a
+second `albumPlaced`: the landing was already announced, and a library notify makes
+every client refetch its whole album list.
 
 The sweep does **one row per pass** on purpose: a source search fans out across
 Soulseek and takes the better part of a minute (`SEARCH_TIMEOUT` is 75 s), so

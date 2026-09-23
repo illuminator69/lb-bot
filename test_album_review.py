@@ -1999,6 +1999,10 @@ class AlbumReviewTests(unittest.TestCase):
         for name, value in (("_slskd_cancel", lambda u, f, *a, **k: cancels.append((u, f))),
                             ("_slskd_fetch_all_downloads", lambda: []),
                             ("_save_state", lambda *a, **k: None),
+                            # The cancel route hands its slskd DELETEs to a thread;
+                            # run them inline so a test can count them.
+                            ("_abandon_transfers_async",
+                             lambda entries: bot._abandon_transfers(entries)),
                             ("_schedule_album_fill_retry", retry)):
             patcher = patch.object(bot, name, value)
             patcher.start()
@@ -2055,10 +2059,243 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(bot.pending_downloads, {})
         self.assertEqual(len(cancels), 3, "every outstanding transfer is cancelled in slskd")
         view = bot._album_fill_view("rel1")
+        # A cancel is its own terminal state, not a failure kind: a Retry
+        # button on a row the user just stopped was the "restart it from
+        # lb-bot" confusion, and `failed` counted cancels as failures.
         self.assertEqual((view["state"], view["failureKind"], view["retryable"]),
-                         ("failed", "cancelled", True))
+                         ("cancelled", "", False))
+        self.assertFalse(view["cancellable"])
         # Nothing in flight any more: a second cancel is a no-op, not an error.
         self.assertFalse(bot._cancel_album_fill("rel1", "Cancelled"))
+
+    def test_cancelled_row_is_refused_over_until_a_new_fill_begins(self):
+        """Every writer on the placement path used to overwrite a cancel — the
+        row flipped cancelled → placed while the files landed anyway."""
+        self._fill_ledger()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "cancelled", reason="Cancelled")
+            self.assertFalse(bot._album_fill_set("rel1", "placing"))
+            self.assertFalse(bot._album_fill_set("rel1", "placed"))
+            bot._album_fill_fail("rel1", "transfer_failed", "late failover")
+            self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+            # Only a new fill replaces the verdict.
+            bot._album_fill_begin("rel1", artist="A", album="B", total=3)
+            view = bot._album_fill_view("rel1")
+            self.assertEqual(view["state"], "searching")
+            self.assertEqual(view["attempts"], 1)
+
+    def test_cancel_answers_before_slskd_is_asked(self):
+        """Each slskd DELETE is a 10 s timeout and the route sits behind the
+        hub's 20 s proxy timeout: a twelve-file album could not be cancelled."""
+        self._fill_ledger()
+        cancels = []
+        old_groups, old_pending = bot.pending_album_groups.copy(), bot.pending_downloads.copy()
+        self.addCleanup(lambda: (bot.pending_album_groups.clear(),
+                                 bot.pending_album_groups.update(old_groups),
+                                 bot.pending_downloads.clear(),
+                                 bot.pending_downloads.update(old_pending)))
+        bot.pending_album_groups.clear()
+        bot.pending_downloads.clear()
+        self._group()
+
+        def slow_cancel(u, f, *a, **k):
+            time.sleep(0.3)
+            cancels.append((u, f))
+            return True
+
+        with patch.object(bot, "_slskd_cancel", slow_cancel), \
+                patch.object(bot, "_slskd_fetch_all_downloads", lambda: []), \
+                patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "downloading")
+            t0 = time.time()
+            self.assertTrue(bot._cancel_album_fill("rel1", "Cancelled"))
+            self.assertLess(time.time() - t0, 0.25, "the route must not wait on slskd")
+            self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+            self.assertNotIn("ag1", bot.pending_album_groups)
+            self.assertEqual(bot.pending_downloads, {})
+            for th in threading.enumerate():
+                if th.name == "slskd-abandon":
+                    th.join(5)
+        self.assertEqual(len(cancels), 3)
+
+    def test_placement_claims_the_row_atomically_against_a_cancel(self):
+        """Finalize and the cancel route run on different threads; whichever
+        claims the row first wins, and the loser finds out rather than
+        overwriting."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "downloading")
+            self.assertTrue(bot._album_fill_transition("rel1", "placing", unless=("cancelled",)))
+            # Too late to cancel: the files are going into the library.
+            self.assertFalse(bot._cancel_album_fill("rel1", "Cancelled"))
+            self.assertEqual(bot._album_fill_view("rel1")["state"], "placing")
+
+            bot._album_fill_set("rel2", "downloading")
+            self.assertTrue(bot._cancel_album_fill("rel2", "Cancelled"))
+            self.assertFalse(bot._album_fill_transition("rel2", "placing", unless=("cancelled",)))
+
+    def test_finalize_never_places_a_cancelled_group(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=3)
+        bot.pending_album_groups["ag1"]["local_dirs"] = {"/downloads/Album": 3}
+        bot.pending_album_groups["ag1"]["cancelled"] = True
+        with patch.object(bot, "_deterministic_album_import",
+                          lambda *a, **k: self.fail("a cancelled group must not be placed")), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+            bot._album_fill_set("rel1", "cancelled")
+            asyncio.run(bot._finalize_group(None, "ag1"))
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def test_a_file_finishing_after_its_group_was_cancelled_is_left_alone(self):
+        """It is not a loose track: tagging it, scanning Navidrome and
+        announcing "✅ Download completed" is how a cancelled album arrived."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        bot.pending_downloads[("slowpeer", "Album\\01.flac")] = {
+            "album_group_id": "ag-gone", "token": "tok", "chat_id": "chat",
+            "track": {"artist": "A", "title": "T"}, "candidates": []}
+        sends = AsyncMock()
+        with patch.object(bot, "slskd_get_all_downloads",
+                          lambda force=False: [{"_username": "slowpeer",
+                                               "filename": "Album\\01.flac",
+                                               "state": "Completed, Succeeded"}]), \
+                patch.object(bot, "_tg_send", sends), \
+                patch.object(bot, "_resolve_local_path", lambda f: "/downloads/Album/01.flac"), \
+                patch.object(bot, "_mutagen_write_tags",
+                             lambda *a, **k: self.fail("must not tag a cancelled album's file")), \
+                patch.object(bot, "_nd_scan_after_import",
+                             lambda *a, **k: self.fail("must not scan for it either")):
+            app = type("App", (), {"bot": AsyncMock()})()
+            asyncio.run(bot._poll_downloads_once({"tok": app}))
+        self.assertEqual(bot.pending_downloads, {})
+        sends.assert_not_called()
+
+    def test_source_switch_stops_when_the_fill_is_cancelled_mid_walk(self):
+        """A cancel landing while the switch is parked on an await used to let
+        it enqueue the next peer's files under a group nothing tracked."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        ag = bot.pending_album_groups["ag1"]
+        ag["alt_sources"] = [{"username": "peer2", "files": [{"filename": "a.flac"}]},
+                             {"username": "peer3", "files": [{"filename": "b.flac"}]}]
+
+        def expand_then_cancel(username, fd, ref):
+            bot._cancel_album_fill("rel1", "Cancelled")
+            return fd["files"]
+
+        with patch.object(bot, "slskd_expand_directory", expand_then_cancel), \
+                patch.object(bot, "slskd_enqueue",
+                             lambda *a, **k: self.fail("must not enqueue after a cancel")), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+            asyncio.run(bot._switch_album_source(None, "ag1"))
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def test_gap_cancel_pops_the_album_group_and_records_the_cancel(self):
+        """The gap route cancelled by filename, never popped the album group and
+        wrote nothing — so the orphan sweep finalized and PLACED it minutes
+        later, under a row every client still read as downloading."""
+        self._fill_ledger()
+        cancels = self._isolated_transfers()
+        self._group()
+        bot.pending_album_groups["ag1"]["review_group_id"] = "g1"
+        for info in bot.pending_downloads.values():
+            info["review_group_id"] = "g1"
+            info["review_track_index"] = 0
+        marks = []
+        with patch.object(bot, "_set_review_track_state",
+                          lambda gid, idx, decision, **k: marks.append(decision)):
+            bot._album_fill_set("rel1", "downloading")
+            self.assertEqual(bot._gap_cancel("g1"), 1)
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot.pending_downloads, {})
+        self.assertEqual(len(cancels), 3)
+        self.assertEqual(set(marks), {"cancelled"})
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def test_dismissing_a_live_album_group_ends_its_fill(self):
+        """The SPA's ✕ dropped tracking and left the ledger on `queued` forever."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        bot._album_fill_set("rel1", "queued")
+        self.assertEqual(bot._dismiss_transfer("ag1"), "album")
+        view = bot._album_fill_view("rel1")
+        self.assertEqual((view["state"], view["failureKind"], view["retryable"]),
+                         ("failed", "transfer_failed", True))
+        self.assertEqual(bot._dismiss_transfer("nope"), "")
+
+    def test_begin_resets_per_fill_fields_and_counts_fills(self):
+        """A new `searching` row merged over the old one, so a retry inherited
+        the previous attempt's counters, reason and MP3 verdict."""
+        self._fill_ledger()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "failed", done=3, failed=1, reason="old",
+                                failureKind="format_rejected", mp3WouldHelp=True,
+                                ndAlbumIds=["nd1"], attempts=1, autoRetries=1,
+                                excludedUsers=["slow"], source="slow")
+            bot._album_fill_begin("rel1", artist="A", album="B", total=12,
+                                  excluded_users=("other",))
+        view = bot._album_fill_view("rel1")
+        self.assertEqual(view["state"], "searching")
+        self.assertEqual((view["done"], view["failed"], view["reason"],
+                          view["failureKind"], view["mp3WouldHelp"], view["ndAlbumIds"]),
+                         (0, 0, "", "", False, []))
+        self.assertEqual(view["attempts"], 2)
+        row = bot._album_fill_get("rel1")
+        self.assertEqual(row["autoRetries"], 0, "a user-initiated fill re-arms the auto-retry")
+        self.assertEqual(row["excludedUsers"], ["slow", "other"])
+
+    def test_auto_retry_excludes_the_peer_that_failed(self):
+        self._fill_ledger()
+        schedule = bot._schedule_album_fill_retry   # the real one, before isolation stubs it
+        self._isolated_transfers(forbid_auto_retry=False)
+        self._group()
+        captured = []
+        with patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_task_run",
+                             lambda kind, label, target, **k: captured.append(target) or "t1"), \
+                patch.object(bot, "_album_download_task",
+                             lambda *a, **k: captured.append((a, k))):
+            bot._album_fill_begin("rel1", artist="A", album="B", total=3)
+            bot._album_fill_fail("rel1", "transfer_failed", "peer went away")
+            row = bot._album_fill_get("rel1")
+            self.assertEqual(row["lastSource"], "slowpeer")
+            self.assertGreater(row["retryAt"], time.time())
+            bot.pending_album_groups.clear()
+            schedule("rel1", row, delay=0)
+            deadline = time.time() + 3
+            while len(captured) < 1 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(captured), 1, "the retry task was scheduled")
+            captured[0]("tid")
+        args, kwargs = captured[1]
+        self.assertEqual(args[8], ("slowpeer",))
+        self.assertFalse(kwargs["user_initiated"])
+
+    def test_cancel_inside_the_retry_backoff_stops_the_retry(self):
+        """A cancel inside the 45 s back-off used to be written as `failed` too,
+        so the worker could not tell it from the failure and fired anyway."""
+        self._fill_ledger()
+        schedule = bot._schedule_album_fill_retry
+        self._isolated_transfers(forbid_auto_retry=False)
+        ran = []
+        with patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_task_run", lambda *a, **k: ran.append(a) or "t"):
+            bot._album_fill_begin("rel1", artist="A", album="B", total=3)
+            bot._album_fill_fail("rel1", "transfer_failed", "peer went away")
+            view = bot._album_fill_view("rel1")
+            self.assertTrue(view["cancellable"], "a pending auto-retry is cancellable")
+            self.assertGreater(view["retryAt"], 0)
+            self.assertTrue(bot._cancel_album_fill("rel1", "Cancelled"))
+            self.assertEqual(bot._album_fill_view("rel1")["retryAt"], 0)
+            schedule("rel1", bot._album_fill_get("rel1"), delay=0)
+            time.sleep(0.2)
+        self.assertEqual(ran, [], "a cancelled fill must not retry itself")
 
     def test_cancel_during_search_stops_the_enqueue(self):
         self._fill_ledger()
@@ -2096,9 +2333,11 @@ class AlbumReviewTests(unittest.TestCase):
                 patch.object(bot, "_resolve_local_path", lambda f: ""):
             asyncio.run(bot._poll_downloads_once({"tok": app}))
 
-    def test_cancel_in_slskd_cancels_the_album_instead_of_failing_over(self):
+    def test_cancel_of_one_file_in_slskd_loses_that_file_and_keeps_the_album(self):
         """A user-cancelled transfer used to be failed over to another peer — the
-        download the user had just stopped, re-queued."""
+        download the user had just stopped, re-queued. Then it cancelled the
+        WHOLE album on one Cancelled row, throwing away 11 landed tracks when
+        the twelfth was stopped. One file is one file."""
         self._fill_ledger()
         cancels = self._isolated_transfers()
         self._group(completed=1)
@@ -2109,9 +2348,23 @@ class AlbumReviewTests(unittest.TestCase):
                               "state": "Completed, Cancelled"},
                              {"_username": "slowpeer", "filename": "Album\\02.flac",
                               "state": "InProgress"}])
+        self.assertIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot.pending_album_groups["ag1"]["failed"], 1)
+        self.assertNotIn(("slowpeer", "Album\\01.flac"), bot.pending_downloads)
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "downloading")
+        self.assertEqual(cancels, [], "the album's other transfers keep going")
+
+    def test_cancelling_every_file_in_slskd_cancels_the_album(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=0)
+        bot._album_fill_set("rel1", "downloading")
+        with patch.object(bot, "_retry_file_from_alt_source",
+                          lambda *a, **k: self.fail("must not fail a user cancel over")):
+            self._poll_once([{"_username": "slowpeer", "filename": f"Album\\0{n}.flac",
+                              "state": "Completed, Cancelled"} for n in (1, 2, 3)])
         self.assertNotIn("ag1", bot.pending_album_groups)
-        self.assertEqual(bot._album_fill_view("rel1")["failureKind"], "cancelled")
-        self.assertTrue(cancels, "the album's other transfers are stopped too")
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
 
     def test_watchdog_cancel_still_fails_over(self):
         self._fill_ledger()
@@ -2144,6 +2397,8 @@ class AlbumReviewTests(unittest.TestCase):
                          ("failed", "transfer_failed", True))
 
     def test_transfers_removed_from_slskd_cancel_the_album(self):
+        """Judged by time missing, not by poll count: at the 5 s active cadence
+        two ticks would cancel an album on a ten-second slskd hiccup."""
         self._fill_ledger()
         self._isolated_transfers()
         self._group(completed=0)
@@ -2152,8 +2407,162 @@ class AlbumReviewTests(unittest.TestCase):
         self._poll_once(other)
         self.assertIn("ag1", bot.pending_album_groups, "one missing poll is not enough")
         self._poll_once(other)
+        self.assertIn("ag1", bot.pending_album_groups, "nor is a second one seconds later")
+        for info in bot.pending_downloads.values():
+            info["_missing_since"] = time.time() - bot.VANISHED_TRANSFER_SECS - 1
+        self._poll_once(other)
         self.assertNotIn("ag1", bot.pending_album_groups)
-        self.assertEqual(bot._album_fill_view("rel1")["failureKind"], "cancelled")
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def test_status_view_progress_is_honest(self):
+        """`done` used to be completed+failed and was written once at `queued`
+        and never again, so a placed album reported percent 0; bytes were on
+        the transfer records and never read."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=1)
+        ag = bot.pending_album_groups["ag1"]
+        ag["failed"] = 1
+        ag["completed_bytes"] = 1000
+        ag["progress_at"] = time.time() + 5
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "queued", done=0, total=3)
+        p1 = bot.pending_downloads[("slowpeer", "Album\\01.flac")]
+        p1.update(latest_state="InProgress",
+                  raw_transfer={"size": 2000, "bytesTransferred": 500, "averageSpeed": 100})
+        view = bot._album_fill_view("rel1")
+        self.assertEqual(view["state"], "downloading")
+        self.assertEqual((view["done"], view["failed"], view["total"]), (1, 1, 3))
+        self.assertEqual((view["bytesDone"], view["bytesTotal"], view["speedBps"],
+                          view["activeFiles"]), (1500, 3000, 100, 1))
+        self.assertEqual(view["percent"], 50)
+        self.assertTrue(view["cancellable"])
+        self.assertEqual(view["updatedAt"], ag["progress_at"], "progress moves updatedAt")
+        self.assertGreater(view["serverTime"], 0)
+        self.assertEqual(len(view["files"]), 3)
+        self.assertNotIn("files", bot._album_fill_view("rel1", include_files=False))
+        # Terminal: 100 % and the final counts, never the counters from `queued`.
+        bot.pending_album_groups.clear()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "placed", done=2, failed=1, total=3)
+        view = bot._album_fill_view("rel1")
+        self.assertEqual((view["percent"], view["done"], view["cancellable"]), (100, 2, False))
+
+    def test_zombie_rows_are_swept_to_a_terminal_state(self):
+        """A restart mid-search left `searching` forever: a live fill with a
+        Cancel button that did nothing, in every client."""
+        self._fill_ledger()
+        self._isolated_transfers(forbid_auto_retry=False)
+        now = time.time()
+        with patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_running_album_download_task", lambda m: ""):
+            bot._album_fill_set("stale-search", "searching", artist="A", album="B")
+            bot._album_fill_set("fresh-search", "searching", artist="A", album="B")
+            bot._album_fill_set("stale-placing", "placing")
+            bot._album_fill_set("stale-placed", "placed")
+            bot._album_fill_status["stale-search"]["updated_at"] = now - bot.SEARCH_TIMEOUT - 120
+            bot._album_fill_status["stale-placing"]["updated_at"] = now - 16 * 60
+            bot._album_fill_status["stale-placed"]["updated_at"] = now - bot.ALBUM_FILL_VERIFY_TIMEOUT - 120
+            self.assertEqual(bot._sweep_album_fill_zombies(), 3)
+        self.assertEqual(bot._album_fill_view("stale-search")["failureKind"], "transfer_failed")
+        self.assertEqual(bot._album_fill_view("fresh-search")["state"], "searching")
+        self.assertEqual(bot._album_fill_view("stale-placing")["failureKind"], "placement_failed")
+        placed = bot._album_fill_view("stale-placed")
+        self.assertEqual((placed["state"], placed["verifyGaveUp"]), ("placed", True))
+
+    def test_gap_fill_rows_reach_verified(self):
+        self._fill_ledger()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("canon-1", "placed")
+            bot._album_fill_set("other", "placed", groupId="g1")
+            bot._album_fill_set("unrelated", "placed")
+            bot._album_fill_mark_group_verified("g1", {"canon-1"}, ["nd-9"])
+        self.assertEqual(bot._album_fill_view("canon-1")["state"], "verified")
+        self.assertEqual(bot._album_fill_view("other")["ndAlbumIds"], ["nd-9"])
+        self.assertEqual(bot._album_fill_view("unrelated")["state"], "placed")
+
+    def _push_capture(self):
+        """Route the hub push at a recorder, with the coalescing window shrunk."""
+        posts = []
+        for name, value in (("HUB_NOTIFY_URL", "http://hub"), ("HUB_NOTIFY_TOKEN", "tok"),
+                            ("PUSH_COALESCE_SECS", 0.05)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(bot.requests, "post",
+                               lambda url, json=None, **k: posts.append((url, json)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return posts
+
+    def _drain_push(self, posts, want, timeout=3.0):
+        deadline = time.time() + timeout
+        while len(posts) < want and time.time() < deadline:
+            time.sleep(0.02)
+        return posts
+
+    def test_every_ledger_transition_is_pushed_to_the_hub_as_a_fill_frame(self):
+        """A landing had a push (`/lb/notify`); a failure, a cancel and progress
+        had none, so the OTHER client kept polling `downloading`."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        posts = self._push_capture()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_begin("rel1", artist="A", album="B", total=3, rgid="rg-1")
+            self._drain_push(posts, 1)
+            bot._cancel_album_fill("rel1", "Cancelled")
+            self._drain_push(posts, 2)
+        self.assertEqual([u for u, _ in posts], ["http://hub/lb/fill"] * 2)
+        first, last = posts[0][1], posts[-1][1]
+        self.assertEqual((first["kind"], first["key"], first["state"]), ("album", "rg-1", "searching"))
+        self.assertEqual((last["state"], last["cancellable"]), ("cancelled", False))
+        self.assertNotIn("files", last, "the frame never carries the per-file list")
+
+    def test_push_coalesces_a_burst_and_never_pushes_unknown(self):
+        self._fill_ledger()
+        posts = self._push_capture()
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            for _ in range(5):
+                bot._push_fill("rel-burst")          # no row: unknown, never sent
+            bot._album_fill_set("rel1", "queued", rgid="rg-1", total=3)
+            bot._album_fill_set("rel1", "downloading", rgid="rg-1", total=3)
+            bot._album_fill_set("rel1", "downloading", rgid="rg-1", total=3)
+            self._drain_push(posts, 1)
+            time.sleep(0.2)
+        self.assertEqual(len(posts), 1, "three writes inside the window are one push")
+        self.assertEqual(posts[0][1]["state"], "downloading")
+
+    def test_progress_push_is_throttled(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=0)
+        sent = []
+        with patch.object(bot, "_push_enqueue", lambda kind, key, payload=None: sent.append(key)):
+            ag = bot.pending_album_groups["ag1"]
+            bot._push_fill_progress("ag1")           # first: always
+            bot._push_fill_progress("ag1")           # same percent, same second: no
+            ag["completed"] = 1                      # 33 %: moved ≥ 5 points
+            bot._push_fill_progress("ag1")
+            ag["_pushed_at"] = time.time() - bot.PUSH_PROGRESS_MIN_SECS - 1
+            bot._push_fill_progress("ag1")           # old enough: yes even unmoved
+        self.assertEqual(sent, ["rel1"] * 3)
+
+    def test_fills_view_answers_every_watched_row_in_one_read(self):
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group(completed=1)
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set("rel1", "queued", total=3)
+            bot._album_fill_set("rel2", "verified", total=9, done=9)
+        out = bot._fills_view(["rel1", "rel2", "rel1", "nope"] + [f"x{i}" for i in range(40)], [])
+        self.assertEqual(set(out["albums"]) >= {"rel1", "rel2", "nope"}, True)
+        self.assertLessEqual(len(out["albums"]), 32)
+        self.assertEqual(out["albums"]["rel1"]["state"], "downloading")
+        self.assertEqual(out["albums"]["rel2"]["percent"], 100)
+        self.assertEqual(out["albums"]["nope"]["state"], "unknown")
+        self.assertNotIn("files", out["albums"]["rel1"])
+        self.assertGreater(out["serverTime"], 0)
+        self.assertEqual(out["gaps"], {})
 
     def test_fill_ledger_survives_a_restart(self):
         """The whole point of §1: pending_album_groups and pending_downloads are
@@ -2227,11 +2636,19 @@ class AlbumReviewTests(unittest.TestCase):
             bot._album_fill_fail("c", "transfer_failed", "peer went away",
                                  artist="A", album="B")
             self.assertEqual(scheduled, ["c"])
-            # attempts is cumulative on the row, so the second failure is past
-            # FILL_AUTO_RETRY_MAX and stops rather than looping forever.
+            # The retry's own failure is past FILL_AUTO_RETRY_MAX and stops
+            # rather than looping forever...
+            bot._album_fill_begin("c", artist="A", album="B", total=3, user_initiated=False)
             bot._album_fill_fail("c", "transfer_failed", "peer went away again")
             self.assertEqual(scheduled, ["c"])
             self.assertEqual(bot._album_fill_view("c")["attempts"], 2)
+            # ...but the user asking again re-arms it: `attempts` counts fills,
+            # and it used to count failures and never reset, so the one retry
+            # only ever fired on a row's first failure.
+            bot._album_fill_begin("c", artist="A", album="B", total=3)
+            bot._album_fill_fail("c", "transfer_failed", "and again")
+            self.assertEqual(scheduled, ["c", "c"])
+            self.assertEqual(bot._album_fill_view("c")["attempts"], 3)
 
     def test_status_view_reports_failure_fields_on_a_healthy_fill(self):
         """A client reads these unconditionally, so they must be present and
@@ -5698,24 +6115,44 @@ class WishlistTests(unittest.TestCase):
 
     def test_a_landing_removes_the_row_and_tells_the_hub(self):
         """A client showing the wishlist has no other way to learn that what it
-        is displaying is now in the library."""
-        notified = []
+        is displaying is now in the library. It is a `fill` frame, not a second
+        `albumPlaced`: the landing was already announced, and a library notify
+        makes every client refetch its whole album list."""
+        pushed = []
         with isolated_review(), \
              patch("listenbrainz_bot._notify_hub_library_change",
-                   side_effect=lambda *a, **k: notified.append(k)):
+                   side_effect=lambda *a, **k: self.fail("no library notify for a wishlist row")), \
+             patch("listenbrainz_bot._push_enqueue",
+                   side_effect=lambda kind, key, payload=None: pushed.append((kind, key, payload))):
             bot._wishlist_add("rg-1", "Band", "Record")
             bot._wishlist_landed("rg-1", "Band", "Record")
             self.assertEqual(bot._wishlist_list(), [])
-        self.assertEqual(len(notified), 1)
-        self.assertEqual(notified[0]["rgid"], "rg-1")
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0][:2], ("wishlist", "rg-1"))
+        self.assertEqual(pushed[0][2]["state"], "landed")
 
     def test_a_landing_for_something_never_wished_for_says_nothing(self):
-        notified = []
+        pushed = []
         with isolated_review(), \
-             patch("listenbrainz_bot._notify_hub_library_change",
-                   side_effect=lambda *a, **k: notified.append(k)):
+             patch("listenbrainz_bot._push_enqueue",
+                   side_effect=lambda *a, **k: pushed.append(a)):
             bot._wishlist_landed("rg-never", "Band", "Record")
-        self.assertEqual(notified, [])
+        self.assertEqual(pushed, [])
+
+    def test_the_re_search_outcome_is_recorded_on_the_row(self):
+        """`_wishlist_retry_one` wrote "re-searching" and nothing ever replaced
+        it, so the row said that forever."""
+        with isolated_review(), \
+             patch("listenbrainz_bot._save_state", lambda *a, **k: None), \
+             patch("listenbrainz_bot._schedule_album_fill_retry", lambda *a, **k: None):
+            bot._wishlist_add("rg-1", "Band", "Record")
+            bot._wishlist_mark_tried("rg-1", "re-searching")
+            bot._album_fill_status.pop("rel-w", None)
+            bot._album_fill_set("rel-w", "searching", rgid="rg-1", artist="Band", album="Record")
+            bot._album_fill_fail("rel-w", "no_source", "Nobody is sharing it today")
+            row = bot._wishlist_list()[0]
+            bot._album_fill_status.pop("rel-w", None)
+        self.assertEqual(row["lastReason"], "Nobody is sharing it today")
 
     def test_a_retry_does_not_start_a_second_fill_for_the_same_release(self):
         """The same guard `_schedule_album_fill_retry` keeps: if anything is

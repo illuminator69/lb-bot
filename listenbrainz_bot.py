@@ -85,7 +85,13 @@ SEARCH_HTTP_TIMEOUT  = 10  # per-request timeout; unrelated to the search deadli
 # cache for its own sake, only enough to survive navigating away and back.
 # "Search again" always bypasses it.
 SOURCE_RESULTS_TTL = float(os.environ.get("SOURCE_RESULTS_TTL", "180"))
-DOWNLOAD_POLL_INT = 60 # seconds between download status checks
+DOWNLOAD_POLL_INT = 60 # seconds between download status checks while idle
+# ...and while any album group or transfer is live. Every counter a client
+# reads off /api/album/status moves only on a poller tick, so at 60 s the
+# status was up to a minute stale by construction while lb-bot's own SPA read
+# slskd through a 3 s cache and looked live. One slskd listing per tick,
+# whatever the number of clients or rows watching.
+DOWNLOAD_POLL_ACTIVE_INT = int(os.environ.get("DOWNLOAD_POLL_ACTIVE_INT", "5"))
 # Stall watchdog. STALL_TIMEOUT only applies once a transfer is actually
 # *transferring* (InProgress): Soulseek peers serve one or two files at a time,
 # so the tail of a 12-track album legitimately sits at 0 bytes in the peer's
@@ -1734,6 +1740,12 @@ def _verify_placement_worker(group_id: str) -> None:
                 with _review_lock:
                     group = _find_review_group(group_id) or {}
                     g_artist, g_album = group.get("artist", ""), group.get("album", "")
+                    g_mbids = {group.get("canonical_mbid", ""), group.get("release_mbid", "")}
+                # A gap fill shares the album ledger (its transfer group carries
+                # the release), but only this worker verifies it — and it never
+                # wrote the row, so gap rows sat on `placed` forever.
+                _album_fill_mark_group_verified(group_id, g_mbids - {""},
+                                                _album_ids_of(matched))
                 _announce_album_indexed("", "", group_id, matched,
                                         artist=g_artist, album=g_album)
             if time.time() >= deadline:
@@ -1793,10 +1805,36 @@ ALBUM_FILL_VERIFY_INTERVAL = PLACEMENT_VERIFY_INTERVAL
 # How long a terminal ledger row is worth keeping across a restart. A `verified`
 # fill is history the moment the library has it; a `failed` one is still worth a
 # day, because the retry buttons in both clients hang off exactly this row.
-_ALBUM_FILL_TERMINAL_TTL = {"verified": 6 * 3600, "failed": 24 * 3600}
+_ALBUM_FILL_TERMINAL_TTL = {"verified": 6 * 3600, "failed": 24 * 3600,
+                            "cancelled": 24 * 3600}
 
-def _album_fill_set(release_mbid: str, state: str, **fields) -> None:
-    """Record where one release-group's fill has got to. Last writer wins.
+# The states a client may cancel from. Stated by the server (`cancellable` on
+# the status view) so both clients render the button from one rule rather than
+# each keeping its own list — Navic's Download Center offered Cancel on a row
+# that was already being placed.
+ALBUM_FILL_CANCELLABLE_STATES = ("searching", "queued", "downloading")
+
+# The fields that describe ONE fill and must not leak into the next. A new
+# `searching` row used to merge over the old one, so a retry inherited the
+# previous attempt's `mp3WouldHelp`, its `ndAlbumIds`, its switch `reason` and
+# its `done`/`failed` counters — the row said "3 of 12 downloaded" a second
+# before the new search had even started.
+_ALBUM_FILL_PER_FILL_FIELDS = (
+    "done", "failed", "source", "ndAlbumIds", "mp3WouldHelp", "groupId",
+    "reason", "failureKind", "retryable", "moved", "destFolder", "retryAt",
+    "verifiedTracks", "verifyGaveUp", "taskId", "progress_at",
+)
+
+def _album_fill_set(release_mbid: str, state: str, **fields) -> bool:
+    """Record where one release-group's fill has got to. Last writer wins —
+    with one exception: a `cancelled` row is refused-over.
+
+    A cancel is the user's verdict on the fill, and every later writer on the
+    placement path — `_finalize_group`, the poller's failover branches, the
+    verifier — used to overwrite it: the row flipped cancelled → placed while
+    the files landed in the library anyway. Now only `_album_fill_begin`, which
+    passes `begin=True` because a new fill genuinely replaces the old verdict,
+    may write over a cancel. Returns whether the write was applied.
 
     Persistence is deferred to the 30 s `state_flush_loop` and the shutdown
     flush rather than written here: `_save_state()` is ~59 ms and this is called
@@ -1805,10 +1843,16 @@ def _album_fill_set(release_mbid: str, state: str, **fields) -> None:
     which is what a resumed download is found by — pass `durable=True`.
     """
     if not release_mbid:
-        return
+        return False
     durable = bool(fields.pop("durable", False))
+    begin = bool(fields.pop("begin", False))
     with _album_fill_lock:
         entry = _album_fill_status.setdefault(release_mbid, {})
+        if (entry.get("state") == "cancelled" and state != "cancelled"
+                and not begin):
+            print(f"  fill ledger: refused {state!r} over a cancelled fill "
+                  f"({release_mbid[:8]})")
+            return False
         entry.update(fields)
         entry["state"] = state
         entry["updated_at"] = time.time()
@@ -1822,6 +1866,65 @@ def _album_fill_set(release_mbid: str, state: str, **fields) -> None:
         # Outside the lock: _save_state takes _album_fill_lock itself via
         # _album_fill_for_disk, and this one is a plain Lock, not an RLock.
         _save_state()
+    _push_fill(release_mbid)
+    return True
+
+def _album_fill_transition(release_mbid: str, state: str, *,
+                           unless: tuple = (), only_from: tuple = (),
+                           **fields) -> bool:
+    """Compare-and-set on one ledger row, under the lock.
+
+    `_finalize_group` (asyncio thread) and the cancel route (Flask thread) both
+    move a fill, and a read-then-write from either can interleave with the
+    other: a cancel that landed between finalize's group pop and its `placing`
+    write was overwritten, and the album placed under a row that said
+    "cancelled". This makes each side's decision atomic: placement claims the
+    row with `unless=("cancelled",)`, a cancel with `only_from=cancellable`.
+    """
+    if not release_mbid:
+        return False
+    with _album_fill_lock:
+        cur = (_album_fill_status.get(release_mbid) or {}).get("state") or "unknown"
+        if unless and cur in unless:
+            return False
+        if only_from and cur not in only_from:
+            return False
+    return _album_fill_set(release_mbid, state, **fields)
+
+def _album_fill_begin(release_mbid: str, *, artist: str, album: str, total: int,
+                      rgid: str = "", quality: str = "", task_id: str = "",
+                      user_initiated: bool = True, allow_mp3: bool = False,
+                      excluded_users: tuple = ()) -> None:
+    """Open the ledger row for a NEW fill of this release.
+
+    Keeps only what describes the release across fills — `created_at`, the
+    fill count, the auto-retry count and the peers the user excluded — and
+    drops every per-fill field (see `_ALBUM_FILL_PER_FILL_FIELDS`), so the row
+    starts clean. `attempts` counts fills started, which is what "Tried N
+    times" on a client means; it used to count failures and never reset, so
+    the one automatic retry only ever fired on a row's first failure. A
+    user-initiated fill resets `autoRetries` for the same reason, and clears
+    any cancel flag left over from a task that died before consuming it.
+    """
+    prior = _album_fill_get(release_mbid)
+    if user_initiated:
+        _album_fill_cancel_requested.discard(release_mbid)
+    excluded = tuple(dict.fromkeys(
+        list(prior.get("excludedUsers") or []) + list(excluded_users or [])))[:10]
+    fields = dict(
+        artist=artist, album=album, total=int(total or 0), rgid=rgid or "",
+        quality=quality or "", taskId=task_id, allowMp3=bool(allow_mp3),
+        attempts=int(prior.get("attempts") or 0) + 1,
+        autoRetries=0 if user_initiated else int(prior.get("autoRetries") or 0),
+        excludedUsers=list(excluded), lastSource=prior.get("lastSource", ""),
+        reason="", failureKind="", retryable=False, done=0, failed=0,
+        begin=True, durable=True)
+    with _album_fill_lock:
+        entry = _album_fill_status.get(release_mbid)
+        if entry:
+            for k in _ALBUM_FILL_PER_FILL_FIELDS:
+                entry.pop(k, None)
+    _album_fill_set(release_mbid, "searching", **fields)
 
 def _album_fill_get(release_mbid: str) -> dict:
     with _album_fill_lock:
@@ -1877,7 +1980,7 @@ def _album_fill_restore(rows) -> None:
 # ---------------------------------------------------------------------------
 
 FILL_FAILURE_KINDS = ("no_source", "format_rejected", "transfer_failed",
-                      "placement_failed", "mb_unavailable", "cancelled")
+                      "placement_failed", "mb_unavailable")
 
 # Release mbids whose fill was cancelled while its search task was still running.
 # The task checks this before enqueueing, so a cancel during the (long) slskd
@@ -1903,16 +2006,36 @@ def _album_fill_fail(release_mbid: str, kind: str, reason: str,
     if kind not in FILL_FAILURE_KINDS:
         kind = "transfer_failed"
     prior = _album_fill_get(release_mbid)
-    attempts = int(prior.get("attempts") or 0) + 1
     if retryable is None:
         retryable = not (kind == "format_rejected"
                          and bool(fields.get("mp3WouldHelp",
                                              prior.get("mp3WouldHelp"))))
-    _album_fill_set(release_mbid, "failed", reason=reason, failureKind=kind,
-                    retryable=bool(retryable), attempts=attempts,
-                    durable=True, **fields)
-    if kind in FILL_AUTO_RETRY_KINDS and attempts <= FILL_AUTO_RETRY_MAX:
-        _schedule_album_fill_retry(release_mbid, prior, delay=FILL_AUTO_RETRY_DELAY)
+    # `attempts` counts fills STARTED (see _album_fill_begin), never failures,
+    # so a row that was never opened through begin — a crash before the task's
+    # first line — still reports one attempt rather than zero.
+    attempts = max(1, int(prior.get("attempts") or 0))
+    auto_retries = int(prior.get("autoRetries") or 0)
+    will_retry = (kind in FILL_AUTO_RETRY_KINDS
+                  and auto_retries < FILL_AUTO_RETRY_MAX
+                  and bool(fields.get("artist") or prior.get("artist"))
+                  and bool(fields.get("album") or prior.get("album")))
+    # Remember the peer this attempt was on before the row moves: the automatic
+    # retry excludes it, so "transfer failed" is not re-run against the very
+    # peer that just failed.
+    gid, ag = _album_group_for_release(release_mbid)
+    last_source = (ag or {}).get("source_user") or prior.get("source") or prior.get("lastSource", "")
+    applied = _album_fill_set(
+        release_mbid, "failed", reason=reason, failureKind=kind,
+        retryable=bool(retryable), attempts=attempts,
+        lastSource=last_source or "",
+        autoRetries=auto_retries + (1 if will_retry else 0),
+        retryAt=(time.time() + FILL_AUTO_RETRY_DELAY) if will_retry else 0,
+        durable=True, **fields)
+    if applied and will_retry:
+        _schedule_album_fill_retry(release_mbid, _album_fill_get(release_mbid),
+                                   delay=FILL_AUTO_RETRY_DELAY)
+    if applied and (fields.get("rgid") or prior.get("rgid")):
+        _wishlist_note_outcome(fields.get("rgid") or prior.get("rgid"), reason)
 
 def _schedule_album_fill_retry(release_mbid: str, prior: dict,
                                delay: float = FILL_AUTO_RETRY_DELAY) -> None:
@@ -1938,15 +2061,27 @@ def _schedule_album_fill_retry(release_mbid: str, prior: dict,
             gid, _ag = _album_group_for_release(release_mbid)
             if gid or _running_album_download_task(release_mbid):
                 return
+            # A cancel is its own terminal state now, so this genuinely means
+            # "still failed, nobody touched it" — a cancel inside the back-off
+            # used to look identical and the retry fired anyway.
             if (_album_fill_get(release_mbid).get("state") or "") != "failed":
                 return          # something else moved it on; leave it alone
+            if release_mbid in _album_fill_cancel_requested:
+                _album_fill_cancel_requested.discard(release_mbid)
+                return
+            # Never the peer that just failed, nor any the user excluded.
+            exclude = tuple(dict.fromkeys(
+                [u for u in [prior.get("lastSource", "")] if u]
+                + list(prior.get("excludedUsers") or [])))[:10]
             _task_run(
                 "album-download",
                 f"Retry album: {artist} - {album}",
                 lambda tid: _album_download_task(
                     tid, release_mbid, artist, album,
                     int(prior.get("total") or 0), None,
-                    prior.get("rgid", ""), prior.get("quality", "")),
+                    prior.get("rgid", ""), prior.get("quality", ""),
+                    exclude, allow_mp3=bool(prior.get("allowMp3")),
+                    user_initiated=False),
                 total=int(prior.get("total") or 0),
                 release_mbid=release_mbid)
         except Exception as e:  # noqa: BLE001 — a retry must never kill the process
@@ -1970,26 +2105,121 @@ def _cancel_album_fill(release_mbid: str, reason: str) -> bool:
     if not release_mbid:
         return False
     stopped = False
+    entries: list = []
     gid, ag = _album_group_for_release(release_mbid)
     if ag is not None:
-        # Mark first: the sweep and the poller both skip a switching group, so
-        # neither can finalize it half-abandoned.
+        # Mark, then detach, then cancel — in that order, and the slskd calls
+        # off this thread. `cancelled` is what the poller's success branch and
+        # `_finalize_group` check; `switching` is what the sweep skips. Popping
+        # the group and its transfers here, synchronously and cheaply, is what
+        # stops the poller finding anything to finalize — the old code ran N
+        # sequential 10 s slskd DELETEs first, on the event loop, and a last
+        # file landing mid-way placed the album under a cancelled row.
+        ag["cancelled"] = True
         ag["switching"] = True
-        _abandon_group_downloads(gid)
         pending_album_groups.pop(gid, None)
+        entries = _detach_group_downloads(gid)
         stopped = True
     if _running_album_download_task(release_mbid):
         _album_fill_cancel_requested.add(release_mbid)
         stopped = True
-    state = (_album_fill_get(release_mbid).get("state") or "unknown")
-    if stopped or state in ("searching", "queued", "downloading"):
-        _album_fill_fail(release_mbid, "cancelled", reason, retryable=True)
-        try:
+    # A failed row whose automatic retry is still pending is cancellable too:
+    # the retry worker checks the state before it fires, so this is how a user
+    # stops it (it used to be indistinguishable from a real failure).
+    entry = _album_fill_get(release_mbid)
+    pending_retry = (entry.get("state") == "failed"
+                     and float(entry.get("retryAt") or 0) > time.time())
+    if stopped:
+        only_from = ALBUM_FILL_CANCELLABLE_STATES + ("unknown", "failed", "cancelled")
+    else:
+        only_from = ALBUM_FILL_CANCELLABLE_STATES + (("failed",) if pending_retry else ())
+    # Atomic against `_finalize_group`'s claim of the row for placement: once
+    # it says `placing` the files are on their way into the library and the
+    # honest answer is "too late", not a row that says cancelled over an album
+    # that is on disk.
+    applied = _album_fill_transition(
+        release_mbid, "cancelled",
+        unless=("placing", "placed", "verified", "needs_match"),
+        only_from=only_from,
+        reason=reason, failureKind="", retryable=False, retryAt=0)
+    if entries:
+        _abandon_transfers_async(entries)
+    if not applied:
+        return False
+    try:
+        _save_state()
+    except Exception as e:  # noqa: BLE001 — the cancel itself already happened
+        print(f"  cancel: state save failed: {e}")
+    return True
+
+def _dismiss_transfer(transfer_id: str) -> str:
+    """Drop one Transfers-panel row from tracking: "album" or "track", or ""
+    when nothing matched. slskd is left alone."""
+    ag = pending_album_groups.pop(transfer_id, None)
+    if ag is not None:
+        ag["cancelled"] = True
+        for key, info in list(pending_downloads.items()):
+            if info.get("album_group_id") == transfer_id:
+                pending_downloads.pop(key, None)
+        # The fill this group belonged to is over, and the ledger row used to
+        # stay on `queued` forever — "downloading" in every client.
+        _album_fill_transition(
+            ag.get("target_release_mbid") or ag.get("release_mbid", ""),
+            "failed", unless=("placing", "placed", "verified", "needs_match",
+                              "cancelled"),
+            failureKind="transfer_failed", retryable=True,
+            reason="Dismissed in lb-bot's Transfers panel")
+        _save_state()
+        return "album"
+    for key in list(pending_downloads.keys()):
+        row_id = hashlib.sha1("|".join(key).encode("utf-8")).hexdigest()[:12]
+        if row_id == transfer_id:
+            pending_downloads.pop(key, None)
             _save_state()
-        except Exception as e:  # noqa: BLE001 — the cancel itself already happened
-            print(f"  cancel: state save failed: {e}")
-        return True
-    return False
+            return "track"
+    return ""
+
+def _gap_cancel(group_id: str) -> int:
+    """Cancel every transfer a Fill-gaps review group has in flight.
+
+    Mirrors `_cancel_album_fill`: mark and pop the album groups first, write
+    their ledger rows `cancelled`, then cancel in slskd off this thread. The
+    route used to cancel by filename (a slskd listing per file), never popped
+    `pending_album_groups`, and wrote nothing to the ledger — so the orphan
+    sweep finalized the group a few minutes later and PLACED whatever had
+    arrived, under a row every client still read as downloading.
+    """
+    cancelled = 0
+    entries: list = []
+    for ag_id, ag in list(pending_album_groups.items()):
+        if ag.get("review_group_id") != group_id:
+            continue
+        ag["cancelled"] = True
+        ag["switching"] = True
+        pending_album_groups.pop(ag_id, None)
+        entries.extend(_detach_group_downloads(ag_id))
+        fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
+        _album_fill_transition(
+            fill_mbid, "cancelled",
+            unless=("placing", "placed", "verified", "needs_match"),
+            reason="Cancelled", failureKind="", retryable=False)
+        cancelled += 1
+    for key, info in list(pending_downloads.items()):
+        if info.get("review_group_id") != group_id:
+            continue
+        entries.append(_detach_transfer(key, info))
+        cancelled += 1
+    for entry in entries:
+        if entry.get("review_group_id") == group_id:
+            _set_review_track_state(group_id, entry.get("review_track_index"),
+                                    "cancelled", download_state="Cancelled",
+                                    error="cancelled by user",
+                                    source_user=entry["username"],
+                                    filename=entry["filename"])
+    if entries:
+        _abandon_transfers_async(entries)
+    _push_gap(group_id)
+    return cancelled
 
 def _album_group_for_release(release_mbid: str) -> tuple:
     """(group_id, group) of the in-flight transfer group for this release, if any."""
@@ -1999,6 +2229,16 @@ def _album_group_for_release(release_mbid: str) -> tuple:
         if release_mbid in (ag.get("target_release_mbid"), ag.get("release_mbid")):
             return gid, ag
     return "", None
+
+def _album_fill_mark_group_verified(group_id: str, release_mbids: set,
+                                    nd_album_ids: list) -> None:
+    """Flip every `placed` ledger row that belongs to a review group."""
+    with _album_fill_lock:
+        targets = [m for m, e in _album_fill_status.items()
+                   if e.get("state") == "placed"
+                   and (m in release_mbids or (group_id and e.get("groupId") == group_id))]
+    for mbid in targets:
+        _album_fill_set(mbid, "verified", ndAlbumIds=list(nd_album_ids or []))
 
 def _start_album_fill_verification(release_mbid: str, result: dict,
                                    artist: str = "", rgid: str = "",
@@ -2060,7 +2300,7 @@ def _start_album_fill_verification(release_mbid: str, result: dict,
                 time.sleep(_placement_verify_delay(started))
             # Placed but never indexed. Not a failure of the fill — say exactly
             # that rather than claiming success or inventing an error.
-            _album_fill_set(release_mbid, "placed",
+            _album_fill_set(release_mbid, "placed", verifyGaveUp=True,
                             reason="Placed, but Navidrome has not indexed it yet")
         except Exception as e:  # noqa: BLE001 — a verifier must never kill the process
             print(f"  album fill verify: {e}")
@@ -2085,7 +2325,7 @@ def _running_album_download_task(release_mbid: str) -> str:
                 return tid
     return ""
 
-def _album_fill_view(release_mbid: str) -> dict:
+def _album_fill_view(release_mbid: str, include_files: bool = True) -> dict:
     """The wire shape of a fill's progress, for /api/album/status.
 
     `state` walks: unknown → searching → queued → downloading → placing →
@@ -2100,55 +2340,292 @@ def _album_fill_view(release_mbid: str) -> dict:
     """
     entry = _album_fill_get(release_mbid)
     gid, ag = _album_group_for_release(release_mbid)
+    now = time.time()
+    state = entry.get("state") or "unknown"
+    retry_at = float(entry.get("retryAt") or 0)
     view = {
         "releaseMbid": release_mbid,
-        "rgid": entry.get("rgid", ""),
-        "quality": entry.get("quality", ""),
-        "state": entry.get("state") or "unknown",
-        "artist": entry.get("artist", ""),
-        "album": entry.get("album", ""),
+        "rgid": entry.get("rgid", "") or "",
+        "quality": entry.get("quality", "") or "",
+        "state": state,
+        "artist": entry.get("artist", "") or "",
+        "album": entry.get("album", "") or "",
+        # `done` is files COMPLETED — never completed+failed. A bar that fills
+        # on failures lies; `failed` is beside it for the client to say so.
         "done": int(entry.get("done") or 0),
         "total": int(entry.get("total") or 0),
         "failed": int(entry.get("failed") or 0),
         "percent": 0,
-        "reason": entry.get("reason", ""),
+        "bytesDone": 0, "bytesTotal": 0, "speedBps": 0, "activeFiles": 0,
+        "reason": entry.get("reason", "") or "",
         "mp3WouldHelp": bool(entry.get("mp3WouldHelp")),
+        "allowMp3": bool(entry.get("allowMp3")),
         # What kind of failure, whether a plain Retry is worth offering, and how
         # many fills this release has had. Clients used to infer all three from
         # `reason`'s wording; these let them render the right button from fields.
         # Empty/False/0 on anything that has not failed, so a client can read
         # them unconditionally.
-        "failureKind": entry.get("failureKind", ""),
+        "failureKind": entry.get("failureKind", "") or "",
         "retryable": bool(entry.get("retryable")),
         "attempts": int(entry.get("attempts") or 0),
-        "groupId": entry.get("groupId", "") or gid,
-        "taskId": entry.get("taskId", ""),
+        # When lb-bot's own automatic retry will fire, or 0. A client renders a
+        # countdown rather than a dead "failed" that then quietly comes alive.
+        "retryAt": retry_at if retry_at > now else 0,
+        "groupId": entry.get("groupId", "") or gid or "",
+        "taskId": entry.get("taskId", "") or "",
         # Set once the verifier has seen the album in Navidrome. The polling
         # client syncs exactly these instead of pulling its whole library.
         "ndAlbumIds": list(entry.get("ndAlbumIds") or []),
+        # `placed` past the verifier's deadline: on disk, not (yet) in Navidrome.
+        "verifyGaveUp": bool(entry.get("verifyGaveUp")),
         # The peer the transfer group was queued from — auto-picked or chosen.
         # A client's "try another source" excludes exactly this one.
-        "source": (ag or {}).get("source_user") or entry.get("source", ""),
-        "updatedAt": entry.get("updated_at", 0),
+        "source": (ag or {}).get("source_user") or entry.get("source", "") or "",
+        # `updatedAt` moves on every state change AND on transfer progress (the
+        # poller stamps `progress_at` on the group); `serverTime` lets a client
+        # render "last checked Ns ago" without trusting its own clock.
+        "updatedAt": float(entry.get("updated_at") or 0),
+        "serverTime": now,
     }
     if ag:
-        total = int(ag.get("total") or 0)
-        done = int(ag.get("completed") or 0) + int(ag.get("failed") or 0)
-        view.update(state="downloading", done=done, total=total,
+        # A live transfer group is the truth about progress; the ledger is only
+        # consulted for a state it has already moved PAST (placing, terminal).
+        if state in ("unknown", "searching", "queued", "downloading"):
+            view["state"] = "downloading"
+        bytes_done = int(ag.get("completed_bytes") or 0)
+        bytes_total = bytes_done
+        speed = 0
+        active = 0
+        files = []
+        for (username, filename), info in list(pending_downloads.items()):
+            if info.get("album_group_id") != gid:
+                continue
+            raw = info.get("raw_transfer") or {}
+            size = int(raw.get("size") or raw.get("fileSize") or 0)
+            got = int(raw.get("bytesDownloaded") or raw.get("bytesTransferred")
+                      or raw.get("downloaded") or 0)
+            st = info.get("latest_state") or ""
+            bytes_done += min(got, size) if size else got
+            bytes_total += size
+            if "InProgress" in st:
+                active += 1
+                speed += int(raw.get("averageSpeed") or raw.get("speed") or 0)
+            if include_files and len(files) < 40:
+                track = info.get("track") or {}
+                files.append({"title": track.get("title") or _slskd_basename(filename),
+                              "state": st, "percent": int(info.get("percent") or 0)})
+        view.update(done=int(ag.get("completed") or 0), total=int(ag.get("total") or 0),
                     failed=int(ag.get("failed") or 0),
+                    bytesDone=bytes_done, bytesTotal=bytes_total,
+                    speedBps=speed, activeFiles=active,
                     artist=view["artist"] or ag.get("artist", ""),
-                    album=view["album"] or ag.get("album", ""))
+                    album=view["album"] or ag.get("album", ""),
+                    updatedAt=max(view["updatedAt"], float(ag.get("progress_at") or 0)))
+        if include_files:
+            view["files"] = files
     elif view["state"] == "unknown":
         # No ledger row survived (restart, or the entry aged out) but a search is
         # still running — reporting "unknown" there would hide a live download.
         running = _running_album_download_task(release_mbid)
         if running:
             view.update(state="searching", taskId=running)
-    if view["total"]:
-        view["percent"] = min(100, int(view["done"] * 100 / view["total"]))
-    elif view["state"] in ("placed", "verified"):
+    if view["state"] in ("placing", "placed", "verified"):
         view["percent"] = 100
+    elif view["bytesTotal"] > 0:
+        view["percent"] = min(100, int(view["bytesDone"] * 100 / view["bytesTotal"]))
+    elif view["total"]:
+        view["percent"] = min(100, int(view["done"] * 100 / view["total"]))
+    # The Cancel rule, stated once, here: both clients render the button from
+    # this rather than each keeping its own list of states.
+    view["cancellable"] = (view["state"] in ALBUM_FILL_CANCELLABLE_STATES
+                           or (view["state"] == "failed" and view["retryAt"] > 0))
     return view
+
+def _sweep_album_fill_zombies(now: float | None = None) -> int:
+    """Move ledger rows that can no longer progress to a terminal state.
+
+    `searching` and `placing` are not terminal, and nothing else ever touched
+    them once the task or coroutine behind them died — a restart mid-search
+    left the row on `searching` forever, which every client rendered as a live
+    fill with a Cancel button that did nothing. The restore docstring claimed
+    "the usual watchdogs" swept these; there were none. Runs once per poller
+    tick; each judgement needs a group AND a task to be absent, so a fill that
+    is merely slow is never touched.
+    """
+    now = now or time.time()
+    with _album_fill_lock:
+        rows = [(m, dict(e)) for m, e in _album_fill_status.items()]
+    swept = 0
+    for mbid, entry in rows:
+        state = entry.get("state") or ""
+        age = now - float(entry.get("updated_at") or now)
+        if state in ("searching", "queued"):
+            if age <= SEARCH_TIMEOUT + 60:
+                continue
+            if _album_group_for_release(mbid)[1] is not None or _running_album_download_task(mbid):
+                continue
+            _album_fill_fail(mbid, "transfer_failed",
+                             "The search did not finish (lb-bot may have restarted)",
+                             retryable=True)
+            swept += 1
+        elif state == "placing":
+            if age > 15 * 60 and _album_group_for_release(mbid)[1] is None:
+                _album_fill_fail(mbid, "placement_failed",
+                                 "Placement did not finish (lb-bot may have restarted)",
+                                 retryable=True)
+                swept += 1
+        elif state == "placed" and not entry.get("verifyGaveUp"):
+            if age > ALBUM_FILL_VERIFY_TIMEOUT + 60:
+                _album_fill_set(mbid, "placed", verifyGaveUp=True,
+                                reason=entry.get("reason") or
+                                "Placed, but Navidrome has not indexed it yet")
+                swept += 1
+    return swept
+
+# ---------------------------------------------------------------------------
+# Fill push — `POST <hub>/lb/fill`, the acquisition channel
+#
+# `/lb/notify` announces a LANDING and the hub answers it by flushing its
+# library caches and telling every client to re-read the library. That is the
+# wrong shape for "3 of 12 downloaded" or "cancelled": nothing in the library
+# moved, and a client that hears about it should touch one ledger row, not
+# refetch its discographies. So fill progress is its own inbound route and its
+# own frame (`t: "fill"`), sent on every ledger transition and on throttled
+# transfer progress. Push accelerates; the poll of /api/fills stays the truth,
+# because nothing is replayed to a client that connects late.
+#
+# Latest-wins per key, one worker thread, a short coalescing window: the poller
+# stamps every file of a group on every tick and `_set_review_track_state` is
+# called per file, so without coalescing a twelve-track album would post
+# twelve times per tick.
+# ---------------------------------------------------------------------------
+
+_push_pending: dict = {}            # key -> ("album" | "gap" | "wishlist", payload-or-None)
+_push_lock = threading.Lock()
+_push_wake = threading.Event()
+_push_thread: threading.Thread | None = None
+PUSH_COALESCE_SECS = 0.5
+PUSH_PROGRESS_MIN_PCT = 5
+PUSH_PROGRESS_MIN_SECS = 10.0
+
+def _push_enabled() -> bool:
+    return bool(HUB_NOTIFY_URL and HUB_NOTIFY_TOKEN)
+
+def _push_enqueue(kind: str, key: str, payload: dict | None = None) -> None:
+    global _push_thread
+    if not key or not _push_enabled():
+        return
+    with _push_lock:
+        _push_pending[(kind, key)] = payload
+        if _push_thread is None or not _push_thread.is_alive():
+            _push_thread = threading.Thread(target=_push_worker, daemon=True,
+                                            name="hub-fill-push")
+            _push_thread.start()
+    _push_wake.set()
+
+def _push_fill(release_mbid: str) -> None:
+    """Tell the hub a fill moved. The payload is built on the worker, so the
+    caller — often inside `_album_fill_set` — never waits on anything."""
+    _push_enqueue("album", release_mbid)
+
+def _push_fill_progress(ag_id: str) -> None:
+    """Throttled progress push for a live transfer group, from the poller."""
+    ag = pending_album_groups.get(ag_id)
+    if not ag:
+        return
+    fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
+    if not fill_mbid:
+        return
+    total = int(ag.get("total") or 0)
+    pct = int((int(ag.get("completed") or 0) * 100 / total)) if total else 0
+    now = time.time()
+    if (abs(pct - int(ag.get("_pushed_pct") or 0)) < PUSH_PROGRESS_MIN_PCT
+            and now - float(ag.get("_pushed_at") or 0) < PUSH_PROGRESS_MIN_SECS):
+        return
+    ag["_pushed_pct"], ag["_pushed_at"] = pct, now
+    _push_enqueue("album", fill_mbid)
+
+def _push_gap(group_id: str) -> None:
+    _push_enqueue("gap", group_id)
+
+def _gap_fill_frame(group: dict) -> dict:
+    """The flat gap summary a fill frame carries (and /api/fills answers)."""
+    view = _gap_detail_view(group, 0)
+    view.pop("sources", None)
+    tracks = view.get("tracks") or []
+    states = [t.get("state", "") for t in tracks]
+    task = view.get("sourceTask") or {}
+    return {
+        "kind": "gap", "key": view.get("id", ""), "groupId": view.get("id", ""),
+        "status": view.get("status", ""), "taskStatus": task.get("status", ""),
+        "artist": view.get("artist", ""), "album": view.get("album", ""),
+        "done": sum(1 for s in states if s in ("downloaded", "placed", "verified")),
+        "failed": sum(1 for s in states if s in ("failed", "cancelled")),
+        "total": len(tracks) or int(view.get("total") or 0),
+        "reason": view.get("failDetail") or view.get("noSourceReason") or "",
+        "failureKind": view.get("failReason", ""),
+        "mp3WouldHelp": bool(view.get("mp3WouldHelp")),
+        "updatedAt": float(view.get("updatedAt") or 0),
+        "serverTime": time.time(),
+        "summary": view,
+    }
+
+def _fill_frame_payload(kind: str, key: str, payload: dict | None) -> dict | None:
+    if kind == "album":
+        view = _album_fill_view(key, include_files=False)
+        if view.get("state") == "unknown":
+            return None
+        view.update(kind="album", key=view.get("rgid") or key)
+        return view
+    if kind == "gap":
+        with _review_lock:
+            group = _find_review_group(key)
+            frame = _gap_fill_frame(group) if group else None
+        if frame:
+            frame.pop("summary", None)
+        return frame
+    return dict(payload or {}, kind=kind, key=key)
+
+def _push_worker() -> None:
+    while True:
+        _push_wake.wait()
+        time.sleep(PUSH_COALESCE_SECS)
+        with _push_lock:
+            batch = dict(_push_pending)
+            _push_pending.clear()
+            _push_wake.clear()
+        for (kind, key), payload in batch.items():
+            try:
+                body = _fill_frame_payload(kind, key, payload)
+                if not body:
+                    continue
+                requests.post(f"{HUB_NOTIFY_URL}/lb/fill", json=body,
+                              headers={"Authorization": f"Bearer {HUB_NOTIFY_TOKEN}"},
+                              timeout=5)
+            except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
+                print(f"  hub fill push failed ({kind} {key[:8]}): {e}")
+
+def _fills_view(release_mbids: list, group_ids: list) -> dict:
+    """`GET /api/fills` — every fill a client watches, in one answer.
+
+    A Download Center with eight rows used to poll eight times per tick; the
+    hub's four proxy slots and lb-bot's locks paid for each. This reads the same
+    ledger and the same review groups, once, and carries `serverTime` so a
+    client can say how old what it shows is. Capped, and never through
+    `_review_snapshot`.
+    """
+    albums = {}
+    for mbid in list(dict.fromkeys(m for m in release_mbids if m))[:32]:
+        albums[mbid] = _album_fill_view(mbid, include_files=False)
+    gaps = {}
+    for gid in list(dict.fromkeys(g for g in group_ids if g))[:32]:
+        with _review_lock:
+            group = _find_review_group(gid)
+            frame = _gap_fill_frame(group) if group else None
+        if frame:
+            gaps[gid] = frame.pop("summary")
+            gaps[gid].update({k: frame[k] for k in ("done", "failed", "taskStatus")})
+    return {"albums": albums, "gaps": gaps, "serverTime": time.time()}
 
 def _notify_hub_library_change(release_mbid: str, rgid: str = "",
                                artist: str = "", album: str = "",
@@ -6455,9 +6932,25 @@ def _wishlist_retry_one(row: dict) -> bool:
     _wishlist_mark_tried(rgid, "re-searching")
     _task_run("album-download", f"Wishlist: {artist} - {title}",
               lambda tid: _album_download_task(tid, release_mbid, artist, title,
-                                               total, None, rgid, ""),
+                                               total, None, rgid, "",
+                                               user_initiated=False),
               total=total, release_mbid=release_mbid)
     return True
+
+def _wishlist_note_outcome(rgid: str, reason: str) -> None:
+    """Record how a wishlist row's re-search ended. `_wishlist_retry_one`
+    writes "re-searching" and nothing ever replaced it, so the row said
+    that forever; the fill ledger knows the answer and passes it here."""
+    if not rgid or not reason:
+        return
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute("UPDATE wishlist SET last_reason = ? WHERE rgid = ?",
+                         ((reason or "")[:200], rgid))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"  wishlist outcome note failed: {e}")
 
 def _wishlist_landed(rgid: str, artist: str = "", title: str = "") -> None:
     """A wishlist row's record arrived: drop it and tell the hub.
@@ -6471,8 +6964,12 @@ def _wishlist_landed(rgid: str, artist: str = "", title: str = "") -> None:
     result = _wishlist_remove(rgid)
     if result.get("removed"):
         print(f"  wishlist: {artist} - {title} landed — removed from the wishlist")
-        _notify_hub_library_change("", rgid=rgid, artist=artist, album=title,
-                                   event="albumPlaced")
+        # A fill frame, not a second `albumPlaced`: the landing itself was
+        # already announced (`albumIndexed` fires before this), and a library
+        # notify makes every client refetch its whole album list. A client
+        # showing the wishlist drops the row on this.
+        _push_enqueue("wishlist", rgid, {"rgid": rgid, "artist": artist,
+                                         "album": title, "state": "landed"})
 
 def _wishlist_sweep_loop() -> None:
     """The slow re-search. One row per pass, deliberately.
@@ -9686,8 +10183,14 @@ def _slskd_find_transfer_id(username: str, filename: str,
     return fallback
 
 def _slskd_cancel(username: str, filename: str, transfer_id: str = "",
-                  downloads: list | None = None) -> bool:
+                  downloads: list | None = None, remove: bool = False) -> bool:
     """Cancel one slskd transfer. Returns whether slskd accepted the cancel.
+
+    `remove=True` also drops the transfer's record (`?remove=true`), which is
+    what a user cancel wants: a retry then re-enqueues the same file without
+    colliding with a stale `Cancelled` row. The watchdog's cancel keeps the
+    record, because the Cancelled state it produces is what its failover reads.
+    Files already on disk are never touched by either.
 
     This used to DELETE `.../downloads/<user>/<filename>` and never read the
     answer. slskd's route takes the transfer's **id**, so every cancel was a
@@ -9705,7 +10208,8 @@ def _slskd_cancel(username: str, filename: str, transfer_id: str = "",
         r = _http.delete(
             f"{SLSKD_URL}/api/v0/transfers/downloads/"
             f"{urllib.parse.quote(username, safe='')}/"
-            f"{urllib.parse.quote(tid, safe='')}",
+            f"{urllib.parse.quote(tid, safe='')}"
+            + ("?remove=true" if remove else ""),
             headers=_slskd_headers(), timeout=10)
         if r.status_code >= 400:
             print(f"  slskd cancel failed ({r.status_code}) for {username} / "
@@ -9716,21 +10220,56 @@ def _slskd_cancel(username: str, filename: str, transfer_id: str = "",
         print(f"  slskd cancel error: {e}")
         return False
 
+def _detach_transfer(key: tuple, info: dict) -> dict:
+    """Take one transfer out of `pending_downloads` and return what a later
+    slskd cancel needs to address it. Cheap and synchronous, so the poller can
+    no longer see the transfer by the time this returns."""
+    username, filename = key
+    if info.get("repair_job_id"):
+        _repair_update_download(info.get("repair_job_id", ""), username, filename,
+                                "cancelled", "abandoned pending transfer",
+                                raw_state="Cancelled")
+    pending_downloads.pop(key, None)
+    return {"username": username, "filename": filename,
+            "transfer_id": info.get("transfer_id", ""),
+            "review_group_id": info.get("review_group_id", ""),
+            "review_track_index": info.get("review_track_index")}
+
+def _detach_group_downloads(ag_id: str) -> list:
+    """Detach every still-pending transfer of an album group (see above)."""
+    return [_detach_transfer(key, info)
+            for key, info in list(pending_downloads.items())
+            if info.get("album_group_id") == ag_id]
+
+def _abandon_transfers(entries: list, remove: bool = True) -> int:
+    """Cancel detached transfers in slskd. One listing for the whole batch, and
+    only if some entry lacks the transfer id the poller normally records."""
+    if not entries:
+        return 0
+    downloads = ([] if all(e.get("transfer_id") for e in entries)
+                 else _slskd_fetch_all_downloads())
+    done = 0
+    for e in entries:
+        if _slskd_cancel(e["username"], e["filename"], e.get("transfer_id", ""),
+                         downloads, remove=remove):
+            done += 1
+    return done
+
+def _abandon_transfers_async(entries: list) -> None:
+    """`_abandon_transfers` on its own thread: each slskd DELETE is a 10 s
+    timeout and the cancel route answers a client sitting behind the hub's
+    20 s proxy timeout — a twelve-file album could not be cancelled at all."""
+    if not entries:
+        return
+    threading.Thread(target=_abandon_transfers, args=(list(entries),),
+                     daemon=True, name="slskd-abandon").start()
+
 def _abandon_group_downloads(ag_id: str):
-    """Drop all still-pending transfers belonging to an album group."""
-    keys = [k for k, v in pending_downloads.items()
-            if v.get("album_group_id") == ag_id]
-    # One transfer listing for the whole album, not one per file.
-    downloads = _slskd_fetch_all_downloads() if keys else []
-    for key in keys:
-        username, filename = key
-        info = pending_downloads.get(key, {})
-        if info.get("repair_job_id"):
-            _repair_update_download(info.get("repair_job_id", ""), username, filename,
-                                    "cancelled", "abandoned pending transfer",
-                                    raw_state="Cancelled")
-        _slskd_cancel(username, filename, info.get("transfer_id", ""), downloads)
-        pending_downloads.pop(key, None)
+    """Drop all still-pending transfers belonging to an album group, and
+    cancel them in slskd synchronously. The failover path wants this — it
+    re-enqueues from the next peer straight after — and it runs on the
+    poller's thread with nobody waiting on an HTTP answer."""
+    _abandon_transfers(_detach_group_downloads(ag_id), remove=False)
 
 def _retry_file_from_alt_source(ag: dict, ag_id: str, info: dict,
                                 failed_username: str) -> str:
@@ -9847,13 +10386,25 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
     """
     review_gid = ag.get("review_group_id", "")
     missing = ag.get("missing_tracks") or []
+
+    def _gone() -> bool:
+        # A cancel that lands while this coroutine is parked on an await pops
+        # the group and detaches its transfers; carrying on would enqueue the
+        # next peer's files under a group nothing tracks any more, and they
+        # would download to completion despite the cancel.
+        return bool(ag.get("cancelled")) or ag_id not in pending_album_groups
+
     while ag.get("alt_sources"):
+        if _gone():
+            return
         fd       = ag["alt_sources"].pop(0)
         username = fd["username"]
         await _tg_send(bot, ag["chat_id"],
             f"🔁 Source for {ag['label']} failed — trying @{username}…")
         ref_file = fd["files"][0] if fd["files"] else {}
         full     = await asyncio.to_thread(slskd_expand_directory, username, fd, ref_file)
+        if _gone():
+            return
         if not full:
             full = fd["files"]
         if not full:
@@ -9869,6 +10420,8 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
             file_pairs = [(f, None) for f in full]
         if not file_pairs:
             continue
+        if _gone():
+            return
         # Reset counters and re-enqueue into the SAME group id
         ag.update({"total": len(file_pairs), "completed": 0, "failed": 0,
                    "source_user": username, "local_dirs": {}, "ts": time.time()})
@@ -9891,12 +10444,19 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
                         source_user=username, filename=f.get("filename", ""))
             else:
                 ag["failed"] += 1
+        if _gone():
+            # Cancelled during the enqueue loop: the files just registered were
+            # not there when the cancel detached the group's transfers.
+            await asyncio.to_thread(_abandon_transfers, _detach_group_downloads(ag_id))
+            return
         if ok:
             await _update_group_progress(bot, ag)
             ag["switching"] = False
             return
         _abandon_group_downloads(ag_id)   # that source enqueued nothing — keep going
 
+    if _gone():
+        return
     # Exhausted every known source — let the user retry a fresh search.
     pending_album_groups.pop(ag_id, None)
     rid = _uid("aretry")
@@ -10525,9 +11085,21 @@ async def _finalize_group(bot, ag_id: str):
     # about to be gone from pending_album_groups, so every exit below has to say
     # where the fill ended up.
     fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
+    # A cancelled group is never placed. The flag is set by the cancel path
+    # before it pops the group, so a finalize that raced the cancel and won the
+    # pop still sees it; the ledger check covers a cancel that landed on a
+    # group this coroutine had already popped.
+    if ag.get("cancelled") or _album_fill_get(fill_mbid).get("state") == "cancelled":
+        print(f"  {label}: cancelled — not placing; files stay in "
+              f"{SLSKD_DOWNLOAD_DIR}")
+        return
+    # The group is gone from here on, so the counters a client reads have to be
+    # written to the row — `done` used to stay at the 0 written at `queued`,
+    # which is why a placed album reported percent 0.
+    counts = dict(done=int(ag["completed"]), failed=int(fails), total=int(ag["total"]))
     if ag["completed"] <= 0:
         _album_fill_fail(fill_mbid, "transfer_failed",
-                         f"No file downloaded ({fails} failed)")
+                         f"No file downloaded ({fails} failed)", **counts)
     if ag["completed"] > 0 and not ag["local_dirs"]:
         import_note = (
             f"\n⚠️ Downloaded files could not be located under {SLSKD_DOWNLOAD_DIR}. "
@@ -10536,7 +11108,7 @@ async def _finalize_group(bot, ag_id: str):
         # wrong. Re-downloading lands them in the same place nobody can see.
         _album_fill_fail(fill_mbid, "placement_failed",
                          "Downloaded, but the files could not be found in "
-                         "the downloads volume", retryable=False)
+                         "the downloads volume", retryable=False, **counts)
     if ag["completed"] > 0 and ag["local_dirs"]:
         album_dir = max(ag["local_dirs"].items(), key=lambda kv: kv[1])[0]
         if ag.get("match_mode") == "manual" and ag.get("review_group_id"):
@@ -10549,12 +11121,19 @@ async def _finalize_group(bot, ag_id: str):
                 {"recommended_action": "manual_match", "still_in_downloads": True})
             _save_state()
             _save_review_state()
-            _album_fill_set(fill_mbid, "needs_match", groupId=recid)
+            _album_fill_set(fill_mbid, "needs_match", groupId=recid, **counts)
             await _tg_send(bot, ag["chat_id"],
                            f"Downloaded {label}. Waiting for web match/import review.",
                            reply_markup=_album_action_markup(recid, "needs_review"))
             return
-        _album_fill_set(fill_mbid, "placing")
+        # Claim the row for placement atomically against a concurrent cancel:
+        # from here the files are on their way into the library, and the cancel
+        # route answers "too late" rather than writing over this.
+        if fill_mbid and not _album_fill_transition(fill_mbid, "placing",
+                                                    unless=("cancelled",), **counts):
+            print(f"  {label}: cancelled before placement — files stay in "
+                  f"{SLSKD_DOWNLOAD_DIR}")
+            return
         await _tg_send(bot, ag["chat_id"], f"📚 Placing {label} into your library…")
         # Every directory that received a file, busiest first — not just the
         # majority one. A file that failed over to another peer downloads into
@@ -10699,7 +11278,8 @@ async def poll_downloads_loop(apps: list):
     token_to_app = {u["telegram_token"]: app for u, app in zip(USERS, apps)}
 
     while True:
-        await asyncio.sleep(DOWNLOAD_POLL_INT)
+        live = bool(pending_album_groups) or bool(pending_downloads)
+        await asyncio.sleep(DOWNLOAD_POLL_ACTIVE_INT if live else DOWNLOAD_POLL_INT)
         try:
             await _poll_downloads_once(token_to_app)
         except Exception as e:
@@ -10708,10 +11288,11 @@ async def poll_downloads_loop(apps: list):
             traceback.print_exc()
             print(f"  poll_downloads_loop iteration error: {e}")
 
-# A transfer lb-bot is waiting on that slskd no longer lists at all. Two polls
-# (DOWNLOAD_POLL_INT apart) rather than one, and never inside the orphan grace,
-# because slskd registers an enqueue a moment after accepting it.
-VANISHED_TRANSFER_POLLS = 2
+# A transfer lb-bot is waiting on that slskd no longer lists at all. Judged by
+# TIME missing rather than by poll count — at the 5 s active cadence, two ticks
+# would cancel an album on a ten-second slskd hiccup — and never inside the
+# orphan grace, because slskd registers an enqueue a moment after accepting it.
+VANISHED_TRANSFER_SECS = 120
 
 async def _settle_vanished_transfers(downloads: list) -> None:
     """Treat an album's transfers removed from slskd as a cancel of that album.
@@ -10732,13 +11313,16 @@ async def _settle_vanished_transfers(downloads: list) -> None:
         username, filename = key
         base = filename.replace("\\", "/").rstrip("/").split("/")[-1].lower()
         if key in seen or (username, base) in seen_base:
-            info["_missing_polls"] = 0
+            info.pop("_missing_since", None)
             continue
         if now - float(info.get("queued_at") or now) < ALBUM_GROUP_ORPHAN_GRACE:
             continue
-        info["_missing_polls"] = int(info.get("_missing_polls") or 0) + 1
+        since = float(info.get("_missing_since") or 0)
+        if not since:
+            info["_missing_since"] = now
+            continue
         ag_id = info.get("album_group_id")
-        if info["_missing_polls"] >= VANISHED_TRANSFER_POLLS and ag_id in pending_album_groups:
+        if now - since >= VANISHED_TRANSFER_SECS and ag_id in pending_album_groups:
             vanished_groups.add(ag_id)
     for ag_id in vanished_groups:
         ag = pending_album_groups.get(ag_id)
@@ -10748,7 +11332,8 @@ async def _settle_vanished_transfers(downloads: list) -> None:
         # ones is a rename or a glitch, not the user removing the album.
         live = [i for i in pending_downloads.values()
                 if i.get("album_group_id") == ag_id
-                and int(i.get("_missing_polls") or 0) < VANISHED_TRANSFER_POLLS]
+                and (not i.get("_missing_since")
+                     or now - float(i["_missing_since"]) < VANISHED_TRANSFER_SECS)]
         if live:
             continue
         fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
@@ -10768,6 +11353,11 @@ async def _poll_downloads_once(token_to_app: dict):
                 if fn.replace("\\", "/").rstrip("/").split("/")[-1].lower() == base:
                     return (u, fn)
             return None
+
+        try:
+            _sweep_album_fill_zombies()
+        except Exception as e:  # noqa: BLE001 — bookkeeping must not stop the poll
+            print(f"  fill ledger sweep failed: {e}")
 
         # Sweep: finalize album groups that have gone quiet for too long, so a
         # never-matched file can't leave a group dangling forever.
@@ -10825,6 +11415,9 @@ async def _poll_downloads_once(token_to_app: dict):
             info["latest_state"] = state
             if dl.get("id"):
                 info["transfer_id"] = str(dl["id"])
+            moved = (percent != info.get("_last_percent")
+                     or state != info.get("_last_state"))
+            info["_last_percent"], info["_last_state"] = percent, state
             info["percent"] = percent
             info["updated_at"] = time.time()
             info["raw_transfer"] = {
@@ -10833,6 +11426,10 @@ async def _poll_downloads_once(token_to_app: dict):
                     "size", "fileSize", "averageSpeed", "speed", "state"
                 ) if k in dl
             }
+            if moved and info.get("album_group_id") in pending_album_groups:
+                # What makes `updatedAt` on the status view a liveness signal.
+                pending_album_groups[info["album_group_id"]]["progress_at"] = time.time()
+                _push_fill_progress(info["album_group_id"])
             review_gid = info.get("review_group_id", "")
             review_idx = info.get("review_track_index")
             repair_job_id = info.get("repair_job_id", "")
@@ -10849,9 +11446,10 @@ async def _poll_downloads_once(token_to_app: dict):
             label   = (f"{track['artist']} - {track['title']}"
                        if track else key[1].split('/')[-1].split('\\')[-1])
             app     = token_to_app.get(token)
-            if not app:
-                continue
-            bot = app.bot
+            # A token with no Telegram app behind it (a web-only deployment)
+            # used to skip the watchdog and every outcome branch below — the
+            # sweep's own comment already says a bot-less finalize is fine.
+            bot = app.bot if app else None
 
             # Stall watchdog: cancel if no byte progress for too long. slskd will
             # set the state to Cancelled on the next poll, which fires the
@@ -10907,12 +11505,27 @@ async def _poll_downloads_once(token_to_app: dict):
                                             source_user=username,
                                             filename=filename)
                 del pending_downloads[key]
+                if ag_id and ag_id not in pending_album_groups:
+                    # The album this file belonged to was cancelled (or already
+                    # finalized) while the transfer was still running. It is
+                    # not a loose track: tagging it, scanning Navidrome and
+                    # announcing "✅ Download completed" was how a cancelled
+                    # album kept arriving anyway.
+                    print(f"  {label}: finished after its album group {ag_id} "
+                          f"was dropped — leaving it in {SLSKD_DOWNLOAD_DIR}")
+                    continue
                 if ag_id and ag_id in pending_album_groups:
                     # Part of an album — do NOT import per file. Record where it
                     # landed and import the whole folder once on finalize.
                     ag = pending_album_groups[ag_id]
+                    if ag.get("cancelled"):
+                        continue
                     ag["completed"] += 1
                     ag["ts"] = time.time()
+                    ag["progress_at"] = ag["ts"]
+                    raw = info.get("raw_transfer") or {}
+                    ag["completed_bytes"] = (int(ag.get("completed_bytes") or 0)
+                                             + int(raw.get("size") or raw.get("fileSize") or 0))
                     if local_path:
                         d = os.path.dirname(local_path)
                         ag["local_dirs"][d] = ag["local_dirs"].get(d, 0) + 1
@@ -10940,19 +11553,63 @@ async def _poll_downloads_once(token_to_app: dict):
 
             elif _slskd_failed(state):
                 ag_id = info.get("album_group_id")
+                if ag_id and ag_id not in pending_album_groups:
+                    # Its album was cancelled or finalized already; nothing to
+                    # fail over to and nobody to tell.
+                    pending_downloads.pop(key, None)
+                    continue
+                if ag_id and pending_album_groups[ag_id].get("cancelled"):
+                    pending_downloads.pop(key, None)
+                    continue
                 is_cancelled = "Cancelled" in (state or "")
                 if (is_cancelled and not info.get("_watchdog_cancelled")
                         and ag_id and ag_id in pending_album_groups):
                     # Nobody in lb-bot cancelled this — the user did, in slskd.
                     # Failing it over to another peer (what the branch below
                     # does) re-queued the very download they had just stopped.
+                    #
+                    # But one file is one file: cancelling the whole album on
+                    # a single Cancelled row threw away 11 landed tracks when
+                    # the user stopped the twelfth. The album is cancelled only
+                    # when nothing has arrived AND every file still pending
+                    # is Cancelled in this same listing; otherwise the one
+                    # file is counted lost, deliberately, with no failover.
                     ag = pending_album_groups[ag_id]
                     fill_mbid = ag.get("target_release_mbid") or ag.get("release_mbid", "")
-                    print(f"  {ag.get('label', ag_id)}: cancelled in slskd — "
-                          f"cancelling the album fill")
+                    cancelled_keys = set()
+                    for other in downloads:
+                        if "Cancelled" in (other.get("state") or ""):
+                            k2 = _match_key(other.get("_username", ""),
+                                            other.get("filename", ""))
+                            if k2 is not None:
+                                cancelled_keys.add(k2)
+                    group_keys = [k for k, i in pending_downloads.items()
+                                  if i.get("album_group_id") == ag_id]
+                    if ag["completed"] == 0 and all(k in cancelled_keys for k in group_keys):
+                        print(f"  {ag.get('label', ag_id)}: cancelled in slskd — "
+                              f"cancelling the album fill")
+                        pending_downloads.pop(key, None)
+                        await asyncio.to_thread(_cancel_album_fill, fill_mbid,
+                                                "Cancelled in slskd")
+                        continue
+                    print(f"  {label}: cancelled in slskd — counting the one "
+                          f"file as lost, album continues")
+                    if repair_job_id:
+                        _repair_update_download(repair_job_id, username, key[1],
+                                                "cancelled", state,
+                                                percent=percent, raw_state=state)
+                    if review_gid:
+                        _set_review_track_state(review_gid, review_idx, "cancelled",
+                                                download_percent=percent,
+                                                download_state=state, error=state,
+                                                source_user=username,
+                                                filename=filename)
                     pending_downloads.pop(key, None)
-                    await asyncio.to_thread(_cancel_album_fill, fill_mbid,
-                                            "Cancelled in slskd")
+                    ag["failed"] += 1
+                    ag["ts"] = time.time()
+                    await _update_group_progress(bot, ag)
+                    if ag["completed"] + ag["failed"] >= ag["total"]:
+                        await _finalize_group(bot, ag_id)
                     continue
                 is_timeout = "TimedOut" in (state or "") or "Timeout" in (state or "")
                 if repair_job_id:
@@ -11033,7 +11690,7 @@ async def _poll_downloads_once(token_to_app: dict):
                         # Update the now-stale progress line so it doesn't sit
                         # there claiming the album is still downloading.
                         pmid = ag.get("progress_msg_id")
-                        if pmid:
+                        if pmid and bot:
                             try:
                                 await bot.edit_message_text(
                                     chat_id=ag["chat_id"], message_id=pmid,
@@ -13363,6 +14020,8 @@ def _set_review_track_state(group_id: str, track_index, decision: str,
                     job["status"] = _repair_job_status_from_tracks(job)
                     _repair_job_touch(job)
             group["updated_at"] = time.time()
+    # Outside the lock: the worker takes it itself to build the frame.
+    _push_gap(group_id)
 
 def _approved_review_tracks(group: dict) -> list:
     approved = []
@@ -14262,7 +14921,8 @@ def _search_task(task_id: str, query: str) -> None:
 def _album_download_task(task_id: str, release_mbid: str, artist: str,
                          album: str, total_tracks: int, chosen: dict = None,
                          rgid: str = "", quality: str = "",
-                         exclude_users: tuple = ()) -> None:
+                         exclude_users: tuple = (), allow_mp3: bool = False,
+                         user_initiated: bool = True) -> None:
     _task_update(task_id, current=f"{artist} - {album}", total=total_tracks)
     # The rgid rides along purely so a successful placement can flip the library
     # index row for this release-group (see _index_mark_release_present) — the
@@ -14271,21 +14931,25 @@ def _album_download_task(task_id: str, release_mbid: str, artist: str,
     # that `_finalize_group` flips the index with and that an auto-retry rebuilds
     # the request from, and the fill it describes outlives a restart because
     # pending_album_groups does.
-    _album_fill_cancel_requested.discard(release_mbid)
-    _album_fill_set(release_mbid, "searching", artist=artist, album=album,
-                    taskId=task_id, total=total_tracks, rgid=rgid,
-                    quality=quality or "", reason="", failureKind="",
-                    retryable=False, durable=True)
+    _album_fill_begin(release_mbid, artist=artist, album=album, total=total_tracks,
+                      rgid=rgid, quality=quality or "", task_id=task_id,
+                      user_initiated=user_initiated, allow_mp3=allow_mp3,
+                      excluded_users=tuple(exclude_users or ()))
     # An empty quality is "whatever Source preferences say"; the scope covers the
     # search and the enqueue, and the group below carries it for the failover.
-    with _quality_preference(quality):
+    # `allow_mp3` is the whole-album counterpart of a review group's opt-in:
+    # without it a `format_rejected` fill had `mp3WouldHelp` on the wire and no
+    # route that could act on it, because `/api/gaps/<id>/allow-mp3` needs a
+    # group and an artist-page download has none.
+    with _quality_preference(quality), _mp3_fallback(bool(allow_mp3)):
         _album_download_search_and_enqueue(
             task_id, release_mbid, artist, album, total_tracks, chosen, quality,
-            exclude_users)
+            exclude_users, allow_mp3=bool(allow_mp3))
 
 def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: str,
                                        album: str, total_tracks: int, chosen: dict,
-                                       quality: str, exclude_users: tuple = ()) -> None:
+                                       quality: str, exclude_users: tuple = (),
+                                       allow_mp3: bool = False) -> None:
     # Same stats dict the gaps path fills, so a fruitless search can say *why*
     # rather than "No album source found on slskd" — which reads as a bug right
     # after a progress line that counted a hundred peers. This is also what
@@ -14339,7 +15003,7 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
         token=_default_web_user().get("telegram_token", ""),
         chat_id=str(_default_web_user().get("chat_id", "")),
         label=album, release_mbid=release_mbid, alt_sources=folders[1:6],
-        artist=artist, album=album, quality=quality)
+        artist=artist, album=album, quality=quality, allow_mp3=bool(allow_mp3))
     # The task ends here — at "accepted by slskd", not "in your library". The
     # transfer, the placement and the Navidrome scan are all still ahead, and
     # they report through the fill-status ledger instead (see _finalize_group).
@@ -14347,14 +15011,20 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
         # Cancelled in the moments the enqueue itself took: undo it.
         _album_fill_cancel_requested.discard(release_mbid)
         if ag_id:
-            _abandon_group_downloads(ag_id)
-            pending_album_groups.pop(ag_id, None)
+            ag = pending_album_groups.pop(ag_id, None)
+            if ag is not None:
+                ag["cancelled"] = True
+            _abandon_transfers(_detach_group_downloads(ag_id))
         _task_finish(task_id, "Cancelled")
         return
     if ok:
-        _album_fill_set(release_mbid, "queued", groupId=ag_id or "",
-                        done=0, total=total, failed=0,
-                        source=fd.get("username", ""), durable=True)
+        # Refused if a cancel landed between the check above and here — the
+        # group is then already popped and its transfers detached.
+        if not _album_fill_set(release_mbid, "queued", groupId=ag_id or "",
+                               done=0, total=total, failed=0,
+                               source=fd.get("username", ""), durable=True):
+            _task_finish(task_id, "Cancelled")
+            return
     else:
         _album_fill_fail(release_mbid, "transfer_failed",
                          "slskd accepted none of the album's files")
@@ -17791,21 +18461,7 @@ def start_web_dashboard() -> None:
             if not group:
                 return jsonify(_api_error_payload("not_found", "Group not found")), 404
         op = _operation_create("cancel_gap_downloads", "Cancelling gap downloads")
-        cancelled = 0
-        for (username, filename), info in list(pending_downloads.items()):
-            if info.get("review_group_id") != group_id:
-                continue
-            _slskd_cancel(username, filename)
-            if info.get("repair_job_id"):
-                _repair_update_download(info.get("repair_job_id", ""), username,
-                                        filename, "cancelled", "cancelled by user",
-                                        raw_state="Cancelled")
-            pending_downloads.pop((username, filename), None)
-            cancelled += 1
-        for ag_id, ag in list(pending_album_groups.items()):
-            if ag.get("review_group_id") == group_id:
-                _abandon_group_downloads(ag_id)
-                cancelled += 1
+        cancelled = _gap_cancel(group_id)
         _operation_finish(op["id"], True, f"Cancelled {cancelled} download(s)")
         _save_state()
         _save_review_state()
@@ -18255,13 +18911,17 @@ def start_web_dashboard() -> None:
 
         existing_gid, _ag = _album_group_for_release(release_mbid)
         running = _running_album_download_task(release_mbid)
-        if existing_gid or running:
+        # `placing` has no group and no task, and a second fill started over
+        # it ran a second placement pass over the same folder.
+        placing = (_album_fill_get(release_mbid).get("state") == "placing")
+        if existing_gid or running or placing:
             return jsonify({"ok": True, "existing": True,
                             "task_id": running,
                             "album_group_id": existing_gid,
                             "status": _album_fill_view(release_mbid),
                             "resolved": resolved})
 
+        allow_mp3 = bool(data.get("allowMp3"))
         chosen = None
         if data.get("sourceUsername"):
             chosen = {"username": data.get("sourceUsername", ""),
@@ -18275,7 +18935,7 @@ def start_web_dashboard() -> None:
             lambda tid: _album_download_task(
                 tid, release_mbid, resolved["artist"],
                 resolved["title"], int(resolved.get("total_tracks") or 0), chosen,
-                rgid, quality, exclude_users),
+                rgid, quality, exclude_users, allow_mp3=allow_mp3),
             total=int(resolved.get("total_tracks") or 0),
             release_mbid=release_mbid)
         return jsonify({"ok": True, "existing": False, "task_id": task_id,
@@ -18315,6 +18975,14 @@ def start_web_dashboard() -> None:
         if not release_mbid:
             return jsonify({"error": "release_mbid or rgid is required"}), 400
         return jsonify(_album_fill_view(release_mbid))
+
+    @app.get("/api/fills")
+    def api_fills():
+        """Every fill a client is watching, in one read (see `_fills_view`)."""
+        def _ids(name):
+            raw = request.args.get(name, "") or ""
+            return [p.strip() for p in raw.split(",") if p.strip()]
+        return jsonify(_fills_view(_ids("release_mbids"), _ids("group_ids")))
 
     @app.get("/api/album/tracklist")
     def api_album_tracklist():
@@ -19203,19 +19871,10 @@ def start_web_dashboard() -> None:
         """Remove one transfer row (album group or single track) from the
         bot's tracking. Never cancels or deletes anything in slskd — this is
         the escape hatch for rows whose real-world work already happened."""
-        if pending_album_groups.pop(transfer_id, None) is not None:
-            for key, info in list(pending_downloads.items()):
-                if info.get("album_group_id") == transfer_id:
-                    pending_downloads.pop(key, None)
-            _save_state()
-            return jsonify({"ok": True, "kind": "album"})
-        for key in list(pending_downloads.keys()):
-            row_id = hashlib.sha1("|".join(key).encode("utf-8")).hexdigest()[:12]
-            if row_id == transfer_id:
-                pending_downloads.pop(key, None)
-                _save_state()
-                return jsonify({"ok": True, "kind": "track"})
-        return jsonify({"error": "Transfer not found"}), 404
+        kind = _dismiss_transfer(transfer_id)
+        if not kind:
+            return jsonify({"error": "Transfer not found"}), 404
+        return jsonify({"ok": True, "kind": kind})
 
     @app.post("/api/imports/<recid>/retry")
     def api_import_retry(recid):

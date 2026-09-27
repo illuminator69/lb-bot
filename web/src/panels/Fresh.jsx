@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useApp, navigate } from '../App.jsx'
-import { api } from '../lib/api.js'
+import { useApp, goArtist, lsGet, lsSet } from '../App.jsx'
+import { api, post } from '../lib/api.js'
 import Cover from '../components/Cover.jsx'
-import { Chip, EmptyState, PageTitle, Skeleton, SortToggle } from '../components/ui.jsx'
+import { Chip, EmptyState, SectionHeader, Skeleton, SortToggle } from '../components/ui.jsx'
 
 const DAYS = [[7, '7 days'], [30, '30 days'], [90, '90 days']]
 const SORTS = [['date', 'Newest'], ['artist', 'Artist A–Z']]
@@ -21,10 +21,7 @@ function typeBucket(r) {
 
 // Restore a saved Fresh preference so scope/sort/window/type survive tab
 // switches and reloads (the mock treats these as sticky filters).
-function stored(key, fallback) {
-  const v = localStorage.getItem('fresh.' + key)
-  return v == null ? fallback : v
-}
+const stored = (key, fallback) => lsGet('fresh.' + key, fallback)
 
 function fmtDate(iso) {
   if (!iso) return ''
@@ -66,19 +63,19 @@ const BUCKET_LABEL = {
 // `release_mbid`, so one transient MusicBrainz 503 hard-failed that album for
 // the next five minutes with nothing the user could do. The album page is the
 // review step, and it sends the release it resolved.
-function FreshCard({ r, onOpenArtist, onOpenAlbum, onGetSources }) {
+function FreshCard({ r, onOpenArtist, onOpenAlbum, onGetSources, wishlisted, onWishlist }) {
   const upcoming = r.releaseDate && r.releaseDate > new Date().toISOString().slice(0, 10)
 
   return (
-    <div className="flex flex-col rounded-[12px] border border-line bg-panel p-2.5">
+    <div className="flex flex-col rounded-card border border-line bg-panel p-2.5">
       <button className="!block !border-0 !bg-transparent !p-0 text-left"
         onClick={() => (r.releaseGroupMbid ? onOpenAlbum(r) : onOpenArtist(r))}
         title={r.releaseGroupMbid ? `Open ${r.releaseName}` : `Open ${r.artist}`}>
         <div className="mb-2"><Cover url={r.coverUrl} name={r.releaseName} fluid /></div>
-        <div className="truncate text-[13px] font-semibold">{r.releaseName}</div>
-        <div className="muted truncate text-[11.5px]">{r.artist}</div>
+        <div className="truncate text-small font-semibold">{r.releaseName}</div>
+        <div className="truncate text-micro text-muted">{r.artist}</div>
       </button>
-      <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-faint">
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 text-micro text-faint">
         <span>{fmtDate(r.releaseDate)}</span>
         {r.type ? <span>· {r.type}</span> : null}
         {/* Only the exact release being on disk earns "in library" — an owned
@@ -86,17 +83,21 @@ function FreshCard({ r, onOpenArtist, onOpenAlbum, onGetSources }) {
         {r.releaseOwned ? <span className="chip good !my-0 !py-0">in library</span> : null}
         {upcoming ? <span className="chip !my-0 !py-0">upcoming</span> : null}
       </div>
+      <span className="spacer" />
       {r.releaseOwned ? (
-        // Already in the library — don't offer a duplicate download; send them
-        // to the artist page instead.
-        <button className="mt-2.5 !py-1 !text-[12.5px]" onClick={() => onOpenArtist(r)}>
-          View in library →
+        // Already in the library — don't offer a duplicate download.
+        <button className="sm mt-2.5" onClick={() => onOpenArtist(r)}>View in library →</button>
+      ) : upcoming ? (
+        // Not out yet: the wishlist re-searches until someone shares it. This
+        // was a disabled "Get this album" on every upcoming tile.
+        <button className="sm tint mt-2.5" disabled={!r.releaseGroupMbid || wishlisted}
+          title="lb-bot will look for it every few hours once it's out"
+          onClick={() => onWishlist(r)}>
+          {wishlisted ? '✓ On the wishlist' : 'Add to wishlist'}
         </button>
       ) : (
-        <button className="primary mt-2.5 !py-1 !text-[12.5px]"
-          disabled={!r.releaseGroupMbid || upcoming}
-          title={upcoming ? 'Not released yet' : 'Review sources, then download'}
-          onClick={() => onGetSources(r)}>
+        <button className="sm primary mt-2.5" disabled={!r.releaseGroupMbid}
+          title="Review sources, then download" onClick={() => onGetSources(r)}>
           Get this album →
         </button>
       )}
@@ -106,6 +107,20 @@ function FreshCard({ r, onOpenArtist, onOpenAlbum, onGetSources }) {
 
 export default function Fresh() {
   const { pushToast } = useApp()
+  const [wishlisted, setWishlisted] = useState(() => new Set())
+  async function wishlist(r) {
+    try {
+      await post('/api/wishlist', { rgid: r.releaseGroupMbid, artist: r.artist, title: r.releaseName })
+      setWishlisted(s => new Set(s).add(r.releaseGroupMbid))
+      pushToast(`${r.releaseName} is on the wishlist`)
+    } catch (e) {
+      pushToast(`Could not add to the wishlist: ${e.message}`, 'error')
+    }
+  }
+  // Already-wishlisted rows read as such on arrival.
+  useEffect(() => {
+    api('/api/wishlist').then(w => setWishlisted(new Set((w.wishlist || []).map(x => x.rgid)))).catch(() => {})
+  }, [])
   const [days, setDays] = useState(() => Number(stored('days', 30)))
   const [scope, setScope] = useState(() => stored('scope', 'yours'))   // 'yours' | 'all'
   const [sort, setSort] = useState(() => stored('sort', 'date'))       // 'date' | 'artist'
@@ -114,10 +129,10 @@ export default function Fresh() {
   const [error, setError] = useState(null)
 
   // Persist the sticky filters whenever they change.
-  useEffect(() => { localStorage.setItem('fresh.days', String(days)) }, [days])
-  useEffect(() => { localStorage.setItem('fresh.scope', scope) }, [scope])
-  useEffect(() => { localStorage.setItem('fresh.sort', sort) }, [sort])
-  useEffect(() => { localStorage.setItem('fresh.type', type) }, [type])
+  useEffect(() => { lsSet('fresh.days', days) }, [days])
+  useEffect(() => { lsSet('fresh.scope', scope) }, [scope])
+  useEffect(() => { lsSet('fresh.sort', sort) }, [sort])
+  useEffect(() => { lsSet('fresh.type', type) }, [type])
 
   useEffect(() => {
     let dead = false
@@ -181,18 +196,13 @@ export default function Fresh() {
   function openArtist(r, { album = false, sources = false } = {}) {
     const id = artistRouteId(r)
     if (!id) { pushToast('No MusicBrainz artist for this release', 'info'); return }
-    if (album && r.releaseGroupMbid) {
-      navigate('Artist', id, r.releaseGroupMbid, sources ? 'sources' : undefined)
-    } else {
-      navigate('Artist', id)
-    }
+    if (album && r.releaseGroupMbid) goArtist(id, r.releaseGroupMbid, sources)
+    else goArtist(id)
   }
 
   return (
     <>
-      <div className="mb-[18px] flex flex-wrap items-end gap-4">
-        <PageTitle eyebrow="Fresh" title="New releases" />
-        <span className="spacer" />
+      <div className="mb-4 flex flex-wrap items-center gap-4">
         <div className="flex items-center gap-1.5">
           <Chip active={scope === 'yours'} count={ownedCount} onClick={() => setScope('yours')}>Your artists</Chip>
           <Chip active={scope === 'all'} count={releases.length} onClick={() => setScope('all')}>All</Chip>
@@ -209,7 +219,7 @@ export default function Fresh() {
           <Chip key={k} active={type === k} count={typeCounts[k]} onClick={() => setType(k)}>{label}</Chip>
         ))}
       </div>
-      <p className="muted mb-4 text-[12.5px]">
+      <p className="mb-4 text-caption text-muted">
         Recent and upcoming releases from ListenBrainz. “Your artists” shows only artists already in your library.
       </p>
 
@@ -218,7 +228,7 @@ export default function Fresh() {
       ) : data === null ? (
         <div className="tile-grid">
           {Array.from({ length: 12 }, (_, i) => (
-            <div key={i} className="rounded-[12px] border border-line bg-panel p-2.5">
+            <div key={i} className="rounded-card border border-line bg-panel p-2.5">
               <Skeleton style={{ width: '100%', aspectRatio: '1 / 1' }} />
               <Skeleton className="mt-2 h-3 w-3/5" />
               <Skeleton className="mt-1.5 h-2.5 w-2/5" />
@@ -244,18 +254,11 @@ export default function Fresh() {
       ) : (
         groups.map(g => (
           <div key={g.key} className="mb-6">
-            {g.label && (
-              <div className="mb-2.5 flex items-center gap-2.5">
-                <div className="text-[12px] font-semibold uppercase tracking-[.1em]" style={{ color: 'var(--text2)' }}>
-                  {g.label}
-                </div>
-                <span className="h-px flex-1" style={{ background: 'var(--border)' }} />
-                <span className="text-[11.5px] text-faint">{g.items.length}</span>
-              </div>
-            )}
+            {g.label && <SectionHeader label={g.label} sub={g.items.length} />}
             <div className="tile-grid">
               {g.items.map(r => (
                 <FreshCard key={r.releaseMbid || r.releaseGroupMbid} r={r}
+                  wishlisted={wishlisted.has(r.releaseGroupMbid)} onWishlist={wishlist}
                   onOpenArtist={openArtist}
                   onOpenAlbum={x => openArtist(x, { album: true })}
                   onGetSources={x => openArtist(x, { album: true, sources: true })} />

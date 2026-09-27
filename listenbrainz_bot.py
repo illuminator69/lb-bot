@@ -22,6 +22,8 @@ import os
 import json
 import time
 import hashlib
+import math
+import zlib
 import datetime
 import requests
 import asyncio
@@ -30,6 +32,7 @@ import threading
 import uuid
 import difflib
 import shutil
+import secrets
 import sqlite3
 import tempfile
 import unicodedata
@@ -137,6 +140,10 @@ LB_BOT_STAGING_DIR = os.environ.get(
 REVIEW_FILE = os.environ.get("LB_BOT_REVIEW_FILE", "/config/missing_album_review.json")
 LIBRARY_INDEX_FILE = os.environ.get("LB_BOT_LIBRARY_INDEX", "/config/library_index.db")
 LB_BOT_INDEX_TTL_DAYS = float(os.environ.get("LB_BOT_INDEX_TTL_DAYS", "30"))
+# The background auto-index worker (`_auto_index_worker`): keeps every Navidrome
+# artist's discography in the library index without anyone pressing "Build
+# library index". On by default; `0` turns it off on the NAS without a rebuild.
+LB_BOT_AUTO_INDEX = os.environ.get("LB_BOT_AUTO_INDEX", "1").lower() not in ("0", "false", "no")
 # Where a "deleted" duplicate actually goes. Inside the library by default so the
 # move is a rename rather than a copy of a whole FLAC, and dot-prefixed so
 # Navidrome skips it. Point it outside MUSIC_LIBRARY_PATH if your Navidrome does
@@ -164,7 +171,11 @@ if LB_BOT_UMASK:
     except ValueError:
         print(f"  config: ignoring bad LB_BOT_UMASK={LB_BOT_UMASK!r} (want octal, e.g. 002)")
 
-WEB_BUILD = "2026-06-21-scan-recovery-trusted-move-p13"
+# Which build is running. Baked in at image build time (`ARG LB_BOT_REVISION` in
+# the Dockerfile; `deploy.sh dev` passes the working tree's commit + "-dev").
+# It used to be a hand-edited constant, which went three months stale and made
+# the System screen name a June build while an unreleased one was running.
+WEB_BUILD = (os.environ.get("LB_BOT_REVISION", "") or "").strip() or "unknown"
 
 # ---------------------------------------------------------------------------
 # Pooled HTTP
@@ -386,7 +397,26 @@ _review_state = {
     "searches": {},
     "operations": {},
 }
+# Two rings. `_web_events` holds deliberate `_web_log` events, which error
+# envelopes' logTail and /api/status read; `_stdout_events` holds what `_LogTee`
+# copies from stdout and stderr. They used to share one ring, and a scan prints
+# a line per track, so a single scan evicted every deliberate event and logTail
+# came back empty. The Logs view merges the two.
 _web_events: list = []
+_stdout_events: list = []
+WEB_EVENTS_MAX = 200
+# How many printed lines the web UI's Logs view keeps.
+WEB_LOG_MAX = 1000
+# Reentrant: the SIGTERM handler flushes state and prints, and the print lands
+# here — on the main thread, which may already hold the lock when the signal
+# arrives.
+_web_events_lock = threading.RLock()
+# What the background workers last did, for Settings -> Status. Each worker
+# keeps its real state in a local; these are the copies it publishes after a
+# tick, read-only to everyone else.
+_PROCESS_STARTED_AT = time.time()
+_auto_index_public: dict = {}
+_index_push_public: dict = {}
 
 # Review-state writes are coalesced rather than done per mutation — see
 # _save_review_state for the measurements and the durability tradeoff. The
@@ -645,27 +675,140 @@ _LOG_TAG_WORDS = ("slskd", "navidrome", "beets", "telegram", "spotify",
                   "musicbrainz", "scan", "task", "import", "placement",
                   "download", "search")
 
-def _web_log(message: str, tag: str = "", severity: str = "") -> None:
-    """Structured log entry. Callers may pass just a message — tag/severity are
-    derived from its text so the UI's filter chips work without touching every
-    call site."""
-    safe = _redact_secrets(str(message))
-    low = safe.lower()
+_LOG_ERROR_RE = re.compile(
+    r"\b(error|errors|failed|failure|exception|traceback|unreachable|refused)\b", re.I)
+# Per-track progress lines: what follows the prefix is an artist, album or
+# track name, and "Refused - New Noise" or "The Exceptions" is not an error.
+_LOG_PROGRESS_PREFIXES = ("checking", "incomplete:", "album group:",
+                          "already complete:", "no release found:",
+                          "+ mbid match:", "+ text match:", "->")
+# Werkzeug's access log goes to stderr: one line per request, i.e. several per
+# second from the SPA's polls. It would evict everything else in the ring.
+_LOG_ACCESS_RE = re.compile(r'"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP/[\d.]+" \d{3}')
+
+def _log_severity(text: str, src: str) -> str:
+    low = text.lower()
+    if src != "web" and low.startswith(_LOG_PROGRESS_PREFIXES):
+        return "info"
+    if _LOG_ERROR_RE.search(text):
+        return "error"
+    if "warning" in low:
+        return "warn"
+    return "warn" if src == "stderr" else "info"
+
+def _web_event_append(message: str, tag: str = "", severity: str = "",
+                      src: str = "stdout") -> None:
+    """Add one line to the web UI's log rings, deriving tag and severity from
+    the text when the caller gives none. Redacts: these rings are served as-is.
+    The tag comes from the raw text, because redaction rewrites host names —
+    "host='slskd'" is exactly what tags an slskd outage."""
+    text = str(message)
+    safe = _redact_secrets(text)
     if not severity:
-        severity = ("error" if any(w in low for w in ("error", "failed", "refused",
-                                                      "unreachable", "exception"))
-                    else "info")
+        severity = _log_severity(safe, src)
     if not tag:
+        low = text.lower()
         tag = next((w for w in _LOG_TAG_WORDS if w in low), "app")
-    print(f"  web: {safe}")
-    _web_events.append({
+    entry = {
         "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "epoch": time.time(),
         "tag": tag,
         "severity": severity,
         "msg": safe,
-    })
-    del _web_events[:-200]
+        # "web" for a deliberate _web_log event, "stdout"/"stderr" for a line
+        # the tee copied.
+        "src": src,
+    }
+    with _web_events_lock:
+        if src == "web":
+            _web_events.append(entry)
+            del _web_events[:-WEB_EVENTS_MAX]
+        else:
+            _stdout_events.append(entry)
+            del _stdout_events[:-WEB_LOG_MAX]
+
+# Set while `_web_log` echoes its own line, so the tee does not record it a
+# second time — every line of it, a multi-line message included.
+_tee_suppress = threading.local()
+
+def _web_log(message: str, tag: str = "", severity: str = "") -> None:
+    """Structured log entry. Callers may pass just a message — tag/severity are
+    derived from its text so the UI's filter chips work without touching every
+    call site."""
+    safe = _redact_secrets(str(message))
+    _tee_suppress.on = True
+    try:
+        print(f"  web: {safe}")
+    finally:
+        _tee_suppress.on = False
+    _web_event_append(str(message), tag, severity, src="web")
+
+class _LogTee:
+    """stdout/stderr wrapper that also records each completed line in the web
+    log ring.
+
+    The bot reports almost everything through bare `print` — placements, slskd
+    failures, scan progress — and none of it reached the web UI, whose Logs view
+    therefore showed one line after two days of uptime. Wrapping the streams
+    gets all of it there without touching the few hundred call sites. Writes
+    pass through unchanged; only complete, non-blank lines are recorded.
+
+    The partial line is buffered **per thread**: `print` is two writes (the
+    text, then "\n"), and with one shared buffer another thread's text landed
+    between them and the two lines were recorded glued into one.
+    """
+
+    def __init__(self, stream, src: str = "stdout"):
+        self._stream = stream
+        self._src = src
+        self._local = threading.local()
+
+    def write(self, data):
+        n = self._stream.write(data)
+        try:
+            local = self._local
+            buf = getattr(local, "buf", "") + data
+            *lines, local.buf = buf.split("\n")
+            if getattr(_tee_suppress, "on", False):
+                return n
+            for line in lines:
+                text = line.strip()
+                if not text:
+                    continue
+                if self._src == "stderr" and _LOG_ACCESS_RE.search(text):
+                    continue
+                _web_event_append(text, src=self._src)
+        except Exception:
+            pass  # logging must never take the caller down
+        return n
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+def _install_log_tee() -> None:
+    """Idempotent: wrap sys.stdout and sys.stderr once, at startup (never at
+    import, so tests that capture stdout are unaffected). stderr is where
+    `traceback.print_exc()` and every `logging` handler write."""
+    if not isinstance(sys.stdout, _LogTee):
+        sys.stdout = _LogTee(sys.stdout)
+    if not isinstance(sys.stderr, _LogTee):
+        sys.stderr = _LogTee(sys.stderr, src="stderr")
+
+def _log_ring_merged() -> list:
+    """Both rings, oldest first — what the Logs view lists."""
+    with _web_events_lock:
+        ring = list(_web_events) + list(_stdout_events)
+    return sorted(ring, key=lambda e: (e.get("epoch", 0) if isinstance(e, dict) else 0))
+
+def _web_log_events() -> list:
+    """The ring's deliberate `_web_log` events, without the tee's stdout copies
+    (entries from before the field existed count as web events)."""
+    with _web_events_lock:
+        return [e for e in _web_events
+                if not isinstance(e, dict) or e.get("src", "web") == "web"]
 
 def _web_event_line(entry) -> str:
     """Render a structured entry back to the legacy string format."""
@@ -1066,6 +1209,14 @@ def _invalidate_review_snapshot() -> None:
         scope.__dict__.pop("_lb_review_list_snap", None)
         scope.__dict__.pop("_lb_tasks_snap", None)
 
+def _task_snapshot(task_id: str) -> dict | None:
+    """One task, `result` included and deep-copied — what `/api/tasks/<id>`
+    serves. Copying every task's result to return one made each 1.5 s poll of
+    a placement or a scan pay for all of them."""
+    with _review_lock:
+        task = (_review_state.get("tasks") or {}).get(task_id)
+        return json.loads(json.dumps(task)) if task is not None else None
+
 def _tasks_snapshot(include_result: bool = False) -> dict:
     """Just the task rows, copied — never the whole review state.
 
@@ -1184,11 +1335,28 @@ def _review_list_snapshot() -> dict:
             row = {k: group[k] for k in _GAP_LIST_GROUP_FIELDS if k in group}
             # Only `decision` is read off a track, only `status` off a match
             # item, and `albums` only for truthiness.
-            row["missing_tracks"] = [{"decision": t.get("decision", "pending")}
-                                     for t in (group.get("missing_tracks") or [])]
+            row["missing_tracks"] = [
+                {"decision": t.get("decision", "pending"),
+                 # Only a downloaded track's age is read (_downloaded_is_stale).
+                 **({"downloaded_at": t["downloaded_at"]}
+                    if t.get("decision") == "downloaded" and t.get("downloaded_at")
+                    else {})}
+                for t in (group.get("missing_tracks") or [])]
+            # Read by _suggest_review_group_for_folder, which the needs-placement
+            # view runs on every summary poll. Not columns of review_groups.
+            for k in ("canonical_mbid", "release_mbid"):
+                if group.get(k):
+                    row[k] = group[k]
+            # Whether a source search has left results to pick from — the rail
+            # used to say "source ready" for every album, searched or not.
+            row["source_count"] = len(
+                ((group.get("source_results") or {}).get("folders") or []))
             row["match_items"] = [{"status": (m or {}).get("status")}
                                   for m in (group.get("match_items") or [])]
-            row["albums"] = [{}] * len(group.get("albums") or [])
+            # Ids only: the library view maps Navidrome albums to groups by them,
+            # and everything else reads `albums` for truthiness.
+            row["albums"] = [{"id": (a or {}).get("id", "")}
+                             for a in (group.get("albums") or [])]
             groups.append(row)
         task = (_review_state.get("tasks", {}) or {}).get(tid) if tid else None
         snap = {
@@ -1457,6 +1625,15 @@ def _create_or_update_repair_job_from_group(group: dict, approved_tracks=None) -
     _repair_job_touch(job)
     return job
 
+def _stamp_downloaded(track: dict, previous_decision: str, at: float | None = None) -> None:
+    """Record when a track *entered* "downloaded". Only the transition counts:
+    _downloaded_is_stale reads this stamp, and re-marking a track that already
+    sat there (a reconcile pass, a projection) is not progress — stamping it
+    made a stuck album read "working" again for another half hour each time."""
+    if track.get("decision") == "downloaded" and (
+            previous_decision != "downloaded" or not track.get("downloaded_at")):
+        track["downloaded_at"] = at or time.time()
+
 def _apply_repair_job_projection_to_group(group: dict) -> dict:
     if not LB_BOT_REPAIR_JOBS or not group:
         return group
@@ -1483,7 +1660,9 @@ def _apply_repair_job_projection_to_group(group: dict) -> dict:
         if track.get("decision") in ("approved", "source_pending"):
             projected = track["decision"]
             track.pop("download_error", None)
+        previous_decision = track.get("decision", "")
         track["decision"] = projected
+        _stamp_downloaded(track, previous_decision, jt.get("updated_at"))
         for key in ("local_path", "source_user", "source_folder", "download_percent",
                     "download_state", "filename", "matched_relpath"):
             if jt.get(key):
@@ -1661,6 +1840,20 @@ def _announce_album_indexed(release_mbid: str, rgid: str, group_id: str,
         release_mbid, rgid=rgid or (row or {}).get("rgid", ""),
         artist=artist, album=album, event="albumIndexed",
         nd_album_ids=album_ids, nd_artist_id=artist_id, row=row)
+    # This placement's own row already has its ids, from the write above — but
+    # `_index_mark_release_present` (a Fill-gaps completion, or an artist-page
+    # download whose verifier fires elsewhere) can leave OTHER `present` rows
+    # on this same artist still without theirs, and until task 4 the only thing
+    # that filled those in was a guess run on every discography GET
+    # (`_index_backfill_present_album_ids`, off the read path now). Kick it here
+    # instead, promptly, on its own thread so a slow Navidrome album-index
+    # fetch never delays this notify; the periodic sweep below is the backstop
+    # for a `present` row this event never touches (Fill-gaps has no artist in
+    # hand) and for whatever a restart drops mid-flight.
+    artist_key = _index_existing_artist_key("", artist_id) if artist_id else ""
+    if artist_key:
+        threading.Thread(target=_index_backfill_present_album_ids, args=(artist_key,),
+                         name=f"backfill-{artist_key[:16]}", daemon=True).start()
 
 _placement_verifiers: set = set()
 _placement_verify_lock = threading.Lock()
@@ -2605,6 +2798,16 @@ def _push_worker() -> None:
             except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
                 print(f"  hub fill push failed ({kind} {key[:8]}): {e}")
 
+def _recent_album_fill_mbids(limit: int = 20) -> list:
+    """The release mbids of the most recently touched album fills, newest first.
+    Lets the web UI list its album downloads without having to remember which
+    ones it started (the hub clients each keep their own watch list)."""
+    with _album_fill_lock:
+        rows = sorted(_album_fill_status.items(),
+                      key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
+                      reverse=True)
+    return [mbid for mbid, _ in rows[:limit]]
+
 def _fills_view(release_mbids: list, group_ids: list) -> dict:
     """`GET /api/fills` — every fill a client watches, in one answer.
 
@@ -3284,12 +3487,123 @@ def _mbz_cache_put(key: str, data: dict) -> None:
 # take it.
 _mbz_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Who goes first on `_mbz_lock` (PLAN-lbbot-index-mirror-2026-09-23 §2.5).
+#
+# The auto-index worker walks the whole library through `mbz_get`, i.e. it
+# would sit on the same one-request-a-second budget every page spends — and
+# `_mbz_lock` is a plain Lock, which is not fair: a page queued behind a worker
+# request could lose the race for the next turn to the worker's *next* request,
+# again and again. So a caller is either interactive (every caller, by default)
+# or background (a thread that entered `mbz_background()`, i.e. only the
+# worker), and a background caller takes a turn only when no interactive
+# caller is waiting for or holding one.
+#
+# - `_mbz_interactive_waiters` counts interactive callers between "wants a
+#   turn" and "finished it". A background caller waits on `_mbz_priority`
+#   while it is non-zero, then takes the lock and **re-checks under it**: an
+#   interactive caller that registered in between wins, and the worker hands
+#   the lock straight back. So a page waits behind at most the one worker
+#   request that was already in flight when it arrived — an HTTP call cannot
+#   be pre-empted — never behind a queue of them.
+# - `MBZ_BACKGROUND_GRACE`: a page usually makes its calls in a quick burst
+#   (a search, then a lookup), with the counter at zero between them. Without
+#   a grace the worker would slip a request into every such gap; with it, the
+#   worker waits until interactive traffic has been quiet this long.
+# - Only the network path is gated. Cache hits never take the lock, so they
+#   neither count as waiters nor wait.
+# - Every increment has its decrement in a `finally`; a counter left raised
+#   would park the worker forever, silently.
+#
+# Lock order: `_mbz_priority` is only ever held briefly and never while
+# acquiring `_mbz_lock`.
+# ---------------------------------------------------------------------------
+MBZ_BACKGROUND_GRACE = 2.0
+_mbz_priority = threading.Condition()
+_mbz_interactive_waiters = 0
+_mbz_interactive_last = 0.0   # time.monotonic() an interactive turn last ended
+_mbz_role = threading.local()
+
+@contextlib.contextmanager
+def mbz_background():
+    """Mark this thread's MusicBrainz calls as background for the block.
+
+    Thread-local, so it follows every `mbz_get` a scan makes however deep in
+    the call tree, and never leaks into another thread (a Flask request, a
+    manual scan task). Nests: the previous role is restored on exit.
+    """
+    previous = getattr(_mbz_role, "background", False)
+    _mbz_role.background = True
+    try:
+        yield
+    finally:
+        _mbz_role.background = previous
+
+def _mbz_is_background() -> bool:
+    return bool(getattr(_mbz_role, "background", False))
+
+def _mbz_background_may_go() -> bool:
+    """Called with `_mbz_priority` held."""
+    return (_mbz_interactive_waiters == 0
+            and time.monotonic() - _mbz_interactive_last >= MBZ_BACKGROUND_GRACE)
+
+def _mbz_background_wait() -> None:
+    """Block until a background caller may take a turn. `_mbz_priority` held."""
+    while not _mbz_background_may_go():
+        if _mbz_interactive_waiters:
+            _mbz_priority.wait()
+        else:
+            _mbz_priority.wait(max(0.0, MBZ_BACKGROUND_GRACE
+                                   - (time.monotonic() - _mbz_interactive_last)))
+
+@contextlib.contextmanager
+def _mbz_turn():
+    """Hold `_mbz_lock` for one MusicBrainz request, by this thread's role."""
+    global _mbz_interactive_waiters, _mbz_interactive_last
+    if not _mbz_is_background():
+        with _mbz_priority:
+            _mbz_interactive_waiters += 1
+        try:
+            with _mbz_lock:
+                yield
+        finally:
+            with _mbz_priority:
+                _mbz_interactive_waiters -= 1
+                _mbz_interactive_last = time.monotonic()
+                _mbz_priority.notify_all()
+        return
+    while True:
+        with _mbz_priority:
+            _mbz_background_wait()
+        _mbz_lock.acquire()
+        with _mbz_priority:
+            clear = _mbz_background_may_go()
+        if clear:
+            break
+        # An interactive caller registered between the wait and the acquire.
+        _mbz_lock.release()
+    try:
+        yield
+    finally:
+        _mbz_lock.release()
+
 def _mbz_cache_key(path: str, params: dict) -> str:
     items = sorted((params or {}).items())
     return path + "?" + "&".join(f"{k}={v}" for k, v in items)
 
 class MusicBrainzUnavailable(RuntimeError):
     """MusicBrainz did not answer a request whose answer cannot be guessed."""
+
+class MusicBrainzNoSuchEntity(MusicBrainzUnavailable):
+    """MusicBrainz answered with a permanent 4xx (400/404/410): the mbid is
+    wrong, merged or gone. Distinct from the base class, which by the time
+    this is raised always means an outage — a caller that treats every
+    MusicBrainzUnavailable as "MusicBrainz is down right now" (the auto-index
+    worker's whole-worker pause is the case that motivated this) must not
+    apply that verdict to one bad tag on one artist. Every existing
+    `except MusicBrainzUnavailable` still catches this — it is only a finer
+    answer for a caller that wants it.
+    """
 
 # A strict caller (a discography scan someone asked for) retries a transient
 # failure after these pauses before giving up out loud.
@@ -3306,7 +3620,8 @@ def _mbz_error_text(e: Exception) -> str:
         return "connection failed"
     return name
 
-def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
+def mbz_get(path: str, params: dict = None, strict: bool = False,
+           bypass_cache: bool = False) -> dict:
     """
     Rate-limited (1/sec) MusicBrainz request with a persistent result cache.
 
@@ -3321,6 +3636,15 @@ def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
     those get a short cooldown in _mbz_fail_until and are never written to the
     durable cache, so a bad afternoon can't poison it.
 
+    A cached empty dict is unambiguous: `if data:` above means only the
+    permanent-4xx branch ever durably caches `{}` — a real answer, even "no
+    releases", is a non-empty dict (`{"release-groups": [], ...}`). So a cache
+    hit of `{}` always means "MusicBrainz has no such entity", never an
+    outage, and `strict=True` raises `MusicBrainzNoSuchEntity` for it instead
+    of quietly handing back `{}` (see that class and ruling R14: a caller
+    that reads any MusicBrainzUnavailable as "MusicBrainz is down right now"
+    must not apply that verdict to one bad tag on one artist).
+
     `strict=True` is for a caller that cannot treat {} as an answer. A
     non-strict failure is indistinguishable from "MusicBrainz has nothing", and
     for an artist's release-group browse that was read as "this artist has no
@@ -3328,13 +3652,31 @@ def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
     rescan inside the five-minute cooldown "succeeded" instantly with nothing,
     never having asked. Strict ignores the cooldown (someone asked), retries
     after MBZ_STRICT_RETRY_BACKOFF, and raises MusicBrainzUnavailable with the
-    reason instead of returning {}.
+    reason instead of returning {} — except for the permanent-4xx case above,
+    which raises the more specific MusicBrainzNoSuchEntity immediately, live
+    or from the cache, with no retry (a bad mbid does not get any better for
+    asking three more times).
+
+    `bypass_cache=True` skips a *positive* cache hit and asks again — for a
+    strict rescan of an artist's release-group browse, whose answer is not
+    immutable the way an entity lookup is: a new release can appear on
+    MusicBrainz between scans, and without this the in-memory cache from an
+    earlier scan (or from the not-owned browse path) would answer every
+    rescan from memory forever and auto-refresh could never see it. It never
+    bypasses the permanent-fail marker above — that one is durable regardless,
+    the whole point of caching a bad mbid being to stop asking about it.
     """
     global _mbz_last_req
     key    = _mbz_cache_key(path, params)
     cached = _mbz_cache.get(key)
     if cached is not None:
-        return cached
+        if not cached:
+            if strict:
+                raise MusicBrainzNoSuchEntity(
+                    f"MusicBrainz has no such entity for {path} (cached)")
+            return cached
+        if not bypass_cache:
+            return cached
     if not strict and time.time() < _mbz_fail_until.get(key, 0):
         return {}
     last_error = ""
@@ -3342,12 +3684,20 @@ def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
         if pause:
             # Outside the lock: a backoff must not stall every other caller.
             time.sleep(pause)
-        with _mbz_lock:
+        # `_mbz_turn`, not a bare `_mbz_lock`: the auto-index worker yields
+        # its turn to any interactive caller (see `mbz_background`).
+        with _mbz_turn():
             # Re-check: a thread that queued behind an identical request should use
             # its answer rather than spend another second of the budget on it.
             cached = _mbz_cache.get(key)
             if cached is not None:
-                return cached
+                if not cached:
+                    if strict:
+                        raise MusicBrainzNoSuchEntity(
+                            f"MusicBrainz has no such entity for {path} (cached)")
+                    return cached
+                if not bypass_cache:
+                    return cached
             if not strict and time.time() < _mbz_fail_until.get(key, 0):
                 return {}
             wait = 1.0 - (time.time() - _mbz_last_req)
@@ -3365,6 +3715,9 @@ def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
                 if status in MBZ_PERMANENT_FAIL_STATUSES:
                     print(f"  MBZ {status} [{path}] — caching as unresolvable")
                     _mbz_cache_put(key, {})
+                    if strict:
+                        raise MusicBrainzNoSuchEntity(
+                            f"MusicBrainz {status} for {path} — no such entity")
                     return {}
                 r.raise_for_status()
                 data = r.json()
@@ -3372,6 +3725,8 @@ def mbz_get(path: str, params: dict = None, strict: bool = False) -> dict:
                     _mbz_cache_put(key, data)
                 _mbz_fail_until.pop(key, None)
                 return data
+            except MusicBrainzNoSuchEntity:
+                raise
             except Exception as e:
                 # A failed request still spent the budget: pace the retry after it.
                 _mbz_last_req = time.time()
@@ -3598,12 +3953,18 @@ def caa_release_front_url(release_mbid: str, size: int = 500) -> str:
     particular pressing has no art of its own."""
     return f"https://coverartarchive.org/release/{release_mbid}/front-{size}"
 
-def mbz_search_artists(query: str, limit: int = 8) -> list:
+def mbz_search_artists(query: str, limit: int = 8, strict: bool = False) -> list:
     """
     Free-text search of MusicBrainz artists.
     Returns [{mbid, name, disambiguation, type, country, area, score}] best-first.
+
+    `strict=True` raises MusicBrainzUnavailable when MusicBrainz did not
+    answer, so `[]` means only "MusicBrainz answered: no such artist". The
+    auto-index worker needs that distinction (ruling R13): it records a
+    no-match as an `nd:` miss-stub that hides the artist for
+    LB_BOT_INDEX_TTL_DAYS, which an outage must never do.
     """
-    data = mbz_get("artist", {"query": query, "limit": str(limit)})
+    data = mbz_get("artist", {"query": query, "limit": str(limit)}, strict=strict)
     out  = []
     for a in data.get("artists", []):
         out.append({
@@ -3665,7 +4026,18 @@ def mbz_artist_release_groups(artist_mbid: str, *,
 
     `strict=True` raises MusicBrainzUnavailable rather than returning a short
     list: a page that failed mid-walk is not the end of the discography, and a
-    scan storing it would delete every release past that page.
+    scan storing it would delete every release past that page. It also raises
+    the narrower MusicBrainzNoSuchEntity when the artist mbid is permanently
+    bad (see mbz_get) — a caller doing per-artist backoff (the auto-index
+    worker) needs to tell that apart from an outage.
+
+    `strict=True` also passes `bypass_cache=True`: a browse page is not an
+    immutable entity lookup the way a release or recording is — a new release
+    can appear on MusicBrainz between two scans of the same artist — so a
+    *strict rescan* (someone asked for fresh data) must re-ask rather than
+    answer from whatever this artist's earlier scan, or the not-owned browse
+    path, already put in `_mbz_cache`. Without this, auto-refresh could never
+    see a release MusicBrainz added after the first scan.
     """
     exclude = ARTIST_DISCOGRAPHY_EXCLUDE_DEFAULT if exclude_secondary is None else exclude_secondary
     out, offset, page_size = [], 0, 100
@@ -3675,9 +4047,12 @@ def mbz_artist_release_groups(artist_mbid: str, *,
             "type":   "|".join(types),
             "limit":  str(page_size),
             "offset": str(offset),
-        }, strict=strict)
+        }, strict=strict, bypass_cache=strict)
         if strict and "release-groups" not in data:
             # A permanent 4xx, cached as {}: nothing to list, and not "no releases".
+            # (mbz_get itself already raises MusicBrainzNoSuchEntity for that
+            # case; this is the safety net for any other data shape strict
+            # cannot treat as an answer.)
             raise MusicBrainzUnavailable(
                 "MusicBrainz returned no release list for this artist id")
         rgs = data.get("release-groups", [])
@@ -4596,9 +4971,15 @@ def _deezer_get(path: str, params: dict = None, ttl: float = _DEEZER_TTL) -> dic
         hit = _deezer_cache.get(key)
         if hit and now - hit[0] < ttl:
             return hit[1]
-    r = _http.get(f"{DEEZER_API}/{path.lstrip('/')}", params=params,
-                  headers={"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"},
-                  timeout=_DEEZER_TIMEOUT)
+    try:
+        r = _http.get(f"{DEEZER_API}/{path.lstrip('/')}", params=params,
+                      headers={"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"},
+                      timeout=_DEEZER_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 — any transport failure is a Deezer failure
+        # Every caller catches DeezerError and nothing else. A read timeout used
+        # to escape as a bare requests exception, so /api/artist/related
+        # answered 500 whenever Deezer was slow (seen live 2026-09-26).
+        raise DeezerError(f"request failed: {e}") from e
     if not r.ok:
         raise DeezerError(f"{r.status_code}: {r.text[:200]}")
     try:
@@ -6146,6 +6527,89 @@ def mbz_release_group_of(release_mbid: str) -> str:
     data = mbz_get(f"release/{release_mbid}", {"inc": "release-groups"})
     return ((data.get("release-group") or {}).get("id")) or ""
 
+def mbz_release_full(release_mbid: str) -> dict:
+    """`release/{id}?inc=release-groups+recordings` — the one document behind
+    both `mbz_release_group_of` and `mbz_release_tracks` for the same release,
+    fetched once and written under *both* of their cache keys.
+
+    The discography scan's wrong-release guard (`_classify_release_group`)
+    used to cost two separate MusicBrainz requests for the identical release
+    id: one for its release-group (the mismatch check, `inc=release-groups`)
+    and, moments later, one for its tracklist (`inc=recordings`, once
+    `_missing_for_album_records` runs) — two different cache keys even though
+    MusicBrainz answers both from this same release document. Asking for both
+    incs together and priming the narrower key neither request will now need
+    halves the MusicBrainz cost of that path per owned album: whichever of
+    `mbz_release_group_of` / `mbz_release_tracks` is called next for this
+    release_mbid finds a cache hit and skips both the network call and the
+    1-second rate-limit sleep.
+
+    The combined payload is a strict superset of either single-inc response —
+    MusicBrainz merges requested incs into one document rather than reshaping
+    it, so `release-group` and `media` sit side by side exactly as a direct
+    request for just one of them would have shaped that one field — so a
+    reader of either narrower key (`(data.get("release-group") or {}).get("id")`,
+    or `media[*].tracks[*]`) sees exactly what a direct request for that key
+    alone would have returned.
+
+    Returns the raw document ({} on a failure — mbz_get's own rules apply).
+
+    **Only when it saves a request** (final review M1). Once an owned album
+    has been scanned both narrower keys are cached, and asking for the
+    combined key anyway cost one NEW request per rescan — so when both are
+    present the answer is assembled from them, with no request at all. And
+    each key gets its own projection (the release-group key without `media`,
+    the tracklist key without `release-group`) rather than one shared
+    document under three keys: that filled the 8000-entry FIFO three times
+    faster and wrote the tracklist to disk three times. The combined key
+    mbz_get stored is dropped for the same reason — nothing reads it but
+    this function, and this function now reads the narrower two.
+    """
+    if not release_mbid:
+        return {}
+    path = f"release/{release_mbid}"
+    rg_key = _mbz_cache_key(path, {"inc": "release-groups"})
+    tr_key = _mbz_cache_key(path, {"inc": "recordings"})
+    rg_doc, tr_doc = _mbz_cache.get(rg_key), _mbz_cache.get(tr_key)
+    if rg_doc is not None and tr_doc is not None:
+        return {**tr_doc, **rg_doc}
+    data = mbz_get(path, {"inc": "release-groups recordings"})
+    if data:
+        _mbz_cache.pop(_mbz_cache_key(path, {"inc": "release-groups recordings"}), None)
+        _mbz_cache_put(rg_key, {k: v for k, v in data.items() if k != "media"})
+        _mbz_cache_put(tr_key, {k: v for k, v in data.items() if k != "release-group"})
+    return data
+
+def _album_search_context(release_mbid: str) -> tuple:
+    """(year, canonical track titles) for the album search variants.
+
+    The self-titled year/track queries and the track-title corroboration
+    evidence only work when the caller has these; Fill Gaps always did, the
+    Telegram and API paths never passed them. Costs at most one cached
+    `mbz_get` (`mbz_release_full` assembles from the narrower keys when the
+    release was already resolved), and answers ("", []) when MusicBrainz is
+    down — the search must run degraded, never block or raise.
+    """
+    if not release_mbid:
+        return "", []
+    try:
+        data = mbz_release_full(release_mbid)
+    except Exception:
+        return "", []
+    if not data:
+        return "", []
+    rg = data.get("release-group") or {}
+    year = ((rg.get("first-release-date") or data.get("date") or "")[:4])
+    if not (len(year) == 4 and year.isdigit()):
+        year = ""
+    titles = []
+    for medium in data.get("media", []):
+        for t in medium.get("tracks", []):
+            title = t.get("title") or (t.get("recording") or {}).get("title") or ""
+            if title:
+                titles.append(title)
+    return year, titles
+
 # Title fallback threshold for discography matching. Deliberately stricter
 # than the old 0.88: at 0.88, sibling titles ("X" vs "X Live") and even
 # unrelated albums cross-matched, and a wrong match is worse than "missing".
@@ -6343,7 +6807,14 @@ def _classify_release_group(rg: dict, matches, match_info: dict,
         records_sorted = sorted(
             tagged, key=lambda r: (-(int(r.get("songCount") or 0)), r.get("name", "")))
         own_mbid = records_sorted[0].get("musicBrainzId") or ""
-        own_rg = own_mbid if own_mbid == rg["rgid"] else mbz_release_group_of(own_mbid)
+        if own_mbid == rg["rgid"]:
+            own_rg = own_mbid
+        else:
+            # One combined request primes the tracklist cache key too (see
+            # mbz_release_full) — the common case below (no mismatch) is about
+            # to ask mbz_release_tracks for this exact own_mbid via
+            # _missing_for_album_records, and this makes that a cache hit.
+            own_rg = ((mbz_release_full(own_mbid).get("release-group") or {}).get("id")) or ""
         if own_rg != rg["rgid"]:
             canonical_override = mbz_resolve_album(rg["rgid"]).get("release_mbid", "")
 
@@ -6379,8 +6850,336 @@ def _classify_release_group(rg: dict, matches, match_info: dict,
 # every index built before this is missing rows rather than merely stale.
 INDEX_SCAN_VERSION = 2
 
+# The shape and meaning of a wire row (`_index_row_to_wire`, including the
+# code-derived `effective_type`) as the clients' index mirrors store it. Bump it
+# whenever either changes: the version is the prefix of every epoch, so a bump
+# rotates the epoch at the next boot and every mirror refetches from zero,
+# instead of keeping rows derived under the old rules forever. Unrelated to
+# INDEX_SCAN_VERSION, which gates the *matcher* and forces MusicBrainz rescans.
+WIRE_VERSION = 1
+
+# Byte cap on the serialized `items` of one /api/index/changes page (contract
+# §1a). ~2 MB: the largest artist observed is ~1,000 release groups (~350 KB),
+# comfortably under the hub's 4 MB PROXY_MAX_RESPONSE even with room to spare
+# for whatever else the page carries.
+INDEX_CHANGES_MAX_BYTES = 2_000_000
+
+# The `index-push` sender's poll and throttle (contract §1a, plan §1
+# propagation 1). Poll is fast because it only reads a counter under a lock;
+# the gap is what keeps a steady library build to one hub POST every two
+# seconds instead of one per artist touched.
+INDEX_PUSH_POLL_SECS = 1.0
+INDEX_PUSH_MIN_GAP_SECS = 2.0
+# A failing HWM write (a read-only /config) is retried on its own doubling
+# ladder rather than every poll (final review M3/T3).
+INDEX_PUSH_PERSIST_BACKOFF_MIN = 2.0
+INDEX_PUSH_PERSIST_BACKOFF_MAX = 60.0
+
 _index_conn = None
 _index_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# The change sequence the clients' index mirrors sync on
+# (PLAN-lbbot-index-mirror-2026-09-23 §1).
+#
+# `index_meta.seq` is one monotonically increasing counter, and every write to
+# `artists` or `release_groups` bumps it and stamps the new value on the one
+# artist the write touched (`artists.seq`). A client asks for everything with a
+# seq above its cursor. Deleted artists leave a row in `index_tombstones` with
+# their own seq, so a deletion travels down the same feed.
+#
+# **Triggers maintain it, not a helper each writer calls.** Several writers
+# update by rgid or by review group id without knowing which artist keys they
+# touch — and one collaboration release spans several artists — so only the
+# row-level trigger sees the key. Triggers also cover every future writer, the
+# tests and a hand edit with the sqlite3 CLI. Why not `updated_at` or rowid:
+# `updated_at` is a wall clock (ties, and 0 on stubs), and rowid does not change
+# on UPDATE and can be reused after a DELETE.
+#
+# **One increment per row write, each value stamped on exactly one key.** A
+# statement touching one artist's 1,000 release-groups bumps 1,000 times; that
+# is deliberate. Deduping "once per artist per statement" against the artist's
+# current seq could drop a change a client has not seen yet, while a value
+# owned by one key means a page boundary can never split a shared value and
+# lose the rest of it. A release-group row with no `artists` parent still bumps
+# the counter and stamps nothing — a harmless gap.
+#
+# **The triggers must have no failure path.** `_index_mark_release_present` and
+# `_index_set_release_album_ids` swallow exceptions, so a trigger that raised
+# would silently lose the `present` mark and the filled album would show twice
+# (the acquisition-coherence round). Hence the `index_meta` row is created on
+# every open before any trigger can fire, and every read of it is COALESCEd.
+#
+# **`recursive_triggers` stays off** (SQLite's default, set explicitly below):
+# with it off, the hidden delete an `INSERT OR REPLACE` performs fires no DELETE
+# trigger, so a rescan (`_index_store_artist` REPLACEs the artist row) does not
+# tombstone the artist it is rewriting. The AFTER INSERT trigger restamps seq,
+# so a REPLACE resetting the column to its default is harmless.
+#
+# **The epoch** is `WIRE_VERSION` plus a random id. It changes whenever seq
+# values stop meaning what a client's cursor assumes: a new DB, a WIRE_VERSION
+# bump, or a DB that went backwards (below). A client whose epoch differs wipes
+# its mirror and pulls from zero.
+#
+# **The high-water mark** is the durability guard. `synchronous=NORMAL` can
+# lose the last few commits to a power cut, and a DB restored without its
+# `-wal` goes backwards; either way the counter would reissue values a client
+# already holds for *different* changes, and the client would skip them. So the
+# highest seq ever let out of the process is recorded beside the DB
+# (`_index_persist_hwm`, called before a seq leaves), and a boot that finds the
+# head below it under the same epoch mints a new epoch. Its own small file
+# rather than `lb_bot_state.json`: that file is rewritten whole by unrelated
+# code on its own schedule, and this one must be written before an answer goes
+# out, not whenever the state happens to flush.
+# ---------------------------------------------------------------------------
+
+def _index_mint_epoch() -> str:
+    return f"{WIRE_VERSION}-{secrets.token_hex(8)}"
+
+def _index_hwm_path() -> str:
+    # Derived from LIBRARY_INDEX_FILE on every call, so a test that points the
+    # index at a temp DB gets a temp high-water mark with it.
+    return LIBRARY_INDEX_FILE + ".hwm.json"
+
+# Guards the read-compare-write in `_index_persist_hwm`, so two threads racing
+# to persist can never leave the lower value on disk. Lock order: it may be
+# taken while holding `_index_lock` (the boot check does), never the reverse.
+_index_hwm_lock = threading.Lock()
+
+def _index_read_hwm() -> dict | None:
+    """The persisted `{"epoch", "hwm"}`, or None when there is none to trust.
+
+    An unreadable or malformed file is treated as absent rather than raised: it
+    can only make the boot check skip (the same as a first boot), and a broken
+    side file must not stop the index opening at all.
+    """
+    try:
+        with open(_index_hwm_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        epoch, hwm = data.get("epoch"), data.get("hwm")
+        if isinstance(epoch, str) and isinstance(hwm, int) and not isinstance(hwm, bool):
+            return {"epoch": epoch, "hwm": hwm}
+        print(f"  index: ignoring malformed high-water mark {_index_hwm_path()}")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"  index: ignoring unreadable high-water mark: {e}")
+    return None
+
+def _index_persist_hwm(seq: int, epoch: str) -> None:
+    """Record that `seq` under `epoch` may now leave the process.
+
+    Call it BEFORE the value goes out (a route answer, a hub push): the guard
+    only works if everything a client can hold is already durable here. A no-op
+    unless `seq` is higher than what is persisted for the same epoch; a
+    different epoch always overwrites, since the DB's current epoch is the only
+    one the boot check compares against.
+
+    Raises on a write failure (e.g. a read-only /config) instead of swallowing
+    it, so the caller can decide not to hand out a seq it could not record.
+    """
+    with _index_hwm_lock:
+        cur = _index_read_hwm()
+        if cur and cur["epoch"] == epoch and cur["hwm"] >= int(seq):
+            return
+        _atomic_json_write(_index_hwm_path(), {"epoch": epoch, "hwm": int(seq)})
+
+def _index_read_head(conn) -> tuple:
+    """`(seq, epoch)` from `index_meta`, on a connection the caller holds.
+
+    For a caller that must read the head together with other rows under one
+    `_index_lock` hold (the change feed); everyone else uses `_index_head`.
+    """
+    row = conn.execute("SELECT seq, epoch FROM index_meta WHERE id = 0").fetchone()
+    return int(row["seq"]), row["epoch"]
+
+def _index_head() -> tuple:
+    """The current `(seq, epoch)` of the library index."""
+    with _index_lock:
+        return _index_read_head(_index_db())
+
+def _index_stub_identity(artist_key: str) -> tuple:
+    """`(artist_mbid, nd_artist_id)` for a parent row inferred from a key alone.
+
+    The key rule `_index_artist_key` mints, run backwards. Mirrored in SQL by
+    `_index_adopt_orphans`; keep the two in step.
+    """
+    if artist_key.startswith("nd:"):
+        return "", artist_key[3:]
+    return artist_key, ""
+
+def _index_adopt_orphans(conn) -> None:
+    """Give every parentless `release_groups` key a stub `artists` row.
+
+    Orphans predate this change (older code could insert a release-group under a
+    key with no artist row). They count as owned in `_index_owned_rgids` but
+    could never reach a client mirror, which is keyed by artist. Deleting them
+    or excluding them from ownership would un-own a filled album and invite a
+    re-download — an acquisition regression — so they are adopted instead: the
+    stub is `scanned_at = 0, scan_version = 0`, i.e. stale, and the rows reach
+    the mirror as an artist due a rescan. INSERT OR IGNORE, so a real row is
+    never touched.
+    """
+    conn.execute("""
+        INSERT OR IGNORE INTO artists
+          (artist_key, artist_mbid, nd_artist_id, name, scanned_at, scan_version)
+        SELECT DISTINCT rg.artist_key,
+               CASE WHEN substr(rg.artist_key, 1, 3) = 'nd:' THEN '' ELSE rg.artist_key END,
+               CASE WHEN substr(rg.artist_key, 1, 3) = 'nd:' THEN substr(rg.artist_key, 4)
+                    ELSE '' END,
+               '', 0, 0
+          FROM release_groups rg
+          LEFT JOIN artists a ON a.artist_key = rg.artist_key
+         WHERE a.artist_key IS NULL AND rg.artist_key != ''
+    """)
+
+# One bump of the counter, and the counter's value for a SET. COALESCE because
+# a trigger must never fail: a missing row would otherwise stamp NULL into a
+# NOT NULL column and raise inside a writer that swallows the error.
+_INDEX_SEQ_BUMP = "UPDATE index_meta SET seq = seq + 1 WHERE id = 0;"
+_INDEX_SEQ_NOW = "COALESCE((SELECT seq FROM index_meta WHERE id = 0), 0)"
+
+# (name, body). Dropped and recreated on every open, so a change to a body here
+# takes effect at the next boot with no version gate.
+_INDEX_SEQ_TRIGGERS = (
+    ("index_seq_rg_insert", f"""
+        AFTER INSERT ON release_groups BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = NEW.artist_key;
+        END"""),
+    ("index_seq_rg_update", f"""
+        AFTER UPDATE ON release_groups BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = NEW.artist_key;
+        END"""),
+    # A row moved between artists changed both of them. Nothing does this
+    # today; it is here so a future writer that does cannot strand the old key.
+    ("index_seq_rg_update_moved", f"""
+        AFTER UPDATE ON release_groups
+        WHEN OLD.artist_key IS NOT NEW.artist_key BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = OLD.artist_key;
+        END"""),
+    ("index_seq_rg_delete", f"""
+        AFTER DELETE ON release_groups BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = OLD.artist_key;
+        END"""),
+    # A key coming back supersedes its own tombstone.
+    ("index_seq_artist_insert", f"""
+        AFTER INSERT ON artists BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = NEW.artist_key;
+          DELETE FROM index_tombstones WHERE artist_key = NEW.artist_key;
+        END"""),
+    # Every column but `seq`: the triggers' own `UPDATE artists SET seq = …`
+    # must not re-fire this one.
+    ("index_seq_artist_update", f"""
+        AFTER UPDATE OF artist_mbid, nd_artist_id, name, scanned_at, scan_version
+        ON artists BEGIN
+          {_INDEX_SEQ_BUMP}
+          UPDATE artists SET seq = {_INDEX_SEQ_NOW} WHERE artist_key = NEW.artist_key;
+        END"""),
+    # Tombstones are never pruned: only an nd: -> mbid swap creates one, and
+    # there cannot be more of those than Navidrome has artists.
+    ("index_seq_artist_delete", f"""
+        AFTER DELETE ON artists BEGIN
+          {_INDEX_SEQ_BUMP}
+          INSERT OR REPLACE INTO index_tombstones (artist_key, seq)
+            VALUES (OLD.artist_key, {_INDEX_SEQ_NOW});
+        END"""),
+)
+
+def _index_migrate_seq(conn) -> None:
+    """Add the change sequence to an index DB, new or pre-existing. Idempotent.
+
+    Runs in one explicit transaction (SQLite DDL is transactional), so a crash
+    mid-migration leaves the DB as it was rather than with a `seq` column and
+    no seeding. Statements go through `execute`, never `executescript`, which
+    would COMMIT the transaction out from under us.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(artists)")}
+    conn.execute("BEGIN")
+    with conn:
+        if "seq" not in have:
+            conn.execute("ALTER TABLE artists ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_artists_seq ON artists(seq)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_meta (
+              id    INTEGER PRIMARY KEY CHECK (id = 0),
+              seq   INTEGER NOT NULL,
+              epoch TEXT NOT NULL
+            )""")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_tombstones (
+              artist_key TEXT PRIMARY KEY,
+              seq        INTEGER NOT NULL
+            )""")
+        # On EVERY open, before anything below can fire a trigger.
+        created = conn.execute(
+            "INSERT OR IGNORE INTO index_meta (id, seq, epoch) VALUES (0, 0, ?)",
+            (_index_mint_epoch(),)).rowcount == 1
+        epoch = conn.execute("SELECT epoch FROM index_meta WHERE id = 0").fetchone()["epoch"]
+        if epoch.split("-", 1)[0] != str(WIRE_VERSION):
+            conn.execute("UPDATE index_meta SET epoch = ? WHERE id = 0",
+                         (_index_mint_epoch(),))
+        # Every open, not only at migration: cheap (a join on the primary key),
+        # and it also catches an orphan anything outside this module left. On a
+        # later open the triggers already exist and stamp the stubs; at
+        # migration they do not yet, and the seeding below numbers them.
+        _index_adopt_orphans(conn)
+        if created:
+            # Seed once, the first time the counter exists: 1..N in artist_key
+            # order, so every pre-existing artist reaches a mirror on its first
+            # pull and each value still belongs to exactly one key.
+            keys = [r["artist_key"] for r in conn.execute(
+                "SELECT artist_key FROM artists ORDER BY artist_key")]
+            conn.executemany("UPDATE artists SET seq = ? WHERE artist_key = ?",
+                             [(i, k) for i, k in enumerate(keys, 1)])
+            conn.execute("UPDATE index_meta SET seq = ? WHERE id = 0", (len(keys),))
+        for name, body in _INDEX_SEQ_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(f"CREATE TRIGGER {name} {body}")
+
+def _index_check_hwm(conn) -> None:
+    """The boot half of the durability guard: rotate the epoch if the DB went
+    backwards past a seq that already left the process.
+
+    A file from a different epoch says nothing about this DB (a recreated DB
+    already has a fresh epoch) and is left for `_index_persist_hwm` to replace.
+    """
+    hwm = _index_read_hwm()
+    seq, epoch = _index_read_head(conn)
+    if not hwm or hwm["epoch"] != epoch or seq >= hwm["hwm"]:
+        return
+    new_epoch = _index_mint_epoch()
+    print(f"  index: head seq {seq} is behind the high-water mark {hwm['hwm']} "
+          f"(epoch {epoch}); rotating the epoch to {new_epoch}")
+    # This one commit must be durable before the file names the new epoch: if a
+    # power cut lost it after the file was written, the next boot would find the
+    # file on an epoch the DB no longer has, skip this check, and reissue the
+    # lost values under the old epoch — the exact failure this guards. NORMAL
+    # only syncs the WAL at checkpoints; FULL syncs it on this commit.
+    conn.execute("PRAGMA synchronous=FULL")
+    try:
+        with conn:
+            conn.execute("UPDATE index_meta SET epoch = ? WHERE id = 0", (new_epoch,))
+    finally:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    # Best-effort: this runs from inside _index_db(), after the epoch rotation
+    # above has already committed. A raise here (e.g. a read-only /config) must
+    # not propagate out of _index_db() — that would leave _index_conn None and
+    # fail whichever caller opened it first (possibly _index_mark_release_present,
+    # which swallows the error and silently loses a placement's "present" mark;
+    # Ruling R12). The routes' own persist-before-answer rule still guarantees no
+    # unrecorded seq ever leaves the process — this is only the boot-time write,
+    # and the next successful persist (from the first request answered) catches
+    # up the file.
+    try:
+        _index_persist_hwm(seq, new_epoch)
+    except Exception as e:  # noqa: BLE001 — must not fail _index_db() at boot
+        print(f"  index: could not persist the high-water mark after rotating "
+              f"the epoch at boot: {e}; continuing with the epoch rotated in memory")
 
 def _index_db():
     """Shared SQLite connection (WAL, thread-safe via _index_lock)."""
@@ -6390,6 +7189,9 @@ def _index_db():
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # The default, stated because the seq triggers depend on it: see the
+        # change-sequence notes above `_index_mint_epoch`.
+        conn.execute("PRAGMA recursive_triggers=OFF")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS artists (
               artist_key   TEXT PRIMARY KEY,   -- artist mbid, or 'nd:'+navidrome id
@@ -6542,6 +7344,10 @@ def _index_db():
             conn.execute("ALTER TABLE release_groups "
                          "ADD COLUMN secondary_types TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
+        # The change sequence. INDEX_SCAN_VERSION is deliberately NOT bumped:
+        # it gates the discography matcher, and nothing here changes a verdict.
+        _index_migrate_seq(conn)
+        _index_check_hwm(conn)
         _index_conn = conn
     return _index_conn
 
@@ -7005,6 +7811,10 @@ def _index_backfill_present_album_ids(artist_key: str) -> int:
     "Added — syncing", because `pendingSync` is exactly `album == null &&
     !isMissing`.
 
+    An artist with neither a name nor a Navidrome id (an adopted orphan stub)
+    can never match anything and returns 0 before the album index is touched
+    (final review M2).
+
     Resolved against `_nd_album_index()`, which is cached on the 300 s Navidrome
     TTL, by normalized title within this artist — **no MusicBrainz**, so this is
     safe on a page-open path. Cheap when there is nothing to do: the SELECT is
@@ -7031,6 +7841,8 @@ def _index_backfill_present_album_ids(artist_key: str) -> int:
             return 0
         artist_norm = _norm_album_text(artist["name"] if artist else "")
         nd_artist_id = (artist["nd_artist_id"] if artist else "") or ""
+        if not artist_norm and not nd_artist_id:
+            return 0
         # Two maps, consulted in order of confidence.
         #
         # `exact` is the original test: Navidrome filed the album under precisely this artist.
@@ -7081,12 +7893,73 @@ def _index_backfill_present_album_ids(artist_key: str) -> int:
         print(f"  index: present-row album id backfill failed: {e}")
         return 0
 
-def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
+# Task 4: the backfill above moved off the discography GET, onto a thread kicked
+# from `_announce_album_indexed` and this periodic sweep as its backstop. The
+# interval matches `_nd_album_index`'s own 300 s Navidrome cache TTL — sweeping
+# faster cannot find a match the cached album index doesn't have yet, and the
+# backfill itself never asks MusicBrainz, so running it that often costs one
+# SELECT (`_index_artists_needing_backfill`) whenever there is nothing to fix.
+INDEX_BACKFILL_SWEEP_INTERVAL = 300
+
+def _index_artists_needing_backfill() -> list:
+    """`artist_key`s with at least one `present` row still missing Navidrome
+    album ids — the sweep's worklist.
+
+    Only artists the backfill could ever match: one with neither a name nor a
+    Navidrome id (an adopted orphan stub), or with no `artists` row at all,
+    can match nothing, and used to cost a walk of the whole Navidrome album
+    index on every 300 s pass (final review M2)."""
+    try:
+        with _index_lock:
+            conn = _index_db()
+            rows = conn.execute(
+                "SELECT DISTINCT r.artist_key FROM release_groups r "
+                "  JOIN artists a ON a.artist_key = r.artist_key "
+                "WHERE r.status = 'present' AND r.rgid != '' "
+                "AND (r.nd_album_ids = '' OR r.nd_album_ids = '[]') "
+                "AND (a.name != '' OR a.nd_artist_id != '')").fetchall()
+        return [r["artist_key"] for r in rows]
+    except Exception as e:  # noqa: BLE001 — a sweep must not crash its own thread
+        print(f"  index: could not list artists needing a present-row backfill: {e}")
+        return []
+
+def _index_backfill_sweep_loop() -> None:
+    """Backstop for the per-artist backfill kicked off after `albumIndexed`.
+
+    That covers the common case — one artist, moments after its own placement
+    lands — but not every `present` row gets there through
+    `_announce_album_indexed`: a Fill-gaps completion marks present by review
+    group id (`_index_mark_release_present`) with no artist in hand at all, and
+    a process restart drops that one-shot thread with nothing left to retry it.
+    One row per DISTINCT artist_key per pass, same shape as `_wishlist_sweep_loop`.
+    """
+    while True:
+        try:
+            time.sleep(INDEX_BACKFILL_SWEEP_INTERVAL)
+            for artist_key in _index_artists_needing_backfill():
+                _index_backfill_present_album_ids(artist_key)
+        except Exception as e:  # noqa: BLE001 — a background errand never exits
+            print(f"  index: present-row backfill sweep failed: {e}")
+
+def _index_store_artist(result: dict, nd_artist_id: str = "",
+                        unless_claimed: bool = False) -> bool:
     """Write one discography scan result into the index (idempotent:
-    delete+reinsert the artist's release-group rows)."""
+    delete+reinsert the artist's release-group rows). Returns whether it wrote.
+
+    `unless_claimed=True` is for recording a MISS (no mbid, so the key is
+    `nd:<id>`): the write is skipped when any OTHER row already holds that
+    Navidrome id — an `nd:` stub beside the real `<mbid>` row is the empty-
+    `nd:X` regression (task 4), because the nd-id lookup can serve the stub
+    and hide the discography, and every mirror would now receive it too. The
+    miss's OWN stub may always be refreshed, which is what keeps a genuinely
+    unresolvable artist off the name search for LB_BOT_INDEX_TTL_DAYS.
+    Checked inside the write's own `_index_lock` hold, so a scan storing the
+    mbid row concurrently cannot slip in between the check and the write.
+    Every caller recording a miss goes through `_index_store_unresolved_artist`.
+    """
     key = _index_artist_key(result.get("artist_mbid", ""), nd_artist_id)
     if not key:
-        return
+        return False
     now = time.time()
     rows = [(key,
              r.get("rgid", ""), r.get("title", ""), r.get("primary_type", ""),
@@ -7098,6 +7971,13 @@ def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
             for r in result.get("releases", [])]
     with _index_lock:
         conn = _index_db()
+        if unless_claimed and nd_artist_id and key == f"nd:{nd_artist_id}":
+            claimed = conn.execute(
+                "SELECT 1 FROM artists WHERE (artist_key = ? OR nd_artist_id = ?) "
+                "AND artist_key != ? LIMIT 1",
+                (key, nd_artist_id, key)).fetchone()
+            if claimed:
+                return False
         with conn:
             conn.execute(
                 "INSERT OR REPLACE INTO artists "
@@ -7121,12 +8001,19 @@ def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
             # across — but only where the fresh scan still says `missing`, since a real
             # verdict of complete/incomplete is better information than our flag and
             # must win.
-            kept = {}
+            #
+            # And a `present` row the scan did not produce at all is appended as it
+            # stands (final review M4). A miss-stub's refresh stores NO releases, so
+            # merging only into scanned rows deleted every album filled under an
+            # unresolvable artist on each refresh; a MusicBrainz browse that no
+            # longer lists a filled release-group did the same to it.
+            kept, kept_rows = {}, {}
             for r in conn.execute(
-                    "SELECT rgid, nd_album_ids FROM release_groups "
+                    "SELECT * FROM release_groups "
                     "WHERE artist_key = ? AND status = 'present' AND rgid != ''",
                     (key,)).fetchall():
                 kept[r["rgid"]] = r["nd_album_ids"] or "[]"
+                kept_rows[r["rgid"]] = r
             if kept:
                 rows = [
                     (r[0], r[1], r[2], r[3], r[4], r[5],
@@ -7136,12 +8023,51 @@ def _index_store_artist(result: dict, nd_artist_id: str = "") -> None:
                      r[11], r[12], r[13])
                     for r in rows
                 ]
+                scanned_rgids = {r[1] for r in rows}
+                rows += [
+                    (key, k["rgid"], k["title"] or "", k["primary_type"] or "",
+                     k["secondary_types"] or "[]", k["year"] or "", "present",
+                     k["group_id"] or "", int(k["present"] or 0), int(k["total"] or 0),
+                     k["nd_album_ids"] or "[]", k["match_method"] or "",
+                     float(k["match_score"] or 0), float(k["updated_at"] or now))
+                    for rgid, k in kept_rows.items() if rgid not in scanned_rgids
+                ]
             conn.execute("DELETE FROM release_groups WHERE artist_key = ?", (key,))
             conn.executemany(
                 "INSERT INTO release_groups (artist_key, rgid, title, primary_type, "
                 "secondary_types, year, status, group_id, present, total, nd_album_ids, "
                 "match_method, match_score, updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    return True
+
+def _index_store_unresolved_artist(name: str, nd_artist_id: str) -> bool:
+    """Record "MusicBrainz has no such artist" under `nd:<id>`, so the next
+    pass does not spend a name search on it again until it goes stale.
+
+    The one place a miss is written, for both the manual build and the
+    auto-index worker, so the nd: invariant (never write `nd:X` while another
+    row holds Navidrome id X) cannot drift between them. Only call it on a
+    genuine no-match: an outage recorded here would hide the artist as
+    unresolvable for LB_BOT_INDEX_TTL_DAYS (ruling R13).
+
+    Refreshing the stub's OWN row, rather than writing it only once, is what
+    keeps a genuinely unresolvable artist off the name search for the TTL. An
+    unconditional "never write when any row exists" (an earlier version of the
+    task-4 fix) skipped that refresh too: once the stub went stale every later
+    pass re-searched, failed again and never moved `scanned_at` — a
+    MusicBrainz search per pass forever, which the auto-index worker would
+    turn into a constant load.
+
+    Before task 5 the guard was `_index_existing_artist_key` at the
+    `_library_index_task` call site, which asks "is the NEWEST row holding
+    this id the stub?". The two agree except when a legacy stub is newer than
+    the real row beside it (the regression task 4 fixed going forward); there
+    the old check refreshed the stub and kept it on top, this one leaves it.
+    """
+    if not nd_artist_id:
+        return False
+    return _index_store_artist({"artist_mbid": "", "artist_name": name, "releases": []},
+                               nd_artist_id=nd_artist_id, unless_claimed=True)
 
 def _index_mark_release_present(rgid: str = "", group_id: str = "",
                                 artist_key: str = "", title: str = "") -> int:
@@ -7193,6 +8119,17 @@ def _index_mark_release_present(rgid: str = "", group_id: str = "",
                 # insert the row. INSERT OR IGNORE rather than a plain INSERT
                 # because the UPDATE above also reports 0 for a row that is
                 # already 'present', and racing another fill must not raise.
+                #
+                # The parent first, in the same transaction: a row whose key has
+                # no `artists` row counts as owned but never reaches a client's
+                # index mirror, which is keyed by artist. The stub follows
+                # `_index_adopt_orphans` (stale, so it is due a rescan); IGNORE
+                # leaves a real artist row alone.
+                stub_mbid, stub_nd = _index_stub_identity(artist_key)
+                conn.execute(
+                    "INSERT OR IGNORE INTO artists "
+                    "(artist_key, artist_mbid, nd_artist_id, name, scanned_at, scan_version) "
+                    "VALUES (?,?,?,'',0,0)", (artist_key, stub_mbid, stub_nd))
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO release_groups "
                     "(artist_key, rgid, title, status, updated_at) "
@@ -7399,6 +8336,31 @@ def _index_row_to_wire(r) -> dict:
         row["navidrome_album_ids"] = nd_ids
     return row
 
+def _owned_artist_for_mbid(artist_mbid: str) -> dict | None:
+    """The library artist behind a MusicBrainz artist id, if there is one:
+    `{"nd_id", "name"}` from Navidrome's own tags, else from an index row a
+    library scan resolved to that mbid (an untagged artist found by name).
+
+    An `mb:` page is for artists the library does not have, and its scan skips
+    the library — so run for an artist it *does* have, it rewrote that artist's
+    own index row with every owned album marked missing."""
+    if not artist_mbid:
+        return None
+    try:
+        for a in _nd_artist_index():
+            if (a.get("musicBrainzId") or "") == artist_mbid and a.get("id"):
+                return {"nd_id": a["id"], "name": a.get("name", "")}
+    except Exception:
+        pass
+    with _index_lock:
+        row = _index_db().execute(
+            "SELECT nd_artist_id, name FROM artists WHERE artist_key = ?",
+            (artist_mbid,)).fetchone()
+    nd_id = (row["nd_artist_id"] or "") if row else ""
+    if nd_id and not nd_id.startswith("mb:"):
+        return {"nd_id": nd_id, "name": row["name"] or ""}
+    return None
+
 def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | None:
     """Stored discography for an artist, or None if not indexed. Shape matches
     the scan-task result so the frontend renders both identically."""
@@ -7409,9 +8371,12 @@ def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | N
             artist = conn.execute(
                 "SELECT * FROM artists WHERE artist_key = ?", (artist_mbid,)).fetchone()
         if artist is None and nd_artist_id:
+            # The `artist_key` tiebreak (contract §1a) makes this resolve
+            # identically to a client mirror's own lookup during the brief
+            # two-rows state a nd: -> mbid swap leaves behind.
             artist = conn.execute(
                 "SELECT * FROM artists WHERE artist_key = ? OR nd_artist_id = ? "
-                "ORDER BY scanned_at DESC LIMIT 1",
+                "ORDER BY scanned_at DESC, artist_key LIMIT 1",
                 (f"nd:{nd_artist_id}", nd_artist_id)).fetchone()
         if artist is None:
             return None
@@ -7424,6 +8389,306 @@ def _index_get_artist(artist_mbid: str = "", nd_artist_id: str = "") -> dict | N
              or int(artist["scan_version"] or 0) != INDEX_SCAN_VERSION)
     return {"artist_mbid": artist["artist_mbid"], "artist_name": artist["name"],
             "scanned_at": scanned_at, "stale": stale, "releases": releases}
+
+# ---------------------------------------------------------------------------
+# The change feed the client mirrors pull (PLAN-lbbot-index-mirror-2026-09-23,
+# contract §1a): GET /api/index/changes, GET /api/index/keys, GET /api/health.
+# Route bodies live here as module-level functions (matching _fills_view /
+# _gap_cancel) because the Flask routes inside start_web_dashboard() can't be
+# unit-tested directly; the thin wrappers there just parse the query string
+# and call these.
+# ---------------------------------------------------------------------------
+
+def _index_persist_hwm_or_error(seq: int, epoch: str) -> dict | None:
+    """Persist the HWM for a `seq` about to leave the process in an answer.
+
+    Returns None on success. Returns the error payload to answer 503 with
+    otherwise: `_index_persist_hwm` raises on a write failure (e.g. a
+    read-only /config) precisely so a route can refuse to hand out a seq it
+    could not record — a client sees 503 as "busy" and backs off with its
+    cursor untouched, rather than advancing past a value it might never see
+    again if this process loses the file.
+    """
+    try:
+        _index_persist_hwm(seq, epoch)
+        return None
+    except Exception as e:  # noqa: BLE001 — a durability failure, not a bug
+        print(f"  index: could not persist the high-water mark before "
+              f"answering: {e}")
+        return {"error": "index high-water mark could not be recorded"}
+
+def _index_changes_view(since: int, epoch: str) -> tuple:
+    """`GET /api/index/changes?since=&epoch=` (contract §1a). Returns
+    `(payload, status)`.
+
+    Head, items, artist count and seq sum are read in ONE `_index_lock` hold —
+    the contract's snapshot requirement — then the lock is released before the
+    HWM is persisted (lock order: `_index_lock` -> `_index_hwm_lock`, never the
+    reverse) and the answer is built. A resync answer goes through the exact
+    same persist-or-503 gate as a normal one: either way a headSeq is about to
+    leave the process.
+    """
+    with _index_lock:
+        conn = _index_db()
+        head_seq, head_epoch = _index_read_head(conn)
+        resync = bool(epoch) and epoch != head_epoch or since > head_seq
+        if resync:
+            payload = {"resync": True, "epoch": head_epoch, "headSeq": head_seq,
+                       "scanVersion": INDEX_SCAN_VERSION, "ttlDays": LB_BOT_INDEX_TTL_DAYS}
+        else:
+            # One UNION ALL stream ordered by seq, exactly as the contract
+            # specifies, so a client can never receive a tombstone and its
+            # superseding artist row (or vice versa) out of the order they
+            # actually happened in.
+            rows = conn.execute(
+                "SELECT seq, 'artist' AS kind, artist_key AS key, artist_mbid, "
+                "       nd_artist_id, name, scanned_at, scan_version "
+                "  FROM artists WHERE seq > ? "
+                "UNION ALL "
+                "SELECT seq, 'tombstone' AS kind, artist_key AS key, '', "
+                "       '', '', 0, 0 "
+                "  FROM index_tombstones WHERE seq > ? "
+                " ORDER BY seq", (since, since)).fetchall()
+            artist_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM artists").fetchone()["n"]
+            seq_sum = conn.execute(
+                "SELECT COALESCE(SUM(seq), 0) AS n FROM artists").fetchone()["n"]
+            items, size, more, last_seq = [], 0, False, since
+            for r in rows:
+                if r["kind"] == "tombstone":
+                    item = {"type": "tombstone", "key": r["key"], "seq": r["seq"]}
+                else:
+                    rg_rows = conn.execute(
+                        "SELECT * FROM release_groups WHERE artist_key = ? "
+                        "ORDER BY year, title", (r["key"],)).fetchall()
+                    item = {"type": "artist", "key": r["key"],
+                            "ndArtistId": r["nd_artist_id"], "mbid": r["artist_mbid"],
+                            "name": r["name"], "scannedAt": r["scanned_at"],
+                            "scanVersion": r["scan_version"], "seq": r["seq"],
+                            "rows": [_index_row_to_wire(rr) for rr in rg_rows]}
+                item_size = len(json.dumps(item).encode("utf-8"))
+                # The cap stops the NEXT item, never the first: a page must
+                # always carry at least one item when any exist, even one
+                # artist alone bigger than the whole cap.
+                if items and size + item_size > INDEX_CHANGES_MAX_BYTES:
+                    more = True
+                    break
+                items.append(item)
+                size += item_size
+                last_seq = r["seq"]
+            payload = {"epoch": head_epoch, "headSeq": head_seq,
+                       "scanVersion": INDEX_SCAN_VERSION, "ttlDays": LB_BOT_INDEX_TTL_DAYS,
+                       "items": items, "nextSince": last_seq if more else head_seq,
+                       "more": more, "artistCount": artist_count, "seqSum": seq_sum}
+    error = _index_persist_hwm_or_error(head_seq, head_epoch)
+    if error is not None:
+        return error, 503
+    return payload, 200
+
+def _index_keys_view() -> tuple:
+    """`GET /api/index/keys` (contract §1a): every `{key, seq}`, for the
+    client-side drift check. Artists only — tombstones don't need a drift
+    reconciliation of their own, since a tombstone is simply a key the server
+    no longer lists here. Same one-lock-hold and HWM rule as the change feed."""
+    with _index_lock:
+        conn = _index_db()
+        head_seq, head_epoch = _index_read_head(conn)
+        keys = [{"key": r["artist_key"], "seq": r["seq"]}
+                for r in conn.execute("SELECT artist_key, seq FROM artists").fetchall()]
+    error = _index_persist_hwm_or_error(head_seq, head_epoch)
+    if error is not None:
+        return error, 503
+    return {"epoch": head_epoch, "headSeq": head_seq, "keys": keys}, 200
+
+def _index_health_view() -> tuple:
+    """`GET /api/health` (contract §1a): the hub's probe. Deliberately light —
+    no Navidrome, no MusicBrainz, no summary view — just proof the process and
+    the index are up, which is all `/lb/status` needs to mark lb-bot available.
+    Named `_index_health_view`, not `_health_view`, because that name is
+    already taken by the bot's own `/api/system/health` view (unrelated: that
+    one reports Navidrome/slskd/MusicBrainz reachability for the SPA's own
+    status panel) — Python would silently rebind the name to whichever
+    definition runs later in the module.
+
+    **Never 503, and never writes** (final review M3). It used to persist the
+    HWM like the feed routes and answer 503 when that failed; the hub reads
+    any non-2xx as "lb-bot is down", broadcasts it, and every client then
+    hides every lb-bot feature over a disk problem that affects only the
+    mirror. So `headSeq` here is the head already recorded in the HWM file
+    for the current epoch (0 before one is) — never the live head, which may
+    not be durable yet. The feed routes keep their persist-or-503 gate: they
+    are where a seq actually leaves the process for a client to act on.
+    """
+    with _index_lock:
+        head_seq, head_epoch = _index_read_head(_index_db())
+    recorded = _index_read_hwm()
+    persisted = 0
+    if recorded and recorded.get("epoch") == head_epoch:
+        persisted = min(int(recorded.get("hwm") or 0), head_seq)
+    return {"ok": True, "epoch": head_epoch, "headSeq": persisted}, 200
+
+def _artist_discography_read_view(mbid: str, nd_id: str) -> dict:
+    """`GET /api/artist/discography`'s body. Module-level so it can be unit
+    tested without booting Flask, matching `_index_changes_view` /
+    `_index_health_view`.
+
+    Instant read from the library index: `{indexed: false}` means the caller
+    should start a scan (`POST` on the same path), a stored result is served
+    immediately even when stale — refresh is explicit (Rescan / bulk build),
+    never a surprise multi-minute wait on page open.
+
+    **Deliberately does not run `_index_backfill_present_album_ids` (task 4).**
+    It used to, on every read, guessing a filled album's Navidrome ids by
+    title against the 300 s-cached album index; that made the GET's cost
+    depend on Navidrome, on the same lock the change-feed routes need, for a
+    write that has nothing to do with reading. The backfill still runs, just
+    not from here — promptly after `_announce_album_indexed` (see there), plus
+    the periodic sweep (`_index_backfill_sweep_loop`) as the backstop — so this
+    stays pure SQLite, matching contract §1a: "nothing computed at read time
+    goes on the wire as a fact."
+    """
+    stored = _index_get_artist(mbid, nd_id)
+    scan = _artist_scan_get(mbid, nd_id)
+    extra = {"scan": scan} if scan else {}
+    if not stored:
+        return {"indexed": False, **extra}
+    return {"indexed": True, **stored, **extra}
+
+# ---------------------------------------------------------------------------
+# Index push — `POST <hub>/lb/index`, the "on a new channel, not /lb/notify"
+# leg of propagation (contract §1a, plan §1 propagation 1). `/lb/notify`
+# flushes the hub's library caches and makes both clients refetch their whole
+# library; a new artist seq is not that, and a bulk scan touching the counter
+# every couple of seconds would trigger it constantly. So the head is polled
+# and pushed on its own channel, and the hub relays it as `t:"index"`, which
+# invalidates nothing but the discography-cache fallback.
+#
+# This is deliberately its own thread and its own state, not a second use of
+# `_push_worker`/`hub-fill-push`/`/lb/fill` above. That thread's coalescing
+# window and "latest wins per key" shape is for many independent fills; this
+# is one head, with a leading-edge throttle the fill push has no equivalent
+# of, and the acquisition round depends on `hub-fill-push` behaving exactly
+# as it does today — sharing it here is exactly the kind of change that
+# round would regress.
+#
+# The throttle decision (`_index_push_tick`) is a pure function of an
+# explicit `state`, `now` and `head`, with the network call factored out to
+# `poster(seq, epoch) -> bool`. That is what lets a test drive every case —
+# a burst inside the gap, a retry after a failure, boot with nothing changed
+# — without a real thread or a real sleep; `_index_push_worker` below is the
+# thin, largely untested wrapper that calls it with real time and a real
+# POST every `INDEX_PUSH_POLL_SECS`.
+# ---------------------------------------------------------------------------
+
+def _index_push_post(seq: int, epoch: str) -> bool:
+    """The real `poster`: one `POST <hub>/lb/index`, bearer-authed. Returns
+    True on a 2xx; a non-2xx returns False and an exception (network down,
+    DNS, timeout) propagates, exactly as `_index_push_tick` expects — it
+    catches on the caller's behalf and treats both the same way (retry)."""
+    resp = requests.post(f"{HUB_NOTIFY_URL}/lb/index",
+                         json={"seq": seq, "epoch": epoch},
+                         headers={"Authorization": f"Bearer {HUB_NOTIFY_TOKEN}"},
+                         timeout=5)
+    return 200 <= resp.status_code < 300
+
+def _index_push_tick(state: dict, now: float, head: tuple, poster) -> dict:
+    """One throttle decision for the index-push sender. Returns the (possibly
+    unchanged) `state` for the next tick.
+
+    `state` is `{"acked": (seq, epoch) | None, "attempted_at": float | None}`.
+    `head` is the current `(seq, epoch)` from `_index_head()`. `poster(seq,
+    epoch)` performs the send and returns True on a 2xx.
+
+    Leading-edge throttle, per the contract: send as soon as `head` differs
+    from the last ACKNOWLEDGED (2xx) send, and at least
+    `INDEX_PUSH_MIN_GAP_SECS` have passed since the previous send ATTEMPT —
+    not since the previous success. That second clause is what turns a burst
+    of writes during a build into one send per gap rather than one per
+    write, and what stops a wedged hub from being hit on every poll tick
+    while it is failing. `acked` starts as `None`, which never equals a real
+    `(seq, epoch)` tuple, so the very first eligible tick always sends —
+    "sends once at boot even if nothing changed" (contract).
+
+    A non-2xx or an exception from `poster` leaves `acked` unchanged, so the
+    same seq is retried on the next eligible tick — but `attempted_at` DOES
+    advance, because the POST was attempted; that is the gap the contract is
+    measuring.
+
+    The HWM is persisted before the POST (contract: "persists the HWM before
+    each POST"). If that raises, this tick sends nothing, and the failure is
+    not a send attempt (`attempted_at` is left alone) — but the persist backs
+    off on its own ladder (final review M3/T3): the next try waits
+    INDEX_PUSH_PERSIST_BACKOFF_MIN (2 s), doubling to _MAX (60 s), reset by
+    the first success. It used to retry every 1 s poll forever with a log
+    line each time. Logged once when the writes start failing and once when
+    they work again, never per retry.
+    """
+    acked, attempted_at = state.get("acked"), state.get("attempted_at")
+    if head == acked:
+        return state
+    if attempted_at is not None and now - attempted_at < INDEX_PUSH_MIN_GAP_SECS:
+        return state
+    retry_at = state.get("persist_retry_at")
+    if retry_at is not None and now < retry_at:
+        return state
+    seq, epoch = head
+    try:
+        _index_persist_hwm(seq, epoch)
+    except Exception as e:  # noqa: BLE001 — a durability failure, not a bug
+        backoff = state.get("persist_backoff") or 0.0
+        backoff = min(max(backoff * 2, INDEX_PUSH_PERSIST_BACKOFF_MIN),
+                      INDEX_PUSH_PERSIST_BACKOFF_MAX)
+        if not state.get("persist_backoff"):
+            print(f"  index push: could not persist the high-water mark for seq "
+                  f"{seq}, not sending (retrying from {backoff:.0f}s, backing off "
+                  f"to {INDEX_PUSH_PERSIST_BACKOFF_MAX:.0f}s): {e}")
+        return {**state, "persist_backoff": backoff, "persist_retry_at": now + backoff}
+    if state.get("persist_backoff"):
+        print(f"  index push: the high-water mark is recorded again (seq {seq})")
+    state = {k: v for k, v in state.items()
+             if k not in ("persist_backoff", "persist_retry_at")}
+    ok = False
+    try:
+        ok = bool(poster(seq, epoch))
+    except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
+        print(f"  index push failed (seq={seq}): {e}")
+    return {**state, "acked": head if ok else acked, "attempted_at": now}
+
+def _index_push_worker(clock=time.time, sleeper=time.sleep, poster=None) -> None:
+    """The `index-push` daemon thread. Polls `_index_head()` every
+    `INDEX_PUSH_POLL_SECS` and hands each poll to `_index_push_tick`, which
+    owns the actual throttle/send decision — kept out of this loop so a test
+    can drive it with a fake clock, sleeper and poster and never sleep for
+    real seconds.
+
+    `_push_enabled()` is checked on every tick, not once at thread start,
+    because the thread itself is started unconditionally from
+    `start_web_dashboard` (same as `wishlist-sweep`) and must simply do
+    nothing when the hub isn't configured, rather than not exist.
+
+    The tick is wrapped in its own try/except, same idiom as
+    `_wishlist_sweep_loop`: `_index_push_tick` already contains its own
+    failures, but `_index_head()` is called from here, outside that
+    boundary, and a background thread must survive its own reads failing
+    (e.g. the index DB briefly unavailable) rather than dying silently and
+    never sending again.
+    """
+    if poster is None:
+        poster = _index_push_post
+    state = {"acked": None, "attempted_at": None}
+    while True:
+        try:
+            if _push_enabled():
+                state = _index_push_tick(state, clock(), _index_head(), poster)
+                acked = state.get("acked")
+                _index_push_public.update({
+                    "ackedSeq": acked[0] if acked else None,
+                    "attemptedAt": state.get("attempted_at"),
+                    "persistFailing": bool(state.get("persist_backoff")),
+                })
+        except Exception as e:  # noqa: BLE001 — a background errand never exits
+            print(f"  index push: tick failed: {e}")
+        sleeper(INDEX_PUSH_POLL_SECS)
 
 # Decisions that claim the track is handled. A fresh scan that still reports the
 # track missing from Navidrome proves otherwise, so they must not be inherited —
@@ -7881,6 +9146,17 @@ def _inherited_decision(previous: dict, fallback: str = "pending") -> str:
         return "pending"
     return decision
 
+# Group fields a rescan must carry from the previous row, on top of the ones
+# _merge_review_groups names inline: user decisions and the last search's verdict.
+_REVIEW_GROUP_CARRIED_FIELDS = ("allow_mp3", "no_source_reason", "mp3_would_help",
+                                "last_action")
+# Per-track fields carried the same way, keyed by (mbid, title).
+_REVIEW_TRACK_CARRIED_FIELDS = ("local_path", "download_state", "download_error",
+                                "downloaded_at", "imported_at", "matched_relpath",
+                                "repair_job_id", "repair_track_id", "manual_pick",
+                                "can_force_place", "force_place_conflict",
+                                "source_user", "source_folder", "match_mode")
+
 def _merge_review_groups(new_groups: list, source_key: str = "groups",
                          include_jobs: bool = True) -> list:
     # Read the live list under the lock rather than via _review_snapshot():
@@ -7905,15 +9181,20 @@ def _merge_review_groups(new_groups: list, source_key: str = "groups",
         group["source_results"] = prev.get("source_results", group.get("source_results", {}))
         group["match_items"] = prev.get("match_items", group.get("match_items", []))
         group["messages"] = prev.get("messages", [])
+        # Decisions the user made on the album, and what the last search said
+        # about it. A rescan used to drop these silently — and since the
+        # auto-index worker unions every artist it walks, "Allow MP3" and a
+        # hand-picked file lasted until that artist's next scan.
+        for field in _REVIEW_GROUP_CARRIED_FIELDS:
+            if field in prev and field not in group:
+                group[field] = prev[field]
         previous_tracks = {(t.get("mbid"), t.get("title")): dict(t)
                      for t in prev.get("missing_tracks", [])}
         for track in group.get("missing_tracks", []):
             previous = previous_tracks.get((track.get("mbid"), track.get("title")), {})
             track["decision"] = _inherited_decision(
                 previous, track.get("decision", "pending"))
-            for field in ("local_path", "download_state", "download_error",
-                          "downloaded_at", "imported_at", "matched_relpath",
-                          "repair_job_id", "repair_track_id"):
+            for field in _REVIEW_TRACK_CARRIED_FIELDS:
                 if previous.get(field):
                     track[field] = previous[field]
         _apply_repair_job_projection_to_group(group)
@@ -8054,6 +9335,13 @@ def refresh_group_albums_from_navidrome(group_id: str) -> bool:
     return True
 
 def refresh_group_missing(group: dict) -> dict:
+    if not group.get("albums"):
+        # Nothing to recompute from: a repair-job projection, or a playlist /
+        # Spotify group, carries its missing tracks and no album records. The
+        # pass below used to blank canonical_mbid and missing_tracks for these
+        # (and ask MusicBrainz for "release/" under _review_lock), so a stuck
+        # album read "complete" with its downloaded files still unplaced.
+        return group
     canonical = next((a for a in group.get("albums", [])
                       if a.get("id") == group.get("canonical_album_id")), None)
     if not canonical:
@@ -8550,28 +9838,85 @@ def _fuzzy_score(a: str, b: str) -> float:
     return max(float(_fuzz.token_sort_ratio(wa, wb)),
                float(_fuzz.partial_ratio(wa, wb)))
 
-def _folder_name_score(target: str, candidate: str) -> float:
+# Bare 1-2 digit numbers that label audio quality rather than a sequel:
+# bit depths and sample rates as peers write them ("FLAC 16 44", "24 96").
+_QUALITY_NUMBERS = frozenset(("16", "24", "44", "48", "88", "96"))
+
+def _folder_name_score(target: str, candidate: str, artist: str = "") -> float:
     """How much a peer's path component names `target`, 0-100.
 
     Not `_fuzzy_score`: `partial_ratio` scores any superstring at 100, so
     "Led Zeppelin" matched the folder "Led Zeppelin/Physical Graffiti" perfectly
     and every album in the discography tied with the one being searched for.
-    Token-sort is the base because it *does* pay for extra words; the partial
-    arm is allowed back in only when the candidate adds at most one token —
-    room for a year or an edition word, not for a different album's title.
+    Token-sort is the base because it *does* pay for extra words. The candidate's
+    extra tokens are sorted into two piles first:
+
+    - *ignorable* — copy labels, not identity: edition/format noise
+      (`_is_match_noise`, defined beside the placement matcher it was built
+      for), years, bitrates, and the artist's own name when the caller says
+      who that is. Stripped before scoring, so "Zone [2016] FLAC" and
+      "Future - Zone" both score as "Zone" instead of paying for tokens that
+      say nothing about *which album* this is.
+    - *disqualifying* — tokens that name a **sibling** album: roman numerals,
+      small bare numbers, part/vol residue. "Led Zeppelin IV" clears 80 on
+      token-sort alone, so these cap the score below ALBUM_MATCH_THRESHOLD
+      rather than merely losing a few points. Accepted limitation: a peer's
+      "Led Zeppelin I" folder is capped too — the debut still ranks through
+      the artist tier, track corroboration and the year query.
+
+    The `partial_ratio` arm (any superstring scores 100) is allowed back in
+    only when *every* extra token was ignorable — room for packaging, never
+    for a different album's title. The old rule was "at most one extra token",
+    which let any "OtherArtist Zone" folder tie with the album asked for.
     """
-    # The candidate gets the same treatment the query does. Peers label folders
-    # "Artist - Album [1969 FLAC]", and both the format tag and the repeated
-    # artist run are extra tokens that would otherwise sink a perfect match.
+    # "CD 1" / "Disc 2" written with a space read like the joined "cd1" the
+    # noise list already covers; counting the bare digit as a sibling marker
+    # capped every spaced multi-disc folder.
+    candidate = re.sub(r"(?i)\b(cd|disc|disk)[\s._-]+(\d{1,2})\b", r"\1\2",
+                       candidate or "")
     wt = _dedupe_terms(_match_words(_clean_album_title(target)))
     wc = _dedupe_terms(_match_words(_clean_album_title(candidate)))
     if not wt or not wc:
         return 0.0
-    score = float(_fuzz.token_sort_ratio(wt, wc))
     target_tokens = set(wt.split())
-    extra = len([t for t in wc.split() if t not in target_tokens])
-    if extra <= 1:
-        score = max(score, float(_fuzz.partial_ratio(wt, wc)))
+    # A numbered series ("Chicago 17", "NOW 47") disables the number
+    # exemptions below: there, a differing number IS a sibling album, and
+    # 16/48/96 are entries in the series before they are bit depths.
+    target_numerals = {t for t in target_tokens
+                       if t.isdigit() or t in _ROMAN or t == "part"}
+    target_has_digits = any(t.isdigit() for t in target_tokens)
+    artist_tokens = (set(_match_words(artist).split()) - target_tokens
+                     if artist else set())
+    kept, real_extras, sibling_extras = [], 0, 0
+    for t in wc.split():
+        if t in target_tokens:
+            kept.append(t)
+            continue
+        if (t in artist_tokens or _is_match_noise(t)
+                or re.fullmatch(r"(1[89]|20)\d{2}", t)   # a year
+                or (not target_has_digits
+                    and (t in _QUALITY_NUMBERS
+                         or (t.isdigit() and len(t) >= 3)))):  # a bitrate
+            continue
+        kept.append(t)
+        if t in _ROMAN or t.isdigit() or t == "part":
+            sibling_extras += 1
+        else:
+            real_extras += 1
+    if not kept:
+        # Nothing left in the candidate names the album: every token was the
+        # artist, a year or packaging. Falling back to the raw candidate here
+        # let partial_ratio score "1" against "The Beatles 1962-1966" at 100.
+        return 0.0
+    wc2 = _dedupe_terms(" ".join(kept))
+    score = float(_fuzz.token_sort_ratio(wt, wc2))
+    if not real_extras and not sibling_extras:
+        score = max(score, float(_fuzz.partial_ratio(wt, wc2)))
+    # Symmetric sibling guard: a candidate with an extra numeral is a sibling,
+    # and so is a candidate MISSING the target's numeral — searching for
+    # "Led Zeppelin II" must not settle for "Led Zeppelin (1969)".
+    if sibling_extras or (target_numerals - set(kept)):
+        score = min(score, ALBUM_MATCH_THRESHOLD - 1.0)
     return score
 
 def _tokens_aligned(a: str, b: str) -> bool:
@@ -8627,8 +9972,72 @@ def _score_file(f: dict, upload_speed: int):
 # A folder name has to look at least this much like the album before it counts
 # as "the album we asked for" rather than a coincidence.
 ALBUM_MATCH_THRESHOLD = 80.0
+# Track-title corroboration: how many of the expected titles must have a file
+# of their own before the folder counts as identified by its contents. The
+# fraction is of whichever is smaller — the tracklist or the files actually
+# visible — and the absolute floor stops one coincidental "Intro" qualifying.
+_TRACK_EVIDENCE_MIN_FRACTION = 0.5
+_TRACK_EVIDENCE_MIN = 2
 
-def _annotate_folder_match(fd: dict, album: str, artist: str, year: str = "") -> None:
+# Credit separators: "Future & Juice WRLD" names two artists, and a peer
+# files the album under either one. NOT split on "and"/"x" — "Florence and
+# the Machine" is one artist, and a fragment like "the Machine" verifying
+# unrelated folders is worse than asking the user about a collab.
+_ARTIST_SPLIT_RE = re.compile(
+    r"\s*(?:[&+/;,]|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bvs\.?\b"
+    r"|\bversus\b|\bwith\b)\s*", re.IGNORECASE)
+
+def _artist_variants(artist: str) -> list:
+    """The full credit first, then each credited sub-artist."""
+    artist = (artist or "").strip()
+    out = [artist] if artist else []
+    for part in _ARTIST_SPLIT_RE.split(artist):
+        part = part.strip(" -–—.")
+        if part and all(part.lower() != v.lower() for v in out):
+            out.append(part)
+    return out
+
+def _artist_variant_in_words(variants: list, words: set, keys: list) -> bool:
+    """Whether any credited artist appears *whole* in the words of a path or
+    filename segment.
+
+    Whole, not by majority: one shared token let "Music/Pink/…" verify Pink
+    Floyd and a genre folder verify Daft Punk. A sub-artist ("Juice WRLD" out
+    of "Future & Juice WRLD") still matches on its own, which is how peers
+    actually file collaborations. A variant with no significant ASCII tokens
+    (Кино, "The The", 久石譲) falls back to its `_match_key` — which handles
+    non-Latin — as a substring of each component's key.
+    """
+    for v in variants:
+        sig = _significant_words(v)
+        if sig:
+            if all(t in words for t in sig):
+                return True
+            continue
+        mk = _match_key(v)
+        if mk and len(mk) >= 3 and any(mk in k for k in keys):
+            return True
+    return False
+
+def _artist_in_file_names(variants: list, files: list) -> bool:
+    """Artist evidence from "Artist - Title.flac" naming: the variant must sit
+    in a NON-final " - " segment — the artist position. Matching anywhere let
+    a song called "The Future Is Now" verify the artist Future."""
+    for f in files[:_ARTIST_EVIDENCE_FILE_CAP]:
+        text = _file_title_text(f.get("filename", ""))
+        for seg in text.split(" - ")[:-1]:
+            if _artist_variant_in_words(variants,
+                                        set(_match_words(seg).split()),
+                                        [_match_key(seg)]):
+                return True
+    return False
+
+# How many files' names are worth reading for artist evidence before the cost
+# outweighs what one more "Artist - Title.flac" could add.
+_ARTIST_EVIDENCE_FILE_CAP = 40
+
+def _annotate_folder_match(fd: dict, album: str, artist: str, year: str = "",
+                           track_titles: list = None) -> None:
     """Score a peer folder's *name* against the album and artist we searched for.
 
     The last two path components are what carry the album name — peers file
@@ -8637,11 +10046,32 @@ def _annotate_folder_match(fd: dict, album: str, artist: str, year: str = "") ->
     `album_match` / `artist_match` (0-100), `album_match_ok`, and
     `year_in_path`; all default to 0/False, so a caller with no album to
     compare against (the single-track search path) simply gets no bonus.
+
+    Also decides **artist evidence** — `artist_verified` plus the
+    `artist_evidence` that carried it, cheapest first:
+
+    - `"path"`: the artist's name in *any* path component (fuzzy on each, or a
+      majority of its tokens anywhere in the path — peers file artists above
+      the two components the album comparison reads: `Music/FLAC/Future/Zone`).
+    - `"files"`: a majority of the artist tokens in a filename
+      ("01 - Future - Draco.flac").
+    - `"tracks"`: the folder's filenames line up with the canonical tracklist
+      (`_folder_track_matches` ≥ the evidence floor) — contents identify a
+      terse folder better than any name. `track_matches` carries the count,
+      computed only when the cheaper checks failed.
+
+    `artist_verified` is True with no artist to check, and for Various
+    Artists: the gate exists to stop guessing, not to brick VA downloads.
+    Downstream, unverified folders sort into a lower tier and are refused by
+    the unattended download paths (`_auto_download_choice`).
     """
     fd["album_match"] = 0.0
     fd["artist_match"] = 0.0
     fd["album_match_ok"] = False
     fd["year_in_path"] = False
+    fd["artist_verified"] = True
+    fd["artist_evidence"] = ""
+    fd["track_matches"] = 0
     path = (fd.get("folder") or "").replace("\\", "/").strip("/")
     if not path:
         return
@@ -8650,14 +10080,75 @@ def _annotate_folder_match(fd: dict, album: str, artist: str, year: str = "") ->
     if len(parts) >= 2:
         candidates.append(f"{parts[-2]} {parts[-1]}")
     if album:
-        fd["album_match"] = round(max((_folder_name_score(album, c) for c in candidates),
-                                      default=0.0), 1)
+        fd["album_match"] = round(max((_folder_name_score(album, c, artist=artist)
+                                       for c in candidates), default=0.0), 1)
         fd["album_match_ok"] = fd["album_match"] >= ALBUM_MATCH_THRESHOLD
     if artist:
         fd["artist_match"] = round(max((_folder_name_score(artist, c) for c in candidates),
                                        default=0.0), 1)
     if year and re.search(rf"\b{re.escape(str(year))}\b", path):
         fd["year_in_path"] = True
+    if (not artist or not artist.strip()
+            or _match_key(artist) == _match_key("Various Artists")):
+        return
+    fd["artist_verified"] = False
+    variants = _artist_variants(artist)
+    wa = _match_words(artist)
+    # Fuzzy per component is token_sort only: partial_ratio scores a component
+    # that is a SUBSET of the artist ("Pink" for "Pink Floyd") at 100.
+    fuzzy_hit = wa and any(
+        _match_words(p) and
+        float(_fuzz.token_sort_ratio(wa, _match_words(p))) >= ALBUM_MATCH_THRESHOLD
+        for p in parts)
+    if (fuzzy_hit
+            or _artist_variant_in_words(variants,
+                                        set(_match_words(path).split()),
+                                        [_match_key(p) for p in parts])):
+        fd["artist_verified"] = True
+        fd["artist_evidence"] = "path"
+        return
+    if _artist_in_file_names(variants, fd.get("files") or []):
+        fd["artist_verified"] = True
+        fd["artist_evidence"] = "files"
+        return
+    if track_titles:
+        _apply_track_evidence(fd, track_titles)
+
+def _apply_track_evidence(fd: dict, track_titles: list) -> None:
+    """Upgrade an unverified folder whose *contents* line up with the
+    canonical tracklist. Split out of `_annotate_folder_match` so the search
+    can apply it after scoring, to the top folders only — it is the expensive
+    check, and it used to run on the whole wrong-artist flood."""
+    files = (fd.get("files") or [])[:_ARTIST_EVIDENCE_FILE_CAP]
+    n = _folder_track_matches(files, track_titles)
+    fd["track_matches"] = n
+    audio = sum(1 for f in files
+                if _file_ext(f.get("filename", "")) in _accepted_formats())
+    floor = max(_TRACK_EVIDENCE_MIN,
+                math.ceil(_TRACK_EVIDENCE_MIN_FRACTION
+                          * min(len(track_titles), audio or len(files))))
+    if n >= floor:
+        fd["artist_verified"] = True
+        fd["artist_evidence"] = "tracks"
+
+# Track corroboration only matters where it could change a pick: the pickers
+# show 10-12 sources and the failover walks 6, so folders past the top ranks
+# never need the expensive check.
+_TRACK_EVIDENCE_FOLDER_CAP = 40
+
+def _apply_track_evidence_pass(folders: list, track_titles: list) -> None:
+    """Run `_apply_track_evidence` over the top-scored UNVERIFIED folders.
+    `folders` is already score-sorted best first."""
+    if not track_titles:
+        return
+    checked = 0
+    for fd in folders:
+        if checked >= _TRACK_EVIDENCE_FOLDER_CAP:
+            break
+        if fd.get("artist_verified", True):
+            continue
+        checked += 1
+        _apply_track_evidence(fd, track_titles)
 
 def _folder_quality_profile(files: list) -> dict:
     """Dominant codec / bitrate / bit-depth / sample-rate across a folder."""
@@ -8872,7 +10363,8 @@ def _no_source_reason(stats: dict) -> str:
 
 def slskd_run_search(query: str, expected_track_count: int = 0,
                      progress=None, stats: dict = None,
-                     album: str = "", artist: str = "", year: str = "") -> list:
+                     album: str = "", artist: str = "", year: str = "",
+                     track_titles: list = None) -> list:
     """
     Run a slskd search and return a list of FOLDER-level result dicts,
     one per (username, directory) pair, sorted best-first by _score_folder.
@@ -9165,6 +10657,10 @@ def slskd_run_search(query: str, expected_track_count: int = 0,
                 fd["score"] = _score_folder(fd, expected_track_count, ignore_guards=True)
             folders = [fd for fd in folders if fd["score"] > 0]
         folders.sort(key=lambda x: -x["score"])
+        # Track corroboration after scoring, top unverified folders only —
+        # running it at annotate time cost seconds per pass on exactly the
+        # wrong-artist flood that fails the cheap checks.
+        _apply_track_evidence_pass(folders, track_titles)
 
         # `folders` here is the count *after* scoring; acc["folders"] is
         # folder_map, before it. The gap between the two is exactly the
@@ -9298,6 +10794,73 @@ def slskd_search_probe(query: str, wait: float = 45.0, stop_at: float = 0.0) -> 
             pass
     return trace
 
+def _search_album_with_context(artist: str, album: str,
+                               expected_track_count: int = 0,
+                               release_mbid: str = "", progress=None,
+                               stats: dict = None,
+                               track_titles: list = None) -> list:
+    """`slskd_search_album_folders` with the release's year and canonical
+    tracklist resolved first (`_album_search_context`, cached, degrades to a
+    bare search when MusicBrainz is down). The one wrapper the callers that
+    only hold a release MBID share, so none of them forgets the context —
+    forgetting it is how the year bonus was dead code for months.
+    """
+    year, titles = _album_search_context(release_mbid)
+    # The canonical tracklist wins over a caller's partial list (a playlist
+    # group's one or two missing titles can never reach the track-evidence
+    # floor); the caller's list is the fallback when MusicBrainz is down.
+    return slskd_search_album_folders(
+        artist, album, expected_track_count, progress=progress, stats=stats,
+        year=year, track_titles=titles or track_titles)
+
+def _debug_album_search_view(artist: str, album: str, year: str = "",
+                             release_mbid: str = "",
+                             track_titles: list = None) -> dict:
+    """Scored album-search trace for `GET /api/debug/album-search`.
+
+    `slskd_search_probe` traces one raw query's slskd lifecycle;
+    this runs the *real* multi-pass album search and answers why every folder
+    ranked where it did — score, pass, matches, artist evidence — with no
+    file payloads and no enqueue. This is what makes a live verification of
+    the ranking observable at all.
+    """
+    if release_mbid and not (year and track_titles):
+        ctx_year, ctx_titles = _album_search_context(release_mbid)
+        year = year or ctx_year
+        track_titles = track_titles or ctx_titles
+    queries = _album_search_queries(artist, album, year, track_titles)
+    stats: dict = {}
+    folders = slskd_search_album_folders(
+        artist, album, len(track_titles or []), stats=stats,
+        year=year, track_titles=track_titles)
+    return {
+        "artist": artist,
+        "album": album,
+        "year": year,
+        "trackTitles": len(track_titles or []),
+        "plannedQueries": queries,
+        "ranQueries": stats.get("queries", []),
+        "passes": stats.get("passes", 0),
+        "mergedFolders": stats.get("merged_folders", 0),
+        "folders": [{
+            "username": fd.get("username", ""),
+            "folder": fd.get("folder", ""),
+            "score": fd.get("score", 0),
+            "searchPass": fd.get("search_pass", 0),
+            "albumMatch": fd.get("album_match", 0),
+            "albumMatchOk": bool(fd.get("album_match_ok")),
+            "artistMatch": fd.get("artist_match", 0),
+            "artistVerified": bool(fd.get("artist_verified", True)),
+            "artistEvidence": fd.get("artist_evidence", ""),
+            "trackMatches": fd.get("track_matches", 0),
+            "yearInPath": bool(fd.get("year_in_path")),
+            "fileCount": len(fd.get("files") or []),
+            "uploadSpeed": fd.get("upload_speed", 0),
+            "queueLength": fd.get("queue_length", 0),
+            "freeSlot": bool(fd.get("has_free_upload_slot")),
+        } for fd in folders],
+    }
+
 def slskd_pick(folders: list) -> dict:
     """
     Pick the best single file from the best folder.
@@ -9315,6 +10878,22 @@ def slskd_pick(folders: list) -> dict:
                 "file": best_file, "folder": best_folder}
     return {"status": "ok", "username": best_folder["username"],
             "file": best_file, "folder": best_folder}
+
+def _auto_download_choice(folders: list) -> dict | None:
+    """The folder an *unattended* path may take, or None when no candidate
+    carries artist evidence — auto must refuse and report no_source rather
+    than guess; the manual pickers still list everything.
+
+    Verified folders sort into the tier above unverified ones
+    (`slskd_search_album_folders`), so checking `folders[0]` is checking
+    whether any verified candidate exists at all. A folder without the flag
+    (older callers, the single-track path) passes: only explicit `False`
+    gates.
+    """
+    if not folders:
+        return None
+    fd = folders[0]
+    return fd if fd.get("artist_verified", True) else None
 
 def slskd_search_and_pick(track: dict) -> dict:
     query   = f"{track['artist']} {track['title']}"
@@ -9367,15 +10946,29 @@ def _album_search_queries(artist: str, album: str, year: str = "",
         if q and not any(q.lower() == e.lower() for e in out):
             out.append(q)
 
-    # 1. Artist + cleaned album, with a repeated run collapsed. A self-titled
-    #    album gains the year instead, which is the one term that separates the
-    #    debut from everything else the artist ever released.
     primary = _dedupe_terms(f"{artist} {clean}".strip())
-    if self_titled and year:
-        add(f"{primary} {year}")
+    if self_titled:
+        # A self-titled album's own name is the artist name, so `primary` is a
+        # discography-wide query. The variants that can only match the debut
+        # come first: the year (the one term separating it from everything
+        # else the artist released), then the most distinctive track title (a
+        # phrase no other album shares). Bare `primary` is the last resort,
+        # not pass 2 — as pass 2 it drowned the pool in sibling albums before
+        # the track query ever ran.
+        if year:
+            add(f"{primary} {year}")
+        best_track = ""
+        for title in (track_titles or []):
+            if len(_significant_words(title)) > len(_significant_words(best_track)):
+                best_track = title
+        if best_track:
+            add(f"{artist} {best_track}")
         add(primary)
-    else:
-        add(primary)
+        add(f"{_strip_diacritics(artist)} {_strip_diacritics(clean)}".replace("'", ""))
+        return out[:MAX_SEARCH_PASSES]
+
+    # 1. Artist + cleaned album, with a repeated run collapsed.
+    add(primary)
 
     # 2. A punctuation-free form, or — for a wordy title — just its distinctive
     #    words. Peers name folders every possible way; dropping the noise is
@@ -9390,18 +10983,9 @@ def _album_search_queries(artist: str, album: str, year: str = "",
     else:
         add(f"{_strip_diacritics(artist)} {_strip_diacritics(clean)}".replace("'", ""))
 
-    # 3. Last resort. For a self-titled album the album name alone is the
-    #    artist name, so it buys nothing — ask for the most distinctive missing
-    #    track instead, which is a phrase no other album shares.
-    if self_titled:
-        best_track = ""
-        for title in (track_titles or []):
-            if len(_significant_words(title)) > len(_significant_words(best_track)):
-                best_track = title
-        if best_track:
-            add(f"{artist} {best_track}")
-    else:
-        add(clean)
+    # 3. Last resort: the album name alone, the widest recall and the least
+    #    precision — its results rank behind artist-verified ones either way.
+    add(clean)
     return out[:MAX_SEARCH_PASSES]
 
 def slskd_search_album_folders(artist: str, album: str,
@@ -9436,17 +11020,42 @@ def slskd_search_album_folders(artist: str, album: str,
         # ran last. That is deliberate and unchanged: it is the widest pass, and
         # therefore the one that explains an empty result.
         for fd in slskd_run_search(query, expected_track_count, progress=progress,
-                                   stats=stats, album=clean_album, artist=artist):
+                                   stats=stats, album=clean_album, artist=artist,
+                                   year=year, track_titles=track_titles):
             key = (fd.get("username", ""), fd.get("folder", ""))
             prev = merged.get(key)
-            if prev is None or (fd.get("score") or 0) > (prev.get("score") or 0):
+            fd["search_pass"] = i + 1
+            if prev is None:
                 merged[key] = fd
-        # Enough folders that actually look like this album — more passes would
-        # only add noise and another 30-90s of peer waiting.
-        strong = [fd for fd in merged.values() if fd.get("album_match_ok")]
+            elif (fd.get("score") or 0) > (prev.get("score") or 0):
+                # The better-scored copy wins, but provenance is the first
+                # pass that found the folder, not the one that rescored it —
+                # and evidence earned from one pass's hit-file subset is not
+                # forgotten because another pass saw different files.
+                fd["search_pass"] = min(fd["search_pass"],
+                                        prev.get("search_pass", i + 1))
+                if (prev.get("artist_verified")
+                        and fd.get("artist_verified", True) is False):
+                    fd["artist_verified"] = True
+                    fd["artist_evidence"] = prev.get("artist_evidence", "")
+                fd["track_matches"] = max(fd.get("track_matches") or 0,
+                                          prev.get("track_matches") or 0)
+                merged[key] = fd
+        # Enough folders that actually look like this album AND carry artist
+        # evidence — two wrong-artist copies of a generic-word title used to
+        # end the walk before the narrower artist+track query ever ran.
+        strong = [fd for fd in merged.values()
+                  if fd.get("album_match_ok") and fd.get("artist_verified", True)]
         if len(strong) >= _ENOUGH_ALBUM_MATCHES:
             break
-    folders = sorted(merged.values(), key=lambda x: -(x.get("score") or 0))
+    # Artist evidence is a tier, not a bonus: a wider pass floods the pool
+    # with fast wrong-artist folders, and no point total should let one of
+    # those beat a verified copy. Absent flag means verified — the
+    # single-track path and older callers never annotate it.
+    folders = sorted(merged.values(),
+                     key=lambda x: (0 if x.get("artist_verified", True) else 1,
+                                    -(x.get("score") or 0),
+                                    x.get("search_pass", MAX_SEARCH_PASSES)))
     if stats is not None:
         stats["passes"] = i + 1
         stats["queries"] = queries[:i + 1]
@@ -9757,6 +11366,31 @@ def _title_match_rank(title_key: str, file_key: str,
                     and _tokens_aligned(wt, wf)):
                 return MATCH_FUZZY
     return -1
+
+def _folder_track_matches(files: list, track_titles: list) -> int:
+    """How many expected track titles have a file of their own in this folder.
+
+    A counting primitive for artist evidence: a terse folder ("Zone [2016]")
+    whose *filenames* line up with the canonical tracklist is better
+    identification than any folder name. Reuses `_title_match_rank`'s tiers,
+    so the Sing/Singularity whole-token guard applies here too. Each file is
+    claimed at most once — two titles cannot both count the same file.
+    """
+    if not files or not track_titles:
+        return 0
+    remaining = []
+    for f in files:
+        name = f.get("filename", "")
+        remaining.append((_file_title_key(name), _file_title_text(name)))
+    matched = 0
+    for title in track_titles:
+        tkey = _match_key(title)
+        for i, (fkey, ftext) in enumerate(remaining):
+            if fkey and _title_match_rank(tkey, fkey, title, ftext) >= 0:
+                matched += 1
+                del remaining[i]
+                break
+    return matched
 
 def _release_track_titles(group: dict) -> list:
     """Every title on the release — the tracks we have as well as the gaps.
@@ -10398,6 +12032,12 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
         if _gone():
             return
         fd       = ag["alt_sources"].pop(0)
+        if fd.get("artist_verified", True) is False:
+            # The failover is unattended, so it obeys the same rule as the
+            # first pick: never guess at a folder with no artist evidence.
+            # Consent for a manually picked source does not extend to its
+            # alternates.
+            continue
         username = fd["username"]
         await _tg_send(bot, ag["chat_id"],
             f"🔁 Source for {ag['label']} failed — trying @{username}…")
@@ -12724,9 +14364,11 @@ async def _send_album_prompt(bot, chat_id, token, label, group, folders):
         free        = "⚡" if fd.get("has_free_upload_slot") else " "
         comp        = "(compilation) " if COMPILATION_RE.search(fd["folder"]) else ""
         live        = "(live) " if LIVE_RE.search(fd["folder"]) else ""
+        unverified  = ("(artist unverified) "
+                       if fd.get("artist_verified", True) is False else "")
         quality = _folder_quality(fd["files"])
         lines.append(
-            f"{i+1}. {free}{comp}{live}{folder_name}\n"
+            f"{i+1}. {free}{unverified}{comp}{live}{folder_name}\n"
             f"   {quality} | {file_count} files | {speed_mb} MB/s"
             f"{f' | queue: {queue}' if queue else ''} | @{fd['username']}"
         )
@@ -12863,12 +14505,21 @@ async def _album_download_worker(bot, chat_id, token, artist, album,
     try:
         await _tg_send(bot, chat_id, f"🔍 Searching Soulseek for {label}…")
         folders = await asyncio.to_thread(
-            slskd_search_album_folders, artist, album, total_tracks)
+            _search_album_with_context, artist, album, total_tracks,
+            release_mbid)
         if not folders:
             await _tg_send(bot, chat_id,
                 f"❌ Couldn't find {label} on Soulseek. "
                 f"Try /search for individual files.")
             return
+        if not manual and _auto_download_choice(folders) is None:
+            # Manual-pick-only policy in the medium's native shape: rather
+            # than a dead-end refusal, the same picker the Choose-source
+            # button sends — with the caution said out loud.
+            await _tg_send(bot, chat_id,
+                f"⚠️ Found {len(folders)} source(s) for {label}, but none "
+                f"verifiably by {artist}. Pick one yourself:")
+            manual = True
         if manual:
             await _tg_send(bot, chat_id, f"📂 Found {len(folders)} source(s) for {label}.")
             group = {"release_mbid": release_mbid, "artist": artist,
@@ -12942,12 +14593,22 @@ async def _dlall_worker(bot, chat_id, token, playlist_name, tracks,
             await _tg_send(bot, chat_id,
                 f"🔍 [{idx}/{n_albums}] Searching Soulseek for {label}…")
             folders = await asyncio.to_thread(
-                slskd_search_album_folders, artist, album, group["total_tracks"])
+                _search_album_with_context, artist, album,
+                group["total_tracks"], group.get("release_mbid", ""), None,
+                None, [t.get("title", "") for t in
+                       group.get("missing_tracks") or [] if t.get("title")])
             if not folders:
                 await _tg_send(bot, chat_id,
                     f"❌ Album not found on Soulseek: {label}. "
                     f"Falling back to individual tracks.")
                 solo_tracks.extend(group["missing_tracks"])
+                continue
+            if auto and _auto_download_choice(folders) is None:
+                await _tg_send(bot, chat_id,
+                    f"⚠️ Sources for {label} don't verifiably match the "
+                    f"artist — pick one yourself:")
+                await _send_album_prompt(bot, chat_id, token, label, group,
+                                         folders)
                 continue
             if auto:
                 ok, total = await _auto_enqueue_album(
@@ -13191,51 +14852,162 @@ def _list_download_folders() -> list:
 def _tokenize_for_match(text: str) -> set:
     return {t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(t) > 1}
 
-def _suggest_review_group_for_folder(folder: dict, review_groups: list) -> dict | None:
+# Words a release folder or tag carries about the *copy* rather than the album:
+# edition, format and quality labels. They must neither count against a match
+# ("Parklife (Special Edition) [2012 Remaster]" is Parklife) nor for one.
+_MATCH_NOISE_TOKENS = frozenset((
+    "deluxe", "edition", "editions", "remaster", "remastered", "remasters",
+    "expanded", "special", "anniversary", "bonus", "tracks", "track", "version",
+    "reissue", "disc", "disk", "cd", "cds", "lp", "vinyl", "flac", "mp3", "opus",
+    "ogg", "aac", "m4a", "alac", "wav", "lossless", "web", "hires", "hi", "res",
+    "mono", "stereo", "album", "limited", "collector", "collectors", "japan",
+    "japanese", "import", "explicit", "clean", "the", "and", "of", "khz", "bit",
+    "kbps", "vbr", "cbr", "rip", "scene", "retail", "promo",
+))
+
+def _is_match_noise(token: str) -> bool:
+    if token in _MATCH_NOISE_TOKENS:
+        return True
+    return bool(re.fullmatch(r"\d+(bit|khz|hz|kbps|k)|(cd|disc|disk)\d+|v[0-2]", token))
+
+def _match_source_words(tokens: set) -> set:
+    """The words of a source that have to be explained by a match: noise and
+    years out, short numbers kept ("25", "21" name albums)."""
+    return {t for t in tokens
+            if not _is_match_noise(t) and not (t.isdigit() and len(t) >= 4)}
+
+def _review_group_match_index(review_groups: list) -> list:
+    """(group, artist_tokens, album_tokens) for every group a folder could be
+    filed into. Built once per listing: the per-folder loop used to re-tokenize
+    all ~3000 groups for every download folder on every poll."""
+    index = []
+    for g in review_groups or []:
+        if g.get("hidden") or not (g.get("missing_tracks") and (g.get("canonical_mbid") or g.get("release_mbid"))):
+            continue
+        artist_tokens = _tokenize_for_match(g.get("artist", ""))
+        album_tokens = _tokenize_for_match(g.get("album", ""))
+        if artist_tokens | album_tokens:
+            index.append((g, artist_tokens, album_tokens))
+    return index
+
+_folder_tag_tokens_cache: dict = {}
+
+def _folder_tag_tokens(folder: dict) -> set:
+    """Artist+album words from the first audio file's tags, cached per folder
+    and file count so a poll does not re-read the same tags with mutagen."""
+    path = folder.get("path", "")
+    key = (path, folder.get("file_count"))
+    hit = _folder_tag_tokens_cache.get(key)
+    if hit is not None:
+        return hit
+    tokens: set = set()
+    try:
+        files = _audio_files_in_folder(path, 1)
+        if files:
+            tags = _audio_file_tags(files[0]["path"])
+            tokens = _tokenize_for_match(
+                f"{tags.get('albumartist', '') or tags.get('artist', '')} {tags.get('album', '')}")
+    except Exception:
+        pass
+    if len(_folder_tag_tokens_cache) > 1000:
+        _folder_tag_tokens_cache.clear()
+    _folder_tag_tokens_cache[key] = tokens
+    return tokens
+
+def _suggest_review_group_for_folder(folder: dict, review_groups: list,
+                                     index: list | None = None) -> dict | None:
     """
     Best-guess review-group match for a downloaded folder, for the Import tab's
     one-click suggestion. Compares embedded tags first (more reliable than the
     folder name when present), then falls back to the folder name. No fuzzy-match
     library -- plain token-overlap scoring against artist+album, same spirit as
     the _match_key normalization used elsewhere in this file.
+
+    `index` is `_review_group_match_index(review_groups)`, for a caller matching
+    many folders against the same list.
     """
     folder_tokens = _tokenize_for_match(folder.get("name", ""))
-    tag_tokens: set = set()
-    try:
-        files = _audio_files_in_folder(folder.get("path", ""), 1)
-        if files:
-            tags = _audio_file_tags(files[0]["path"])
-            tag_tokens = _tokenize_for_match(
-                f"{tags.get('albumartist', '') or tags.get('artist', '')} {tags.get('album', '')}")
-    except Exception:
-        pass
+    tag_tokens = _folder_tag_tokens(folder)
+    if index is None:
+        index = _review_group_match_index(review_groups)
 
     best = None
-    best_score = 0.0
-    for g in review_groups:
-        if g.get("hidden") or not (g.get("missing_tracks") and (g.get("canonical_mbid") or g.get("release_mbid"))):
-            continue
-        group_tokens = _tokenize_for_match(f"{g.get('artist', '')} {g.get('album', '')}")
-        if not group_tokens:
-            continue
-        for source_tokens, weight in ((tag_tokens, 1.2), (folder_tokens, 1.0)):
+    best_rank = (0.0, 0.0)
+    best_basis = ""
+    best_ambiguous = False
+    for g, artist_tokens, album_tokens in index:
+        group_tokens = artist_tokens | album_tokens
+        # The words that name the *album* rather than the artist. When there are
+        # any, the source must share one: overlap on the artist alone is how
+        # "Led Zeppelin IV" was offered as Led Zeppelin — Coda, one tap from
+        # being filed into the wrong album.
+        album_only = album_tokens - artist_tokens
+        for source_tokens, weight, basis in ((tag_tokens, 1.2, "tags"),
+                                             (folder_tokens, 1.0, "folder name")):
             if not source_tokens:
                 continue
-            overlap = len(source_tokens & group_tokens)
+            shared = source_tokens & group_tokens
+            overlap = len(shared)
             if overlap < max(1, len(group_tokens) - 1):
                 continue
+            if album_only and not (source_tokens & album_only):
+                continue
+            # And most of the source's own words must be accounted for (years,
+            # edition and format labels aside): "Speakerboxxx _ The Love Below"
+            # shares one word with the self-titled "Love — Love" and nothing else.
+            source_words = _match_source_words(source_tokens)
+            coverage = (len(shared & source_words) / len(source_words)
+                        if source_words else 1.0)
+            if coverage < 0.5:
+                continue
+            # A self-titled album has no album-only word to insist on, so every
+            # folder by that artist clears the guard above: "Led Zeppelin IV"
+            # is not the self-titled debut. A word left unexplained there
+            # makes the match something to look at, never a one-tap.
+            ambiguous = not album_only and bool(source_words - group_tokens)
             score = weight * overlap / len(group_tokens)
-            if score > best_score:
-                best_score = score
+            # Ties go to the group that explains more of the source's words,
+            # so the right album beats a self-titled one scoring the same.
+            rank = (score, coverage)
+            if rank > best_rank:
+                best_rank = rank
                 best = g
-    if best and best_score >= 0.6:
+                best_basis = basis
+                best_ambiguous = ambiguous
+    if best and best_rank[0] >= 0.6:
         return {
             "group_id": best.get("id", ""),
             "artist": best.get("artist", ""),
             "album": best.get("album", ""),
             "missing": len(best.get("missing_tracks") or []),
+            # How the match was made and how strong it is, so a client can
+            # offer one-tap confirm only where it is earned (see
+            # _suggestion_confidence).
+            "score": round(best_rank[0], 2),
+            "basis": best_basis,
+            "ambiguous": best_ambiguous,
         }
     return None
+
+def _suggestion_confidence(suggestion: dict | None, file_count: int = 0) -> str:
+    """'likely' earns a one-tap confirm; 'possible' means "look first".
+
+    Every review-group suggestion used to be reported as `likely`, including
+    ones that plainly named another album. A full-token match from the files'
+    own tags is likely; a folder-name match, a self-titled match with words
+    left over, or a folder holding far more files than the album is missing (a
+    whole discography dumped in one folder), is only possible.
+    """
+    if not suggestion:
+        return "unknown"
+    missing = int(suggestion.get("missing") or 0)
+    oversized = bool(missing) and file_count > max(missing * 3, missing + 6)
+    # 1.0 = every artist and album word matched (tags are weighted 1.2, so a
+    # tag match clears it with one word to spare).
+    if (suggestion.get("basis") == "tags" and suggestion.get("score", 0) >= 1.0
+            and not suggestion.get("ambiguous") and not oversized):
+        return "likely"
+    return "possible"
 
 def _selected_paths_under_album(album_dir: str, relpaths: list) -> list:
     if not album_dir or not os.path.isdir(album_dir):
@@ -13995,8 +15767,10 @@ def _set_review_track_state(group_id: str, track_index, decision: str,
             return
         tracks = group.get("missing_tracks", [])
         if 0 <= idx < len(tracks):
+            previous_decision = tracks[idx].get("decision", "")
             tracks[idx]["decision"] = decision
             tracks[idx].update({k: v for k, v in updates.items() if v is not None})
+            _stamp_downloaded(tracks[idx], previous_decision)
             job = _repair_job_for_group(group_id)
             if job:
                 tid = tracks[idx].get("repair_track_id") or _repair_track_id(group_id, idx, tracks[idx])
@@ -14205,6 +15979,12 @@ def _source_summary(fd: dict, idx: int, group: dict = None,
         "album_match_ok": bool(fd.get("album_match_ok")),
         "artist_match": round(float(fd.get("artist_match") or 0)),
         "year_in_path": bool(fd.get("year_in_path")),
+        # Artist evidence (additive). Absent means verified: only a folder the
+        # annotation explicitly failed renders — and gates — as unverified.
+        "artist_verified": bool(fd.get("artist_verified", True)),
+        "artist_evidence": fd.get("artist_evidence", ""),
+        "search_pass": int(fd.get("search_pass") or 0),
+        "track_matches": int(fd.get("track_matches") or 0),
         "quality_profile": _folder_quality_profile(files),
         "is_live": bool(LIVE_RE.search(fd.get("folder", ""))),
         "is_compilation": bool(COMPILATION_RE.search(fd.get("folder", ""))),
@@ -14358,9 +16138,13 @@ def _apply_group_sources(group: dict, plan: dict, folders: list,
     group.pop("no_source_reason", None)
     group.pop("mp3_would_help", None)
     now = time.time()
+    # The query on the wire is the one that actually ran: plan["query"] is
+    # built for display before the search and the pass walk may never use it.
+    ran = list((stats or {}).get("queries") or ([query] if query else []))
     group["source_results"] = {
         "mode": mode,
-        "query": query,
+        "query": ran[0] if ran else query,
+        "queries": ran,
         "created_at": now,
         "folders": folders,
         "summaries": [_source_summary(fd, idx, group)
@@ -14742,13 +16526,41 @@ def _union_review_groups(new_groups: list, origin: str = "library") -> None:
         seen.add(gid)
         g.setdefault("origin", origin)
         deduped.append(g)
-    merged = _merge_review_groups(deduped)
+    # include_jobs=False: a union keeps every group it did not cover exactly as
+    # it is, so there is nothing for a repair-job projection to stand in for —
+    # and appending one made the swap below REPLACE the live group with it,
+    # dropping its source_results, albums and counts. A source search opens a
+    # repair job, so once the auto-index worker unioned every few seconds, a
+    # search's results vanished within seconds of landing (Loveworm, 2026-09-24).
+    # The projection is for _replace_review_groups, where the group would
+    # otherwise disappear.
+    merged = _merge_review_groups(deduped, include_jobs=False)
+    touched, displaced = [], set()
     with _review_lock:
         by_id = {g.get("id"): g for g in merged}
         out = [by_id.pop(g.get("id"), g) for g in _review_state.get("groups", []) or []]
-        out.extend(by_id.values())
+        # A genuinely new row for an album another origin already lists folds
+        # into it, as _replace_review_groups does — otherwise a playlist's
+        # album and the auto-index worker's row for it were two tiles.
+        by_identity = {k: g for g in out if (k := _identity_key(g))}
+        for group in by_id.values():
+            key = _identity_key(group)
+            existing = by_identity.get(key) if key else None
+            if existing is None or _review_group_origin(existing) == _review_group_origin(group):
+                out.append(group)
+                if key:
+                    by_identity[key] = group
+                continue
+            winner = _fold_by_identity(existing, group)
+            touched.append(winner)
+            if winner is group:
+                displaced.add(existing.get("id"))
+                by_identity[key] = group
+                out = [group if g is existing else g for g in out]
         _review_state["groups"] = out
     _mark_review_groups_dirty(merged)
+    _mark_review_groups_dirty(touched)
+    _mark_review_groups_dirty(displaced)
     _save_review_state()
 
 def _fold_missing_tracks(into: dict, extra: dict) -> None:
@@ -14766,6 +16578,30 @@ def _fold_missing_tracks(into: dict, extra: dict) -> None:
         have.add(key)
         into.setdefault("missing_tracks", []).append(dict(track))
         into["updated_at"] = time.time()
+
+def _review_group_richer(a: dict, b: dict) -> bool:
+    """Whether `a` should stand for the album over `b` when two origins reach
+    it. The library row carries `albums`, canonical_album_id and `extra`; a
+    playlist or Spotify row carries none of them."""
+    return bool(a.get("albums")) and not b.get("albums")
+
+def _fold_by_identity(existing: dict, incoming: dict) -> dict:
+    """Collapse two rows for one album into the richer, which is returned; the
+    other's missing tracks are folded into it."""
+    if _review_group_richer(incoming, existing):
+        _fold_missing_tracks(incoming, existing)
+        if existing.get("hidden"):
+            incoming["hidden"] = True
+        return incoming
+    _fold_missing_tracks(existing, incoming)
+    return existing
+
+def _identity_key(group: dict) -> str:
+    """`_review_group_identity`, or "" when the group names no album at all —
+    rows with neither an MBID nor artist/album keys must not all collapse onto
+    one another under the key "|"."""
+    key = _review_group_identity(group)
+    return "" if key.strip("|") == "" else key
 
 def _replace_review_groups(origin: str, new_groups: list, message: str,
                            fuzzy: bool = None) -> None:
@@ -14790,19 +16626,39 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
         before = len(current)
         was = {g.get("id") for g in current}
         kept = [g for g in current if _review_group_origin(g) != origin]
-        by_identity = {_review_group_identity(g): g for g in kept}
-        fresh, folded = [], []
+        kept_ids = {g.get("id") for g in kept}
+        by_identity = {k: g for g in kept if (k := _identity_key(g))}
+        fresh, folded, fresh_ids, displaced = [], [], set(), set()
         for group in merged:
-            existing = by_identity.get(_review_group_identity(group))
-            if existing is not None:
-                # Another origin already has this album, and its row is the
-                # richer one (a library group carries `albums`,
-                # canonical_album_id and `extra`; a playlist group carries none
-                # of them). Contribute the tracks, not a duplicate tile.
-                _fold_missing_tracks(existing, group)
-                folded.append(existing)
+            gid = group.get("id")
+            if gid in kept_ids or gid in fresh_ids:
+                # A repair-job projection for a group another origin still holds
+                # live. Keeping it made two rows with one id, and whichever came
+                # first won both _find_review_group and the flush — sometimes the
+                # projection, which has no albums and no sources.
                 continue
+            key = _identity_key(group)
+            existing = by_identity.get(key) if key else None
+            if existing is not None and _review_group_origin(group) == "repair":
+                # Same album, reached through a job whose release drifted from
+                # the group's: the live group already stands for it, and folding
+                # the job's tracks in would list a verified track as missing.
+                continue
+            fresh_ids.add(gid)
+            if existing is not None:
+                # Another origin already has this album. Contribute the tracks,
+                # not a duplicate tile — into whichever row is richer, which is
+                # the library one whichever side it arrives from. A scan-all used
+                # to fold the library group into a playlist row and drop it.
+                winner = _fold_by_identity(existing, group)
+                if winner is existing:
+                    folded.append(existing)
+                    continue
+                displaced.add(existing.get("id"))
+                by_identity[key] = group
             fresh.append(group)
+        if displaced:
+            kept = [g for g in kept if g.get("id") not in displaced]
         _review_state.update({
             "status": "complete",
             "message": message,
@@ -14955,7 +16811,8 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
     # after a progress line that counted a hundred peers. This is also what
     # decides whether offering the MP3 opt-in is worth the user's time.
     stats: dict = {}
-    folders = slskd_search_album_folders(artist, album, total_tracks, stats=stats)
+    folders = _search_album_with_context(artist, album, total_tracks,
+                                         release_mbid=release_mbid, stats=stats)
     if release_mbid in _album_fill_cancel_requested:
         _album_fill_cancel_requested.discard(release_mbid)
         _task_finish(task_id, "Cancelled before queueing")
@@ -14988,6 +16845,7 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
     # Honor a manually-picked source: float the matching peer/folder to the front
     # (the rest stay as alt_sources for auto-failover). Falls back to the best
     # ranked folder if that peer has since vanished.
+    manual_pick = False
     if chosen and chosen.get("username"):
         cu = chosen.get("username")
         cf = chosen.get("folder") or ""
@@ -14996,7 +16854,20 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
                     and (not cf or cf in (f.get("folder"), f.get("raw_folder")))), -1)
         if idx > 0:
             folders = [folders[idx]] + folders[:idx] + folders[idx + 1:]
-    fd = folders[0]
+        # A vanished peer (idx == -1) falls back to the ranked pick, which is
+        # an *auto* decision again and goes back through the gate.
+        manual_pick = idx >= 0
+    fd = folders[0] if manual_pick else _auto_download_choice(folders)
+    if fd is None:
+        # Decision: unattended paths never guess. Every candidate lacks artist
+        # evidence (path, filenames and tracklist all silent), so this reports
+        # the same no_source the wishlist and retry policies already handle;
+        # the manual pickers still list — and label — every candidate.
+        reason = (f"Sources found, but none verifiably by {artist} — "
+                  f"pick one manually")
+        _album_fill_fail(release_mbid, "no_source", reason, retryable=True)
+        _task_finish(task_id, error=reason, no_source_reason="artist_unverified")
+        return
     full = slskd_expand_directory(fd["username"], fd, fd["files"][0] if fd.get("files") else {})
     ok, total, ag_id = slskd_enqueue_folder(
         fd["username"], full or fd.get("files", []),
@@ -15071,6 +16942,15 @@ def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
         _task_update(task_id, done=done, total=total,
                      current=f"{artist} - {album}".strip(" -"))
     started = time.time()
+    if not artist_name or artist_name == artist_mbid:
+        # An `mb:` page knows only the id. Posting that as the name stored the
+        # UUID as the artist's name in the index — and in every client mirror,
+        # and as the page title. One cached lookup finds the real one.
+        try:
+            artist_name = (mbz_get(f"artist/{artist_mbid}", strict=True).get("name")
+                           or artist_name)
+        except MusicBrainzUnavailable:
+            pass
     _artist_scan_set(artist_mbid, nd_artist_id, state="running",
                      task_id=task_id, started_at=started)
 
@@ -15132,6 +17012,40 @@ def _task_cancelled(task_id: str) -> bool:
         task = (_review_state.get("tasks", {}) or {}).get(task_id) or {}
         return task.get("status") == "cancelled"
 
+def _index_library_artist_mbid(row: dict, stored: dict | None,
+                               strict: bool = False) -> str:
+    """The MusicBrainz artist id to scan a Navidrome artist under, or "" for a
+    genuine no-match. Shared by `_library_index_task` and the auto-index worker.
+
+    `row` is an `_artist_index_rows()` row (`id`, `name`, optional `mbid`);
+    `stored` is the artist's current index row (anything with `artist_mbid`),
+    or None.
+
+    The tag mbid first, then whatever an earlier scan already resolved and
+    stored — only when NEITHER exists does this fall back to a fresh
+    MusicBrainz name search. A stale artist whose tags have since lost their
+    mbid used to always re-search by name; when MusicBrainz answered nothing,
+    the miss got written under `nd:<id>` with a newer `scanned_at` than the
+    real `mb:<mbid>` row sharing that nd id, and the nd-id lookup
+    (`_index_get_artist`, `ORDER BY scanned_at DESC`) then served the empty
+    stub instead of the real discography.
+
+    Non-strict (the manual build): `mbz_search_artists` answers `[]` both for
+    a genuine no-match and for a quiet MusicBrainz failure under its
+    fail-cooldown, so there a failure also reads as a miss. `strict=True` (the
+    auto-index worker) raises MusicBrainzUnavailable instead, so an outage is
+    never written down as "no such artist" (ruling R13).
+    """
+    mbid = row.get("mbid", "") or (stored or {}).get("artist_mbid", "")
+    if mbid:
+        return mbid
+    name = row.get("name", "")
+    if strict:
+        candidates = mbz_search_artists(name, 1, strict=True)
+    else:
+        candidates = mbz_search_artists(name, 1)
+    return candidates[0].get("mbid", "") if candidates else ""
+
 def _library_index_task(task_id: str, user: dict) -> None:
     """
     Bulk-build the library index: scan every Navidrome artist's discography
@@ -15158,15 +17072,9 @@ def _library_index_task(task_id: str, user: dict) -> None:
         if stored and not stored["stale"]:
             skipped += 1
             continue
-        mbid = row.get("mbid", "")
+        mbid = _index_library_artist_mbid(row, stored)
         if not mbid:
-            candidates = mbz_search_artists(name, 1)
-            mbid = (candidates[0].get("mbid", "") if candidates else "")
-        if not mbid:
-            # Record the miss under the Navidrome id so the next run doesn't
-            # burn a MusicBrainz search on it again until it goes stale.
-            _index_store_artist({"artist_mbid": "", "artist_name": name,
-                                 "releases": []}, nd_artist_id=row.get("id", ""))
+            _index_store_unresolved_artist(name, row.get("id", ""))
             unresolved += 1
             continue
         try:
@@ -15182,6 +17090,457 @@ def _library_index_task(task_id: str, user: dict) -> None:
             unresolved += 1
     _task_finish(task_id, f"Indexed {indexed} artist(s), "
                           f"{skipped} already fresh, {unresolved} unresolved")
+
+# ---------------------------------------------------------------------------
+# The auto-index worker (PLAN-lbbot-index-mirror-2026-09-23 §2.5, task 5).
+#
+# The clients' index mirrors are only as complete as the index, and until this
+# the index grew only when someone pressed "Build library index" or opened an
+# artist page. The worker keeps it complete in the background, one artist per
+# tick, lowest priority on everything it shares:
+#
+# - **Sources**, all of them Navidrome artists (`_auto_index_select`): those
+#   with no index row; those whose row is a stub (`scan_version = 0`, left by
+#   a fill or by orphan adoption); those whose row is stale (older than
+#   LB_BOT_INDEX_TTL_DAYS, or scanned under an older INDEX_SCAN_VERSION); and
+#   any of those that failed before, once their backoff expires. Index rows
+#   no Navidrome artist maps to (a MusicBrainz-browse `mb:` page, an artist
+#   since removed from the library) are not the library's and are left alone.
+# - **The artist list** is re-read every AUTO_INDEX_DIFF_SECS, and at once when
+#   Navidrome finishes a scan. lb-bot had no scan-finished signal (placement
+#   only asks `getScanStatus` whether one is running), so the worker polls it
+#   every AUTO_INDEX_SCAN_POLL_SECS and treats `scanning` going true -> false,
+#   or `lastScan` moving, as "a scan finished".
+# - **MusicBrainz**: the whole scan runs under `mbz_background()`, so every
+#   request it makes yields to any interactive caller (see `_mbz_turn`). The
+#   name search is strict: an outage raises and is backed off, never written
+#   down as "no such artist" (ruling R13).
+# - **A manual build** (`_library_index_task`) pauses the worker; they would
+#   walk the same artists. Checked before each artist, so the overlap is at
+#   most the one artist already in progress, and that scan is idempotent.
+# - **Failures** back off per artist, exponentially, in memory
+#   (`_auto_index_backoff`); a MusicBrainz outage also pauses the whole worker
+#   for AUTO_INDEX_MB_OUTAGE_PAUSE, since the next artist would fail the same way.
+# - **Writes** go through the same `_index_store_artist` /
+#   `_index_store_unresolved_artist` the manual build uses, so the seq triggers
+#   carry every one of them to the mirrors — and so does any mistake.
+#   `POST /api/artist/discography` stays the per-artist retry/force button.
+# - **The review too, exactly like the manual build** (ruling R36, which
+#   reverted R32). Each scan's review groups are unioned into Fill-gaps: an
+#   `incomplete` row's `group_id` is the clients' live `/lb/gap` handle, and a
+#   worker that wrote the row without the group made Fill gaps on that album
+#   answer 404 until a manual build. A hidden group stays hidden
+#   (`_merge_review_groups` carries the decision); a removed one can come back
+#   on the artist's next rescan, as it always could with the manual build —
+#   and the stale jitter below spreads those rescans rather than delivering
+#   them as one monthly burst.
+# - **Bounded, whatever the DB says** (final review C1). Two Navidrome artists
+#   that name-search to the same mbid ("Beyonce"/"Beyoncé") used to take the
+#   one `nd_artist_id` column in turns: each scan made the other "missing",
+#   which always ranks first, so the worker rescanned the pair live against
+#   MusicBrainz forever and moved the head every tick. Two guards: a resolved
+#   mbid whose row is fresh and held by ANOTHER Navidrome artist still in the
+#   library is "covered" (remembered in `state["covered"]`, nothing written),
+#   and a Navidrome id scanned in this process is not picked again inside the
+#   TTL (`state["scanned"]`) unless its tag mbid changed (R15).
+# - **Staleness is jittered per key** (final review I2): a row is stale after
+#   `_auto_index_stale_after(key)`, 0-25 % past LB_BOT_INDEX_TTL_DAYS by a
+#   stable hash of the key. One bulk build otherwise ages out on one day and
+#   stays aligned forever — a monthly multi-hour burst of scans, pushes and
+#   whole-artist re-sends to every client. Missing artists, stubs and a
+#   scan-version change are not jittered. Clients still call a row stale at
+#   the plain TTL (contract §1a); the worker just gets to it a little later.
+# ---------------------------------------------------------------------------
+
+AUTO_INDEX_DIFF_SECS = 900.0            # re-read Navidrome's artist list
+AUTO_INDEX_SCAN_POLL_SECS = 60.0        # ask getScanStatus whether a scan finished
+AUTO_INDEX_IDLE_SECS = 30.0             # nothing to scan, paused, or backed off
+AUTO_INDEX_FAIL_BACKOFF_BASE = 1800.0   # first retry of a failed artist: 30 min
+AUTO_INDEX_FAIL_BACKOFF_MAX = 86400.0   # doubling per failure, capped at a day
+AUTO_INDEX_MB_OUTAGE_PAUSE = MBZ_FAIL_COOLDOWN  # whole worker, after an outage
+
+def _auto_index_new_state() -> dict:
+    """The worker's memory between ticks. In memory on purpose: a restart
+    costs a re-read of the artist list and a failed artist one early retry."""
+    return {"nd_artists": [], "nd_fetched_at": None,
+            "nd_scan": None, "scan_polled_at": None,
+            "failures": {},      # nd id -> {"count", "retry_at", "error"}
+            "scanned": {},       # nd id -> {"at", "tag"}: done in this process (C1)
+            "covered": {},       # nd id -> mbid whose fresh row another artist holds
+            "paused_until": 0.0}
+
+def _auto_index_enabled() -> bool:
+    """On unless `LB_BOT_AUTO_INDEX=0`, and only with a Navidrome login to scan
+    against — without one there is no library to index."""
+    user = _default_web_user() or {}
+    return bool(LB_BOT_AUTO_INDEX and NAVIDROME_URL and user.get("navidrome_user"))
+
+def _auto_index_backoff(count: int) -> float:
+    """Seconds before a failed artist is tried again, after `count` consecutive
+    failures: AUTO_INDEX_FAIL_BACKOFF_BASE doubling, capped at _MAX."""
+    exponent = min(max(0, int(count) - 1), 30)
+    return min(AUTO_INDEX_FAIL_BACKOFF_BASE * (2 ** exponent), AUTO_INDEX_FAIL_BACKOFF_MAX)
+
+def _auto_index_stale_after(key: str) -> float:
+    """Seconds after its `scanned_at` at which the worker treats `key`'s row
+    as stale: LB_BOT_INDEX_TTL_DAYS stretched by 0-25 %, by a hash of the key.
+
+    zlib.crc32, not hash(): Python salts str hashes per process, and a jitter
+    that moved on every restart would re-align nothing and re-scatter the
+    queue each boot.
+    """
+    ttl = LB_BOT_INDEX_TTL_DAYS * 86400
+    return ttl * (1 + (zlib.crc32(key.encode("utf-8")) % 1000) / 4000)
+
+def _auto_index_row_fresh(meta: dict, now: float) -> bool:
+    """A scanned (not stub) row, current scan version, inside its jittered TTL."""
+    version = int(meta.get("scan_version") or 0)
+    return (version == INDEX_SCAN_VERSION
+            and now - float(meta.get("scanned_at") or 0)
+            <= _auto_index_stale_after(meta.get("artist_key") or ""))
+
+def _auto_index_manual_build_running() -> bool:
+    """A user-started "Build library index" task is running. Reads the task rows
+    in place, without the copy `_tasks_snapshot` makes — this runs every tick."""
+    with _review_lock:
+        tasks = (_review_state.get("tasks") or {}).values()
+        return any(t.get("kind") == "library-index" and t.get("status") == "running"
+                   for t in tasks)
+
+def _auto_index_read_meta() -> list:
+    """Every `artists` row's identity and freshness, in one `_index_lock` hold."""
+    with _index_lock:
+        rows = _index_db().execute(
+            "SELECT artist_key, artist_mbid, nd_artist_id, scanned_at, scan_version "
+            "FROM artists").fetchall()
+    return [dict(r) for r in rows]
+
+def _auto_index_select(nd_artists: list, meta: list, now: float, failures: dict,
+                       scanned: dict | None = None, covered: dict | None = None) -> list:
+    """The worker's queue, best first: `[{nd_id, name, row, stored, reason}]`.
+
+    `row` is the artist in `_artist_index_rows()` shape (what
+    `_index_library_artist_mbid` takes); `stored` is its matched index row or
+    None; `reason` is `missing`, `stub` or `stale`. Order: missing, then stubs,
+    then stale oldest-first — a library with gaps is worse than one with old
+    rows. An artist inside its failure backoff is left out.
+
+    **Which row is the artist's.** Like `_index_get_artist`: the tag mbid's
+    key first; otherwise the rows holding the Navidrome id (`nd:<id>` or
+    `nd_artist_id`) — but with an mbid-keyed row preferred over an `nd:` one,
+    whatever their `scanned_at`. The two coexist only as residue: a fill's
+    insert racing an `nd:` -> mbid swap can recreate the stub, and old builds
+    could leave a miss-stub newer than the real row. Either way the mbid row
+    is the artist's discography, so a fresh one means no work, a stale one is
+    rescanned through its mbid, and the stub is never re-searched by name
+    (`_index_drop_shadowed_nd_stubs` removes it when that loses nothing).
+
+    `scanned` and `covered` are the worker's memory (C1): an id scanned
+    inside the TTL under the same tag mbid is skipped outright, and an
+    untagged id with no row of its own is judged by the row it was found to
+    share (`covered`), so a fresh shared row is no work.
+    """
+    scanned, covered = scanned or {}, covered or {}
+    by_key = {m["artist_key"]: m for m in meta}
+    by_nd: dict = {}
+    for m in meta:
+        key = m["artist_key"]
+        ids = {m.get("nd_artist_id") or ""}
+        if key.startswith("nd:"):
+            ids.add(key[3:])
+        for nd_id in ids - {""}:
+            by_nd.setdefault(nd_id, []).append(m)
+    ttl = LB_BOT_INDEX_TTL_DAYS * 86400
+    picked = []
+    for a in nd_artists:
+        nd_id = a.get("id") or ""
+        if not nd_id:
+            continue
+        fail = failures.get(nd_id)
+        if fail and fail.get("retry_at", 0) > now:
+            continue
+        tag_mbid = a.get("musicBrainzId") or ""
+        recent = scanned.get(nd_id)
+        if recent and now - recent["at"] < ttl and recent.get("tag", "") == tag_mbid:
+            continue
+        stored = by_key.get(tag_mbid) if tag_mbid else None
+        if stored is None and by_nd.get(nd_id):
+            stored = sorted(by_nd[nd_id], key=lambda m: (
+                m["artist_key"].startswith("nd:"),
+                -float(m.get("scanned_at") or 0), m["artist_key"]))[0]
+        if stored is None and not tag_mbid and covered.get(nd_id):
+            stored = by_key.get(covered[nd_id])
+        scanned_at = float((stored or {}).get("scanned_at") or 0)
+        version = int((stored or {}).get("scan_version") or 0)
+        # R15: a fresh `nd:` miss-stub is stale the moment Navidrome's row
+        # gains a tag mbid, however recently it was written. `stored` landed
+        # here via `by_nd` only because no row is keyed by `tag_mbid` yet —
+        # the stub predates the tag (or the tag was added after the miss) and
+        # its own `scanned_at`/`scan_version` say nothing about whether the
+        # *mbid* has ever been scanned. Without this, a stub scanned an hour
+        # ago hides the now-resolvable artist for up to LB_BOT_INDEX_TTL_DAYS,
+        # since the ordinary staleness check below only looks at its clock.
+        if (stored is not None and tag_mbid
+                and stored["artist_key"].startswith("nd:")
+                and not stored.get("artist_mbid")):
+            reason, rank = "stale", 2
+        elif stored is None:
+            reason, rank = "missing", 0
+        elif version == 0:
+            reason, rank = "stub", 1
+        elif (now - scanned_at > _auto_index_stale_after(stored["artist_key"])
+              or version != INDEX_SCAN_VERSION):
+            reason, rank = "stale", 2
+        else:
+            continue
+        picked.append((rank, scanned_at, (a.get("name") or "").lower(), nd_id, {
+            "nd_id": nd_id, "name": a.get("name") or "", "reason": reason,
+            "stored": stored,
+            "row": {"id": nd_id, "name": a.get("name") or "", "mbid": tag_mbid}}))
+    picked.sort(key=lambda p: p[:4])
+    return [p[4] for p in picked]
+
+def _auto_index_scan_finished(previous: dict | None, status: dict) -> bool:
+    """Did Navidrome finish a library scan between two `getScanStatus` answers?
+
+    `scanning` true -> false is the scan we watched; `lastScan` moving catches
+    one that started and finished between two polls. No baseline yet, or an
+    unreadable answer (`{}`), says nothing.
+    """
+    if not previous or not status or "scanning" not in status:
+        return False
+    if status.get("scanning"):
+        return False
+    if previous.get("scanning"):
+        return True
+    last = status.get("lastScan") or ""
+    return bool(last and previous.get("lastScan") and last != previous.get("lastScan"))
+
+def _index_drop_shadowed_nd_stubs() -> list:
+    """Delete `nd:X` rows that an mbid-keyed row holding Navidrome id X
+    supersedes, when that loses no filled album. Returns the keys dropped.
+
+    `_index_store_artist` already deletes `nd:X` whenever it writes the mbid
+    row, so these are residue: a fill's `_index_mark_release_present` insert
+    that used a key read just before an `nd:` -> mbid swap recreates the stub
+    (and, via the insert trigger, deletes its tombstone), and a pre-task-4
+    build could leave a miss-stub beside the real row. A stub is dropped only
+    when every `present` row it holds is also `present` on the mbid row;
+    otherwise it is left alone, since deleting it would un-own a filled album
+    and invite a second download (the acquisition-coherence round). Plain
+    DELETEs, so the triggers tombstone the key and every mirror drops it.
+    """
+    dropped = []
+    with _index_lock:
+        conn = _index_db()
+        with conn:
+            stubs = conn.execute("""
+                SELECT s.artist_key FROM artists s
+                 WHERE substr(s.artist_key, 1, 3) = 'nd:'
+                   AND EXISTS (SELECT 1 FROM artists m
+                                WHERE substr(m.artist_key, 1, 3) != 'nd:'
+                                  AND m.nd_artist_id = substr(s.artist_key, 4))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM release_groups r
+                        WHERE r.artist_key = s.artist_key AND r.status = 'present'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM release_groups k
+                                JOIN artists m ON m.artist_key = k.artist_key
+                               WHERE substr(m.artist_key, 1, 3) != 'nd:'
+                                 AND m.nd_artist_id = substr(s.artist_key, 4)
+                                 AND k.rgid = r.rgid AND r.rgid != ''
+                                 AND k.status = 'present'))
+            """).fetchall()
+            for row in stubs:
+                key = row["artist_key"]
+                conn.execute("DELETE FROM release_groups WHERE artist_key = ?", (key,))
+                conn.execute("DELETE FROM artists WHERE artist_key = ?", (key,))
+                dropped.append(key)
+    if dropped:
+        print(f"  auto-index: dropped {len(dropped)} nd: stub(s) an mbid row "
+              f"supersedes: {', '.join(dropped[:10])}")
+    return dropped
+
+def _auto_index_refresh(state: dict, now: float, user: dict) -> None:
+    """Re-read Navidrome's artist list when the 15-minute diff is due or a
+    Navidrome scan just finished. Mutates `state`.
+
+    **The album index expires with it** whenever a scan finished or the list
+    grew. `build_artist_discography` classifies against `_nd_album_index()`,
+    cached for up to `_ND_ALBUM_INDEX_TTL`; a new artist scanned against the
+    pre-scan copy would have every album it just gained classified `missing`
+    and then count as fresh for LB_BOT_INDEX_TTL_DAYS.
+    """
+    due = state["nd_fetched_at"] is None or now - state["nd_fetched_at"] >= AUTO_INDEX_DIFF_SECS
+    scan_finished = False
+    if state["scan_polled_at"] is None or now - state["scan_polled_at"] >= AUTO_INDEX_SCAN_POLL_SECS:
+        state["scan_polled_at"] = now
+        status = nd_get_scan_status(user["navidrome_user"], user["navidrome_password"]) or {}
+        scan_finished = _auto_index_scan_finished(state["nd_scan"], status)
+        if status and "scanning" in status:
+            state["nd_scan"] = {"scanning": bool(status.get("scanning")),
+                                "lastScan": status.get("lastScan") or ""}
+    if not (due or scan_finished):
+        return
+    known = {a.get("id") for a in state["nd_artists"]}
+    artists = _nd_artist_index(force=True)
+    if artists:
+        # Stamped only on an answer: a Navidrome still starting up at boot is
+        # asked again next tick, not fifteen minutes later.
+        state["nd_artists"] = list(artists)
+        state["nd_fetched_at"] = now
+    if scan_finished or any(a.get("id") not in known for a in artists or []):
+        with _ND_ALBUM_INDEX_LOCK:
+            _ND_ALBUM_INDEX["ts"] = 0.0
+    _index_drop_shadowed_nd_stubs()
+
+def _auto_index_covering_row(mbid: str, nd_id: str, now: float, live_ids) -> dict | None:
+    """The row keyed `mbid` when it is fresh and held by ANOTHER Navidrome
+    artist that is still in the library — i.e. this artist's discography is
+    already in the index under someone else's id (C1). None otherwise.
+
+    The holder must be live: a row still pointing at an id that left the
+    library (a retag mints a new one) belongs to whoever is here now.
+    """
+    with _index_lock:
+        row = _index_db().execute(
+            "SELECT artist_key, nd_artist_id, scanned_at, scan_version "
+            "FROM artists WHERE artist_key = ?", (mbid,)).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    holder = row.get("nd_artist_id") or ""
+    if not holder or holder == nd_id or holder not in live_ids:
+        return None
+    return row if _auto_index_row_fresh(row, now) else None
+
+def _auto_index_scan(cand: dict, user: dict, now: float | None = None,
+                     live_ids=frozenset()) -> str:
+    """Scan one candidate and store it. Returns `indexed`, `unresolved` (a
+    genuine MusicBrainz no-match, recorded as the miss-stub), `covered` (the
+    resolved mbid's fresh row belongs to another library artist; nothing is
+    written, and `cand["mbid"]` says which) or `kept`.
+
+    Raises MusicBrainzUnavailable on an outage (the name search is strict,
+    and `build_artist_discography`'s browse always was), and whatever else a
+    scan can raise; the caller backs off either way and writes nothing.
+    `kept`: MusicBrainz listed nothing for an artist whose stored discography
+    has releases — never the safer mistake to store, same rule as
+    `_artist_discography_task`'s, so it is treated as a failure too.
+    """
+    name, nd_id = cand["name"], cand["nd_id"]
+    now = time.time() if now is None else now
+    mbid = _index_library_artist_mbid(cand["row"], cand["stored"], strict=True)
+    cand["mbid"] = mbid
+    if not mbid:
+        _index_store_unresolved_artist(name, nd_id)
+        return "unresolved"
+    if _auto_index_covering_row(mbid, nd_id, now, live_ids) is not None:
+        return "covered"
+    result = build_artist_discography(mbid, name, user["navidrome_user"],
+                                      user["navidrome_password"])
+    if not result["releases"]:
+        stored = _index_get_artist(mbid, nd_id)
+        if stored and stored.get("releases"):
+            return "kept"
+    # Same as the manual build (R36): the row's group_id must resolve.
+    if result["review_groups"]:
+        _union_review_groups(result["review_groups"])
+    _index_store_artist(result, nd_artist_id=nd_id)
+    return "indexed"
+
+def _auto_index_record_failure(state: dict, nd_id: str, now: float, error: str) -> None:
+    fail = state["failures"].get(nd_id) or {"count": 0}
+    count = int(fail.get("count") or 0) + 1
+    state["failures"][nd_id] = {"count": count, "error": error,
+                                "retry_at": now + _auto_index_backoff(count)}
+
+def _auto_index_tick(state: dict, now: float, user: dict) -> str:
+    """One step of the worker: at most one artist scanned. Mutates `state`,
+    returns what happened — `indexed`, `unresolved`, `covered` or `failed`
+    (keep going), or `paused` (a manual build runs), `outage` (MusicBrainz is
+    backed off) and `idle` (nothing to do), after which the loop sleeps.
+    """
+    if _auto_index_manual_build_running():
+        return "paused"
+    if now < state["paused_until"]:
+        return "outage"
+    _auto_index_refresh(state, now, user)
+    queue = _auto_index_select(state["nd_artists"], _auto_index_read_meta(),
+                               now, state["failures"],
+                               state.setdefault("scanned", {}),
+                               state.setdefault("covered", {}))
+    if not queue:
+        return "idle"
+    cand = queue[0]
+    live_ids = {a.get("id") for a in state["nd_artists"] if a.get("id")}
+    try:
+        with mbz_background():
+            outcome = _auto_index_scan(cand, user, now, live_ids)
+    except MusicBrainzNoSuchEntity as e:
+        # R14: a permanent 4xx (a bad or merged mbid) is this ONE artist's
+        # problem, not MusicBrainz's — pausing the whole worker for it meant
+        # every tick that landed on this artist again after its own backoff
+        # expired re-paused everyone else for AUTO_INDEX_MB_OUTAGE_PAUSE too.
+        # Caught before the base MusicBrainzUnavailable below, since this is
+        # a subclass of it.
+        print(f"  auto-index: {cand['name']}: {e}; per-artist backoff only "
+              f"(bad mbid, not an outage)")
+        _auto_index_record_failure(state, cand["nd_id"], now, str(e))
+        return "failed"
+    except MusicBrainzUnavailable as e:
+        print(f"  auto-index: {cand['name']}: {e}; backing off")
+        _auto_index_record_failure(state, cand["nd_id"], now, str(e))
+        state["paused_until"] = now + AUTO_INDEX_MB_OUTAGE_PAUSE
+        return "failed"
+    except Exception as e:  # noqa: BLE001 — one artist must not stop the worker
+        print(f"  auto-index: {cand['name']} failed: {e}")
+        _auto_index_record_failure(state, cand["nd_id"], now, str(e))
+        return "failed"
+    if outcome == "kept":
+        print(f"  auto-index: {cand['name']}: MusicBrainz listed no releases; "
+              f"kept the stored discography")
+        _auto_index_record_failure(state, cand["nd_id"], now, "no releases listed")
+        return "failed"
+    state["failures"].pop(cand["nd_id"], None)
+    # C1: whatever the DB now says about this id, it is not picked again
+    # inside the TTL (unless its tag mbid changes).
+    state["scanned"][cand["nd_id"]] = {"at": now, "tag": cand["row"]["mbid"]}
+    if outcome == "covered":
+        print(f"  auto-index: {cand['name']}: {cand['mbid']} is already indexed "
+              f"under another library artist; not rewriting it")
+        state["covered"][cand["nd_id"]] = cand["mbid"]
+    else:
+        state["covered"].pop(cand["nd_id"], None)
+    return outcome
+
+def _auto_index_worker(clock=time.time, sleeper=time.sleep) -> None:
+    """The `auto-index` daemon thread. A no-op when LB_BOT_AUTO_INDEX is off or
+    Navidrome is not configured — checked once, since neither can change
+    without a restart. Otherwise ticks back to back while there is work (the
+    MusicBrainz pacing is the throttle) and sleeps AUTO_INDEX_IDLE_SECS when a
+    tick found none. Clock and sleeper are injectable so a test never sleeps.
+    """
+    if not _auto_index_enabled():
+        print("  auto-index: off (LB_BOT_AUTO_INDEX=0 or no Navidrome login)")
+        _auto_index_public.update({"running": False})
+        return
+    state = _auto_index_new_state()
+    _auto_index_public.update({"running": True})
+    while True:
+        outcome = "idle"
+        try:
+            outcome = _auto_index_tick(state, clock(), _default_web_user())
+        except Exception as e:  # noqa: BLE001 — a background errand never exits
+            print(f"  auto-index: tick failed: {e}")
+        _auto_index_public.update({
+            "outcome": outcome, "at": clock(),
+            "failing": len(state.get("failures") or {}),
+            "pausedUntil": float(state.get("paused_until") or 0),
+            "scannedThisRun": len(state.get("scanned") or {}),
+        })
+        if outcome in ("idle", "paused", "outage"):
+            sleeper(AUTO_INDEX_IDLE_SECS)
 
 def _retag_task(task_id: str, group_id: str) -> None:
     with _review_lock:
@@ -15312,7 +17671,13 @@ def _gap_auto_task(task_id: str, group_id: str) -> None:
     if not folders:
         _task_finish(task_id, error="No sources found on slskd")
         return
-    order = _source_failover_order(len(folders), 0)
+    order = _source_failover_order(len(folders), 0, folders=folders)
+    if not order:
+        # Sources exist but none carries artist evidence: the unattended path
+        # must not guess. The list stays on the group for a manual pick.
+        _task_finish(task_id, error="Sources found, but none verifiably match "
+                                    "the artist — pick one manually")
+        return
     _task_update(task_id, total=len(order))
     last_msg = ""
     for attempt, idx in enumerate(order):
@@ -15504,10 +17869,27 @@ def _redact_secrets(value) -> str:
         *(u.get("navidrome_password", "") for u in USERS),
     ]
     for secret in secrets:
-        if secret:
-            text = text.replace(str(secret), "[redacted]")
+        if not secret:
+            continue
+        secret = str(secret)
+        if len(secret) >= 12:
+            text = text.replace(secret, "[redacted]")
+        else:
+            # A short secret is only replaced where it stands on its own: this
+            # runs on every printed line now, and a password like "music"
+            # rewrote every /music/… path in the Logs view. Where one rides in
+            # a query string, the p=/token= rules below catch it anyway.
+            text = re.sub(r"(?<![\w/.-])" + re.escape(secret) + r"(?![\w/.-])",
+                          "[redacted]", text)
     text = re.sub(r"(?i)(token|password|secret|api[_-]?key)(=|:)[^\s,;}]+",
                   r"\1\2[redacted]", text)
+    # Subsonic auth rides in the query string: t (md5 token) + s (salt) replay
+    # as a login, p is the password itself, u the user. requests prints the
+    # whole URL in its exceptions, and since 2026-09-26 printed lines reach the
+    # web log ring (_LogTee), so they have to go.
+    text = re.sub(r"([?&](?:u|t|s|p)=)[^&\s'\")]*", r"\1[redacted]", text)
+    # urllib3 names the host outside any URL: HTTPSConnectionPool(host='…').
+    text = re.sub(r"host='(?!localhost'|127\.0\.0\.1')[^']+'", "host='[redacted-host]'", text)
     text = re.sub(r"https?://(?!localhost|127\.0\.0\.1)([^/:@\s]+)",
                   lambda m: m.group(0).replace(m.group(1), "[redacted-host]"),
                   text)
@@ -15529,31 +17911,22 @@ def _config_card(key: str, title: str, values: dict, ok: bool,
 def _settings_cards(user: dict = None, diagnostics: list = None) -> dict:
     user = user or (_default_web_user() or {})
     checks = diagnostics or []
-    failed_text = " ".join(label for ok, label, _detail in checks if not ok).lower()
-    examples = {
-        "docker_run": (
-            "docker run -d --name lb-bot --restart unless-stopped -p 8899:8899 "
-            "-e LB_BOT_WEB=1 -e LB_BOT_WEB_HOST=0.0.0.0 -e LB_BOT_WEB_PORT=8899 "
-            "-e LB_BOT_MUSIC_DIR=/music "
-            "-e SLSKD_DOWNLOAD_DIR=/downloads "
-            "-v /mnt/user/appdata/lb-bot:/bot-config:rw "
-            "-v /mnt/user/appdata/slskd/downloads:/downloads:rw "
-            "-v /mnt/user/Music:/music:rw lb-bot:local"
-        ),
-        "paths": "/music, /downloads, /config, /bot-config, web port 8899",
-    }
+    # Exact labels, not a substring of all of them: "Library path ↔ Navidrome"
+    # failing used to flag the Navidrome *credentials* card as well, while the
+    # Navidrome check itself passed on the same screen.
+    failed = {label.strip().lower() for ok, label, _detail in checks if not ok}
     cards = [
         _config_card("navidrome", "Navidrome", {
             "url": _redacted_url(NAVIDROME_URL),
             "user": user.get("navidrome_user", ""),
             "password": "[redacted]" if user.get("navidrome_password") else "not set",
-        }, "navidrome" not in failed_text,
+        }, "navidrome" not in failed,
             "Check NAVIDROME_URL and keep credentials in environment variables."),
         _config_card("slskd", "slskd", {
             "url": _redacted_url(SLSKD_URL),
             "api_key": "[redacted]" if SLSKD_API_KEY else "not set",
             "downloads": SLSKD_DOWNLOAD_DIR,
-        }, "slskd" not in failed_text,
+        }, "slskd" not in failed,
             "Set SLSKD_URL, SLSKD_API_KEY, and mount slskd downloads at /downloads."),
         _config_card("listenbrainz", "ListenBrainz", {
             "user": user.get("listenbrainz_user", ""),
@@ -15572,10 +17945,9 @@ def _settings_cards(user: dict = None, diagnostics: list = None) -> dict:
         _config_card("docker_mounts", "Docker mounts", {
             "music": MUSIC_LIBRARY_PATH,
             "downloads": SLSKD_DOWNLOAD_DIR,
-            "config": "/config",
-            "bot_config": os.path.dirname(REVIEW_FILE) or "/bot-config",
+            "config": os.path.dirname(REVIEW_FILE) or "/config",
         }, MUSIC_LIBRARY_PATH.startswith("/") and SLSKD_DOWNLOAD_DIR.startswith("/"),
-            "Mount /music, /downloads, /config, and /bot-config into the container."),
+            "Mount /music, /downloads and /config into the container."),
         _config_card("web", "Web dashboard", {
             "host": WEB_UI_HOST,
             "port": WEB_UI_PORT,
@@ -15583,7 +17955,7 @@ def _settings_cards(user: dict = None, diagnostics: list = None) -> dict:
         }, bool(WEB_UI_ENABLED),
             "Set LB_BOT_WEB=1 and publish port 8899 on your LAN host."),
     ]
-    return {"cards": cards, "examples": examples}
+    return {"cards": cards}
 
 def _audio_files_in_folder(folder: str, limit: int = 80,
                            recursive: bool = True) -> list:
@@ -16381,11 +18753,12 @@ def _reconcile_group_downloaded_files(group: dict, folder_paths: list = None) ->
         if not best:
             continue
         used.add(best.get("filename", ""))
+        previous_decision = track.get("decision", "")
         track["decision"] = "downloaded"
         track["local_path"] = best.get("path", "")
         track["matched_relpath"] = best.get("relpath") or best.get("name", "")
         track["download_state"] = "reconciled"
-        track["downloaded_at"] = time.time()
+        _stamp_downloaded(track, previous_decision)
         track.pop("download_error", None)
         if job:
             tid = track.get("repair_track_id") or _repair_track_id(group.get("id", ""), idx, track)
@@ -16621,7 +18994,8 @@ def _artist_index_rows() -> list:
 # shelf is "more of what you already have", not a shopping list.
 _SIMILAR_ALBUM_STATUS_RANK = {"complete": 0, "incomplete": 1, "untagged": 2}
 
-def _album_lookup_marked(query: str, limit: int = 8) -> list:
+def _album_lookup_marked(query: str, limit: int = 8, artist: str = "",
+                         album: str = "") -> list:
     """MusicBrainz album search with ownership marked rather than left unanswered.
 
     `mbz_search_release_groups` returns MusicBrainz's own ranking and knows
@@ -16656,9 +19030,17 @@ def _album_lookup_marked(query: str, limit: int = 8) -> list:
     library index. This route's `_mbz_lock` exposure stays the one search it
     always had.
     """
-    candidates = mbz_search_release_groups(query.replace(" - ", " "), limit)
-    candidates.sort(key=lambda c: (0 if c["primary_type"] == "album" else 1,
-                                   -c["score"]))
+    if album:
+        # The caller knows which half is the artist: fielded, quoted, with the
+        # free-text fallback and the title re-rank (`_mbz_release_group_for`).
+        # The SPA used to build `artist:"…" AND releasegroup:"…"` itself, with
+        # no quoting and no fallback, so '"Heroes"' or a title with an edition
+        # suffix came back as "MusicBrainz has no album called …".
+        candidates = _mbz_release_group_for(artist, album, limit)
+    else:
+        candidates = mbz_search_release_groups(query.replace(" - ", " "), limit)
+        candidates.sort(key=lambda c: (0 if c["primary_type"] == "album" else 1,
+                                       -c["score"]))
 
     # Best-effort, exactly as on the Fresh feed and the similar-artists row: a
     # stale index DB degrades to "no badges", never to a 500 on a search box.
@@ -17072,9 +19454,42 @@ _TRACK_STATE_BY_DECISION = {
     "verified": "done",
 }
 
-def _gap_status_for_group(group: dict) -> str:
+# How long a group may sit on "downloaded" — files fetched, placement still to
+# come — before it stops claiming to be in progress. Placement follows a finished
+# download within minutes; the 18 groups the Fill-gaps rail reported as
+# "downloading" on 2026-09-26 had been there for 7 to 55 days, with nothing
+# transferring and nothing placing. Past this age the honest status is
+# "failed": it needs the user (reconcile, rescan), not patience.
+DOWNLOADED_STALE_SECS = 1800
+
+def _downloaded_is_stale(group: dict, now: float | None = None) -> bool:
+    """True when no track has *entered* "downloaded" for DOWNLOADED_STALE_SECS.
+
+    Reads only the tracks' `downloaded_at`, which `_stamp_downloaded` sets on the
+    transition and nothing else moves. It used to read the group's `updated_at`
+    too, which Skip, Unhide, allow-MP3, a rescan, a source search and the Stuck
+    card's own Reconcile all bump without placing anything — so a stuck album
+    read "working" for another 30 minutes after every one of them. A downloaded
+    track with no stamp predates the stamp and has been there at least that long.
+    """
+    stamps = [float(t.get("downloaded_at") or 0)
+              for t in (group.get("missing_tracks") or [])
+              if t.get("decision") == "downloaded"]
+    newest = max(stamps, default=0.0)
+    return ((now or time.time()) - newest) > DOWNLOADED_STALE_SECS
+
+def _gap_status_for_group(group: dict, now: float | None = None) -> str:
     bucket = _review_group_next_action(group).get("bucket", "")
+    if bucket == "downloaded" and _downloaded_is_stale(group, now):
+        return "failed"
     return _GAP_STATUS_BY_BUCKET.get(bucket, "ready")
+
+def _group_needs_attention(status: str) -> bool:
+    """The one definition of "this album has gaps" for every count the UI shows:
+    anything not complete. The Fill-gaps rail, the Library title and the summary
+    used to answer it three different ways (3103 / 3012 / 3121 on the same
+    library), which read as a bug even when each was defensible."""
+    return status != "complete"
 
 def rescan_group_from_disk(group_id: str) -> dict:
     """Re-check one album, without a full library scan.
@@ -17180,8 +19595,15 @@ def _album_view(group: dict, artist_map: dict = None) -> dict:
         "extra": int(group.get("extra") or 0),
         "missingCount": len(group.get("missing_tracks") or []),
         "status": _gap_status_for_group(group),
+        # How many ranked sources the last search left on the group; 0 means no
+        # search has run (or it found nothing), so nothing is "ready" yet.
+        "sourceCount": (int(group.get("source_count") or 0) if "source_count" in group
+                        else len((group.get("source_results") or {}).get("folders") or [])),
         "coverUrl": f"/api/cover/{album_id}?size=160" if album_id else "",
         "updatedAt": group.get("updated_at", 0),
+        # The release a folder would be filed as. Empty for a playlist's
+        # "Loose tracks" group, which /api/place-folder cannot file into.
+        "releaseMbid": group.get("canonical_mbid", "") or group.get("release_mbid", ""),
     }
 
 def _source_view(summary: dict) -> dict:
@@ -17220,12 +19642,19 @@ def _source_view(summary: dict) -> dict:
         "albumMatch": summary.get("album_match", 0),
         "albumMatchOk": bool(summary.get("album_match_ok")),
         "yearInPath": bool(summary.get("year_in_path")),
+        "artistVerified": bool(summary.get("artist_verified", True)),
+        "artistEvidence": summary.get("artist_evidence", ""),
+        "searchPass": summary.get("search_pass", 0),
         "score": summary.get("score", 0),
     }
 
-def _gaps_view(status_filter: str = "", origin_filter: str = "") -> dict:
+def _gaps_view(status_filter: str = "", origin_filter: str = "",
+               hidden: bool = False) -> dict:
+    """The Fill-gaps list. `hidden=True` lists only the groups the user skipped,
+    so a skip can be undone; the counts and origins always describe the visible
+    list, so the chips don't change meaning while you look at the hidden one."""
     snap = _review_list_snapshot()
-    counts = {"needs": 0, "working": 0, "done": 0, "all": 0}
+    counts = {"needs": 0, "working": 0, "done": 0, "all": 0, "hidden": 0}
     # Since a scan replaces only its own origin, a playlist's handful of albums
     # now lands among the library's thousands. Counting them per origin is what
     # lets the UI offer "just what this scan found" — which is the affordance
@@ -17237,6 +19666,13 @@ def _gaps_view(status_filter: str = "", origin_filter: str = "") -> dict:
     items = []
     for group in snap.get("groups", []) or []:
         if group.get("hidden"):
+            counts["hidden"] += 1
+            if hidden:
+                view = _album_view(group, artist_map)
+                view["origin"] = _review_group_origin(group)
+                view["hidden"] = True
+                view["searching"] = False
+                items.append(view)
             continue
         origin = _review_group_origin(group)
         origins[origin] = origins.get(origin, 0) + 1
@@ -17249,6 +19685,10 @@ def _gaps_view(status_filter: str = "", origin_filter: str = "") -> dict:
         for key, statuses in _GAP_FILTER_STATUSES.items():
             if view["status"] in statuses:
                 counts[key] += 1
+        # Counted above either way, so the chips keep meaning the visible list
+        # while the hidden one is on screen.
+        if hidden:
+            continue
         if wanted is not None and view["status"] not in wanted:
             continue
         if origin_filter and origin != origin_filter:
@@ -17355,7 +19795,10 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
     for i, summary in enumerate(page.get("sources", [])):
         src = _source_view(summary)
         src["rank"] = page.get("page", 0) * page.get("per", 10) + i + 1
-        src["recommended"] = (src["rank"] == 1)
+        # Same rule as /api/album/sources: rank 1 is only a recommendation
+        # when it carries artist evidence.
+        src["recommended"] = (src["rank"] == 1
+                              and src.get("artistVerified", True))
         sources.append(src)
     fail_msg = next((m for m in reversed(group.get("messages", []) or [])
                      if m.get("kind") in ("error", "blocked_no_source", "download_failed")),
@@ -17367,7 +19810,23 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
         1 for t in missing
         if t.get("decision") == "failed"
         and "no matching file in source" in (t.get("download_error", "") or ""))
+    # Files that downloaded and were never placed (see DOWNLOADED_STALE_SECS).
+    # Said in words, because the list only shows "failed" and the usual failure
+    # card offers the next source — which is the wrong fix for files already here.
+    stalled = sum(1 for t in missing if t.get("decision") == "downloaded")
+    stalled_placement = bool(stalled) and view["status"] == "failed" \
+        and _review_group_next_action(group).get("bucket") == "downloaded"
+    # Whatever an older message says: the files are here, so an earlier search's
+    # "no peer had these tracks" is not why the album is stuck, and a client
+    # handed that failureKind offers a source retry that cannot help.
+    if stalled_placement:
+        fail_msg = {"kind": "stalled_placement",
+                    "message": (f"{stalled} track(s) downloaded but were never filed "
+                                "into the album. Reconcile the downloaded files to "
+                                "match them again, or rescan the album if they are "
+                                "already there.")}
     view.update({
+        "stalledPlacement": stalled_placement,
         "tracks": tracks,
         "sources": sources,
         "sourcesTotal": page.get("total", 0),
@@ -17414,7 +19873,9 @@ def _transfers_view() -> dict:
     # review_group_id → {artist, album}, so per-track fills can be grouped under
     # one collapsible album header on the Downloads tab (the track dict itself
     # rarely carries the album name).
-    group_meta = {g.get("id"): g for g in _review_snapshot().get("groups", []) or []}
+    # artist and album are list-snapshot fields: the full copy here cost every
+    # /api/summary poll ~234 ms for two strings per group.
+    group_meta = {g.get("id"): g for g in _review_list_snapshot().get("groups", []) or []}
     transfers = []
     for row in snap.get("bot_pending", []):
         key = (row.get("username", ""), row.get("filename", ""))
@@ -17511,27 +19972,38 @@ def _unidentified_count(placements: list) -> int:
     return sum(1 for p in placements
                if not p.get("match") and not p.get("releaseMbid"))
 
-def _needs_placement_view() -> list:
+def _needs_placement_view(include_filed: bool = False) -> list:
+    """Download folders waiting to be filed. `include_filed` also lists the ones
+    already imported or dismissed that are still on disk — the leftovers the old
+    Import tab showed alongside the real queue without telling them apart."""
     folders = _download_folders_cached()
-    groups = _review_snapshot().get("groups", []) or []
+    # The list snapshot, not _review_snapshot(): this runs inside /api/summary,
+    # i.e. on every poll of every screen, and the full copy is ~14 MB live.
+    groups = _review_list_snapshot().get("groups", []) or []
+    match_index = _review_group_match_index(groups)
     rows = []
     for folder in folders:
         # Already-imported and user-dismissed folders are not "waiting to be
         # filed" — only this view filters them; the Import tab and telegram
         # /beets listing deliberately keep showing everything on disk.
         path = folder.get("path", "")
-        if path in _imported_folders or path in _dismissed_folders:
+        filed = ("imported" if path in _imported_folders
+                 else "dismissed" if path in _dismissed_folders else "")
+        if filed and not include_filed:
             continue
-        suggestion = _suggest_review_group_for_folder(folder, groups)
+        suggestion = (None if filed
+                      else _suggest_review_group_for_folder(folder, groups, match_index))
         # A review group is higher-signal than anything we can infer from the
         # folder itself, so it keeps precedence; the cached MusicBrainz identity
         # only speaks for folders the bot never queued.
         ident = {} if suggestion else _folder_identity_for(folder)
-        confidence = "likely" if suggestion else (ident.get("confidence") or "unknown")
         file_count = folder.get("file_count", 0)
+        confidence = (_suggestion_confidence(suggestion, file_count) if suggestion
+                      else (ident.get("confidence") or "unknown"))
         track_count = int(ident.get("track_count") or 0)
         rows.append({
             "id": hashlib.sha1(folder["path"].encode("utf-8")).hexdigest()[:12],
+            "filed": filed,
             "name": folder.get("name", ""),
             "path": folder.get("path", ""),
             "fileCount": file_count,
@@ -17547,9 +20019,11 @@ def _needs_placement_view() -> list:
             "releaseMbid": ident.get("release_mbid", ""),
             "coverUrl": ident.get("cover_url", ""),
             "identifyError": ident.get("error", ""),
-            "canConfirm": bool(suggestion) or bool(
-                ident.get("release_mbid")
+            "canConfirm": bool(
+                (suggestion or ident.get("release_mbid"))
                 and confidence in _CONFIRMABLE_CONFIDENCE),
+            "groupId": (suggestion or {}).get("group_id", ""),
+            "matchBasis": (suggestion or {}).get("basis", ""),
             "diff": {
                 "filesFound": file_count,
                 "trackCount": track_count,
@@ -17559,29 +20033,58 @@ def _needs_placement_view() -> list:
         })
     return rows
 
-def _library_view(status_filter: str = "", query: str = "",
-                  page: int = 0, per: int = 50) -> dict:
-    albums = _nd_album_index()
-    groups = _review_snapshot().get("groups", []) or []
-    group_by_album_id = {}
-    for group in groups:
+def _library_groups_by_album_id() -> dict:
+    """Navidrome album id -> the visible review group covering it. From the list
+    snapshot: this used to deep-copy the whole review (14 MB live) per poll."""
+    out = {}
+    for group in _review_list_snapshot().get("groups", []) or []:
         if group.get("hidden"):
             continue
         for rec in group.get("albums", []) or []:
-            group_by_album_id[rec.get("id", "")] = group
+            if rec.get("id"):
+                out[rec["id"]] = group
+    return out
+
+def _library_gap_album_count(albums: list = None) -> int:
+    """Library albums whose review group is not complete — the number the Library
+    title and the summary both report."""
+    albums = _nd_album_index() if albums is None else albums
+    by_id = _library_groups_by_album_id()
+    n = 0
+    for album in albums:
+        group = by_id.get(album.get("id", ""))
+        if group and _group_needs_attention(_gap_status_for_group(group)):
+            n += 1
+    return n
+
+# Sorts the Library table offers. The table paginates here, so it has to sort
+# here too; "" keeps Navidrome's own album order.
+_LIBRARY_SORTS = {
+    "artist":  (lambda r: ((r["artist"] or "").lower(), (r["album"] or "").lower()), False),
+    "album":   (lambda r: (r["album"] or "").lower(), False),
+    "year":    (lambda r: int(r["year"] or 0), True),
+    # Most missing first, then A→Z — reverse=True flipped the tie-break to Z→A.
+    "missing": (lambda r: (-max(0, (r["total"] or 0) - (r["present"] or 0)),
+                           (r["artist"] or "").lower()), False),
+}
+
+def _library_view(status_filter: str = "", query: str = "",
+                  page: int = 0, per: int = 50, sort: str = "") -> dict:
+    albums = _nd_album_index()
+    group_by_album_id = _library_groups_by_album_id()
     q = (query or "").lower().strip()
     rows = []
     with_gaps = 0
     for album in albums:
         group = group_by_album_id.get(album.get("id", ""))
         status = _gap_status_for_group(group) if group else "complete"
-        if group and group.get("missing_tracks"):
+        if group and _group_needs_attention(status):
             with_gaps += 1
         if q and q not in (album.get("artist", "") or "").lower() \
                 and q not in (album.get("name", "") or "").lower():
             continue
         if status_filter and status_filter != "all":
-            if status_filter == "gaps" and not (group and group.get("missing_tracks")):
+            if status_filter == "gaps" and not (group and _group_needs_attention(status)):
                 continue
             if status_filter == "working" and status != "downloading":
                 continue
@@ -17603,6 +20106,9 @@ def _library_view(status_filter: str = "", query: str = "",
             "groupId": group.get("id", "") if group else "",
             "coverUrl": f"/api/cover/{album.get('id', '')}?size=96",
         })
+    key = _LIBRARY_SORTS.get(sort or "")
+    if key:
+        rows.sort(key=key[0], reverse=key[1])
     pages = max(1, (len(rows) + per - 1) // per)
     page = max(0, min(int(page or 0), pages - 1))
     start = page * per
@@ -17684,6 +20190,7 @@ def _prefs_view() -> dict:
             "stallTimeoutSeconds": STALL_TIMEOUT,
             "albumMatchThreshold": ALBUM_MATCH_THRESHOLD,
             "maxSearchPasses": MAX_SEARCH_PASSES,
+            "trackEvidenceMin": _TRACK_EVIDENCE_MIN,
         },
     }
 
@@ -17749,7 +20256,7 @@ def _api_error_payload(code: str, reason: str, detail: str = "",
         "detail": detail,
         "nextSource": next_source,
         "logTail": log_tail if log_tail is not None
-                   else [_web_event_line(e) for e in _web_events[-5:]],
+                   else [_web_event_line(e) for e in _web_log_events()[-5:]],
     }
 
 # Decisions that mean "this track is still missing and nobody is working on
@@ -17769,14 +20276,31 @@ def _api_error_payload(code: str, reason: str, detail: str = "",
 # two decisions identically.
 _RETRYABLE_DECISIONS = ("pending", "failed", "cancelled", "source_pending")
 
+def _group_placement_stalled(group: dict) -> bool:
+    """Files downloaded, never placed, and nothing has moved for
+    DOWNLOADED_STALE_SECS — the Stuck card's case."""
+    return (_review_group_next_action(group).get("bucket") == "downloaded"
+            and _downloaded_is_stale(group))
+
 def _approve_pending_missing_tracks(group: dict) -> int:
     """The redesigned UI has no separate approve step — 'Get N tracks' means
-    all still-missing tracks. Flip them to approved in place."""
+    all still-missing tracks. Flip them to approved in place.
+
+    On a stalled group the downloaded-but-never-placed tracks count as missing
+    too: "download again from another source" and "search again" are the Stuck
+    card's remedies, and with "downloaded" left out every source answered "No
+    approved/source-pending tracks" — reported to the user as the peers
+    rejecting the request."""
     changed = 0
     live = None
+    stalled = _group_placement_stalled(group)
     for idx, track in enumerate(group.get("missing_tracks", []) or []):
         decision = track.get("decision", "pending")
-        if decision not in _RETRYABLE_DECISIONS:
+        if decision == "downloaded" and stalled:
+            for field in ("local_path", "matched_relpath", "download_state",
+                          "downloaded_at", "download_percent"):
+                track.pop(field, None)
+        elif decision not in _RETRYABLE_DECISIONS:
             # queued/downloading with no transfer behind it is a phantom — it
             # will never progress and must be re-approvable. Anything genuinely
             # in flight, and anything settled, is left alone.
@@ -17804,17 +20328,30 @@ SOURCE_FAILOVER_MAX = 6
 # attempts, but the *client* still needs an answer.
 SOURCE_FAILOVER_DEADLINE = float(os.environ.get("LB_BOT_SOURCE_FAILOVER_DEADLINE", "45"))
 
-def _source_failover_order(folder_count: int, start_index: int) -> list:
+def _source_failover_order(folder_count: int, start_index: int,
+                           folders: list = None,
+                           start_is_choice: bool = False) -> list:
     """The source indexes to try: the chosen one first, then the rest by rank.
 
     One definition shared by the two entry points that walk the list — the
     `/api/gaps/<id>/fetch` route and `_gap_auto_task` — because they disagreeing
     about it is how "auto picked a source manual wouldn't" happens.
+
+    With `folders`, indexes whose folder carries no artist evidence are
+    dropped: the walk is unattended, so it obeys the same rule as the first
+    pick (`_auto_download_choice`) and never guesses. `start_is_choice` keeps
+    the start index in even then — a user who tapped an unverified source has
+    looked at it, but the consent does not extend to the rest of the list.
     """
     if folder_count <= 0:
         return []
     start_index = max(0, min(int(start_index or 0), folder_count - 1))
     order = [start_index] + [i for i in range(folder_count) if i != start_index]
+    if folders is not None:
+        order = [i for i in order
+                 if (i == start_index and start_is_choice)
+                 or i >= len(folders)
+                 or folders[i].get("artist_verified", True)]
     return order[:SOURCE_FAILOVER_MAX]
 
 def _next_source_view(group: dict, after_index: int) -> dict | None:
@@ -17825,6 +20362,52 @@ def _next_source_view(group: dict, after_index: int) -> dict | None:
         view["rank"] = nxt + 1
         return view
     return None
+
+def _rejected_sources_count() -> int:
+    try:
+        with _index_lock:
+            row = _index_db().execute("SELECT COUNT(*) FROM rejected_sources").fetchone()
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+def _system_status_view() -> dict:
+    """Read-only facts about this process for Settings -> Status: which build,
+    what the background workers are doing, and which optional integrations are
+    configured. Everything env-only is reported, never editable here — the
+    only runtime-writable settings are /api/prefs."""
+    user = _default_web_user() or {}
+    head_seq = None
+    try:
+        head_seq = _index_head()[0]
+    except Exception:
+        pass
+    return {
+        "revision": WEB_BUILD,
+        "startedAt": _PROCESS_STARTED_AT,
+        "autoIndex": {"enabled": bool(LB_BOT_AUTO_INDEX),
+                      "ttlDays": LB_BOT_INDEX_TTL_DAYS,
+                      **_auto_index_public},
+        "hubPush": {"configured": _push_enabled(),
+                    "url": _redacted_url(HUB_NOTIFY_URL) if HUB_NOTIFY_URL else "",
+                    "headSeq": head_seq,
+                    **_index_push_public},
+        "acoustid": {"keySet": bool(ACOUSTID_API_KEY),
+                     "fpcalc": bool(shutil.which("fpcalc")),
+                     "minScore": ACOUSTID_MIN_SCORE,
+                     "unavailable": _acoustid_unavailable[0],
+                     "rejectedSources": _rejected_sources_count()},
+        "lastfm": {"keySet": bool(LASTFM_API_KEY)},
+        "spotify": {"configured": bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)},
+        "listenbrainz": {"user": user.get("listenbrainz_user", ""),
+                         "playlists": list((user.get("playlist_sources") or {}).values())},
+        "wishlist": {"intervalSeconds": WISHLIST_RESEARCH_INTERVAL,
+                     "cooldownSeconds": WISHLIST_ROW_COOLDOWN},
+        "search": {"timeoutSeconds": SEARCH_TIMEOUT,
+                   "stallTimeoutSeconds": STALL_TIMEOUT,
+                   "failoverMax": SOURCE_FAILOVER_MAX,
+                   "failoverDeadlineSeconds": SOURCE_FAILOVER_DEADLINE},
+    }
 
 def _summary_view() -> dict:
     gaps = _gaps_view()
@@ -17840,8 +20423,7 @@ def _summary_view() -> dict:
         ],
         "library": {
             "albums": len(albums),
-            "withGaps": sum(1 for g in _review_list_snapshot().get("groups", []) or []
-                            if not g.get("hidden") and g.get("missing_tracks")),
+            "withGaps": _library_gap_album_count(albums),
         },
         "ts": time.time(),
     }
@@ -18152,7 +20734,7 @@ def start_web_dashboard() -> None:
     def api_task(task_id):
         # The only caller that wants `result`: the Artist panel polls this one
         # task to pick up a finished discography scan's payload.
-        task = _tasks_snapshot(include_result=True).get(task_id)
+        task = _task_snapshot(task_id)
         if not task:
             return jsonify({"error": "Task not found"}), 404
         return jsonify(task)
@@ -18187,7 +20769,8 @@ def start_web_dashboard() -> None:
     @app.get("/api/gaps")
     def api_gaps():
         return jsonify(_gaps_view(request.args.get("filter", ""),
-                                  request.args.get("origin", "")))
+                                  request.args.get("origin", ""),
+                                  hidden=request.args.get("hidden", "") in ("1", "true")))
 
     @app.get("/api/gaps/<group_id>")
     def api_gap_detail(group_id):
@@ -18219,7 +20802,7 @@ def start_web_dashboard() -> None:
         return jsonify(_library_view(
             request.args.get("filter", ""),
             request.args.get("q", ""),
-            page))
+            page, sort=request.args.get("sort", "")))
 
     def _fresh_requested() -> bool:
         """?fresh=1 bypasses a TTL cache — the explicit "re-check" affordances."""
@@ -18369,11 +20952,23 @@ def start_web_dashboard() -> None:
                 return jsonify(_api_error_payload(
                     "bad_source", "Source index out of range")), 400
             _approve_pending_missing_tracks(group)
+            if not any(t.get("decision") in ("approved", "source_pending")
+                       for t in group.get("missing_tracks") or []):
+                # A local refusal, said as one: walking the sources here
+                # reported "N source(s) rejected the request" for a group with
+                # nothing to fetch, blaming every peer for it.
+                return jsonify(_api_error_payload(
+                    "nothing_to_fetch", "Nothing left to fetch for this album",
+                    "Every missing track is already downloading, downloaded or placed.")), 400
             job = (_repair_job_for_group(group_id)
                    or _create_or_update_repair_job_from_group(group))
             op = _operation_create("select_source", "Queueing selected source",
                                    (job or {}).get("id", ""))
-            order = _source_failover_order(len(folders), idx)
+            # start_is_choice: the tapped source is walked even unverified —
+            # the user looked at it — but the failover continuation is
+            # unattended and skips other unverified ones.
+            order = _source_failover_order(len(folders), idx, folders=folders,
+                                           start_is_choice=True)
             result = _enqueue_group_source(group, order[0])
             tried = 1
 
@@ -18473,8 +21068,14 @@ def start_web_dashboard() -> None:
 
     @app.get("/api/placements")
     def api_placements():
-        items = _needs_placement_view()
-        return jsonify({"items": items, "unidentified": _unidentified_count(items)})
+        # ?all=1 adds folders already filed or dismissed that are still on disk
+        # (each row's `filed` says which), for the Downloads screen's leftovers
+        # section. The default stays the queue, which /api/transfers also carries.
+        include_filed = request.args.get("all", "") in ("1", "true")
+        items = _needs_placement_view(include_filed=include_filed)
+        return jsonify({"items": items,
+                        "unidentified": _unidentified_count(
+                            [i for i in items if not i.get("filed")])})
 
     @app.post("/api/placements/identify")
     def api_placements_identify():
@@ -18509,17 +21110,24 @@ def start_web_dashboard() -> None:
         artist = data.get("artist", "")
         album = data.get("album", "")
         group_id = data.get("groupId", "") or data.get("group_id", "")
-        if not release_mbid:
+        if not release_mbid and not group_id:
+            # No body: file into the suggestion only if it is one a client may
+            # offer as one tap. The ident branch below has always been gated
+            # this way; this one used to file into whatever matched at click
+            # time, however weakly.
             suggestion = _suggest_review_group_for_folder(
-                folder, _review_snapshot().get("groups", []) or [])
-            if suggestion:
-                with _review_lock:
-                    group = _find_review_group(suggestion.get("group_id", ""))
-                    if group:
-                        group_id = group_id or group.get("id", "")
-                        release_mbid = group.get("canonical_mbid", "")
-                        artist = artist or group.get("artist", "")
-                        album = album or group.get("album", "")
+                folder, _review_list_snapshot().get("groups", []) or [])
+            if suggestion and _suggestion_confidence(
+                    suggestion, folder.get("file_count", 0)) in _CONFIRMABLE_CONFIDENCE:
+                group_id = suggestion.get("group_id", "")
+        if not release_mbid and group_id:
+            with _review_lock:
+                group = _find_review_group(group_id)
+                if group:
+                    release_mbid = (group.get("canonical_mbid", "")
+                                    or group.get("release_mbid", ""))
+                    artist = artist or group.get("artist", "")
+                    album = album or group.get("album", "")
         if not release_mbid:
             # No review group for this folder — fall back to its cached identity
             # (the hand-downloaded-album case), but only when identification was
@@ -18648,6 +21256,18 @@ def start_web_dashboard() -> None:
             stop_at = 0.0
         return jsonify(slskd_search_probe(query, wait, stop_at))
 
+    @app.get("/api/debug/album-search")
+    def api_debug_album_search():
+        """Scored album-search trace — see _debug_album_search_view."""
+        artist = (request.args.get("artist", "") or "").strip()
+        album = (request.args.get("album", "") or "").strip()
+        if not album:
+            return jsonify({"error": "album is required"}), 400
+        return jsonify(_debug_album_search_view(
+            artist, album,
+            (request.args.get("year", "") or "").strip(),
+            (request.args.get("release_mbid", "") or "").strip()))
+
     @app.post("/api/search")
     def api_search():
         data = request.get_json(silent=True) or {}
@@ -18695,9 +21315,12 @@ def start_web_dashboard() -> None:
         `_album_lookup_marked` for why they are release-level fields and why the
         existing snake_case keys are left alone."""
         query = request.args.get("q", "").strip()
-        if not query:
+        # `artist` + `album` instead of `q`: a fielded search for a known pair.
+        artist = request.args.get("artist", "").strip()
+        album = request.args.get("album", "").strip()
+        if not query and not album:
             return jsonify({"error": "q is required"}), 400
-        return jsonify({"candidates": _album_lookup_marked(query)})
+        return jsonify({"candidates": _album_lookup_marked(query, artist=artist, album=album)})
 
     @app.get("/api/album/releases")
     def api_album_releases():
@@ -18717,7 +21340,19 @@ def start_web_dashboard() -> None:
         rgid = request.args.get("rgid", "").strip()
         if not rgid:
             return jsonify({"error": "rgid is required"}), 400
-        data = mbz_get(f"release-group/{rgid}", {"inc": "releases artist-credits media"})
+        # Strict: a failed lookup used to come back as {} and answer 200 with
+        # artist "?", which the album page read as "MusicBrainz names no artist
+        # for this album" — for as long as the failure cooldown lasted.
+        try:
+            data = mbz_get(f"release-group/{rgid}", {"inc": "releases artist-credits media"},
+                           strict=True)
+        except MusicBrainzNoSuchEntity:
+            return jsonify(_api_error_payload(
+                "not_found", "MusicBrainz has no such release group")), 404
+        except MusicBrainzUnavailable:
+            return jsonify(_api_error_payload(
+                "musicbrainz_unavailable", "MusicBrainz is not answering right now",
+                "Try again in a few minutes.")), 503
         # Coarse buckets: MusicBrainz has dozens of format strings ('12" Vinyl',
         # 'Digital Media', 'Enhanced CD') and the picker offers three choices.
         def _edition_label(fmt: str) -> str:
@@ -18833,7 +21468,13 @@ def start_web_dashboard() -> None:
         artist = resolved.get("artist", "")
         album = resolved.get("title", "")
         total = int(resolved.get("total_tracks") or 0)
-        folders = slskd_search_album_folders(artist, album, total)
+        # The tracklist is fetched BEFORE the search now: it feeds the search
+        # (self-titled track query, track-title corroboration evidence) as
+        # well as the coverage pairing below. Same cached release document
+        # either way.
+        year, titles = _album_search_context(resolved["release_mbid"])
+        folders = slskd_search_album_folders(artist, album, total,
+                                             year=year, track_titles=titles)
         # Pair against the canonical tracklist. Coverage used to be
         # min(fileCount, total)/total with coverageFull = fileCount >= total — a
         # pure file count, so a folder holding a completely different album with
@@ -18846,7 +21487,9 @@ def start_web_dashboard() -> None:
         for i, fd in enumerate(folders[:12]):
             view = _source_view(_source_summary(fd, i, tracks=tracklist))
             view["rank"] = i + 1
-            view["recommended"] = (i == 0)
+            # Rank 1 is only a recommendation when it carries artist
+            # evidence; an unverified list is a manual decision by design.
+            view["recommended"] = (i == 0 and view.get("artistVerified", True))
             if tracklist:
                 detail = view.get("coverageDetail") or {}
                 have = int(detail.get("haveTracks") or 0)
@@ -18859,6 +21502,8 @@ def start_web_dashboard() -> None:
                 view["coverageFull"] = False
             sources.append(view)
         return jsonify({"sources": sources, "artist": artist, "album": album,
+                        "verifiedCount": sum(1 for s in sources
+                                             if s.get("artistVerified", True)),
                         "query": f"{artist} - {album}"})
 
     @app.post("/api/album/download")
@@ -18982,7 +21627,11 @@ def start_web_dashboard() -> None:
         def _ids(name):
             raw = request.args.get(name, "") or ""
             return [p.strip() for p in raw.split(",") if p.strip()]
-        return jsonify(_fills_view(_ids("release_mbids"), _ids("group_ids")))
+        mbids = _ids("release_mbids")
+        # ?recent=1: the newest album fills, for a screen that did not start them.
+        if request.args.get("recent", "") in ("1", "true"):
+            mbids = _recent_album_fill_mbids() + mbids
+        return jsonify(_fills_view(mbids, _ids("group_ids")))
 
     @app.get("/api/album/tracklist")
     def api_album_tracklist():
@@ -19345,27 +21994,41 @@ def start_web_dashboard() -> None:
         return jsonify({"releases": out, "days": days, "limit": limit,
                         "total": total, "truncated": total > len(out)})
 
+    @app.get("/api/index/changes")
+    def api_index_changes():
+        """The client index mirrors' change feed. See `_index_changes_view`."""
+        raw_since = request.args.get("since", "0")
+        try:
+            since = int(raw_since)
+        except (TypeError, ValueError):
+            return jsonify({"error": "since must be an integer"}), 400
+        if since < 0:
+            return jsonify({"error": "since must not be negative"}), 400
+        epoch = request.args.get("epoch", "")
+        payload, status = _index_changes_view(since, epoch)
+        return jsonify(payload), status
+
+    @app.get("/api/index/keys")
+    def api_index_keys():
+        """The drift-check key list. See `_index_keys_view`."""
+        payload, status = _index_keys_view()
+        return jsonify(payload), status
+
+    @app.get("/api/health")
+    def api_health():
+        """The hub's probe target. See `_index_health_view`."""
+        payload, status = _index_health_view()
+        return jsonify(payload), status
+
     @app.get("/api/artist/discography")
     def api_artist_discography_read():
-        """Instant read from the library index. {indexed: false} means the
-        caller should start a scan (POST below); a stored result is served
-        immediately even when stale — refresh is explicit (Rescan / bulk
-        build), never a surprise multi-minute wait on page open."""
+        """See `_artist_discography_read_view` — pure SQLite (task 4); the
+        present-row backfill no longer runs on this path."""
         mbid = request.args.get("mbid", "").strip()
         nd_id = request.args.get("nd_id", "").strip()
         if not mbid and not nd_id:
             return jsonify({"error": "mbid or nd_id is required"}), 400
-        # Before reading: give this artist's `present` rows their Navidrome album
-        # ids, so a client can open an album lb-bot itself filled. Placement
-        # cannot write them and only a full rescan otherwise would. No-ops (one
-        # SELECT) unless there is such a row, and never asks MusicBrainz.
-        _index_backfill_present_album_ids(_index_existing_artist_key(mbid, nd_id))
-        stored = _index_get_artist(mbid, nd_id)
-        scan = _artist_scan_get(mbid, nd_id)
-        extra = {"scan": scan} if scan else {}
-        if not stored:
-            return jsonify({"indexed": False, **extra})
-        return jsonify({"indexed": True, **stored, **extra})
+        return jsonify(_artist_discography_read_view(mbid, nd_id))
 
     @app.post("/api/artist/discography")
     def api_artist_discography():
@@ -19373,14 +22036,24 @@ def start_web_dashboard() -> None:
         mbid = data.get("mbid", "").strip()
         name = data.get("name", "").strip()
         nd_id = data.get("nd_id", "").strip()
-        if not mbid or not name:
-            return jsonify({"error": "mbid and name are required"}), 400
+        if not mbid:
+            return jsonify({"error": "mbid is required"}), 400
         user = _default_web_user()
         if not user:
             return jsonify({"error": "No configured user"}), 400
         # `mb:` ids come from the MusicBrainz search (artists not in the
         # library), so there's nothing to match against — skip the library fetch.
         skip_library = bool(data.get("external")) or nd_id.startswith("mb:")
+        if skip_library:
+            # Unless the library does have them, reached through a search row,
+            # a pasted link or a credit whose spelling differs from the tag.
+            # Scanned as external, their own index row was overwritten with
+            # every owned album marked missing.
+            owned = _owned_artist_for_mbid(mbid)
+            if owned:
+                skip_library = False
+                nd_id = owned["nd_id"]
+                name = owned["name"] or name
         running = _artist_scan_get(mbid, nd_id)
         if running and running["state"] == "running":
             # Pressing Rescan again while one runs queues nothing new; it used to
@@ -19388,7 +22061,7 @@ def start_web_dashboard() -> None:
             return jsonify({"ok": True, "task_id": running["taskId"], "running": True})
         task_id = _task_run(
             "artist-discography",
-            f"Scan discography: {name}",
+            f"Scan discography: {name or mbid}",
             lambda tid: _artist_discography_task(tid, mbid, name, user, nd_id,
                                                  skip_library=skip_library))
         return jsonify({"ok": True, "task_id": task_id})
@@ -19551,16 +22224,22 @@ def start_web_dashboard() -> None:
                      if build else None),
         })
 
+    @app.get("/api/download-folders")
     @app.get("/api/beets/folders")
     def api_beets_folders():
         # Cached: a fresh os.walk plus a mutagen read per file on every request
         # is the single most expensive thing the Import tab does. ?fresh=1 for
         # the explicit refresh. Copy the rows — the cache is shared.
         folders = [dict(f) for f in _download_folders_cached(_fresh_requested())]
-        with _review_lock:
-            groups = list(_review_state.get("groups", []) or [])
+        # ?path= answers for one folder: the placement drill-down needs only its
+        # own, and the full listing reads tags and matches every folder.
+        only = request.args.get("path", "")
+        if only:
+            folders = [f for f in folders if f.get("path") == only]
+        groups = _review_list_snapshot().get("groups", []) or []
+        match_index = _review_group_match_index(groups)
         for f in folders:
-            f["suggested_match"] = _suggest_review_group_for_folder(f, groups)
+            f["suggested_match"] = _suggest_review_group_for_folder(f, groups, match_index)
             # Seeds the release picker's search box, so arriving there from a
             # failed/low-confidence identification isn't an empty query.
             ident = _folder_identity_for(f)
@@ -19569,6 +22248,7 @@ def start_web_dashboard() -> None:
                 if ident.get("release_mbid") else "")
         return jsonify({"folders": folders})
 
+    @app.post("/api/place-folder/candidates")
     @app.post("/api/beets/release-candidates")
     def api_beets_release_candidates():
         data = request.get_json(silent=True) or {}
@@ -19589,6 +22269,10 @@ def start_web_dashboard() -> None:
             group, rec, data.get("query", ""))
         return jsonify({"ok": True, "candidates": candidates})
 
+    # The /api/beets/* names predate the beets removal (placement is the
+    # deterministic tag-and-move in _deterministic_import_task); the SPA uses the
+    # plain names, the old ones stay for anything still calling them.
+    @app.post("/api/place-folder")
     @app.post("/api/beets/import")
     def api_beets_import():
         data = request.get_json(silent=True) or {}
@@ -19596,13 +22280,22 @@ def start_web_dashboard() -> None:
         if not path:
             return jsonify({"error": "path is required"}), 400
         release_mbid = data.get("release_mbid", "")
+        group_id = data.get("group_id", "")
+        if not release_mbid and group_id:
+            # A caller holding only the gap's id (the SPA's match list is built
+            # from /api/gaps, which carries no MBIDs) — the group knows the rest.
+            with _review_lock:
+                group = _find_review_group(group_id)
+                if group:
+                    release_mbid = group.get("canonical_mbid") or group.get("release_mbid") or ""
+                    data.setdefault("artist", group.get("artist", ""))
+                    data.setdefault("album", group.get("album", ""))
         if not release_mbid:
             return jsonify(_api_error_payload(
                 "no_release", "No release selected",
                 "Pick a MusicBrainz release before placing this folder.")), 400
         artist = data.get("artist", "")
         album = data.get("album", "")
-        group_id = data.get("group_id", "")
         task_id = _task_run("placement", f"Place: {path}",
                             lambda tid: _deterministic_import_task(
                                 tid, path, release_mbid, artist, album, group_id))
@@ -19642,6 +22335,26 @@ def start_web_dashboard() -> None:
         _save_review_state()
         return jsonify(_with_operation({"ok": ok}, op)), (200 if ok else 500)
 
+    @app.get("/api/system/status")
+    def api_system_status():
+        return jsonify(_system_status_view())
+
+    @app.post("/api/acoustid/rejected/clear")
+    def api_acoustid_rejected_clear():
+        """Forget every peer AcoustID caught serving the wrong recording, so
+        they can be offered again. Destructive to a safety memory, hence the
+        explicit confirm."""
+        data = request.get_json(silent=True) or {}
+        if not data.get("confirm"):
+            return jsonify(_api_error_payload(
+                "confirm_required", "Pass {\"confirm\": true} to clear")), 400
+        with _index_lock:
+            conn = _index_db()
+            n = conn.execute("DELETE FROM rejected_sources").rowcount
+            conn.commit()
+        _web_log(f"acoustid: cleared {n} rejected source(s)")
+        return jsonify({"ok": True, "cleared": n})
+
     @app.get("/api/settings")
     def api_settings():
         user = _default_web_user()
@@ -19660,7 +22373,8 @@ def start_web_dashboard() -> None:
         subsystem = (request.args.get("subsystem", "") or "").lower()
         tag = (request.args.get("tag", "") or "").lower() or subsystem
         entries = []
-        for e in _web_events[-200:]:
+        ring = _log_ring_merged()
+        for e in ring:
             if not isinstance(e, dict):  # pre-restructure string entries
                 e = {"ts": "", "epoch": 0, "tag": "app", "severity": "info", "msg": str(e)}
             if severity and severity not in (e.get("severity", "") or "").lower() \
@@ -20223,7 +22937,7 @@ def start_web_dashboard() -> None:
             "music_library_path": MUSIC_LIBRARY_PATH,
             "downloads": len(pending_downloads),
             "album_groups": len(pending_album_groups),
-            "events": [_web_event_line(e) for e in _web_events[-100:]],
+            "events": [_web_event_line(e) for e in _web_log_events()[-100:]],
         })
 
     def _run():
@@ -20236,6 +22950,23 @@ def start_web_dashboard() -> None:
     # whose results nothing would surface.
     threading.Thread(target=_wishlist_sweep_loop, daemon=True,
                      name="wishlist-sweep").start()
+    # The hub push for the index mirror's "new channel" leg (contract §1a).
+    # Unconditional like wishlist-sweep above: `_index_push_worker` itself
+    # goes quiet when `_push_enabled()` is false, so a process with no hub
+    # configured just grows an idle thread rather than needing its own gate
+    # here too.
+    threading.Thread(target=_index_push_worker, daemon=True,
+                     name="index-push").start()
+    # The present-row album-id backfill's periodic backstop (task 4). Started
+    # here like the two above; the per-artist kick after `albumIndexed`
+    # (`_announce_album_indexed`) covers the common case within seconds, this
+    # is what catches everything that doesn't go through that event.
+    threading.Thread(target=_index_backfill_sweep_loop, daemon=True,
+                     name="index-backfill-sweep").start()
+    # The auto-index worker (task 5). Unconditional like the others; it
+    # returns at once when LB_BOT_AUTO_INDEX=0 or Navidrome is not configured.
+    threading.Thread(target=_auto_index_worker, daemon=True,
+                     name="auto-index").start()
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
@@ -20481,6 +23212,8 @@ async def on_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         print(f"  Failed to notify chat about handler error: {notify_err}")
 
 async def main():
+    if WEB_UI_ENABLED:
+        _install_log_tee()
     print("Bot starting...")
     _load_state()
     _load_review_state()

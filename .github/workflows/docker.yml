@@ -39,5 +39,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Baked into the image as WEB_BUILD so /api/system/status can say
+          # which commit is running; deploy.sh dev passes its own.
+          build-args: |
+            LB_BOT_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

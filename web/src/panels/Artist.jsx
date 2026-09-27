@@ -1,47 +1,82 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useApp, navigate } from '../App.jsx'
-import { api } from '../lib/api.js'
+import { useApp, navigate, replaceRoute, goArtist } from '../App.jsx'
+import { api, post } from '../lib/api.js'
 import Cover from '../components/Cover.jsx'
 import {
-  AlbumStateChip, ArtistTile, Chip, EmptyState, PageTitle, ProgressBar,
-  ReleaseTile, Skeleton, SortToggle, SourceRow, TrackList,
+  AlbumStateChip, ArtistTile, Chip, EmptyState, ProgressBar, ReleaseTile,
+  SectionHeader, Skeleton, SortToggle, SourceRow, StatusChip, TrackList, PageTitle,
 } from '../components/ui.jsx'
 
 // ── Routing ──────────────────────────────────────────────────────────────────
-// This panel has no parser of its own — App is the only router. It reads
-// state.routeParams for the route it was mounted by:
-//   #/artist                      → ArtistIndex
-//   #/artist/<artistId>           → DiscographyView
-//   #/artist/<artistId>/<rgid>    → AlbumDetail
+// Rendered by Library for #/library/artists/…; `params` is what follows:
+//   []                          → ArtistIndex
+//   [artistId]                  → DiscographyView
+//   [artistId, rgid, 'sources'?] → AlbumDetail (picker open with 'sources')
+//   ['-', rgid, …]              → AlbumResolver: an album known only by its
+//                                 release-group (search, charts, wishlist)
+// artistId is a Navidrome id for an owned artist, or `mb:<mbid>`.
 
-// Hand an album off to the Fill gaps screen. navigate() pushes a history entry,
-// so Back comes back here.
-function openGaps(groupId) {
-  navigate('Fill gaps', groupId)
-}
+const caaCover = rgid => `https://coverartarchive.org/release-group/${rgid}/front-250`
 
 // ── Discography data ─────────────────────────────────────────────────────────
-// Scan results keyed by artist id, session-lived, so index ↔ discography ↔
-// album navigation doesn't re-run the (minutes-long, MusicBrainz-bound) scan.
+// Scan results keyed by artist id, session-lived.
 const discoCache = new Map()
+// Owned artists, shared by every view here and refetched once a minute. It
+// used to be fetched once per session, so an artist a fill or a scan added
+// read "Artist not found" — and AlbumResolver sent them to an `mb:` page —
+// until a reload.
+const ARTISTS_TTL_MS = 60_000
+let artistsPromise = null
+let artistsAt = 0
+export function loadArtists() {
+  if (!artistsPromise || Date.now() - artistsAt > ARTISTS_TTL_MS) {
+    artistsAt = Date.now()
+    artistsPromise = api('/api/artists').then(r => (Array.isArray(r) ? r : []))
+      .catch(e => { artistsPromise = null; throw e })
+  }
+  return artistsPromise
+}
 
-// Artists found via MusicBrainz search that aren't in the library, keyed by
-// their `mb:<mbid>` route id, so the root can resolve them for full browse.
-const externalArtists = new Map()
+// A credit and a tag spell the same artist differently often enough ("JAY‐Z"
+// with U+2010, "Beyoncé"/"Beyonce") that name equality is only a fallback.
+const nameKey = s => (s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase().replace(/[\u2010-\u2015\u2212]/g, '-').replace(/\s+/g, ' ').trim()
 
-// Runs (or reuses) the discography scan for one artist. The scan needs a
-// MusicBrainz artist mbid; Navidrome supplies one for tagged libraries, and
-// we silently resolve the top text-search hit otherwise.
+// The library artist a MusicBrainz artist (and credit name) stands for, or null.
+// By mbid first — exact — and by name only when exactly one artist has it.
+export function ownedArtistFor(artists, mbid, name) {
+  if (mbid) {
+    const byMbid = (artists || []).filter(a => a.mbid && a.mbid === mbid)
+    if (byMbid.length === 1) return byMbid[0]
+  }
+  const key = nameKey(name)
+  if (!key) return null
+  const byName = (artists || []).filter(a => nameKey(a.name) === key)
+  // A same-name artist with a different mbid is someone else.
+  return byName.length === 1 && !(mbid && byName[0].mbid && byName[0].mbid !== mbid) ? byName[0] : null
+}
+
+function useArtists() {
+  const [artists, setArtists] = useState(null)
+  const [error, setError] = useState(null)
+  useEffect(() => {
+    let dead = false
+    loadArtists().then(a => !dead && setArtists(a)).catch(e => { if (!dead) { setError(e.message); setArtists([]) } })
+    return () => { dead = true }
+  }, [])
+  return [artists, error]
+}
+
+// Runs (or reuses) the discography scan for one artist. Index-first: a
+// previously scanned artist renders instantly.
 function useDiscography(artist, { autoScan = true } = {}) {
   const { action } = useApp()
   const [disco, setDisco] = useState(() => (artist ? discoCache.get(artist.id) || null : null))
-  const [progress, setProgress] = useState(null) // { done, total, current }
+  const [progress, setProgress] = useState(null)
   const [error, setError] = useState(null)
   const [nonce, setNonce] = useState(0)
   // Whether the server HAS an index for this artist: true / false / null while
-  // we're still asking. `disco` alone cannot answer that — it is null both while
-  // loading and for the whole multi-minute scan — and a caller that needs to act
-  // on "not indexed" was left waiting on a value that only arrives at the end.
+  // asking. `disco` alone can't answer that during a multi-minute scan.
   const [indexed, setIndexed] = useState(null)
   const pollRef = useRef(null)
   const forceScanRef = useRef(false)
@@ -60,25 +95,25 @@ function useDiscography(artist, { autoScan = true } = {}) {
     forceScanRef.current = false
     async function start() {
       try {
-        // Index-first: the server keeps a persistent per-artist index, so a
-        // previously scanned artist renders instantly. Rescan bypasses it.
         if (!forceScan) {
           const idx = await api('/api/artist/discography'
             + `?mbid=${encodeURIComponent(artist.mbid || '')}`
             + `&nd_id=${encodeURIComponent(artistId)}`)
           if (dead) return
           setIndexed(idx.indexed === true)
-          if (idx.indexed) {
+          // A stub — the row an album page's single-release add or an adopted
+          // orphan leaves, never scanned — is indexed but is not a discography:
+          // rendering it showed a one-album artist and never scanned.
+          const stub = idx.indexed && !idx.scanned_at
+          if (idx.indexed && !stub) {
             discoCache.set(artistId, idx)
             setDisco(idx)
             return
           }
+          if (stub) setDisco(idx)
         }
-        // Not indexed. Whether to fix that by walking the artist's whole
-        // MusicBrainz discography is the CALLER's decision, not this hook's: it
-        // is one request per second per release-group, minutes for a real
-        // artist, and an album page that merely wants one row must never start
-        // it. See AlbumDetail, which passes autoScan:false.
+        // Whether to walk the artist's whole MusicBrainz discography (minutes)
+        // is the caller's decision; an album page never does.
         if (!autoScan) return
         let mbid = artist.mbid
         if (!mbid) {
@@ -86,11 +121,11 @@ function useDiscography(artist, { autoScan = true } = {}) {
           mbid = (r.candidates || [])[0]?.mbid
           if (!mbid) throw new Error(`No MusicBrainz match for “${artist.name}”`)
         }
+        // No name for an `mb:` page is fine: the server looks the real one up.
+        // Posting the mbid in its place stored the UUID as the artist's name.
         const r = await action('/api/artist/discography',
-          { mbid, name: artist.name, nd_id: artistId })
+          { mbid, name: artist.name || '', nd_id: artistId, external: !!artist.external })
         if (dead) return
-        // A discography scan is MusicBrainz-bound and can run for minutes, so
-        // the 2s poll backs off toward 15s rather than hammering the whole time.
         let delay = 2000
         const tick = async () => {
           try {
@@ -102,10 +137,7 @@ function useDiscography(artist, { autoScan = true } = {}) {
               setDisco(result)
               return
             }
-            if (t.status === 'error') {
-              setError(t.error || 'Discography scan failed')
-              return
-            }
+            if (t.status === 'error') { setError(t.error || 'Discography scan failed'); return }
             setProgress({ done: t.done, total: t.total, current: t.current })
           } catch { /* poll again */ }
           if (dead) return
@@ -116,12 +148,8 @@ function useDiscography(artist, { autoScan = true } = {}) {
       } catch (e) {
         if (dead) return
         setError(e.message)
-        // A probe that FAILED is not "still asking". Leaving `indexed` at null
-        // left AlbumDetail's index-add effect returning early forever, so the
-        // add never ran, `release` stayed null and the page sat on skeletons
-        // with no title and no buttons — permanently, for one failed request.
-        // The single-release add is exactly the cheap path that should still
-        // run here.
+        // A failed probe is not "still asking" — the album page's cheap
+        // single-release add must still be able to run.
         setIndexed(false)
       }
     }
@@ -135,10 +163,6 @@ function useDiscography(artist, { autoScan = true } = {}) {
     forceScanRef.current = true
     setNonce(n => n + 1)
   }
-  // Re-read the *stored* index, without forcing a MusicBrainz rescan. The
-  // session-lived discoCache means even a tab switch won't re-fetch, so
-  // something that changed one row server-side (a single-release add, a
-  // completed fill) has no other way to become visible.
   const refreshIndex = () => {
     if (artistId) discoCache.delete(artistId)
     setNonce(n => n + 1)
@@ -147,98 +171,14 @@ function useDiscography(artist, { autoScan = true } = {}) {
 }
 
 // ── Artist index ─────────────────────────────────────────────────────────────
-const SORTS = [['az', 'A–Z'], ['plays', 'Most listened']]
-
-// Bulk index build: kick the background task and surface its progress. The
-// task is resumable — fresh artists are skipped, so re-running after a
-// cancel/crash fast-forwards.
-function IndexBuildControl() {
-  const { action, pushToast } = useApp()
-  const [status, setStatus] = useState(null)
-  const [cancelling, setCancelling] = useState(false)
-
-  // Self-scheduling rather than an interval keyed on render state: the cadence
-  // follows the value just fetched, so the poll can't tear down and restart on
-  // every status object, and can't keep running at 5s through a live build.
-  useEffect(() => {
-    let dead = false
-    let timer = null
-    const load = async () => {
-      let building = false
-      try {
-        const s = await api('/api/library-index/status')
-        if (dead) return
-        building = !!s.building
-        setStatus(s)
-        if (!building) setCancelling(false)
-      } catch { /* poll again */ }
-      if (!dead) timer = setTimeout(load, building ? 2000 : 5000)
-    }
-    load()
-    return () => { dead = true; if (timer) clearTimeout(timer) }
-  }, [])
-
-  async function cancelBuild(id) {
-    if (!id) return
-    setCancelling(true)
-    try {
-      await action(`/api/tasks/${id}/cancel`)
-      pushToast('Index build cancelling…')
-    } catch (e) {
-      setCancelling(false)
-      pushToast(`Cancel failed: ${e.message}`, 'error')
-    }
-  }
-
-  if (!status) return null
-  if (status.building) {
-    const t = status.task || {}
-    const pct = t.total ? (t.done / t.total) * 100 : 3
-    return (
-      <span className="flex min-w-0 items-center gap-2.5">
-        <span className="flex min-w-0 items-center gap-2 text-[12px] text-faint">
-          <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-pill" style={{ background: 'var(--green)' }} />
-          <span className="truncate">
-            indexing {t.done ?? 0}/{t.total ?? '?'}{t.current ? ` · ${t.current}` : ''}
-          </span>
-        </span>
-        <span className="w-[110px] shrink-0"><ProgressBar value={pct} /></span>
-        <button className="!py-1 !text-[12px]" disabled={cancelling || !t.id}
-          onClick={() => cancelBuild(t.id)}>
-          {cancelling ? 'Cancelling…' : 'Cancel'}
-        </button>
-      </span>
-    )
-  }
-  const complete = status.artistsTotal > 0 && status.artistsIndexed >= status.artistsTotal
-  return (
-    <span className="flex items-center gap-2">
-      <span className="text-[12px] text-faint">
-        {status.artistsIndexed}/{status.artistsTotal} indexed
-        {status.artistsStale ? ` · ${status.artistsStale} stale` : ''}
-      </span>
-      {(!complete || status.artistsStale > 0) && (
-        <button onClick={async () => {
-          try {
-            await action('/api/library-index/build')
-            setStatus(s => ({ ...s, building: true, task: null }))
-            pushToast('Index build started — it runs in the background at MusicBrainz pace')
-          } catch (e) {
-            pushToast(`Index build failed to start: ${e.message}`, 'error')
-          }
-        }}>
-          {complete ? 'Refresh index' : 'Build full index'}
-        </button>
-      )}
-    </span>
-  )
-}
+const SORTS = [['az', 'A–Z'], ['plays', 'Most played']]
+const TILE_CHUNK = 120
 
 function SkeletonTileGrid({ tiles = 12, round = false }) {
   return (
     <div className="tile-grid">
       {Array.from({ length: tiles }, (_, i) => (
-        <div key={i} className="rounded-[12px] border border-line bg-panel p-2.5">
+        <div key={i} className="rounded-card border border-line bg-panel p-2.5">
           <Skeleton className={round ? '!rounded-pill' : ''} style={{ width: '100%', aspectRatio: '1 / 1' }} />
           <Skeleton className="mt-2 h-3" style={{ width: `${70 - (i % 3) * 15}%` }} />
           <Skeleton className="mt-1.5 h-2.5 w-1/3" />
@@ -248,109 +188,164 @@ function SkeletonTileGrid({ tiles = 12, round = false }) {
   )
 }
 
-function ArtistIndex({ artists, error, onPick }) {
+// One line on how complete the library index is. Building it moved to
+// Settings → Status once the auto-index worker started doing it in the
+// background.
+function IndexLine() {
+  const [s, setS] = useState(null)
+  useEffect(() => { api('/api/library-index/status').then(setS).catch(() => {}) }, [])
+  if (!s) return null
+  return (
+    <button className="quiet sm" onClick={() => navigate('Settings', 'status')}
+      title="How many of your artists have their full discography indexed">
+      {s.artistsIndexed.toLocaleString()}/{s.artistsTotal.toLocaleString()} indexed
+      {s.artistsStale ? ` · ${s.artistsStale} stale` : ''}{s.building ? ' · building…' : ''}
+    </button>
+  )
+}
+
+function ArtistIndex() {
+  const [artists, error] = useArtists()
   const [sort, setSort] = useState('az')
   const [q, setQ] = useState('')
-  // MusicBrainz artist search for artists you don't own yet.
-  const [mb, setMb] = useState({ q: '', loading: false, results: null })
+  const [limit, setLimit] = useState(TILE_CHUNK)
   const hasPlays = (artists || []).some(a => a.plays != null)
-
-  const needle = q.trim()
-  async function searchMb() {
-    if (!needle) return
-    setMb({ q: needle, loading: true, results: null })
-    try {
-      const r = await api('/api/artist/lookup?q=' + encodeURIComponent(needle))
-      setMb({ q: needle, loading: false, results: r.candidates || [] })
-    } catch {
-      setMb({ q: needle, loading: false, results: [] })
-    }
-  }
-  const mbFresh = mb.q === needle
-  const ownedNames = useMemo(
-    () => new Set((artists || []).map(a => (a.name || '').toLowerCase())),
-    [artists])
+  const needle = q.trim().toLowerCase()
 
   const shown = useMemo(() => {
     let list = artists || []
-    const needle = q.trim().toLowerCase()
     if (needle) list = list.filter(a => (a.name || '').toLowerCase().includes(needle))
     list = [...list]
-    if (sort === 'plays' && hasPlays) {
-      list.sort((a, b) => (b.plays || 0) - (a.plays || 0) || a.name.localeCompare(b.name))
-    } else {
-      list.sort((a, b) => a.name.localeCompare(b.name))
-    }
+    if (sort === 'plays' && hasPlays) list.sort((a, b) => (b.plays || 0) - (a.plays || 0) || a.name.localeCompare(b.name))
+    else list.sort((a, b) => a.name.localeCompare(b.name))
     return list
-  }, [artists, q, sort, hasPlays])
+  }, [artists, needle, sort, hasPlays])
+  useEffect(() => { setLimit(TILE_CHUNK) }, [needle, sort])
+
+  // Grow the grid as the end comes into view — 2,500 round covers at once
+  // was the slowest paint in the app.
+  const sentinelRef = useRef(null)
+  useEffect(() => {
+    const node = sentinelRef.current
+    if (!node) return
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) setLimit(n => n + TILE_CHUNK) }, { rootMargin: '600px' })
+    obs.observe(node)
+    return () => obs.disconnect()
+  }, [shown.length, limit])
 
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center gap-2.5">
-        <input placeholder="Filter or search for an artist…" className="w-60" value={q}
-          onChange={e => setQ(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') searchMb() }} />
+        <input type="search" placeholder="Filter your artists…" aria-label="Filter your artists" className="w-60"
+          value={q} onChange={e => setQ(e.target.value)} />
         {hasPlays && <SortToggle value={sort} options={SORTS} onChange={setSort} />}
+        <span className="text-caption text-muted">{artists ? `${shown.length.toLocaleString()} artist(s)` : ''}</span>
         <span className="spacer" />
-        <IndexBuildControl />
+        <IndexLine />
       </div>
 
-      {artists === null ? (
-        <SkeletonTileGrid round />
-      ) : error ? (
-        <EmptyState title="Couldn't load your artists" hint={error} />
-      ) : !artists.length ? (
-        <EmptyState title="No artists in your library yet"
-          hint="Once Navidrome has scanned some music, every artist shows up here for browsing." />
-      ) : !shown.length ? (
-        <EmptyState title={`No artist matches “${needle}”`}
-          hint="Nothing in your library — search MusicBrainz below to browse an artist you don't own yet." />
-      ) : (
-        <div className="tile-grid">
-          {shown.map(a => (
-            <ArtistTile key={a.id} name={a.name} releaseCount={a.releaseCount}
-              plays={a.plays} coverUrl={a.coverUrl} onClick={() => onPick(a)} />
-          ))}
-        </div>
-      )}
-
-      {needle && artists !== null && (
-        <div className="mt-7">
-          <SectionRule label="Not in your library" sub="MusicBrainz" />
-          {!mbFresh || mb.results === null ? (
-            <button className="primary" disabled={mb.loading} onClick={searchMb}>
-              {mb.loading ? 'Searching…' : `Search MusicBrainz for “${needle}”`}
-            </button>
-          ) : !mb.results.length ? (
-            <EmptyState title={`No MusicBrainz artist for “${needle}”`}
-              hint="Try a different spelling." />
-          ) : (
+      {artists === null ? <SkeletonTileGrid round />
+        : error ? <EmptyState title="Couldn't load your artists" hint={error} />
+        : !artists.length ? <EmptyState title="No artists in your library yet" hint="Once Navidrome has scanned some music, every artist shows up here." />
+        : !shown.length ? (
+          <EmptyState title={`None of your artists match “${q.trim()}”`} hint="Search everywhere to open an artist you don't own yet.">
+            <button className="primary" onClick={() => navigate('Search', q.trim())}>Search for “{q.trim()}”</button>
+          </EmptyState>
+        ) : (
+          <>
             <div className="tile-grid">
-              {mb.results
-                .filter(c => c.mbid && !ownedNames.has((c.name || '').toLowerCase()))
-                .map(c => (
-                  <button key={c.mbid}
-                    className="rounded-[12px] border border-line bg-panel p-3 text-left hover:border-[var(--accent-bd)]"
-                    onClick={() => onPick({ id: 'mb:' + c.mbid, name: c.name, mbid: c.mbid, external: true })}>
-                    <div className="truncate text-[14px] font-semibold">{c.name}</div>
-                    <div className="muted mt-0.5 truncate text-[12px]">
-                      {[c.disambiguation, c.type, c.area || c.country].filter(Boolean).join(' · ') || 'artist'}
-                    </div>
-                  </button>
-                ))}
+              {shown.slice(0, limit).map(a => (
+                <ArtistTile key={a.id} name={a.name} coverUrl={a.coverUrl}
+                  sub={`${a.releaseCount} release${a.releaseCount === 1 ? '' : 's'}${a.plays != null ? ` · ${a.plays.toLocaleString()} play${a.plays === 1 ? '' : 's'}` : ''}`}
+                  onClick={() => goArtist(a.id)} />
+              ))}
             </div>
-          )}
-        </div>
-      )}
+            {limit < shown.length && <div ref={sentinelRef} className="p-4 text-center text-caption text-faint">Loading more…</div>}
+          </>
+        )}
     </>
   )
 }
 
+// ── About ────────────────────────────────────────────────────────────────────
+// Editorial text from Wikipedia/Wikidata via /api/meta/*. The clients have
+// shown this since 2026-09-22; the web UI never did.
+function About({ meta, compact = false }) {
+  const [open, setOpen] = useState(false)
+  if (!meta?.found) return null
+  const paras = meta.paragraphs?.length ? meta.paragraphs : (meta.summary ? [meta.summary] : [])
+  const shown = open ? paras : paras.slice(0, 1)
+  return (
+    <div className={compact ? '' : 'mb-6'}>
+      {!compact && <SectionHeader label="About" sub={meta.wikidataDescription} />}
+      <div className="max-w-[820px] text-small leading-[1.65]" style={{ color: 'var(--text2)' }}>
+        {shown.map((p, i) => <p key={i} className={i ? 'mt-2.5' : ''}>{p}</p>)}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-caption">
+        {paras.length > 1 && (
+          <button className="link-inline !text-muted" onClick={() => setOpen(o => !o)}>{open ? 'Show less' : 'Read more'}</button>
+        )}
+        {meta.source?.url && (
+          <a href={meta.source.url} target="_blank" rel="noreferrer" className="text-faint">
+            From {meta.source.name}{meta.source.license ? ` · ${meta.source.license}` : ''}
+          </a>
+        )}
+        {(meta.links || []).slice(0, 8).map(l => (
+          <a key={l.url} href={l.url} target="_blank" rel="noreferrer"
+            className="rounded-pill border border-line px-2 py-0.5 text-micro text-muted no-underline hover:text-[var(--accent)]">{l.label}</a>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function useMeta(path) {
+  const [meta, setMeta] = useState(null)
+  useEffect(() => {
+    if (!path) { setMeta(null); return }
+    let dead = false
+    setMeta(null)
+    api(path, { timeoutMs: 15000 }).then(m => !dead && setMeta(m)).catch(() => !dead && setMeta({ found: false }))
+    return () => { dead = true }
+  }, [path])
+  return meta
+}
+
+// Similar artists, owned and not — ListenBrainz + Last.fm, with Deezer's
+// related artists as the fallback when those know nobody.
+function SimilarArtists({ mbid, name }) {
+  const [data, setData] = useState(null)
+  useEffect(() => {
+    if (!mbid && !name) return
+    let dead = false
+    const q = new URLSearchParams({ name: name || '' })
+    if (mbid) q.set('mbid', mbid)
+    api(`/api/artist/similar?${q}`, { timeoutMs: 20000 })
+      .then(r => (r.artists?.length ? r : api(`/api/artist/related?${q}`, { timeoutMs: 20000 })))
+      .then(r => !dead && setData(r))
+      .catch(() => !dead && setData({ artists: [] }))
+    return () => { dead = true }
+  }, [mbid, name])
+  const rows = (data?.artists || []).filter(a => a.owned ? a.artistId : a.mbid).slice(0, 12)
+  if (!rows.length) return null
+  return (
+    <div className="mb-6">
+      <SectionHeader label="Similar artists" sub={(data.sources || []).join(' + ')} />
+      <div className="flex flex-wrap gap-1.5">
+        {rows.map(a => (
+          <button key={a.mbid || a.artistId} className="sm"
+            title={a.owned ? 'In your library' : 'Not in your library'}
+            style={a.owned ? { borderColor: 'var(--green-bd)' } : undefined}
+            onClick={() => goArtist(a.owned ? a.artistId : `mb:${a.mbid}`)}>
+            {a.name}{a.owned ? ' ✓' : ''}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── Discography ──────────────────────────────────────────────────────────────
-// Sections follow the server's `effective_type`, which already resolves a
-// release's MusicBrainz secondary types (a greatest-hits set reads
-// "compilation", not "album"). Anything unrecognised falls into Other rather
-// than being folded into Albums, so a new MusicBrainz type can't hide.
 const TYPE_GROUPS = [
   ['album', 'Albums'],
   ['ep', 'EPs'],
@@ -367,6 +362,8 @@ const STATUS_FILTERS = [
   ['complete', 'Complete'],
   ['untagged', 'Untagged'],
 ]
+// A section this long starts folded — 59 singles buried 7 albums.
+const FOLD_OVER = 12
 
 function groupKey(release) {
   const t = release.effective_type || release.primary_type || ''
@@ -381,19 +378,32 @@ function relTime(epoch) {
   return `${Math.floor(days / 30)} month(s) ago`
 }
 
-function SectionRule({ label, sub }) {
+function TypeSection({ label, releases, onOpen }) {
+  const [open, setOpen] = useState(releases.length <= FOLD_OVER)
   return (
-    <div className="mb-[11px] mt-5 flex items-center gap-2.5 first:mt-0">
-      <div className="text-[13px] font-semibold uppercase tracking-[.06em]" style={{ color: 'var(--text2)' }}>{label}</div>
-      <span className="h-px flex-1" style={{ background: 'var(--border)' }} />
-      {sub && <span className="text-[11.5px] text-faint">{sub}</span>}
+    <div className="mb-5">
+      <SectionHeader label={label} sub={releases.length}
+        action={releases.length > FOLD_OVER && (
+          <button className="link-inline !text-caption !text-muted" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+            {open ? 'Fold' : `Show all ${releases.length}`}
+          </button>)} />
+      <div className="tile-grid">
+        {(open ? releases : releases.slice(0, 6)).map(r => (
+          <ReleaseTile key={r.rgid} title={r.title} year={r.year} state={r.status}
+            count={r.status === 'incomplete' ? (r.total || 0) - (r.present || 0) : null}
+            coverUrl={caaCover(r.rgid)} onClick={() => onOpen(r.rgid)} />
+        ))}
+      </div>
     </div>
   )
 }
 
-function DiscographyView({ artist, onOpenAlbum, onBack }) {
+function DiscographyView({ artist }) {
   const { disco, progress, error, rescan } = useDiscography(artist)
+  const { requestConfirm, pushToast } = useApp()
   const [filter, setFilter] = useState('all')
+  const mbid = artist.mbid || disco?.artist_mbid || ''
+  const meta = useMeta(mbid ? `/api/meta/artist?mbid=${encodeURIComponent(mbid)}` : null)
 
   const releases = disco?.releases || []
   const counts = useMemo(() => {
@@ -402,27 +412,48 @@ function DiscographyView({ artist, onOpenAlbum, onBack }) {
     return c
   }, [releases])
   const shown = filter === 'all' ? releases : releases.filter(r => r.status === filter)
+  const missingAlbums = releases.filter(r => r.status === 'missing' && ['album', 'ep'].includes(groupKey(r)))
+  const name = (artist.external ? (disco?.artist_name || meta?.name || artist.name) : artist.name) || 'Artist'
 
-  // Every tile opens the album's own detail page, including the ones with
-  // gaps. Sending "2 missing" straight to Fill gaps hijacked the global queue
-  // cursor: you clicked one album in a discography and landed on a different
-  // screen pointed at a different album. The detail page keeps the Fill-gaps
-  // deep link as an explicit action instead.
-  const openRelease = (r) => onOpenAlbum(r.rgid)
+  async function wishlistMissing() {
+    const ok = await requestConfirm(
+      `Add ${missingAlbums.length} missing album(s) and EP(s) by ${name} to the wishlist? lb-bot re-searches one every few hours.`,
+      { confirmLabel: 'Add to wishlist' })
+    if (!ok) return
+    let added = 0
+    for (const rel of missingAlbums) {
+      try { await post('/api/wishlist', { rgid: rel.rgid, artist: artist.name || disco?.artist_name || meta?.name || '', title: rel.title }); added++ } catch { /* keep going */ }
+    }
+    pushToast(`Added ${added} album(s) to the wishlist`)
+  }
 
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center gap-2.5">
-        <button onClick={onBack}>← All artists</button>
+        <button onClick={() => navigate('Library', 'artists')}>← All artists</button>
         <span className="spacer" />
         {disco?.scanned_at ? (
-          <span className="text-[12px] text-faint">
+          <span className="text-caption text-faint">
             scanned {relTime(disco.scanned_at)}
-            {disco.stale ? ' · ' : ''}
-            {disco.stale && <span style={{ color: 'var(--decide-fg)' }}>may be out of date</span>}
+            {disco.stale && <span style={{ color: 'var(--decide-fg)' }}> · may be out of date</span>}
           </span>
+        ) : disco ? (
+          <span className="text-caption" style={{ color: 'var(--decide-fg)' }}>not fully scanned yet</span>
         ) : null}
-        {disco && <button onClick={rescan}>Rescan discography</button>}
+        {disco && <button className="sm" onClick={rescan}>Rescan discography</button>}
+      </div>
+
+      <div className="hero mb-5 flex items-start gap-5">
+        <div className="w-[120px] shrink-0">
+          <Cover url={meta?.imageUrl || artist.coverUrl} name={name} fluid round />
+        </div>
+        <div className="min-w-0 flex-1">
+          {/* An `mb:` route can still be an artist you own (a link from search or
+              a similar-artists row), so ask the discography, not the route. */}
+          <PageTitle eyebrow={disco && !releases.some(r => r.status !== 'missing') ? 'Not in your library' : 'Artist'} title={name} />
+          {meta?.wikidataDescription && <div className="mt-1 text-small text-muted">{meta.wikidataDescription}</div>}
+          {meta?.found && <div className="mt-3"><About meta={meta} compact /></div>}
+        </div>
       </div>
 
       {error ? (
@@ -431,51 +462,40 @@ function DiscographyView({ artist, onOpenAlbum, onBack }) {
         </EmptyState>
       ) : !disco ? (
         <>
-          <div className="mb-4 flex flex-wrap items-center gap-3 rounded-[12px] border border-line bg-panel px-4 py-3">
+          <div className="mb-4 flex flex-wrap items-center gap-3 rounded-card border border-line bg-panel px-4 py-3">
             <div className="min-w-[180px] flex-1">
               <ProgressBar value={progress?.total ? (progress.done / progress.total) * 100 : 4} />
             </div>
-            <span className="text-[12.5px]" style={{ color: 'var(--text2)' }}>
-              {progress?.total
-                ? `Checking ${progress.done}/${progress.total}`
-                : 'Pulling discography from MusicBrainz…'}
+            <span className="text-caption" style={{ color: 'var(--text2)' }}>
+              {progress?.total ? `Checking ${progress.done}/${progress.total}` : 'Pulling the discography from MusicBrainz…'}
             </span>
-            {progress?.current && (
-              <span className="min-w-0 truncate text-[12px] text-faint">{progress.current}</span>
-            )}
+            {progress?.current && <span className="min-w-0 truncate text-caption text-faint">{progress.current}</span>}
           </div>
           <SkeletonTileGrid />
         </>
       ) : (
         <>
-          <div className="mb-3 flex flex-wrap items-center gap-2">
+          <div className="mb-4 flex flex-wrap items-center gap-2">
             {STATUS_FILTERS.map(([k, label]) => (
-              <Chip key={k} active={filter === k} count={counts[k] || 0}
-                onClick={() => setFilter(k)}>{label}</Chip>
+              <Chip key={k} active={filter === k} count={counts[k] || 0} onClick={() => setFilter(k)}>{label}</Chip>
             ))}
+            <span className="spacer" />
+            {missingAlbums.length > 0 && (filter === 'missing' || filter === 'all') && (
+              <button className="sm tint" onClick={wishlistMissing}
+                title="Albums and EPs you don't have; lb-bot will look for them slowly in the background">
+                Wishlist {missingAlbums.length} missing album(s)
+              </button>
+            )}
           </div>
-          {!shown.length ? (
-            <EmptyState title="No releases match this filter" />
-          ) : (
+          {!shown.length ? <EmptyState title="No releases match this filter" /> : (
             TYPE_GROUPS.map(([type, label]) => {
               const group = shown.filter(r => groupKey(r) === type)
-              if (!group.length) return null
-              return (
-                <div key={type || 'other'}>
-                  <SectionRule label={label} sub={`${group.length}`} />
-                  <div className="tile-grid">
-                    {group.map(r => (
-                      <ReleaseTile key={r.rgid} title={r.title} year={r.year}
-                        state={r.status}
-                        count={r.status === 'incomplete' ? (r.total || 0) - (r.present || 0) : null}
-                        coverUrl={`https://coverartarchive.org/release-group/${r.rgid}/front-250`}
-                        onClick={() => openRelease(r)} />
-                    ))}
-                  </div>
-                </div>
-              )
+              return group.length
+                ? <TypeSection key={type || 'other'} label={label} releases={group} onOpen={rgid => goArtist(artist.id, rgid)} />
+                : null
             })
           )}
+          <SimilarArtists mbid={mbid} name={name} />
         </>
       )}
     </>
@@ -483,25 +503,12 @@ function DiscographyView({ artist, onOpenAlbum, onBack }) {
 }
 
 // ── Album detail ─────────────────────────────────────────────────────────────
-// Manual source panel, toggled from the hero's "Pick a source manually" button
-// (kept beside "Get this album" so both paths sit together). Mirrors the
-// Fill-gaps flow: "Get this album" is the zero-friction auto path (server picks
-// the best-ranked peer); this is the deliberate override — it runs the slskd
-// search, ranks folders, and downloads the exact one you choose through the same
-// album pipeline (so failover to alt_sources still applies).
-// The release the user actually has on screen, in the shape both /api/album/sources
-// and /api/album/download accept as an override. Sending it is not an
-// optimisation: the server's own resolver picks "official, earliest" on its own,
-// so an edition the user chose here would otherwise be silently overruled — and
-// `mbz_resolve_album` parks a transient MusicBrainz 503 in a five-minute
-// negative cache, which turns one hiccup into "Could not resolve album" for
-// every attempt inside that window, with nothing the user can do about it.
 // Ceiling for the two MusicBrainz-backed lookups the album page blocks on.
-// They are one hop to MusicBrainz behind a global one-request-per-second lock,
-// so a busy scan or an unhappy MusicBrainz can park them well past any useful
-// wait — and the page has a sensible answer for "we don't know" in both cases.
 const LOOKUP_TIMEOUT_MS = 10000
 
+// The release the user has on screen, in the shape /api/album/sources and
+// /api/album/download accept. Sending it keeps the server from overruling the
+// edition the user picked.
 function releaseOverride(release, variant, artistName) {
   if (!variant?.releaseMbid) return {}
   return {
@@ -512,14 +519,47 @@ function releaseOverride(release, variant, artistName) {
   }
 }
 
+// Where an album request has got to, straight after you made it — so the page
+// doesn't just say "see Downloads".
+function RequestStatus({ releaseMbid }) {
+  const [f, setF] = useState(null)
+  useEffect(() => {
+    if (!releaseMbid) return
+    let dead = false
+    let timer
+    const tick = async () => {
+      try {
+        const r = await api(`/api/fills?release_mbids=${encodeURIComponent(releaseMbid)}`)
+        if (dead) return
+        const v = r.albums?.[releaseMbid]
+        setF(v)
+        if (v && ['verified', 'failed', 'cancelled'].includes(v.state)) return
+      } catch { /* poll again */ }
+      if (!dead) timer = setTimeout(tick, 3000)
+    }
+    tick()
+    return () => { dead = true; clearTimeout(timer) }
+  }, [releaseMbid])
+  if (!f || f.state === 'unknown') return <p className="mt-2 text-caption text-muted">Requested — looking for a source…</p>
+  return (
+    <div className="mt-2.5 flex max-w-[460px] flex-wrap items-center gap-2 text-caption">
+      <StatusChip status={f.state} />
+      <span className="text-muted">
+        {f.total ? `${f.done}/${f.total} files` : ''}{f.reason ? ` · ${f.reason}` : ''}
+      </span>
+      <button className="link-inline !text-muted" onClick={() => navigate('Downloads')}>Downloads</button>
+      {['searching', 'queued', 'downloading', 'placing'].includes(f.state) && (
+        <div className="w-full"><ProgressBar value={f.percent || 0} height={5} /></div>
+      )}
+    </div>
+  )
+}
+
 function AlbumSourcePicker({ rgid, open, onDownloaded, override }) {
   const { action, pushToast } = useApp()
-  const [sources, setSources] = useState(null)   // null=loading, []=none
+  const [sources, setSources] = useState(null)
   const [chosen, setChosen] = useState(null)
   const [busy, setBusy] = useState(false)
-
-  // Serialized so the effect re-runs when the user switches edition, without
-  // making the object identity a dependency.
   const overrideKey = JSON.stringify(override || {})
 
   useEffect(() => {
@@ -527,9 +567,7 @@ function AlbumSourcePicker({ rgid, open, onDownloaded, override }) {
     let dead = false
     setSources(null)
     const q = new URLSearchParams({ rgid })
-    for (const [k, v] of Object.entries(JSON.parse(overrideKey))) {
-      if (v) q.set(k, String(v))
-    }
+    for (const [k, v] of Object.entries(JSON.parse(overrideKey))) if (v) q.set(k, String(v))
     api('/api/album/sources?' + q)
       .then(r => !dead && setSources(r.sources || []))
       .catch(e => { if (!dead) { setSources([]); pushToast(`Source search failed: ${e.message}`, 'error') } })
@@ -541,14 +579,12 @@ function AlbumSourcePicker({ rgid, open, onDownloaded, override }) {
     setBusy(true)
     setChosen(src.id)
     try {
-      // The peer is a *preference*, not a guarantee: lb-bot floats it to the
-      // front of its own ranked list and keeps the rest as failover, so if this
-      // peer has gone by transfer time the best ranked folder wins instead.
-      await action('/api/album/download',
-        { rgid, ...(override || {}),
-          sourceUsername: src.peer, sourceFolder: src.folder })
-      pushToast('Queued from @' + src.peer + ' — see Downloads')
-      onDownloaded?.()
+      // The peer is a preference: lb-bot floats it to the front of its ranked
+      // list and keeps the rest as failover.
+      const r = await action('/api/album/download',
+        { rgid, ...(override || {}), sourceUsername: src.peer, sourceFolder: src.folder })
+      pushToast('Queued from @' + src.peer)
+      onDownloaded?.(r)
     } catch (e) {
       setChosen(null)
       pushToast(`Download failed: ${e.message}`, 'error')
@@ -558,76 +594,52 @@ function AlbumSourcePicker({ rgid, open, onDownloaded, override }) {
   }
 
   if (!open) return null
-
   return (
     <div className="mt-5">
-      <SectionRule label="Available on slskd" sub="ranked by your source preferences" />
+      <SectionHeader label="Available on Soulseek" sub="ranked by your source preferences" />
       {sources === null ? (
         <div className="flex flex-col gap-2">
           {Array.from({ length: 3 }, (_, i) => (
-            <div key={i} className="flex items-center gap-3.5 rounded-[12px] border border-line p-3.5"
-              style={{ background: 'var(--inset-warm)' }}>
-              <Skeleton className="h-11 w-11 !rounded-[9px]" />
-              <div className="flex-1">
-                <Skeleton className="h-3.5 w-2/5" />
-                <Skeleton className="mt-2 h-3 w-3/5" />
-              </div>
+            <div key={i} className="flex items-center gap-3.5 rounded-card border border-line p-3.5" style={{ background: 'var(--inset-warm)' }}>
+              <Skeleton className="h-11 w-11" />
+              <div className="flex-1"><Skeleton className="h-3.5 w-2/5" /><Skeleton className="mt-2 h-3 w-3/5" /></div>
             </div>
           ))}
-          <p className="text-[12px] text-faint">Searching peers — results can take ~10s to trickle in.</p>
+          <p className="text-caption text-faint">Searching peers — results can take ~10s to trickle in.</p>
         </div>
       ) : !sources.length ? (
-        <EmptyState title="No sources found on slskd"
-          hint="No peer is sharing this album right now — try again later." />
-      ) : (
-        sources.map(s => (
-          <SourceRow key={s.id} src={s} busy={busy}
-            selected={chosen === s.id}
-            actionLabel="Use this →"
-            done={chosen === s.id && !busy}
-            doneLabel="✓ Queued — see Downloads"
-            onUse={() => useSource(s)} />
-        ))
-      )}
+        <EmptyState title="No peer is sharing this album right now"
+          hint="Add it to the wishlist and lb-bot will look again every few hours." />
+      ) : sources.map(s => (
+        <SourceRow key={s.id} src={s} busy={busy} selected={chosen === s.id}
+          actionLabel="Use this →" done={chosen === s.id && !busy} doneLabel="✓ Queued"
+          onUse={() => useSource(s)} />
+      ))}
     </div>
   )
 }
 
-// Release / edition switcher: two axes, because they answer different
-// questions. A *release* variant (Original / Remaster / Deluxe) changes the
-// tracklist; an *edition* (Digital / CD / Vinyl) is the same tracklist pressed
-// differently — and carries its own cover art, which is the point. The
-// release-group's art is whichever release the Cover Art Archive picked, so a
-// vinyl-tagged copy routinely shows a photo of the disc where the sleeve
-// belongs. Digital is the default: it is the likeliest to have a correct front.
+// Release / edition switcher: a *release* variant changes the tracklist; an
+// *edition* is the same tracklist pressed differently, with its own cover.
 function EditionSwitcher({ variants, variantIdx, editionIdx, onPick }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
-
   useEffect(() => {
     if (!open) return
     function onDocClick(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
     function onEsc(e) { if (e.key === 'Escape') setOpen(false) }
     document.addEventListener('mousedown', onDocClick)
     document.addEventListener('keydown', onEsc)
-    return () => {
-      document.removeEventListener('mousedown', onDocClick)
-      document.removeEventListener('keydown', onEsc)
-    }
+    return () => { document.removeEventListener('mousedown', onDocClick); document.removeEventListener('keydown', onEsc) }
   }, [open])
 
   const variant = variants?.[variantIdx]
   const editions = variant?.editions || []
   if (!variants?.length) return null
-  // Nothing to switch between on either axis — a chooser with one option in it
-  // is just noise.
   if (variants.length < 2 && editions.length < 2) return null
 
-  const variantLabel = (v, i) =>
-    v.disambiguation || (i === 0 ? 'Original' : v.year || `Edition ${i + 1}`)
-  const summary = [variantLabel(variant, variantIdx), editions[editionIdx]?.label]
-    .filter(Boolean).join(' · ')
-
+  const variantLabel = (v, i) => v.disambiguation || (i === 0 ? 'Original' : v.year || `Edition ${i + 1}`)
+  const summary = [variantLabel(variant, variantIdx), editions[editionIdx]?.label].filter(Boolean).join(' · ')
   const chipStyle = active => ({
     borderColor: active ? 'var(--accent)' : 'var(--border)',
     background: active ? 'var(--accent-tint)' : 'var(--inset-warm)',
@@ -637,41 +649,30 @@ function EditionSwitcher({ variants, variantIdx, editionIdx, onPick }) {
 
   return (
     <div className="relative" ref={ref}>
-      <button className="!rounded-pill !py-1 !text-[12px]" aria-expanded={open}
-        onClick={() => setOpen(o => !o)}>
-        {summary} ▾
-      </button>
+      <button className="sm !rounded-pill" aria-expanded={open} aria-haspopup="true" onClick={() => setOpen(o => !o)}>{summary} ▾</button>
       {open && (
-        <div className="absolute left-0 top-[calc(100%+6px)] z-20 min-w-[240px] rounded-card border border-line bg-panel p-3 shadow-md">
+        <div className="absolute left-0 top-[calc(100%+6px)] z-20 min-w-[240px] rounded-panel border border-line bg-panel p-3"
+          style={{ boxShadow: '0 20px 48px -14px rgba(0,0,0,.6)' }}>
           {variants.length > 1 && (
             <>
-              <div className="mb-[7px] text-[11px] font-semibold uppercase tracking-[.08em] text-faint">
-                Release
-              </div>
+              <div className="mb-[7px] text-micro font-semibold uppercase tracking-[.08em] text-faint">Release</div>
               <div className="mb-3 flex flex-wrap gap-1.5">
                 {variants.map((v, i) => (
-                  <button key={v.releaseMbid || i} className="!rounded-pill !py-1 !text-[12px]"
-                    style={chipStyle(i === variantIdx)}
-                    onClick={() => onPick(i, 0)}>
-                    {variantLabel(v, i)}
-                    <span className="opacity-70"> · {v.trackCount}</span>
+                  <button key={v.releaseMbid || i} className="sm !rounded-pill" style={chipStyle(i === variantIdx)} onClick={() => onPick(i, 0)}>
+                    {variantLabel(v, i)}<span className="opacity-70"> · {v.trackCount}</span>
                   </button>
                 ))}
               </div>
             </>
           )}
-          <div className="mb-[7px] text-[11px] font-semibold uppercase tracking-[.08em] text-faint">
-            Edition
-          </div>
+          <div className="mb-[7px] text-micro font-semibold uppercase tracking-[.08em] text-faint">Edition</div>
           <div className="flex flex-col gap-1.5">
             {editions.map((e, i) => (
-              <button key={e.releaseMbid} className="!rounded-[10px] px-3 text-left"
-                style={chipStyle(i === editionIdx)}
+              <button key={e.releaseMbid} className="px-3 text-left" style={chipStyle(i === editionIdx)}
                 onClick={() => { onPick(variantIdx, i); setOpen(false) }}>
                 <div className="font-semibold">{e.label}</div>
-                <div className="text-[11px] font-normal opacity-75">
-                  {[e.format !== e.label ? e.format : null, e.year, e.country]
-                    .filter(Boolean).join(' · ') || 'no pressing details'}
+                <div className="text-micro font-normal opacity-75">
+                  {[e.format !== e.label ? e.format : null, e.year, e.country].filter(Boolean).join(' · ') || 'no pressing details'}
                 </div>
               </button>
             ))}
@@ -682,39 +683,29 @@ function EditionSwitcher({ variants, variantIdx, editionIdx, onPick }) {
   )
 }
 
-// "Similar albums": one album per similar artist, all of them already in the
-// library. Every entry is attributed to the artist you're looking at — this is
-// "because you're on Radiohead", never an unattributed popularity claim. It
-// renders nothing at all when the lookup finds no owned, indexed match, since
-// an empty shelf teaches the reader nothing.
-function SimilarAlbums({ artistMbid, artistName, rgid, onOpen }) {
+// One album per similar artist, all already in the library.
+function SimilarAlbums({ artistMbid, artistName, rgid }) {
   const [data, setData] = useState(null)
-
   useEffect(() => {
     if (!artistMbid && !artistName) return
     let dead = false
     setData(null)
     const q = new URLSearchParams({ artist_name: artistName || '', rgid })
     if (artistMbid) q.set('artist_mbid', artistMbid)
-    api('/api/album/similar?' + q)
-      .then(r => !dead && setData(r))
-      .catch(() => !dead && setData({ albums: [] }))
+    api('/api/album/similar?' + q).then(r => !dead && setData(r)).catch(() => !dead && setData({ albums: [] }))
     return () => { dead = true }
   }, [artistMbid, artistName, rgid])
-
   if (!data?.albums?.length) return null
   return (
     <div className="mb-6">
-      <SectionRule label="Similar albums" sub={(data.sources || []).join(' + ')} />
+      <SectionHeader label="Similar albums you have" sub={(data.sources || []).join(' + ')} />
       <div className="tile-grid">
         {data.albums.map(a => (
-          <button key={`${a.artistId}-${a.rgid}`}
-            className="!block w-full !border-0 !bg-transparent !p-0 text-left"
-            title={`In your library — similar to ${a.because}`}
-            onClick={() => onOpen(a.artistId, a.rgid)}>
+          <button key={`${a.artistId}-${a.rgid}`} className="!block w-full !border-0 !bg-transparent !p-0 text-left"
+            title={`In your library — similar to ${a.because}`} onClick={() => goArtist(a.artistId, a.rgid)}>
             <Cover url={a.coverUrl} name={a.title} fluid />
-            <div className="mt-2 truncate text-[13.5px] font-semibold">{a.title}</div>
-            <div className="muted truncate text-[12px]">{a.artist}</div>
+            <div className="mt-2 truncate text-small font-semibold">{a.title}</div>
+            <div className="truncate text-caption text-muted">{a.artist}</div>
           </button>
         ))}
       </div>
@@ -722,88 +713,45 @@ function SimilarAlbums({ artistMbid, artistName, rgid, onOpen }) {
   )
 }
 
-function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
-  const { dispatch, action, pushToast } = useApp()
-  // autoScan:false — an album page must NEVER start a whole-artist MusicBrainz
-  // walk. It is one request per second per release-group, minutes for a real
-  // discography, and arriving here from Fresh is precisely the unindexed case
-  // that used to trigger it while the user stared at skeletons.
+function AlbumDetail({ artist, rgid, autoPick = false }) {
+  const { action, pushToast } = useApp()
+  // autoScan:false — an album page never starts a whole-artist MusicBrainz walk.
   const { disco, indexed, error: discoError, refreshIndex } = useDiscography(artist, { autoScan: false })
-  // Two axes: which release variant (tracklist) and which edition of it
-  // (pressing + cover art). See EditionSwitcher.
   const [variants, setVariants] = useState(null)
-  // The release-group's own title and credited artist, from MusicBrainz rather
-  // than from the index — the header for a release the index has never heard of,
-  // and the artist name the index add is stamped with.
   const [groupTitle, setGroupTitle] = useState('')
   const [releaseArtist, setReleaseArtist] = useState('')
-  // The release-group's primary type and year, carried so the index add can be
-  // classified correctly without MusicBrainz answering a second time.
   const [groupMeta, setGroupMeta] = useState({ primaryType: '', year: '' })
-  // The row /api/artist/release classified and returned. Rendering from this
-  // rather than re-reading the index keeps the page working even if the write
-  // landed under an artist key the reader doesn't look under.
   const [addedRelease, setAddedRelease] = useState(null)
   const [sel, setSel] = useState({ variant: 0, edition: 0 })
   const [tracks, setTracks] = useState(null)
+  const [requested, setRequested] = useState(null)   // release mbid of our request
   const [downloading, setDownloading] = useState(false)
   const [fillingGaps, setFillingGaps] = useState(false)
+  const [wishlisted, setWishlisted] = useState(false)
   const [pickOpen, setPickOpen] = useState(autoPick)
-  // 'adding' while the single-release index add is in flight, 'failed' if it
-  // could not be done. Distinguished from "still loading the discography",
-  // which is what an absent release used to be indistinguishable from.
   const [indexAdd, setIndexAdd] = useState(null)
   const [addError, setAddError] = useState('')
-  // Bumped by "Try again". The effect below is keyed on the release, so without
-  // this a retry has nothing to re-trigger it with.
   const [addNonce, setAddNonce] = useState(0)
   const addedRef = useRef('')
+  const meta = useMeta(`/api/meta/album?rgid=${encodeURIComponent(rgid)}`)
 
-  // The component is not remounted when the route changes rgid, so the initial
-  // state above only covers a cold arrival.
   useEffect(() => { if (autoPick) setPickOpen(true) }, [autoPick, rgid])
-  // Same reason: a new album must not inherit the previous one's added row.
-  useEffect(() => { setAddedRelease(null); setIndexAdd(null); setAddError('') }, [rgid])
+  useEffect(() => {
+    setAddedRelease(null); setIndexAdd(null); setAddError(''); setRequested(null)
+    setDownloading(false); setFillingGaps(false); setWishlisted(false)
+  }, [rgid])
 
   const indexedRelease = (disco?.releases || []).find(r => r.rgid === rgid)
-  // If the index cannot be taught about this release (no MusicBrainz artist,
-  // MusicBrainz down), the page must still work: /api/album/releases and
-  // /api/album/download both take the raw rgid. An unindexed release the
-  // library demonstrably does not list is `missing`.
-  // Three sources, best first. `addedRelease` is the row /api/artist/release
-  // just classified and handed back — rendering from THAT rather than
-  // re-reading the index is what makes this page independent of whether the
-  // index write landed under a key the reader looks for.
-  const release = indexedRelease
-    || addedRelease
-    || (indexAdd === 'failed'
-      ? { rgid, title: groupTitle, status: 'missing' }
-      : null)
+  // Three sources, best first; an unindexed release the library demonstrably
+  // does not list is `missing`.
+  const release = indexedRelease || addedRelease
+    || (indexAdd === 'failed' ? { rgid, title: groupTitle, status: 'missing' } : null)
   const status = release?.status
-  // The index row's title if we have one, else MusicBrainz's — the header must
-  // not be hostage to the index, which is exactly what left this page on
-  // skeletons with no title and no buttons when a probe failed.
   const headerTitle = release?.title || groupTitle
-  const readOnly = status === 'complete' || status === 'untagged'
-  // A `mb:`-deep-linked artist has no name but its own MBID (the synthetic
-  // artist in the root below), so prefer the one MusicBrainz credited this
-  // release-group to rather than printing a UUID as the artist.
   const displayArtist = artist.external ? (releaseArtist || artist.name) : artist.name
 
-  // A release the artist's stored index predates — the normal case for anything
-  // arrived at from Fresh, because the index is served immediately even when
-  // stale, by design. Add the one row rather than offering a full rescan: that
-  // is a MusicBrainz request per second per release-group, for one album.
-  //
-  // Gated on `indexed !== null` — "the server has answered" — and NOT on a
-  // loaded `disco`. That was the bug: for an unindexed artist `disco` stays null
-  // for the whole scan, so the fast path never ran in exactly the case it was
-  // written for, and the page sat on skeletons with no buttons at all.
-  //
-  // Waits for the /api/album/releases lookup to settle (`variants !== null`)
-  // because that lookup is where the override below comes from — and it is a
-  // MusicBrainz call this add can then be answered from without making a
-  // second one.
+  // A release the artist's stored index predates (anything from Fresh): add
+  // the one row rather than rescanning the whole artist.
   useEffect(() => {
     if (indexed === null || indexedRelease || addedRelease || variants === null) return
     if (addedRef.current === rgid) return
@@ -815,16 +763,10 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
       rgid,
       mbid: artist.mbid || '',
       nd_id: artist.id || '',
-      // The route's escape hatch for a MusicBrainz outage: `mbz_release_group_row`
-      // remembers a transient failure for five minutes and answers {} without
-      // asking again, and /api/album/releases has already told us all of this.
       title: groupTitle || '',
       artist: releaseArtist || '',
       type: groupMeta.primaryType || '',
       year: groupMeta.year || '',
-      // The synthetic external artist's `name` is its raw MBID, which would go
-      // into the index as the artist's name. Prefer the real one MusicBrainz
-      // gave us for this release-group.
       name: releaseArtist || (artist.external ? '' : artist.name || ''),
       external: !!artist.external,
     })
@@ -832,41 +774,25 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
         if (dead) return
         setIndexAdd(null)
         if (r?.release) setAddedRelease(r.release)
-        // Best-effort only: the page already has what it needs to render, and
-        // this just makes the artist's own discography agree.
         refreshIndex()
       })
       .catch(e => {
         if (dead) return
         setIndexAdd('failed')
         setAddError(e.message)
-        // `addedRef` is stamped BEFORE the request, so a failure used to be
-        // permanent for the life of the mount — the toast said what went wrong
-        // and nothing could act on it. Clearing it is what makes "Try again"
-        // (and a later dep change) able to run at all.
         addedRef.current = ''
-        pushToast(`Could not add this release to the index: ${e.message}`, 'error')
       })
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist, variants, addNonce])
 
-  const retryIndexAdd = () => {
-    addedRef.current = ''
-    setIndexAdd(null)
-    setAddError('')
-    setAddNonce(n => n + 1)
-  }
+  const retryIndexAdd = () => { addedRef.current = ''; setIndexAdd(null); setAddError(''); setAddNonce(n => n + 1) }
 
   useEffect(() => {
     let dead = false
-    setVariants(null)
-    setGroupTitle('')
-    setReleaseArtist('')
-    setGroupMeta({ primaryType: '', year: '' })
+    setVariants(null); setGroupTitle(''); setReleaseArtist(''); setGroupMeta({ primaryType: '', year: '' })
     setSel({ variant: 0, edition: 0 })
-    api('/api/album/releases?rgid=' + encodeURIComponent(rgid),
-        { timeoutMs: LOOKUP_TIMEOUT_MS })
+    api('/api/album/releases?rgid=' + encodeURIComponent(rgid), { timeoutMs: LOOKUP_TIMEOUT_MS })
       .then(r => {
         if (dead) return
         setVariants(r.releases || [])
@@ -876,10 +802,7 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
       })
       .catch(e => {
         if (dead) return
-        // `[]`, not null: null means "still asking", and the index add below
-        // waits for this lookup to settle so it can hand the server the title
-        // MusicBrainz already gave us. A failure that left this null would hang
-        // the add forever.
+        // [] not null: null means "still asking", and the index add waits on it.
         setVariants([])
         pushToast(`Release lookup failed: ${e.message}`, 'error')
       })
@@ -887,28 +810,14 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rgid])
 
-  // The tracklist carries per-track presence whenever we can name the
-  // Navidrome albums this release resolves to — which is what turns the
-  // tracklist from a MusicBrainz reference into an answer to "what am I
-  // actually missing".
   const albumIds = (release?.navidrome_album_ids || []).join(',')
   const groupId = release?.group_id || ''
   const variant = variants?.[sel.variant]
   const edition = variant?.editions?.[sel.edition]
-  // The tracklist follows the *variant*; editions of one variant share it, so
-  // switching Digital → Vinyl must not re-fetch or flash a skeleton.
   const trackReleaseMbid = variant?.releaseMbid || ''
   useEffect(() => {
-    // Every exit from here settles `tracks` to something. `null` means "still
-    // asking" and renders a skeleton with no timer behind it, so the two cases
-    // that used to leave it null — the releases lookup answering with no
-    // usable release, and a tracklist request that never comes back — were an
-    // infinite spinner. Both are now finished states with a reason.
     if (variants === null) { setTracks(null); return }
-    if (!trackReleaseMbid) {
-      setTracks({ rows: [], presenceKnown: false, reason: 'no-release' })
-      return
-    }
+    if (!trackReleaseMbid) { setTracks({ rows: [], presenceKnown: false, reason: 'no-release' }); return }
     let dead = false
     setTracks(null)
     const q = new URLSearchParams({ release_mbid: trackReleaseMbid })
@@ -916,264 +825,233 @@ function AlbumDetail({ artist, rgid, onBack, autoPick = false }) {
     else if (groupId) q.set('group_id', groupId)
     api('/api/album/tracklist?' + q, { timeoutMs: LOOKUP_TIMEOUT_MS })
       .then(r => !dead && setTracks({ rows: r.tracks || [], presenceKnown: !!r.presenceKnown }))
-      .catch(e => !dead && setTracks({
-        rows: [], presenceKnown: false, reason: e.timeout ? 'timeout' : 'error',
-        error: e.message,
-      }))
+      .catch(e => !dead && setTracks({ rows: [], presenceKnown: false, reason: e.timeout ? 'timeout' : 'error', error: e.message }))
     return () => { dead = true }
   }, [variants, trackReleaseMbid, albumIds, groupId])
 
   async function downloadBest() {
     setDownloading(true)
     try {
-      await action('/api/album/download',
-        { rgid, ...releaseOverride(release, variant, displayArtist) })
+      const r = await action('/api/album/download', { rgid, ...releaseOverride(release, variant, displayArtist) })
+      setRequested(r?.resolved?.release_mbid || r?.status?.releaseMbid || variant?.releaseMbid || '')
     } catch (e) {
-      // Only a failure un-latches the button — on success it deliberately
-      // stays disabled reading "Requested". Resetting outside the try means a
-      // throw from anything after the request can't strand it either.
       setDownloading(false)
       pushToast(`Download failed: ${e.message}`, 'error')
-      return
     }
-    pushToast(`Queued ${release?.title || 'album'} — see Downloads`)
   }
 
-  // Auto-select on the review group: search, rank and download the best
-  // source for the missing tracks only.
   async function fillGaps() {
     setFillingGaps(true)
     try {
       await action(`/api/gaps/${release.group_id}/auto`)
+      pushToast(`Looking for the missing tracks of ${release.title}`)
     } catch (e) {
       setFillingGaps(false)
       pushToast(`Could not start the fill: ${e.message}`, 'error')
-      return
     }
-    pushToast(`Looking for the missing tracks of ${release.title} — see Downloads`)
+  }
+
+  async function addToWishlist() {
+    try {
+      await post('/api/wishlist', { rgid, artist: displayArtist, title: headerTitle })
+      setWishlisted(true)
+      pushToast(`${headerTitle} is on the wishlist`)
+    } catch (e) {
+      pushToast(`Could not add to the wishlist: ${e.message}`, 'error')
+    }
   }
 
   const trackCount = variant?.trackCount || 0
   const missingCount = Math.max(0, (release?.total || 0) - (release?.present || 0))
-  const rgCover = `https://coverartarchive.org/release-group/${rgid}/front-250`
-
+  const rgCover = caaCover(rgid)
   const heroMeta = {
-    missing: 'not in your library yet — pick an edition, then get the album.',
-    complete: 'in your library, no gaps — nothing to do here.',
-    untagged: 'in your library, but without MusicBrainz tags lb-bot can verify.',
-    incomplete: 'in your library with gaps — the tracklist below marks which ones.',
+    missing: 'not in your library yet',
+    complete: 'in your library, complete',
+    untagged: 'in your library, without MusicBrainz tags',
+    incomplete: 'in your library, with gaps',
   }[status] || ''
 
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center gap-2.5">
-        <button onClick={onBack}>← Back to discography</button>
+        <button onClick={() => goArtist(artist.id)}>← {displayArtist || 'Discography'}</button>
       </div>
 
-      <div className="hero mb-4 flex items-start gap-[22px] rounded-[14px] border border-line bg-panel p-5">
+      <div className="hero mb-5 flex items-start gap-[22px] rounded-panel border border-line bg-panel p-5">
         <div className="shrink-0" style={{ boxShadow: '0 14px 34px -10px rgba(0,0,0,.65)', borderRadius: 12 }}>
           <div style={status === 'missing' ? { opacity: 0.75 } : undefined}>
-            {/* The chosen edition's own sleeve, with the release-group's as the
-                fallback for a pressing the Archive has no art for. */}
-            <Cover url={edition?.coverUrl || rgCover} fallbackUrl={rgCover}
-              name={headerTitle} size={132} />
+            <Cover url={edition?.coverUrl || rgCover} fallbackUrl={rgCover} name={headerTitle} size={132} />
           </div>
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-[12px] font-semibold uppercase tracking-[.12em]" style={{ color: 'var(--accent)' }}>
-            {displayArtist}
-          </div>
-          {/* The header renders from `groupTitle` when there is no index row —
-              /api/album/releases fetches it independently of the index, so an
-              index probe or add that failed no longer blanks the page. Only a
-              release-group we cannot name at all falls back to skeletons. */}
+          <button className="!border-0 !bg-transparent !p-0 text-caption font-semibold uppercase tracking-[.12em] hover:underline"
+            style={{ color: 'var(--accent)' }} onClick={() => goArtist(artist.id)}>{displayArtist}</button>
           {!headerTitle ? (
-            <>
-              <Skeleton className="mb-2 mt-1.5 h-6 w-3/5" />
-              <Skeleton className="h-3 w-2/5" />
-            </>
+            <><Skeleton className="mb-2 mt-1.5 h-6 w-3/5" /><Skeleton className="h-3 w-2/5" /></>
           ) : (
             <>
               <div className="mb-1.5 mt-0.5 flex flex-wrap items-center gap-2.5">
-                <span className="text-[24px] font-bold leading-[1.1]">{headerTitle}</span>
-                <EditionSwitcher variants={variants} variantIdx={sel.variant}
-                  editionIdx={sel.edition}
-                  onPick={(variant, edition) => setSel({ variant, edition })} />
-                {status && <AlbumStateChip state={status}
-                  count={status === 'incomplete' ? (release.total || 0) - (release.present || 0) : null} />}
+                <h1 className="text-heading font-bold">{headerTitle}</h1>
+                <EditionSwitcher variants={variants} variantIdx={sel.variant} editionIdx={sel.edition}
+                  onPick={(v, e) => setSel({ variant: v, edition: e })} />
+                {status && <AlbumStateChip state={status} count={status === 'incomplete' ? missingCount : null} />}
               </div>
-              <div className="muted mb-3.5 text-[12.5px]">
-                {[release?.year || groupMeta.year,
-                  variant ? `${variant.trackCount} tracks` : null, heroMeta]
-                  .filter(Boolean).join(' · ')}
+              <div className="mb-3.5 text-caption text-muted">
+                {[release?.year || groupMeta.year, variant ? `${variant.trackCount} tracks` : null, heroMeta].filter(Boolean).join(' · ')}
               </div>
             </>
           )}
 
-          {/* Fetched and then discarded before: a failed index probe or add left
-              the page with no title, no buttons and no explanation. Both are
-              recoverable, so both say so and offer the retry. */}
           {(addError || (discoError && !release)) && (
-            <div className="muted mb-3 text-[12.5px]">
-              {addError
-                ? `Could not add this release to the index: ${addError}`
-                : `Could not read this artist's index: ${discoError}`}
-              {' '}
-              <button className="link-inline" onClick={retryIndexAdd}>Try again</button>
+            <div className="mb-3 text-caption text-muted">
+              {addError ? `Could not add this release to the index: ${addError}` : `Could not read this artist's index: ${discoError}`}
+              {' '}<button className="link-inline" onClick={retryIndexAdd}>Try again</button>
             </div>
           )}
 
           {status === 'missing' && (
-            <div className="flex flex-wrap items-center gap-2.5">
-              {/* Soulseek first and primary: choosing the source is the real
-                  decision here, and the one-tap auto path sits beside it. */}
-              {/* Never gated on the MusicBrainz lookups. Both routes take the
-                  raw `rgid` and resolve the release server-side; the variant
-                  only ever *refines* the request (exact release, track count).
-                  Disabling them until a variant arrived meant an album whose
-                  release lookup was slow, empty or unofficial-only could not be
-                  downloaded at all — the one thing the page is for. */}
-              <button className="primary" onClick={() => setPickOpen(o => !o)}>
-                {pickOpen ? 'Hide sources' : 'Find sources on Soulseek →'}
-              </button>
-              <button disabled={downloading} onClick={downloadBest}>
-                {downloading ? '✓ Requested — see Downloads' : 'Get this album'}
-              </button>
-            </div>
+            <>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button className="primary" onClick={() => setPickOpen(o => !o)}>
+                  {pickOpen ? 'Hide sources' : 'Find sources on Soulseek →'}
+                </button>
+                <button disabled={downloading} onClick={downloadBest}
+                  title="Let lb-bot pick the best-ranked source and download it">
+                  {downloading ? '✓ Requested' : 'Get the best source'}
+                </button>
+                <button className="tint" disabled={wishlisted} onClick={addToWishlist}
+                  title="Nobody sharing it? lb-bot re-searches the wishlist every few hours">
+                  {wishlisted ? '✓ On the wishlist' : 'Add to wishlist'}
+                </button>
+              </div>
+              {requested && <RequestStatus releaseMbid={requested} />}
+            </>
           )}
-          {/* An album with gaps is actionable from here too. The request is
-              scoped to the review group, so it fetches only the missing
-              tracks — never the whole release over the top of what you own.
-              The manual picker is not rebuilt here; it lives in Fill gaps. */}
           {status === 'incomplete' && release.group_id && (
             <div className="flex flex-wrap items-center gap-2.5">
               <button className="primary" disabled={fillingGaps} onClick={fillGaps}>
-                {fillingGaps
-                  ? '✓ Requested — see Downloads'
-                  : `Get ${missingCount} missing track${missingCount === 1 ? '' : 's'} →`}
+                {fillingGaps ? '✓ Requested — see Downloads' : `Get ${missingCount} missing track${missingCount === 1 ? '' : 's'} →`}
               </button>
-              <button onClick={() => openGaps(release.group_id)}>
-                Find sources on Soulseek →
-              </button>
+              <button onClick={() => navigate('Fill gaps', release.group_id)}>Choose the source yourself →</button>
             </div>
           )}
           {status === 'untagged' && (
-            <button onClick={() => navigate('Import')}>
-              File into library →
-            </button>
+            <p className="text-small text-muted">
+              lb-bot can't check this album against MusicBrainz because its files carry no MusicBrainz tags. Tag them
+              (MusicBrainz Picard does it), then rescan the discography.
+            </p>
           )}
+          {status === 'complete' && <p className="text-small text-muted">Nothing to do here.</p>}
         </div>
       </div>
-
-      <SimilarAlbums artistMbid={artist.mbid || ''} artistName={displayArtist}
-        rgid={rgid} onOpen={(artistId, otherRgid) => navigate('Artist', artistId, otherRgid)} />
-
-      <SectionRule label="Tracklist"
-        sub={variant ? `${variant.trackCount} tracks${variant.year ? ` · ${variant.year}` : ''}` : ''} />
-      {tracks && !tracks.rows.length
-        ? <EmptyState title="No tracklist available"
-            hint={{
-              timeout: 'MusicBrainz did not answer within 10 seconds. The tracklist is only a reference — finding sources and downloading still work.',
-              error: `Could not load the tracklist${tracks.error ? `: ${tracks.error}` : ''}. Finding sources and downloading still work.`,
-              'no-release': 'MusicBrainz lists no release for this album, so there is no tracklist to show. You can still search Soulseek for it.',
-            }[tracks.reason] || 'MusicBrainz has no track data for this edition.'} />
-        : <TrackList tracks={tracks?.rows} loading={tracks === null}
-            presenceKnown={!!tracks?.presenceKnown}
-            rows={Math.max(4, Math.min(trackCount || 8, 14))} />}
 
       {status === 'missing' && release && (
         <AlbumSourcePicker rgid={rgid} open={pickOpen}
           override={releaseOverride(release, variant, displayArtist)}
-          onDownloaded={() => setDownloading(true)} />
+          onDownloaded={r => { setDownloading(true); setRequested(r?.resolved?.release_mbid || variant?.releaseMbid || '') }} />
       )}
-      {readOnly && (
-        <p className="muted mt-3">
-          Read-only view — this album is already in your library
-          {status === 'untagged' ? ', it just needs tags before lb-bot can verify it.' : '.'}
-        </p>
-      )}
+
+      <div className="mt-6"><About meta={meta} /></div>
+
+      <SectionHeader label="Tracklist" sub={variant ? `${variant.trackCount} tracks${variant.year ? ` · ${variant.year}` : ''}` : ''} />
+      <div className="mb-6">
+        {tracks && !tracks.rows.length
+          ? <EmptyState title="No tracklist available"
+              hint={{
+                timeout: 'MusicBrainz did not answer within 10 seconds. The tracklist is only a reference — finding sources and downloading still work.',
+                error: `Could not load the tracklist${tracks.error ? `: ${tracks.error}` : ''}. Finding sources and downloading still work.`,
+                'no-release': 'MusicBrainz lists no release for this album, so there is no tracklist to show. You can still search Soulseek for it.',
+              }[tracks.reason] || 'MusicBrainz has no track data for this edition.'} />
+          : <TrackList tracks={tracks?.rows} loading={tracks === null} presenceKnown={!!tracks?.presenceKnown}
+              rows={Math.max(4, Math.min(trackCount || 8, 14))} />}
+      </div>
+
+      <SimilarAlbums artistMbid={artist.mbid || ''} artistName={displayArtist} rgid={rgid} />
     </>
   )
 }
 
-// ── Root ─────────────────────────────────────────────────────────────────────
-export default function Artist() {
-  const { state } = useApp()
-  // Drill-down state derives from the route; App's single hashchange listener
-  // keeps it current.
-  // A third param opens the source picker on arrival — how Fresh's "Get this
-  // album" reaches the review step instead of firing a blind download.
-  const route = { artistId: state.routeParams[0] || null,
-                  rgid: state.routeParams[1] || null,
-                  pick: state.routeParams[2] === 'sources' }
-  const [artists, setArtists] = useState(null)
-  const [artistsErr, setArtistsErr] = useState(null)
-
+// An album known only by its release-group: ask MusicBrainz who made it, then
+// replace this route with the real album page.
+function AlbumResolver({ rgid, pick }) {
+  const [artists] = useArtists()
+  const [failed, setFailed] = useState('')
   useEffect(() => {
+    if (artists === null) return
     let dead = false
-    api('/api/artists')
-      .then(r => !dead && setArtists(Array.isArray(r) ? r : []))
-      .catch(e => { if (!dead) { setArtistsErr(e.message); setArtists([]) } })
+    api('/api/album/releases?rgid=' + encodeURIComponent(rgid), { timeoutMs: 15000 })
+      .then(r => {
+        if (dead) return
+        // Owned by mbid, else by an unambiguous name; otherwise the `mb:` page
+        // (which redirects to the owned page if the library turns out to have
+        // that mbid after all).
+        const owned = ownedArtistFor(artists, r.artistMbid, r.artist)
+        const id = owned ? owned.id : (r.artistMbid ? `mb:${r.artistMbid}` : '')
+        if (!id) { setFailed('MusicBrainz names no artist for this album.'); return }
+        replaceRoute('Library', 'artists', id, rgid, pick ? 'sources' : undefined)
+      })
+      .catch(e => !dead && setFailed(e.message))
     return () => { dead = true }
-  }, [])
+  }, [artists, rgid, pick])
+  if (failed) {
+    return (
+      <EmptyState title="Couldn't open this album" hint={failed}>
+        <button onClick={() => history.back()}>← Back</button>
+      </EmptyState>
+    )
+  }
+  return <p className="text-caption text-muted">Finding the album…</p>
+}
 
-  const nav = (artistId, rgid) => navigate('Artist', artistId, rgid)
-  const pick = (a) => { if (a.external) externalArtists.set(a.id, a); nav(a.id) }
+// ── Root ─────────────────────────────────────────────────────────────────────
+// Synthetic artists for `mb:<mbid>` routes, remembered for the session so the
+// display name upgrades once a scan or the meta lookup names them.
+const externalArtists = new Map()
+
+export default function Artist({ params }) {
+  const [artistId, rgid, pickParam] = params
+  const pick = pickParam === 'sources'
+  const [artists, artistsErr] = useArtists()
+
+  // An `mb:` route for an artist the library has (a search row, a pasted link,
+  // a similar-artists row, a credit spelled differently from the tag): open
+  // the owned page. On the `mb:` one, Rescan ran an external scan over the
+  // owned artist's own index row.
+  const ownedForMb = useMemo(() => {
+    if (!artistId?.startsWith('mb:') || !artists) return null
+    const mbid = artistId.slice(3)
+    const hits = artists.filter(a => a.mbid === mbid)
+    return hits.length === 1 ? hits[0] : null
+  }, [artists, artistId])
+  useEffect(() => {
+    if (ownedForMb) replaceRoute('Library', 'artists', ownedForMb.id, rgid, pickParam)
+  }, [ownedForMb, rgid, pickParam])
 
   const artist = useMemo(() => {
-    const id = route.artistId
-    if (!id) return null
-    // Owned artists first, then a MusicBrainz-searched external artist. A bare
-    // `mb:<mbid>` deep link (refresh) resolves to a synthetic artist so browse
-    // still works; DiscographyView upgrades the display name once the scan runs.
-    const owned = (artists || []).find(a => a.id === id)
+    if (!artistId || artistId === '-') return null
+    const owned = (artists || []).find(a => a.id === artistId)
     if (owned) return owned
-    // A completed scan carries the real artist name — prefer it over a bare mbid.
-    const scannedName = discoCache.get(id)?.artist_name
-    if (externalArtists.has(id)) {
-      const ext = externalArtists.get(id)
-      if (scannedName && ext.name !== scannedName) {
-        const upgraded = { ...ext, name: scannedName }
-        externalArtists.set(id, upgraded)
-        return upgraded
-      }
-      return ext
-    }
-    if (id.startsWith('mb:')) {
-      const mbid = id.slice(3)
-      const syn = { id, mbid, name: scannedName || mbid, external: true }
-      externalArtists.set(id, syn)
+    const scannedName = discoCache.get(artistId)?.artist_name
+    if (artistId.startsWith('mb:')) {
+      const prev = externalArtists.get(artistId)
+      const mbid = artistId.slice(3)
+      const syn = { id: artistId, mbid, name: scannedName || prev?.name || '', external: true }
+      externalArtists.set(artistId, syn)
       return syn
     }
     return null
-  }, [artists, route.artistId])
+  }, [artists, artistId])
 
-  let body
-  if (!route.artistId) {
-    body = <ArtistIndex artists={artists} error={artistsErr} onPick={pick} />
-  } else if (artists === null) {
-    body = <SkeletonTileGrid />
-  } else if (!artist) {
-    body = (
-      <EmptyState title="Artist not found"
-        hint="This link doesn't match an artist in your library anymore.">
-        <button className="primary" onClick={() => nav()}>← All artists</button>
+  if (!artistId) return <ArtistIndex />
+  if (artistId === '-' && rgid) return <AlbumResolver rgid={rgid} pick={pick} />
+  if (artists === null || ownedForMb) return <SkeletonTileGrid />
+  if (!artist) {
+    return (
+      <EmptyState title="Artist not found" hint={artistsErr || "This link doesn't match an artist in your library anymore."}>
+        <button className="primary" onClick={() => navigate('Library', 'artists')}>← All artists</button>
       </EmptyState>
     )
-  } else if (route.rgid) {
-    body = <AlbumDetail artist={artist} rgid={route.rgid} autoPick={route.pick}
-      onBack={() => nav(artist.id)} />
-  } else {
-    body = <DiscographyView artist={artist} onOpenAlbum={rgid => nav(artist.id, rgid)}
-      onBack={() => nav()} />
   }
-
-  return (
-    <>
-      <div className="mb-[18px] flex items-end gap-4">
-        <PageTitle eyebrow="Artist" title={artist ? artist.name : 'Your artists'} />
-      </div>
-      {body}
-    </>
-  )
+  if (rgid) return <AlbumDetail key={`${artist.id}-${rgid}`} artist={artist} rgid={rgid} autoPick={pick} />
+  return <DiscographyView key={artist.id} artist={artist} />
 }

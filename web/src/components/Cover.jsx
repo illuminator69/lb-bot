@@ -10,10 +10,16 @@ import { useState } from 'react'
 // the Archive doesn't hold should show the release-group's sleeve, not a
 // coloured rectangle.
 export default function Cover({ albumId, url, fallbackUrl, name = '', size = 48, fluid = false, round = false }) {
-  const [failed, setFailed] = useState(0)   // count of sources exhausted
   const hint = fluid ? 300 : size <= 64 ? 64 : 300
   const primary = url || (albumId ? `/api/cover/${encodeURIComponent(albumId)}?size=${hint}` : null)
   const chain = [primary, fallbackUrl && fallbackUrl !== primary ? fallbackUrl : null].filter(Boolean)
+  // Sources exhausted, *for this chain*: a count carried over from an earlier
+  // url (a 204 on the Navidrome cover before the artist image arrived) skipped
+  // the new url and left the gradient up for good.
+  const chainKey = chain.join('\n')
+  const [fail, setFail] = useState({ key: chainKey, n: 0 })
+  const failed = fail.key === chainKey ? fail.n : 0
+  const setFailed = () => setFail(f => ({ key: chainKey, n: (f.key === chainKey ? f.n : 0) + 1 }))
   const src = chain[failed] || null
   const showImg = !!src
   // Deterministic hue from the album name so fallbacks vary pleasantly.
@@ -36,8 +42,8 @@ export default function Cover({ albumId, url, fallbackUrl, name = '', size = 48,
         <img key={src} src={src} alt="" width={size} height={size}
           loading="lazy" decoding="async"
           className="h-full w-full object-cover"
-          onError={() => setFailed(n => n + 1)}
-          onLoad={e => { if (!e.target.naturalWidth) setFailed(n => n + 1) }} />
+          onError={setFailed}
+          onLoad={e => { if (!e.target.naturalWidth) setFailed() }} />
       )}
     </div>
   )

@@ -176,6 +176,35 @@ ROUTES = {
     "/api/operations": lambda q: {},
     "/api/downloads": lambda q: {"slskd": [], "bot_pending": [], "album_groups": [], "review": [], "repair_jobs": []},
     "/api/action-center": lambda q: {"cards": [], "buckets": {}, "groups": [], "summary": {}},
+    # Routes the 2026-09-26 UI added. Shapes match the real ones; values are
+    # just enough for each screen to render something.
+    "/api/system/status": lambda q: {
+        "revision": "stub", "startedAt": time.time() - 3600,
+        "autoIndex": {"enabled": True, "running": True, "outcome": "idle", "at": time.time() - 20,
+                      "failing": 0, "pausedUntil": 0, "scannedThisRun": 3, "ttlDays": 30},
+        "hubPush": {"configured": False, "url": "", "headSeq": 12},
+        "acoustid": {"keySet": False, "fpcalc": True, "minScore": 0.6, "unavailable": "", "rejectedSources": 0},
+        "lastfm": {"keySet": False}, "spotify": {"configured": False},
+        "listenbrainz": {"user": "stub", "playlists": ["Weekly Jams"]},
+        "wishlist": {"intervalSeconds": 21600, "cooldownSeconds": 43200},
+        "search": {"timeoutSeconds": 75, "stallTimeoutSeconds": 120, "failoverMax": 6,
+                   "failoverDeadlineSeconds": 45}},
+    "/api/wishlist": lambda q: {"wishlist": [
+        {"rgid": "rg-mez-v", "artist": "Massive Attack", "title": "Mezzanine (The Remixes)",
+         "addedAt": time.time() - 86400, "lastTriedAt": time.time() - 7200, "attempts": 2,
+         "lastReason": "no peer is sharing it"}], "total": 1,
+        "intervalSeconds": 21600, "cooldownSeconds": 43200},
+    "/api/fills": lambda q: {"albums": {"rel-9": {
+        "releaseMbid": "rel-9", "rgid": "rg-heligoland", "state": "failed", "artist": "Massive Attack",
+        "album": "Heligoland", "done": 0, "total": 10, "failed": 0, "percent": 0,
+        "failureKind": "no_source", "retryable": False, "reason": "no peer is sharing it",
+        "cancellable": False, "updatedAt": time.time() - 600, "serverTime": time.time()}},
+        "gaps": {}, "serverTime": time.time()},
+    "/api/download-folders": lambda q: {"folders": []},
+    "/api/placements": lambda q: {"items": [], "unidentified": 0},
+    "/api/settings": lambda q: {"cards": []},
+    "/api/library-index/status": lambda q: {"artistsTotal": 40, "artistsIndexed": 38,
+                                            "artistsStale": 1, "building": False, "task": None},
 }
 
 class Handler(SimpleHTTPRequestHandler):

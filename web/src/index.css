@@ -7,6 +7,16 @@
  * Tailwind v4's CSS-based @theme turns the semantic names into utilities
  * (bg-panel, text-ink, border-accent, etc); legacy class names below and
  * Tailwind utilities both resolve through the same generated variables.
+ *
+ * Type and radius scales. Before these existed every screen picked its own
+ * `text-[…]` and `rounded-[…]` values — 18 font sizes and 8 radii were in use.
+ * Use these names; an arbitrary value is a sign a new step is needed (add it
+ * here) or that an existing one should have been used.
+ *
+ *   text-micro 11 · caption 12 · small 13 · body 14 · lead 16 · title 18 ·
+ *   heading 24 · display 30
+ *   rounded-ctl 8 (controls, chips, inner rows) · rounded-card 12 (cards,
+ *   list rows) · rounded-panel 14 (heroes, workspaces) · rounded-pill
  */
 @theme {
   --color-line: var(--border);
@@ -21,12 +31,33 @@
   --color-inset: var(--inset-deep);
   --color-accent: var(--accent);
   --color-accent-2: var(--accent-2);
-  --color-accent-fg: #17130f;
+  --color-accent-fg: var(--on-accent);
   --color-bad: var(--danger);
   --color-warn: var(--decide-fg);
   --color-good: var(--green);
+
+  --text-micro: 11px;
+  --text-micro--line-height: 1.45;
+  --text-caption: 12px;
+  --text-caption--line-height: 1.5;
+  --text-small: 13px;
+  --text-small--line-height: 1.5;
+  --text-body: 14px;
+  --text-body--line-height: 1.5;
+  --text-lead: 16px;
+  --text-lead--line-height: 1.4;
+  --text-title: 18px;
+  --text-title--line-height: 1.3;
+  --text-heading: 24px;
+  --text-heading--line-height: 1.15;
+  --text-display: 30px;
+  --text-display--line-height: 1.1;
+
+  --radius-ctl: 8px;
   --radius-card: 12px;
+  --radius-panel: 14px;
   --radius-pill: 999px;
+
   --font-sans: 'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 }
@@ -40,11 +71,12 @@
   --border: #322b23;
   --muted: #98907f;
   --accent: #e0913f;
-  /* Legacy aliases: pre-rewrite class names and panels keep working. */
+  --on-accent: #17130f;
+  /* Legacy aliases kept for any markup still using the old names. */
   --line: var(--border);
   --ink: var(--text);
   --panel: var(--surface);
-  --accent-fg: #17130f;
+  --accent-fg: var(--on-accent);
   --bad: var(--danger);
   --warn: var(--decide-fg);
 }
@@ -59,70 +91,59 @@ body {
   transition: background 0.35s ease;
 }
 
-h1 { font-size: 18px; margin: 0 8px 0 0; }
+/* In the base layer, so the text-* / font-* utilities on a heading win. As
+   unlayered CSS this reset outranked every utility and headings rendered at
+   body size. */
+@layer base {
+  h1, h2, h3 { margin: 0; font-size: inherit; font-weight: inherit; }
+}
 
-/*
- * Component layer: existing markup keeps referencing these semantic class
- * names, but the rules themselves are expressed with Tailwind utilities and
- * theme tokens (@apply) so the whole app's visual language -- radius,
- * shadow, spacing, color -- comes from one Tailwind-driven system. New,
- * bespoke UI (nav, dropdown, ConfirmBar, toasts, folder cards, toolbar
- * clusters) is written with inline utility classes directly in JSX instead
- * of being added here.
- */
 @layer components {
   .card {
-    @apply rounded-card border border-line bg-panel p-3 shadow-sm;
+    @apply rounded-card border border-line bg-panel p-4;
   }
 
   .toolbar {
-    @apply mb-3 flex flex-wrap items-center gap-2;
+    @apply flex flex-wrap items-center gap-2;
   }
 
-  /* A real <button> that reads as an inline text link. Used where the markup
-     was a bare <a> with no href — which is neither focusable nor announced as
-     interactive, so those actions were keyboard-unreachable. */
+  /* A real <button> that reads as an inline text link. */
   .link-inline {
     @apply cursor-pointer !border-0 !bg-transparent !p-0 underline;
     font: inherit;
   }
 
-  /* Fill-gaps workspace cards (ready / picker / downloading): surface panel
-     with the soft accent border from the mock. */
+  /* The large bordered card a screen's main decision lives in. */
   .workspace-card {
     background: var(--surface);
     border: 1px solid var(--accent-bd-soft);
-    border-radius: 14px;
+    border-radius: var(--radius-panel);
     padding: 20px;
   }
 
-  /* Library table: CSS grid per the mock (1fr 150px 90px 150px), zebra rows,
-     hairline separators; rows collapse to stacked cards on narrow screens. */
+  /* Library table: CSS grid, zebra rows, hairline separators; rows collapse
+     to stacked cards on narrow screens. */
   .library-table {
     @apply overflow-hidden rounded-card border border-line;
   }
-
   .library-row {
     display: grid;
-    grid-template-columns: 1fr 150px 90px 150px;
+    grid-template-columns: minmax(0, 1fr) 150px 90px 150px;
     @apply items-center gap-2.5 px-3 py-2;
     border-bottom: 1px solid var(--hairline);
   }
-
   .library-row:last-child { border-bottom: 0; }
   .library-row:nth-child(even) { background: var(--surface); }
   .library-row:nth-child(odd) { background: var(--surface-alt); }
-
   .library-head {
-    @apply text-xs font-semibold text-muted;
+    @apply text-caption font-semibold text-muted;
     background: var(--inset-warm) !important;
   }
 
   .placement-grid {
     display: grid;
-    /* minmax(0,…) not 1fr: a grid track's auto min-width lets a long unbroken
-       folder path widen the column and scroll the page sideways instead of
-       letting the card's `truncate` do its job. */
+    /* minmax(0,…) not 1fr: a long unbroken folder path would otherwise widen
+       the column and scroll the page sideways. */
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     @apply gap-3;
   }
@@ -133,124 +154,130 @@ h1 { font-size: 18px; margin: 0 8px 0 0; }
     @apply gap-3;
   }
 
-  /* Cover-forward tile grids (Artist index + discography). Intrinsic
-     auto-fill so they stay grids at narrow widths instead of collapsing to
-     stacked cards; the minmax floor tightens under 560px. */
   .tile-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 14px;
   }
 
-  /* Shimmer placeholder for loading silhouettes. */
   .skeleton {
-    border-radius: 8px;
+    border-radius: var(--radius-ctl);
     background: linear-gradient(90deg, var(--inset-warm) 25%, var(--surface) 50%, var(--inset-warm) 75%);
     background-size: 200% 100%;
     animation: skeleton-shimmer 1.4s ease-in-out infinite;
   }
 
-  .muted { @apply text-xs text-muted; }
+  .muted { @apply text-caption text-muted; }
   .bad { @apply text-bad; }
   .warn { @apply text-warn; }
   .spacer { flex: 1 1 auto; }
 
   .chip {
-    @apply mr-[3px] my-0.5 inline-block whitespace-nowrap rounded-pill border border-line px-[7px] py-0.5 text-xs;
+    @apply mr-[3px] my-0.5 inline-block whitespace-nowrap rounded-pill border border-line px-[7px] py-0.5 text-caption;
   }
-
   .chip.good { @apply border-good text-good; }
   .chip.warn { @apply border-warn text-warn; }
   .chip.bad { @apply border-bad text-bad; }
 
-  button, input, select {
-    @apply rounded-[8px] border border-line bg-panel px-2.5 py-2 text-ink;
+  button, input, select, textarea {
+    @apply rounded-ctl border border-line bg-panel px-2.5 py-2 text-ink;
     font: inherit;
   }
 
   button { @apply cursor-pointer transition-[opacity,transform]; }
   button:hover:not(:disabled) { @apply opacity-85; }
-  /* Pressed feedback: a small physical nudge so taps register even when the
-     color barely changes. */
   button:active:not(:disabled) { transform: translateY(0.5px) scale(0.985); }
   button:disabled { @apply cursor-not-allowed opacity-45; }
+
+  /* Button variants — the only ones. A button that needs a colour not listed
+     here should get a variant, not inline styles. */
   button.primary, button.active { @apply border-accent bg-accent text-accent-fg; }
-  button.warn { @apply border-warn bg-warn text-accent-fg; }
-  /* "Go" variant — a recovery/continue action that isn't the card's main CTA.
-     Was three different sets of inline styles in Fill gaps. */
+  /* Recovery / continue action that isn't the card's main CTA. */
   button.go {
     border-color: transparent;
     background: var(--green);
     color: var(--green-on);
   }
-  /* Tinted secondary — accent-coloured but not filled, for a side action next to
-     an accent CTA ("Change source"). Also was inline styles. */
+  /* Accent-coloured but not filled, for a side action next to an accent CTA. */
   button.tint {
     background: var(--accent-btn);
     border-color: var(--accent-bd);
     color: var(--accent);
   }
+  /* Destructive: never filled, so it can't be mistaken for the primary. */
+  button.danger {
+    background: transparent;
+    border-color: var(--danger-bd);
+    color: var(--danger);
+  }
+  /* Quiet: a borderless text button for low-emphasis actions. */
+  button.quiet {
+    background: transparent;
+    border-color: transparent;
+    color: var(--muted);
+  }
+  button.sm { @apply px-2.5 py-1 text-caption; }
+  /* The big accent CTA (Fill gaps "Get N tracks"). */
+  .btn-accent {
+    @apply rounded-card border-accent bg-accent px-5 py-3 text-body font-semibold text-accent-fg;
+  }
 
-  /* One visible keyboard-focus ring for every interactive control — was
-     missing entirely, so tabbing through the app gave no feedback. Uses
-     :focus-visible so mouse clicks stay clean. */
   button:focus-visible,
   input:focus-visible,
   select:focus-visible,
+  textarea:focus-visible,
   [role="switch"]:focus-visible,
+  [role="option"]:focus-visible,
   summary:focus-visible,
   a:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 8px;
   }
 
-  /* Async in-flight affordance: any control marked aria-busy reads as working
-     (wait cursor + gentle pulse) without each call site re-styling. */
   [aria-busy="true"] { cursor: progress; animation: btn-pulse 1.1s ease-in-out infinite; }
 
-  /* Prominent CTA — the big accent button (Fill gaps "Get N tracks", etc). */
-  .btn-accent {
-    @apply rounded-[11px] border-accent bg-accent px-5 py-3 text-[14.5px] font-semibold text-accent-fg;
-  }
-
   details {
-    @apply mt-2.5 rounded-card border border-line bg-panel p-2.5;
+    @apply rounded-card border border-line bg-panel p-2.5;
   }
-
   summary { @apply cursor-pointer font-semibold; }
 
-  /* ── Album review layout ── */
+  /* ── Fill gaps rail + workspace ── */
   .review-layout {
     display: grid;
     grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
     @apply items-start gap-3.5;
   }
-
   .review-sidebar {
     @apply sticky flex flex-col overflow-hidden;
-    top: 112px;
-    max-height: calc(100vh - 126px);
+    top: 84px;
+    max-height: calc(100vh - 100px);
   }
-
   .review-list {
     @apply min-h-[220px] flex-1 overflow-y-auto;
   }
-
 }
 
+/* One content width for every screen. Screens used to pick 1000 or 1400 px
+   and the page jumped sideways when you changed tabs. */
 .app-main {
   max-width: 1400px;
   margin: 0 auto;
   padding: 28px 34px;
 }
 
-/* ── Responsive ── */
+/* Header: the full nav on wide screens, a menu button on narrow ones. At
+   640 px the old header wrapped into three rows (~200 px, sticky). */
+.nav-menu-btn { display: none !important; }
+
+@media (max-width: 980px) {
+  .app-search { order: 10; flex-basis: 100%; }
+}
+
 @media (max-width: 860px) {
   .review-layout { grid-template-columns: 1fr; }
   .review-sidebar { position: relative; top: 0; max-height: 55vh; }
 
-  /* Fill gaps: the 320px rail becomes a horizontal queue scroller above the
+  /* Fill gaps: the rail becomes a horizontal queue scroller above the
      workspace — items become fixed-width cards. */
   .fill-gaps .review-sidebar { max-height: none; }
   .fill-gaps .queue-list {
@@ -264,19 +291,15 @@ h1 { font-size: 18px; margin: 0 8px 0 0; }
   .fill-gaps .queue-item {
     flex: 0 0 auto;
     width: 240px;
-    border-bottom: 0;
-    border-radius: 10px;
   }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 760px) {
+  .app-nav { display: none !important; }
+  .nav-menu-btn { display: inline-flex !important; }
   .settings-grid,
   .placement-grid { grid-template-columns: 1fr; }
-
   .hero { flex-direction: column; align-items: flex-start; }
-
-  /* Library table → stacked cards: hide the header row, let each row flow
-     as a single-column card. */
   .library-head { display: none; }
   .library-row {
     grid-template-columns: 1fr;

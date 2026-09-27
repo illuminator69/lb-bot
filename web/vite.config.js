@@ -11,7 +11,9 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:8899',
+      // LB_API points the dev server at another lb-bot, e.g. the NAS:
+      //   LB_API=http://192.168.129.153:8899 npm run dev
+      '/api': process.env.LB_API || 'http://localhost:8899',
     },
   },
 })

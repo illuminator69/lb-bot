@@ -20,5 +20,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY listenbrainz_bot.py .
 COPY --from=web /web/dist ./web/dist
+# Which build this is, shown on the Settings -> Status screen. `deploy.sh dev`
+# passes the working tree's commit + "-dev"; CI can pass the pushed sha. Unset
+# reads "unknown", which is honest, rather than a hand-edited constant.
+ARG LB_BOT_REVISION=""
+ENV LB_BOT_REVISION=${LB_BOT_REVISION}
 EXPOSE 8899
 CMD ["python", "-u", "listenbrainz_bot.py"]

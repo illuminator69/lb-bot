@@ -22,7 +22,7 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** **32 errors, 0 failures** (319 tests as of 2026-09-23 — the total drifts as
+**Test baseline:** **32 errors, 0 failures** (441 tests on `index-mirror`, 2026-09-24 — the total drifts as
 tests are added, so check the 32/0, not the count; all 32 are in `AlbumReviewTests`). The errors are all stale beets tests kept
 from before the beets removal (see Decision below). Anything *else* failing is yours.
 
@@ -101,6 +101,7 @@ rather than to an error:
 | `LB_BOT_WISHLIST_INTERVAL` | `21600` (6 h) | how often the wishlist sweep wakes |
 | `LB_BOT_WISHLIST_COOLDOWN` | `43200` (12 h) | how long before one wishlist row is re-searched |
 | `LB_BOT_SOURCE_FAILOVER_DEADLINE` | `45` | wall-clock ceiling on the fetch route's walk down the ranked source list |
+| `LB_BOT_AUTO_INDEX` | `1` (on) | the background auto-index worker (`_auto_index_worker`): scans Navidrome artists with no, stub or stale index rows, yielding every MusicBrainz request to interactive callers. `0` turns it off without a rebuild. Like `index-push`, it only exists when the web UI does (`LB_BOT_WEB`, see § The index change feed) |
 
 Deezer needs no configuration at all — the browse API is open.
 
@@ -265,6 +266,14 @@ albums. `_artist_credit_mbid` takes the **first** credited artist rather than
 merging: a tap has to land on somebody, the display credit still carries the whole
 thing, and the lead credit is the only defensible answer for a collaboration.
 Additive, and costs no MusicBrainz request.
+
+**A failed lookup is an error, not an empty album** (2026-09-26). The fetch was
+non-strict, so a MusicBrainz outage came back as `{}` and answered 200 with artist
+`?` — which the SPA's album resolver read as "MusicBrainz names no artist for this
+album" for as long as the failure cooldown lasted. It is strict now: **404**
+`not_found` for a release-group MusicBrainz does not have, **503**
+`musicbrainz_unavailable` for an outage. A hub client that treated the old empty
+200 as "no variants" gets an error status instead.
 
 ### Editorial metadata — `GET /api/meta/artist`, `GET /api/meta/album`
 
@@ -577,6 +586,48 @@ landing is a `kind: "wishlist"` fill frame now rather than a second `albumPlaced
 for the whole-album path — a `format_rejected` fill with no review group had
 `mp3WouldHelp` on the wire and no route that could act on it.
 
+**6. Artist evidence, and the search that stopped guessing** (2026-09-27, branch
+`slskd-search-accuracy`). Short and self-titled album titles ("Zone" by Future,
+"Led Zeppelin") used to download the wrong album: the album-only fallback query
+flooded the pool, `_folder_name_score`'s old extra≤1 partial-ratio allowance
+scored any "OtherArtist Zone" folder at 100, and artist agreement was a +250
+bonus against ~4,000 points of peer metrics. Now:
+
+- `_annotate_folder_match` decides `artist_verified` + `artist_evidence`
+  (`path` / `files` / `tracks`): a complete credited sub-artist
+  (`_artist_variants` — split on real separators, never "and") whole in any
+  path component or the artist segment of a filename, or
+  `_folder_track_matches` lining the folder's files up with the canonical
+  tracklist (applied after scoring to the top unverified folders only —
+  `_apply_track_evidence_pass` — because it is the expensive check). Non-Latin
+  and stopword-only artists fall back to `_match_key` per component. Various
+  Artists and empty artists are never gated.
+- **Evidence is a tier, not a bonus**: `slskd_search_album_folders` sorts
+  verified above unverified whatever the score, stamps `search_pass`
+  provenance, and its early-stop needs *verified* album matches. **Absent flag
+  means verified** — only explicit `False` demotes, so legacy dicts and the
+  single-track path (still ungated, see backlog I-015) behave as before.
+- **Unattended paths never guess** (`_auto_download_choice`, the one rule):
+  the API download task fails `no_source` ("artist_unverified"), Telegram
+  falls through to the picker with a caution, `_source_failover_order(...,
+  folders=)` and `_switch_album_source_inner` skip unverified alternates. A
+  user's explicit pick (`chosen`, `start_is_choice`) is consent — for that one
+  source only.
+- `_folder_name_score` classifies a candidate's extra tokens: packaging/years/
+  bitrates and the artist's own name are stripped before scoring, sibling
+  markers (roman numerals, small numbers, part/vol — symmetric, both
+  directions, with the number exemptions off for numbered-series titles) cap
+  the score below the 80 threshold. An all-ignorable candidate scores 0.
+- Every album caller passes year + canonical tracklist now
+  (`_album_search_context` / `_search_album_with_context`, cached, degrades to
+  a bare search on a MusicBrainz outage). The year bonus was dead code before
+  — `slskd_search_album_folders` never forwarded it.
+- Wire: `artistVerified` / `artistEvidence` / `searchPass` on source rows,
+  `verifiedCount` on `/api/album/sources`, `recommended` only when rank 1 is
+  verified (both pickers). **`GET /api/debug/album-search?artist=&album=&year=|release_mbid=`**
+  runs the real search and shows every folder's rank inputs — use it before
+  theorising about this path, like the slskd probe before it.
+
 ### The wishlist — `GET/POST /api/wishlist`, `POST /api/wishlist/remove`
 
 Where a `no_source` failure goes. `no_source` deliberately never auto-retries
@@ -672,6 +723,254 @@ of the review file, and `/api/tasks` served all of it — past the hub's 4 MB
 the on-disk state and from the collection-wide snapshot; only `/api/tasks/<id>`
 serves it, deep-copied, because the SPA's Artist panel polls that one task for it.
 
+### The index change feed — seq triggers, epoch, high-water mark, auto-index
+
+Since 2026-09-24 (branch `index-mirror` in all four repos, not yet deployed when
+this was written; `PLAN-lbbot-index-mirror-2026-09-23` in `navi-connect/`, and the
+round's `SESSION-*` note there for what was verified) both clients keep a **local copy of `library_index.db`'s
+`artists` + `release_groups`** and pull deltas from it, so an artist page paints its
+missing albums in the same frame as the owned ones instead of ~10 s later. **Only
+lb-bot writes the index**; a client never writes a mirror row from a user action,
+it asks lb-bot and waits for the change to come back through the feed. The wire
+contract is `navi-connect/PROTOCOL.md` §15.3. What this repo owns:
+
+**The sequence is maintained by SQLite triggers, and the index must never be
+written around them.** `index_meta` holds one counter (`seq`) and the `epoch`;
+seven triggers (`_INDEX_SEQ_TRIGGERS`, dropped and recreated on every open by
+`_index_migrate_seq`) bump it on every row written to `artists` or
+`release_groups` and stamp the new value on the **one** artist that row belongs
+to (`artists.seq`). A deleted artist leaves a row in `index_tombstones` carrying
+its own seq, and re-inserting the key deletes its tombstone. Why triggers and not
+a helper each writer calls: several writers update by rgid or review group id
+without knowing which artist keys they touch, and one collaboration release spans
+several artists — only a row-level trigger sees the key. Why not `updated_at` or
+rowid: a wall clock ties and is 0 on stubs, and rowid does not change on UPDATE.
+Consequences that bind every future change:
+
+- **Every index write must be ordinary SQL that fires the triggers** — in practice
+  the shared `_index_db()` connection under `_index_lock`. No dropping or
+  disabling the triggers for a bulk load "and restamping afterwards", and no
+  `PRAGMA recursive_triggers=ON` (it is set OFF explicitly: with it on, the hidden
+  delete inside `INSERT OR REPLACE` would tombstone the artist a rescan is
+  rewriting). Anything that changes rows without firing the triggers is a change
+  **no client will ever see** — a mirror only asks for seqs above its cursor, and
+  the drift check only notices count/sum mismatches. A hand edit with the
+  `sqlite3` CLI is fine; the triggers are in the schema and fire there too.
+  Replacing the whole file is a different case and is covered: a fresh DB mints a
+  new epoch, and an older copy of this one is caught by the high-water mark below,
+  as long as the `.hwm.json` is left where it is.
+- **The triggers have no failure path, deliberately.** `_index_mark_release_present`
+  and `_index_set_release_album_ids` swallow exceptions, so a trigger that raised
+  would silently lose the `present` mark and a filled album would list twice (the
+  acquisition-coherence round). `index_meta`'s row is created before any trigger
+  can fire and every read of it is `COALESCE`d. Keep it that way.
+- **One increment per row write, not per artist** (ruling R1). A rescan of a
+  1,000-row artist bumps the counter ~2,000 times; that is fine for a 64-bit
+  integer and it guarantees every value belongs to exactly one key, so a page
+  boundary can never split a shared value.
+- The `artists` UPDATE trigger names every column **except** `seq`
+  (`UPDATE OF artist_mbid, nd_artist_id, name, scanned_at, scan_version`), so the
+  triggers' own stamp does not re-fire it. A new `artists` column that a client
+  should see change must be added to that list.
+- **Tombstones are never pruned.** Only an `nd:` → mbid key swap creates one, and
+  there cannot be more of those than Navidrome has artists.
+
+**Orphans are adopted, not deleted** (ruling R2). A `release_groups` row with no
+`artists` parent counts as owned in `_index_owned_rgids` but could never reach a
+mirror, which is keyed by artist; deleting it or excluding it from ownership
+would un-own a filled album and invite a second download. `_index_adopt_orphans`
+therefore gives every parentless key a **stub** parent on every open —
+`scanned_at = 0, scan_version = 0`, mbid or `nd:` id inferred from the key
+(`_index_stub_identity` is the same rule in Python) — and
+`_index_mark_release_present`'s insert path creates the same stub in the same
+transaction so no new orphan can appear. Know what a stub looks like to readers:
+`_index_get_artist` returns it (so the discography read says `indexed: true,
+stale: true`), `/api/library-index/status` counts it as indexed-and-stale, and an
+mbid-keyed stub's mbid is in `_index_indexed_artist_mbids` (so a similar-artist
+row reads `indexed: true` for an artist whose discography was never walked). The
+auto-index worker picks stubs up second, right after artists with no row at all.
+
+**The epoch, `WIRE_VERSION` and the high-water mark.** The epoch is
+`f"{WIRE_VERSION}-{secrets.token_hex(8)}"`. A client whose epoch differs from the
+server's wipes its mirror and pulls from zero, so the epoch changes exactly when
+a seq stops meaning what a client's cursor assumes:
+
+- **a new DB** (the `index_meta` row is created; existing artists are seeded
+  `1..N` in key order on that first migration only);
+- **a `WIRE_VERSION` bump** — the stored epoch's prefix no longer matches and is
+  re-minted at the next open. `WIRE_VERSION` (currently `1`) covers the shape and
+  meaning of a wire row, `_index_row_to_wire` **including the code-derived
+  `effective_type`**: a change to `_effective_release_type` must bump it, or every
+  mirror keeps rows classified under the old rule forever. It is unrelated to
+  `INDEX_SCAN_VERSION`, which gates the *matcher* and forces MusicBrainz rescans;
+- **the DB went backwards.** `synchronous=NORMAL` can lose the last commits to a
+  power cut and a DB restored without its `-wal` rewinds; either way the counter
+  would reissue values a client already holds for *different* changes, and the
+  client would skip them. So the highest seq ever let out of the process is
+  recorded in **`<index db>.hwm.json`** (`LIBRARY_INDEX_FILE + ".hwm.json"`, i.e.
+  `/config/library_index.db.hwm.json`, shape `{"epoch", "hwm"}`) and
+  `_index_check_hwm` rotates the epoch at the first open if the head is below it
+  under the same epoch. It is its own file rather than a key in
+  `lb_bot_state.json` (ruling R3): that file is rewritten whole by unrelated code on
+  its own schedule, and this one must be durable *before* an answer goes out.
+  Corollary for anyone restoring a backup: restore the DB and **leave the current
+  `.hwm.json` in place**. Restoring the old HWM with the old DB disarms the check,
+  and a client whose cursor sits between the two heads then silently skips the
+  values the restored DB reissues.
+
+The rule that makes the HWM worth anything: **a seq never leaves the process
+before `_index_persist_hwm` has recorded it.** The three feed routes persist before
+answering and answer `503 {"error": ...}` if the write fails
+(`_index_persist_hwm_or_error`), which a client treats as busy and backs off with
+its cursor untouched; the `index-push` sender persists before each POST and does
+not send on a failure. `_index_persist_hwm` raises on purpose; only the boot-time
+write inside `_index_check_hwm` swallows (ruling R12), because raising there would
+fail `_index_db()` for whichever caller opened it first — possibly the
+exception-swallowing present-mark. The rotation commit itself runs with
+`synchronous=FULL` for that one commit so the new epoch is durable before the file
+names it. Lock order is `_index_lock` then `_index_hwm_lock`, never the reverse.
+A read-only `/config` therefore shows up as the two feed routes answering 503 and the
+sender logging "could not persist the high-water mark" once — it then retries on its
+own ladder, `INDEX_PUSH_PERSIST_BACKOFF_MIN` (2 s) doubling to `_MAX` (60 s), reset by
+the first success, which it also logs once. It used to retry every 1 s poll with a
+line each time. `/api/health` is deliberately *not* gated on the write (below). The
+fix is the same chown as in § Runtime / Docker.
+
+**The feed routes** (module-level views, unit-tested without Flask; thin wrappers
+in `start_web_dashboard()`). No inbound auth, like every other `/api/*` route —
+the hub is the only thing that reaches them.
+
+- **`GET /api/index/changes?since=&epoch=`** (`_index_changes_view`): every artist
+  and tombstone with `seq > since`, one `UNION ALL … ORDER BY seq`, each artist
+  carrying all its rows in `_index_row_to_wire` shape. Pages are capped by
+  **bytes** (`INDEX_CHANGES_MAX_BYTES`, 2 MB, under the hub's 4 MB
+  `PROXY_MAX_RESPONSE`) and always carry at least one item. The envelope carries
+  `scanVersion` and `ttlDays` so a client computes `stale` itself — nothing
+  computed at read time goes on the wire as a fact. `artistCount` and `seqSum` are
+  for the client's drift check. Head, items, count and sum are read in **one**
+  `_index_lock` hold, which is what makes them one snapshot; a future second reader
+  connection would need an explicit `BEGIN`. A wrong `epoch`, or `since > headSeq`,
+  answers `{"resync": true, …}` with no items. A non-integer or negative `since` is
+  400.
+- **`GET /api/index/keys`** (`_index_keys_view`): every artist's `{key, seq}`,
+  ~120 KB, for the drift repair. Tombstones are not listed — a tombstoned key is
+  simply absent.
+- **`GET /api/health`** (`_index_health_view`): `{"ok": true, "epoch", "headSeq"}`,
+  nothing else — no Navidrome, no MusicBrainz, no summary. It is the hub's liveness
+  probe; before it existed the hub probed `/api/summary`, the heaviest read in the
+  module. (Not `_health_view`: that name is the SPA's unrelated
+  `/api/system/health`.) **It never writes and never answers 503.** Its `headSeq`
+  is the head already recorded in `.hwm.json` for the current epoch (0 before one
+  is), never the live head, which may not be durable yet. It used to persist and
+  503 like the feed routes, and the hub read that as lb-bot down — every client hid
+  every lb-bot feature over a disk fault that affects only the mirror.
+
+**The `index-push` thread** (`_index_push_worker`, `_index_push_tick` is the pure
+throttle) polls the head every `INDEX_PUSH_POLL_SECS` (1 s) and POSTs `{seq,
+epoch}` to `<LB_BOT_HUB_URL>/lb/index` with `LB_BOT_HUB_TOKEN`: leading edge, at most
+one attempt per `INDEX_PUSH_MIN_GAP_SECS` (2 s), retried until a 2xx, and once at
+boot even with nothing new. A trailing debounce would never fire during a steady
+bulk build, which is why it is leading-edge. It is **not** `/lb/notify` — that
+flushes the hub's library caches and makes both clients refetch their whole
+library, every 2 s during a build — and deliberately **not** a second use of
+`hub-fill-push`/`_push_worker`, whose behaviour the acquisition round depends on.
+It shares only the `_push_enabled()` gate.
+
+**The auto-index worker** (`_auto_index_worker`, thread `auto-index`). The mirrors
+are only as complete as the index, and until this round the index grew only when
+someone pressed "Build library index" or opened an artist page. The worker scans
+one Navidrome artist per tick — no row first, then stubs, then stale rows
+(older than `_auto_index_stale_after(key)`, or an older `INDEX_SCAN_VERSION`) oldest
+first — through
+the same `_index_store_artist` / `_index_store_unresolved_artist` the manual build
+uses. It re-reads Navidrome's artist list every `AUTO_INDEX_DIFF_SECS` (15 min) and
+right after a Navidrome scan finishes, which it detects by polling
+`getScanStatus` every `AUTO_INDEX_SCAN_POLL_SECS` (60 s): lb-bot had no
+scan-finished signal. Six things about it:
+
+- **It yields MusicBrainz to every page.** The whole scan runs under
+  `mbz_background()`; `mbz_get`'s network path takes `_mbz_turn()`, where a
+  background caller waits while any interactive caller is queued and for
+  `MBZ_BACKGROUND_GRACE` (2 s) after the last one finished. The worst a page waits
+  is the one worker request already in flight.
+- **Backoff.** A failed artist is retried after `AUTO_INDEX_FAIL_BACKOFF_BASE`
+  (30 min) doubling to `AUTO_INDEX_FAIL_BACKOFF_MAX` (1 day), in memory. A
+  `MusicBrainzUnavailable` also pauses the whole worker for
+  `AUTO_INDEX_MB_OUTAGE_PAUSE` (= `MBZ_FAIL_COOLDOWN`, 300 s), since the next artist
+  would fail the same way. **`MusicBrainzNoSuchEntity`** — a subclass `mbz_get`
+  raises for a strict caller on a permanent 400/404/410, live or from the cached
+  `{}` marker — is caught first and backs off *only that artist*: one bad tag mbid
+  must not stall the worker (ruling R14). Every existing `except
+  MusicBrainzUnavailable` still catches it. The name search is strict too, so an
+  outage is never written down as "no such artist" (R13). An empty release list for
+  an artist with a stored discography keeps the stored one and counts as a failure.
+- **A manual build pauses it** — checked before every artist; the overlap is at
+  most the one artist in progress.
+- **It fills the review like a manual build** (ruling R36). `_auto_index_scan`
+  calls `_union_review_groups` on the scan's gap groups, same as
+  `_library_index_task`, so **the Fill-gaps review fills up on its own** as the
+  worker walks the library. That is load-bearing: an `incomplete` row's `group_id`
+  is the clients' `/lb/gap` handle, and a brief R32 that skipped the union left it
+  answering 404 "Group not found" until a manual build. A group the user **hid**
+  stays hidden (`_merge_review_groups` carries `hidden` across a rescan); one the
+  user **removed** can come back on that artist's next rescan, as it always could
+  with the manual build. The stale jitter below spreads those rescans, so the
+  re-merges do not arrive as one monthly burst.
+- **It is bounded, whatever the DB says** (final review C1). Two untagged artists
+  whose name search resolves to the same mbid ("Beyonce"/"Beyoncé") used to take the
+  one `nd_artist_id` column in turns: each scan made the other "missing" — always
+  ranked first — so the pair was rescanned live against MusicBrainz forever and the
+  head moved every tick. Now a resolved mbid whose row is fresh and held by
+  **another** Navidrome artist still in the library is `covered`: nothing is
+  written, and `state["covered"]` remembers the mapping so selection judges that
+  artist by the shared row. And any id scanned in this process
+  (`state["scanned"]`) is not picked again inside the TTL unless its tag mbid
+  changed (which keeps R15's "a new tag rescans at once"). Staleness is **jittered
+  per key** as well: `_auto_index_stale_after` is the TTL × (1 + (crc32(key) %
+  1000) / 4000), 0–25 % longer and stable across restarts, so one bulk build does
+  not age out on one day and rescan (and re-merge the review for) the whole
+  library in a burst. Missing
+  artists, stubs and a scan-version bump are not jittered, and the clients still
+  compute `stale` at the plain TTL.
+- It also deletes, with plain SQL so the triggers tombstone them, `nd:X` miss-stubs
+  shadowed by an mbid row holding the same Navidrome id when every `present` row
+  they carry is present there too (`_index_drop_shadowed_nd_stubs`), and it never
+  writes an `nd:` row over another row claiming that id (`_index_store_artist(...,
+  unless_claimed=True)`, checked inside the write's own lock hold).
+
+`LB_BOT_AUTO_INDEX=0` turns it off (it returns at thread start with one log line;
+also off with no Navidrome login). **`auto-index`, `index-push` and
+`index-backfill-sweep` are started from `start_web_dashboard()`, so with
+`LB_BOT_WEB=0` none of them runs** — a Telegram-only process has no index push and
+no background indexing, whatever `LB_BOT_AUTO_INDEX` says.
+
+**The read path is pure SQLite now.** `GET /api/artist/discography` no longer runs
+`_index_backfill_present_album_ids` (it did, per read, against Navidrome's 300 s
+album cache, on the lock the feed routes need). The backfill runs after
+`_announce_album_indexed` for the placed release's artist, and every
+`INDEX_BACKFILL_SWEEP_INTERVAL` (300 s) from the `index-backfill-sweep` thread for
+anything else with an unresolved `present` row — except an artist it can never
+match (no name and no Navidrome id, i.e. an adopted orphan stub, or no `artists`
+row at all), which used to cost a walk of the whole Navidrome album index every
+pass. Its writes are plain SQL, so they reach the mirrors like any other.
+
+**A rescan never forgets a fill.** `_index_store_artist` carries every `present`
+row across a rewrite: onto the scan's own row where the scan says `missing`, and
+appended as it stands where the scan did not produce that release-group at all. The
+second half is from the final review (M4): a miss-stub's refresh stores no
+releases, so an album filled under an unresolvable artist was un-owned — and
+offered for download again — on the stub's next refresh.
+
+Scans got cheaper in the same round: a strict release-group browse bypasses a
+positive `mbz_get` cache hit (`bypass_cache`), otherwise a TTL rescan re-read the
+old answer forever; and `mbz_release_full` fetches `inc=release-groups+recordings`
+once and caches a projection under each narrower key (the release-group key without
+`media`, the tracklist key without `release-group`; the combined key itself is
+dropped), halving the MusicBrainz cost of every title-matched owned album in a scan.
+When both narrower keys are already cached it answers from them with no request at
+all — asking for the combined key anyway cost one new request per owned album per
+rescan.
+
 ### Why a playlist scan was taking 40 minutes
 
 `group_missing_by_album` is O(tracks in the matched *releases*), not O(missing
@@ -717,6 +1016,138 @@ the fix would have been a silent no-op. Caught only by running it against the
 live server.
 
 **Don't reintroduce the retry on a bulk path.** A one-off lookup should keep it.
+
+### What the web UI relies on (the 2026-09-26 audit round)
+
+The SPA was restructured on branch `ui-polish` (see `README.md` § The React web
+frontend for the screens, `SESSION-2026-09-26-ui-audit-polish.md` for the audit).
+Most of the round was frontend, but it found several places where the backend
+handed the UI a claim that wasn't true, and the fixes are rules now:
+
+- **A group stuck on `downloaded` stops claiming to be in progress.** The
+  `downloaded` bucket (files fetched, placement to come) mapped to the gap status
+  `downloading` forever; on 2026-09-26 eighteen repair-origin groups had read
+  "Working" for 7–55 days with nothing transferring. `_gap_status_for_group` now
+  reports `failed` once `_downloaded_is_stale` (no track has *entered*
+  `downloaded` for `DOWNLOADED_STALE_SECS`, 30 min), and `_gap_detail_view` sets
+  `failReason: "stalled_placement"` + `stalledPlacement` — over any older error
+  message, which is not why the album is stuck — so the UI offers
+  Reconcile/Rescan, not "try the next source". **The clock is the tracks'
+  `downloaded_at` and nothing else**, stamped by `_stamp_downloaded` only on the
+  transition into `downloaded` (from `_set_review_track_state`, the repair
+  projection and the reconcile pass). It first read the group's `updated_at`
+  too, which Skip, Unhide, allow-MP3, a rescan, a source search and the Stuck
+  card's own Reconcile all bump without placing anything, so a stuck album read
+  "working" for another half hour after each. On a stalled group
+  `_approve_pending_missing_tracks` re-approves the downloaded tracks, so the
+  Stuck card's "download again" and "search again" can actually fetch; the
+  fetch route answers 400 `nothing_to_fetch` when nothing is approvable rather
+  than reporting every source as a peer rejection. `refresh_group_missing` is a
+  no-op on a group with no `albums` (repair projections, playlist and Spotify
+  groups) — it used to blank `canonical_mbid` and `missing_tracks` and mark them
+  complete.
+- **One definition of "has gaps"**: `_group_needs_attention(status)` — anything
+  not `complete`. The Fill-gaps counts, the Library title (`libraryTotals`) and
+  `/api/summary`'s `library.withGaps` used to answer three different ways
+  (3103 / 3012 / 3121). `_library_gap_album_count` is the library-album count.
+- **`/api/library` and `_needs_placement_view` read the list snapshot**, not
+  `_review_snapshot()`: the latter deep-copies the whole review (~14 MB live) and
+  `_needs_placement_view` runs inside `/api/summary`, i.e. every poll of every
+  screen. `_review_list_snapshot` rows now also carry `source_count`, album ids,
+  `canonical_mbid`/`release_mbid` and downloaded tracks' `downloaded_at` — none of
+  which are `review_groups` columns, so `_GAP_LIST_GROUP_FIELDS` is unchanged.
+- **List rows say whether a search has run** (`sourceCount` on `_album_view`). The
+  rail said "source ready" for every album.
+- **Hidden groups are listable** (`/api/gaps?hidden=1`, and `counts.hidden`), so a
+  skip can be undone; the counts still describe the visible list.
+- **Placement suggestions must share an album word.** `_suggest_review_group_for_folder`
+  used to accept artist-only overlap ("Led Zeppelin IV" → *Coda*) and one shared
+  word in a long folder name ("Speakerboxxx _ The Love Below" → *Love — Love*).
+  It now requires an album-specific token and ≥50 % of the folder's own words,
+  and returns `score` + `basis` (tags / folder name). `_suggestion_confidence`
+  grades it `likely` (one-tap confirm) or `possible` (look first); every group
+  suggestion used to be `likely`. **Only a full match on the files' tags is
+  `likely`**; a folder-name match never is. Edition and format words
+  (`_MATCH_NOISE_TOKENS`: "Deluxe Edition", "[FLAC 24bit 96kHz]", years) count
+  neither for nor against. A **self-titled** group has no album-only word to
+  insist on, so any word the source leaves unexplained marks the suggestion
+  `ambiguous` → `possible` ("Led Zeppelin IV" is not the debut), and a tie goes
+  to the group explaining more of the source's words. `POST
+  /api/placements/<id>/confirm` takes the card's `groupId` (or `releaseMbid`);
+  with neither it files only into a suggestion that grades `likely`, as the
+  identity branch always did. The whole match is one-tap *library damage* when
+  wrong: `_place` retags every file with the target release and files leftovers
+  as bonus tracks.
+- **An `mb:` scan never runs over an owned artist.** `POST /api/artist/discography`
+  with `external` (or an `mb:` nd id) skips the library, so every release reads
+  `missing` — and `_index_store_artist` rewrote the owned artist's own row that
+  way when the mbid was theirs (reached from a search row, a pasted link, or a
+  credit spelled differently from the tag). `_owned_artist_for_mbid` checks
+  Navidrome's tags and then the index row, and the route scans as that library
+  artist instead. The SPA also redirects an `mb:` route to the owned page when
+  an owned artist carries that mbid. `name` is optional now: an `mb:` page has
+  none, and posting the mbid in its place stored the UUID as the artist's name
+  (mirrors included); the task looks the real one up.
+- **Review merges keep user state and never double a row.** `_merge_review_groups`
+  carries `_REVIEW_GROUP_CARRIED_FIELDS` (allow-MP3, the last no-source verdict)
+  and `_REVIEW_TRACK_CARRIED_FIELDS` (manual picks, force-place state) across a
+  rescan — the auto-index worker unions every artist it walks, so they used to
+  last until that artist's next scan. `_replace_review_groups` drops a repair-job
+  projection whose id (or identity) another origin still holds live; keeping it
+  made two rows with one id. Both union and replace fold a second origin's row
+  for the same album into the **richer** one (`_fold_by_identity`); rows naming
+  no album at all (`_identity_key` == "") never fold together.
+- **`GET /api/album/lookup?artist=&album=`** runs `_mbz_release_group_for` —
+  fielded, quoted, free-text fallback, exact-title re-rank — for a caller that
+  knows which half is which. The SPA used to hand-build the fielded query with no
+  quoting, so '"Heroes"' or an edition suffix found nothing.
+- **`/api/placements?all=1`** adds folders already filed or dismissed that are
+  still on disk (`filed` says which). The old Import tab listed these beside the
+  real queue without telling them apart.
+- **`WEB_BUILD` is `LB_BOT_REVISION`**, baked in by `ARG LB_BOT_REVISION` in the
+  Dockerfile. `deploy.sh dev` passes `<commit>[+dirty]-dev`; **CI does not yet**
+  (the workflow lives in the publish clone — add `build-args: LB_BOT_REVISION=${{ github.sha }}`
+  to `docker/build-push-action` there at the next release). Unset reads `unknown`.
+  It was a hand-edited constant three months stale.
+- **stdout and stderr reach the Logs view.** `_LogTee` (installed at the top of
+  `main()`, never at import, so tests that capture stdout are unaffected) wraps
+  both streams — stderr is where `traceback.print_exc()` and every `logging`
+  handler write; werkzeug's per-request access lines are skipped. **Two rings**:
+  printed lines go to `_stdout_events` (`WEB_LOG_MAX` = 1000), deliberate
+  `_web_log` events to `_web_events` (`WEB_EVENTS_MAX` = 200), which error
+  envelopes' `logTail` and `/api/status` read (`_web_log_events`); `/api/logs`
+  merges them (`_log_ring_merged`). One shared ring let a single scan (a line
+  per track) evict every deliberate event. The tee buffers the partial line
+  **per thread** — `print` is two writes, and a shared buffer glued lines from
+  two threads — and `_web_log` suppresses its own echo with a thread-local flag,
+  not a `web: ` prefix match. Severity is keyword-derived on word boundaries,
+  except for per-track progress lines ("Checking: Refused - New Noise" is not an
+  error); the tag comes from the raw text, before redaction rewrites the host.
+  The lock is an `RLock`: the SIGTERM handler prints on the main thread.
+  **Everything printed now reaches a served endpoint**, so `_redact_secrets` also
+  strips Subsonic's `u`/`t`/`s`/`p` query parameters — `requests` prints whole
+  Navidrome URLs in its exceptions, and `t`+`s` replay as a login. A secret
+  shorter than 12 characters is replaced only where it stands alone, so a
+  password like "music" no longer rewrites every `/music/…` path.
+- **`GET /api/system/status`** (`_system_status_view`): revision, uptime, what the
+  auto-index worker and index-push sender last did (`_auto_index_public`,
+  `_index_push_public` — each worker publishes a copy after its tick), AcoustID
+  (key, fpcalc, rejected-peer count), Last.fm, Spotify, ListenBrainz playlists,
+  wishlist and search timings. Read-only; no secrets, hub URL redacted.
+  **`POST /api/acoustid/rejected/clear`** `{confirm: true}` empties `rejected_sources`.
+- **`GET /api/fills?recent=1`** prepends the 20 most recently touched ledger rows,
+  so the SPA can list album requests it didn't start.
+- **`/api/library?sort=`** `artist | album | year | missing` (the table paginates
+  server-side, so it sorts there too).
+- **Plain route names for placement**: `/api/place-folder`, `/api/download-folders`,
+  `/api/place-folder/candidates` alias the `/api/beets/*` routes (beets is not
+  involved). `/api/place-folder` with only `group_id` resolves the release from the group.
+- **`_settings_cards` matches failed checks by exact label** — "Library path ↔
+  Navidrome" failing used to flag the Navidrome credentials card too — and no
+  longer serves the stale `docker run` example.
+- **`_deezer_get` raises `DeezerError` for transport failures too.** A read
+  timeout escaped as a bare `requests` exception, which no caller catches, so
+  `/api/artist/related` answered 500 whenever Deezer was slow.
 
 ## The goal (confirmed spec)
 

@@ -2,8 +2,8 @@
 // method. The full palette is derived from three appearance inputs --
 // theme (dark/light) x bgTone (warm/slate/plum) x accent (amber/sky/sage/rose)
 // -- by mixing a small anchor table, and written onto :root as CSS custom
-// properties. Components must never hardcode hex except cover gradients and
-// the constant dark-on-accent text #17130f.
+// properties. Components must never hardcode hex except cover gradients —
+// text on a filled accent is `var(--on-accent)`.
 
 const BG_ANCHORS = {
   warm: {
@@ -55,6 +55,9 @@ export function tokens({ theme, bgTone, accent: accentName }) {
     '--border': m(surf, text, 0.085), '--border-warm': m(surf, text, 0.12), '--hairline': m(surf, text, 0.045),
     '--text': text, '--text2': m(text, bg, 0.22), '--muted': m(text, bg, 0.42), '--faint': m(text, bg, 0.60), '--dot': m(text, bg, 0.74),
     '--accent': accent,
+    // Text on a filled accent (primary buttons, active chips). Was a hex
+    // literal repeated in four components.
+    '--on-accent': '#17130f',
     '--accent-2': theme === 'dark' ? m(accent, '#ffffff', 0.18) : m(accent, '#000000', 0.28),
     '--accent-3': theme === 'dark' ? m(accent, '#ffffff', 0.35) : m(accent, '#000000', 0.12),
     '--accent-tint': m(accent, surf, 0.90), '--accent-btn': m(accent, surf, 0.86), '--accent-bd-soft': m(accent, surf, 0.80),

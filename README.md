@@ -97,5 +97,6 @@ navigate by function name.
 - `CLAUDE.md` — authoritative design notes; **read before editing the pipeline.**
 - `AGENTS.md` — agent instructions.
 - `test_album_review.py` — test scaffolding for the album-review flow. Its
-  baseline is **32 errors**, all `No module named 'mutagen'` in this
-  environment; anything beyond that is yours.
+  baseline is **0 errors, 0 failures** (the 32 stale beets tests were deleted);
+  the test count drifts as tests are added, so check the 0/0 invariant, not a
+  total. Anything beyond that is yours.

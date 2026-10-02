@@ -33,6 +33,34 @@ sys.modules.setdefault("telegram.ext", telegram_ext_stub)
 import listenbrainz_bot as bot
 
 
+def swap_index(path, conn=None, *, close_old=True):
+    """Point the shared library index at `path` and `conn`; return the (path, conn) it displaced.
+
+    Every test that redirects or reopens library_index.db goes through here (Q-022). The file
+    and the connection change in one `_index_lock` hold, and the displaced connection is closed
+    inside it, because the review flusher is a daemon thread that can fire in the middle of any
+    test and it uses the connection under that lock (`_review_groups_write`). Done piecemeal,
+    without the lock, a teardown closed the connection mid-statement (an intermittent SIGSEGV),
+    or the flusher opened a fresh connection between a reset connection and a restored path —
+    into a temp dir about to be removed ("Directory not empty"), and leaked it to later tests.
+
+    `close_old=False` keeps the displaced connection open, for entering a scratch index that
+    will put the outer one back. A simulated restart (drop the connection, reopen the same
+    file on the next `_index_db()`) is `swap_index(bot.LIBRARY_INDEX_FILE)`.
+    """
+    with bot._index_lock:
+        old = bot.LIBRARY_INDEX_FILE, bot._index_conn
+        bot.LIBRARY_INDEX_FILE, bot._index_conn = path, conn
+        if close_old and old[1] is not None and old[1] is not conn:
+            old[1].close()
+    return old
+
+
+def scratch_index(test, path):
+    """Point the shared index at `path` for one test; the cleanup puts the old one back."""
+    test.addCleanup(swap_index, *swap_index(path, close_old=False))
+
+
 @contextlib.contextmanager
 def isolated_review():
     """An empty review with its own JSON file and its own library_index.db.
@@ -43,12 +71,10 @@ def isolated_review():
     Yields the temp dir.
     """
     old_file = bot.REVIEW_FILE
-    old_index, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
     old_state = bot._review_snapshot()
     with tempfile.TemporaryDirectory() as td:
         bot.REVIEW_FILE = os.path.join(td, "review.json")
-        bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
-        bot._index_conn = None
+        old_index = swap_index(os.path.join(td, "index.db"), close_old=False)
         with bot._review_lock:
             bot._review_state = bot._empty_review_state()
             bot._review_dirty_groups.clear()
@@ -56,15 +82,44 @@ def isolated_review():
         try:
             yield td
         finally:
-            if bot._index_conn is not None:
-                bot._index_conn.close()
-            bot._index_conn = old_conn
+            # In this order (Q-022), because the flusher may fire mid-teardown:
+            # aim its JSON write away from the temp dir, leave it no group to
+            # write, and only then move the index — under the lock it writes under.
             bot.REVIEW_FILE = old_file
-            bot.LIBRARY_INDEX_FILE = old_index
-            bot._review_dirty.clear()
             with bot._review_lock:
-                bot._review_state = old_state
                 bot._review_dirty_groups.clear()
+                bot._review_state = old_state
+            bot._review_dirty.clear()
+            swap_index(*old_index)
+
+
+class IsolatedIndexTests(unittest.TestCase):
+    """The scratch-index helpers themselves (Q-022)."""
+
+    def test_teardown_waits_for_a_writer_holding_the_index_lock(self):
+        """The review flusher is a daemon thread that can fire inside any test's
+        teardown, and it holds `_index_lock` while it uses the connection
+        (`_review_groups_write`). A teardown that closed the connection without
+        that lock pulled it out from under the write: an intermittent SIGSEGV."""
+        seen = {}
+        held = threading.Event()
+
+        def writer(conn):
+            with bot._index_lock:
+                held.set()
+                time.sleep(0.2)          # the teardown runs meanwhile
+                try:
+                    conn.execute("SELECT 1").fetchone()
+                    seen["ok"] = True
+                except Exception as e:   # closed under us
+                    seen["error"] = repr(e)
+
+        with isolated_review():
+            t = threading.Thread(target=writer, args=(bot._index_db(),))
+            t.start()
+            held.wait(5)
+        t.join(5)
+        self.assertEqual(seen, {"ok": True})
 
 
 class AlbumReviewTests(unittest.TestCase):
@@ -280,7 +335,7 @@ class AlbumReviewTests(unittest.TestCase):
         return g
 
     def test_playlist_scan_does_not_touch_library_groups(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             with bot._review_lock:
                 bot._review_state["groups"] = [
                     self._origin_group(f"lib{i}", "library", album=f"Album {i}")
@@ -293,7 +348,7 @@ class AlbumReviewTests(unittest.TestCase):
                              ["lib0", "lib1", "lib2", "pl1"])
 
     def test_library_scan_does_not_touch_playlist_groups(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             with bot._review_lock:
                 bot._review_state["groups"] = [
                     self._origin_group("pl1", "playlist", artist="P", album="Q"),
@@ -309,7 +364,7 @@ class AlbumReviewTests(unittest.TestCase):
 
     def test_a_scan_replaces_only_its_own_origin_repeatedly(self):
         """Two playlist scans in a row leave one playlist row, not two."""
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             for album in ("First", "Second"):
                 bot._replace_review_groups(
                     "playlist", [self._origin_group("pl", "playlist", album=album)], "x")
@@ -319,7 +374,7 @@ class AlbumReviewTests(unittest.TestCase):
     def test_a_playlist_album_the_library_already_lists_folds_in(self):
         """Group ids are built per origin, so the same album reached two ways
         has two ids. Without folding, the rail shows it twice."""
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             lib = self._origin_group("lib0", "library", canonical_mbid="rel-1")
             lib["missing_tracks"] = [{"mbid": "t1", "title": "One",
                                       "decision": "approved"}]
@@ -337,31 +392,8 @@ class AlbumReviewTests(unittest.TestCase):
             # The track the library group already had keeps the user's decision.
             self.assertEqual(groups[0]["missing_tracks"][0]["decision"], "approved")
 
-    def test_an_active_repair_job_survives_a_library_scan_as_one_row(self):
-        """_merge_review_groups appends a group for every active repair job, so
-        a library scan both keeps the existing repair row and re-synthesizes
-        one. They must collapse — two rows for one album is the thing origin
-        folding exists to prevent."""
-        job = {"id": "job1", "group_id": "rg1", "artist": "A", "album": "B",
-               "status": "needs_review", "tracks": [], "downloads": [],
-               "source_pools": [], "file_matches": [], "import_attempts": [],
-               "verification": {}, "messages": [], "created_at": 1,
-               "updated_at": 1, "canonical_album_id": "",
-               "canonical_release_mbid": ""}
-        with isolated_review(), patch.object(bot, "repair_jobs", {"job1": job}):
-            bot._replace_review_groups("library", [], "x")
-            first = list(bot._review_state["groups"])
-            self.assertEqual([g["id"] for g in first], ["rg1"])
-            self.assertEqual(bot._review_group_origin(first[0]), "repair")
-
-            # A second library scan must not add a second row for it.
-            bot._replace_review_groups(
-                "library", [self._origin_group("lib0", "library", album="L")], "x")
-            ids = [g["id"] for g in bot._review_state["groups"]]
-            self.assertEqual(sorted(ids), ["lib0", "rg1"])
-
     def test_a_scan_carries_the_hidden_decision_across(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             with bot._review_lock:
                 bot._review_state["groups"] = [
                     self._origin_group("lib0", "library", hidden=True)]
@@ -372,7 +404,7 @@ class AlbumReviewTests(unittest.TestCase):
     def test_a_library_scan_keeps_stored_searches(self):
         """scan-all used to rebuild the state from _empty_review_state() and
         re-attach tasks/operations by hand — `searches` was not on that list."""
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             with bot._review_lock:
                 bot._review_state["searches"] = {"s1": {"id": "s1", "query": "q"}}
             bot._replace_review_groups("library", [], "x")
@@ -411,14 +443,13 @@ class AlbumReviewTests(unittest.TestCase):
     def test_groups_survive_closing_the_database(self):
         """A real restart drops the SQLite connection too. WAL means the bytes
         are only in -wal until then, so reopening is the honest round trip."""
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             bot._replace_review_groups(
                 "library", [self._origin_group("lib0", "library", album="Kept")], "x")
             bot._find_review_group("lib0")["hidden"] = True
             bot._save_review_state(urgent=True)
 
-            bot._index_conn.close()
-            bot._index_conn = None
+            swap_index(bot.LIBRARY_INDEX_FILE)
             with bot._review_lock:
                 bot._review_state = bot._empty_review_state()
             bot._load_review_state()
@@ -429,7 +460,7 @@ class AlbumReviewTests(unittest.TestCase):
             self.assertEqual(groups[0]["origin"], "library")
 
     def test_a_group_dropped_from_the_review_loses_its_row(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             bot._replace_review_groups(
                 "library", [self._origin_group("lib0", "library")], "x")
             bot._save_review_state(urgent=True)
@@ -441,7 +472,7 @@ class AlbumReviewTests(unittest.TestCase):
     def test_a_scan_only_rewrites_rows_it_changed(self):
         """A five-album playlist scan must not rewrite the library's ~3000
         rows just because it keeps them."""
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             bot._replace_review_groups(
                 "library",
                 [self._origin_group(f"lib{i}", "library", album=f"L{i}",
@@ -459,7 +490,7 @@ class AlbumReviewTests(unittest.TestCase):
             self.assertEqual(bot._review_dirty_groups, {"pl1"})
 
     def test_a_fold_marks_the_row_it_changed(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             lib = self._origin_group("lib0", "library", canonical_mbid="rel-1")
             bot._replace_review_groups("library", [lib], "x")
             bot._save_review_state(urgent=True)
@@ -472,7 +503,7 @@ class AlbumReviewTests(unittest.TestCase):
             # Folded into lib0, so lib0 is what has to be rewritten.
             self.assertEqual(bot._review_dirty_groups, {"lib0"})
             bot._save_review_state(urgent=True)
-            bot._index_conn.close(); bot._index_conn = None
+            swap_index(bot.LIBRARY_INDEX_FILE)
             with bot._review_lock:
                 bot._review_state = bot._empty_review_state()
             bot._load_review_state()
@@ -636,7 +667,7 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(groups, [])
 
     def test_gaps_view_counts_per_origin(self):
-        with isolated_review(), patch.object(bot, "repair_jobs", {}):
+        with isolated_review():
             with bot._review_lock:
                 bot._review_state["groups"] = [
                     self._origin_group("lib0", "library", album="L0"),
@@ -671,10 +702,7 @@ class AlbumReviewTests(unittest.TestCase):
                         mk("A"),
                         mk("B", canonical_album_id="keepme", hidden=True),
                     ]
-                # repair_jobs is module-global; isolate from other tests'
-                # leftovers (active jobs get appended by _merge_review_groups).
-                with patch.object(bot, "repair_jobs", {}):
-                    bot._union_review_groups([mk("B"), mk("C"), mk("C")])
+                bot._union_review_groups([mk("B"), mk("C"), mk("C")])
                 groups = bot._review_snapshot()["groups"]
                 # A untouched, B updated in place, C appended once (duplicate dropped)
                 self.assertEqual([g["id"] for g in groups], ["A", "B", "C"])
@@ -685,16 +713,14 @@ class AlbumReviewTests(unittest.TestCase):
             with bot._review_lock:
                 bot._review_state = old_state
 
-    def test_union_leaves_a_group_with_an_active_repair_job_alone(self):
-        """A union for one artist must not rebuild OTHER groups from their repair jobs.
+    def test_union_leaves_a_group_it_did_not_cover_alone(self):
+        """A union for one artist must not rebuild OTHER groups.
 
-        _merge_review_groups appends a projection of every active repair job whose
-        group the scan did not cover — right for a full replace, where that group
-        would otherwise vanish, and wrong for a union, which keeps uncovered groups
-        as they are. The union swapped the projection in over the live group, so a
-        source search (which opens a repair job) lost its results within seconds of
-        finishing whenever the auto-index worker unioned another artist
-        (beabadoobee / Loveworm, 2026-09-24).
+        Until B-022 the merge appended a repair-job projection for every group
+        the scan did not cover, and the union swapped it in over the live group,
+        so a source search lost its results within seconds of finishing whenever
+        the auto-index worker unioned another artist (beabadoobee / Loveworm,
+        2026-09-24). The jobs are gone; the property stays pinned.
         """
         old_file = bot.REVIEW_FILE
         old_state = bot._review_snapshot()
@@ -705,18 +731,15 @@ class AlbumReviewTests(unittest.TestCase):
                 "source_results": {"folders": [{"username": "u", "folder": "f"}],
                                    "created_at": time.time()},
                 "last_action": "source_search"}
-        job = {"id": "job-G", "group_id": "G", "status": "needs_source",
-               "artist": "Band", "album": "Record", "tracks": []}
         try:
             with tempfile.TemporaryDirectory() as td:
                 bot.REVIEW_FILE = os.path.join(td, "review.json")
                 with bot._review_lock:
                     bot._review_state = bot._empty_review_state()
                     bot._review_state["groups"] = [live]
-                with patch.object(bot, "repair_jobs", {"job-G": job}):
-                    bot._union_review_groups([{
-                        "id": "OTHER", "canonical_album_id": "", "merge_mode": "",
-                        "match_mode": "auto", "missing_tracks": [], "messages": []}])
+                bot._union_review_groups([{
+                    "id": "OTHER", "canonical_album_id": "", "merge_mode": "",
+                    "match_mode": "auto", "missing_tracks": [], "messages": []}])
                 groups = {g["id"]: g for g in bot._review_snapshot()["groups"]}
                 self.assertEqual(set(groups), {"G", "OTHER"})
                 self.assertEqual(groups["G"]["origin"], "library")
@@ -730,9 +753,7 @@ class AlbumReviewTests(unittest.TestCase):
 
     def test_library_index_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
-            old_file, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-            bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
-            bot._index_conn = None
+            old_index = swap_index(os.path.join(td, "index.db"), close_old=False)
             try:
                 result = {"artist_mbid": "amb", "artist_name": "Artist",
                           "releases": [
@@ -758,10 +779,7 @@ class AlbumReviewTests(unittest.TestCase):
                 self.assertEqual(len(bot._index_get_artist("amb")["releases"]), 2)
                 self.assertIsNone(bot._index_get_artist("unknown"))
             finally:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-                bot._index_conn = old_conn
-                bot.LIBRARY_INDEX_FILE = old_file
+                swap_index(*old_index)
 
     # ── discography matching (MBID-first + safe fuzzy) ──────────────────────
     def _disco(self, rgs, albums, rg_of=None):
@@ -843,115 +861,6 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["group_type"], "incomplete")
         self.assertEqual(groups[0]["missing_tracks"][0]["title"], "Two")
-
-    @patch("listenbrainz_bot._canonical_release_fields")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_beets_merge_fails_when_beets_skips(self, mock_run, mock_fields):
-        mock_fields.return_value = {
-            "album": "Album",
-            "albumartist": "Artist",
-            "mb_albumid": "rel1",
-        }
-        mock_run.return_value = (False, "/music/Artist/Album (8 items)\nSkipping.")
-        ok, output = bot.beets_merge_album_folders(["/music/Artist/Album"], "rel1")
-        self.assertFalse(ok)
-        self.assertIn("Skipping", output)
-
-    @patch("listenbrainz_bot._canonical_release_fields")
-    @patch("listenbrainz_bot._beets_query_for_folder")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_beets_merge_registers_unmatched_folder_before_modify(
-            self, mock_run, mock_query, mock_fields):
-        mock_fields.return_value = {
-            "album": "Album",
-            "albumartist": "Artist",
-            "mb_albumid": "rel1",
-        }
-        mock_query.side_effect = [
-            (None, ""),
-            (["album:Album", "albumartist:Artist"], "matched"),
-        ]
-        mock_run.return_value = (True, "ok")
-        ok, output = bot.beets_merge_album_folders(["/music/Artist/Album"], "rel1")
-        self.assertTrue(ok)
-        commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
-        self.assertTrue(any("import" in c and "-A" in c for c in commands))
-        self.assertTrue(any("beets_merge_register" in c for c in commands))
-        self.assertTrue(any("modify" in c for c in commands))
-        modify_cmd = next(c for c in commands if "modify" in c)
-        self.assertNotIn(" -a ", f" {modify_cmd} ")
-        self.assertIn("album:Album", modify_cmd)
-        self.assertIn("import", output)
-
-    @patch("listenbrainz_bot._canonical_release_fields")
-    @patch("listenbrainz_bot._beets_ls")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_beets_merge_finds_imported_album_by_current_mbid_when_path_differs(
-            self, mock_run, mock_ls, mock_fields):
-        mock_fields.return_value = {
-            "album": "Canonical",
-            "albumartist": "Artist",
-            "mb_albumid": "target-rel",
-        }
-
-        def fake_ls(query=""):
-            if query == "path:/music/Artist/Old":
-                return False, ""
-            if query == ["mb_albumid:old-rel"]:
-                return True, "Artist - Old - Track"
-            return False, ""
-
-        mock_ls.side_effect = fake_ls
-        mock_run.return_value = (True, "ok")
-        ok, output = bot.beets_merge_album_folders(
-            ["/music/Artist/Old"], "target-rel",
-            [{"name": "Old", "artist": "Artist", "musicBrainzId": "old-rel"}])
-        self.assertTrue(ok)
-        commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
-        self.assertTrue(any("modify -y mb_albumid:old-rel" in c for c in commands))
-        self.assertIn("mb_albumid:old-rel", output)
-
-    @patch("listenbrainz_bot._canonical_release_fields")
-    @patch("listenbrainz_bot._beets_ls")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_beets_merge_prefers_album_metadata_when_duplicates_share_folder(
-            self, mock_run, mock_ls, mock_fields):
-        mock_fields.return_value = {
-            "album": "Stereotype A",
-            "albumartist": "Cibo Matto",
-            "mb_albumid": "target-rel",
-        }
-
-        def fake_ls(query=""):
-            if query in (["mb_albumid:old-rel-a"], ["mb_albumid:old-rel-b"]):
-                return True, "Cibo Matto - Stereotype A - Track"
-            if query == "path:/music/Cibo Matto/Stereotype A":
-                return True, "Cibo Matto - Stereotype A - Already Canonical"
-            return False, ""
-
-        mock_ls.side_effect = fake_ls
-        mock_run.return_value = (True, "ok")
-        ok, output = bot.beets_merge_album_folders(
-            [
-                "/music/Cibo Matto/Stereotype A",
-                "/music/Cibo Matto/Stereotype A",
-            ],
-            "target-rel",
-            [
-                {"name": "Stereotype A", "artist": "Cibo Matto",
-                 "musicBrainzId": "old-rel-a"},
-                {"name": "Stereotype A", "artist": "Cibo Matto",
-                 "musicBrainzId": "old-rel-b"},
-            ],
-        )
-        self.assertTrue(ok)
-        commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
-        self.assertTrue(any("modify -y mb_albumid:old-rel-a" in c for c in commands))
-        self.assertTrue(any("modify -y mb_albumid:old-rel-b" in c for c in commands))
-        self.assertFalse(any("modify -y path:/music/Cibo Matto/Stereotype A" in c
-                             for c in commands))
-        self.assertIn("mb_albumid:old-rel-a", output)
-        self.assertIn("mb_albumid:old-rel-b", output)
 
     def test_source_page_slices_ten_results(self):
         group = {
@@ -1266,6 +1175,148 @@ class AlbumReviewTests(unittest.TestCase):
                                    "usable": 0, "accepted_formats": ["flac"]})
         self.assertIn("locked", r)
 
+    def test_no_source_reason_picks_the_most_informative_pass_whole(self):
+        """Q-013 (Q-017(b) follow-up): `stats` only ever carries the one pass
+        that "won" _publish's peer-count comparison. A narrow first pass that
+        found real (rejected) mp3 evidence used to vanish the moment a wider,
+        emptier pass took over the top-level fields -- the reason then claimed
+        no files were even offered, and mp3_would_help read False for an album
+        that plainly had an mp3 copy on the network.
+
+        The fix reads one whole pass (peers, files, folders, rejected_formats
+        together), not the max of each field independently -- so the sentence
+        never states a peer count from one pass alongside a file count from
+        another."""
+        stats = {
+            # The "winning" pass: more peers, but they offered nothing at all.
+            "peers": 8, "files": 0, "folders": 0, "rejected_formats": [],
+            "accepted_formats": ["flac", "opus"],
+            "pass_stats": [
+                {"peers": 5, "files": 5, "folders": 0,
+                 "rejected_formats": ["mp3"]},
+                {"peers": 8, "files": 0, "folders": 0, "rejected_formats": []},
+            ],
+        }
+        r = bot._no_source_reason(stats)
+        self.assertIn("5 file(s)", r)
+        self.assertIn("mp3", r)
+        self.assertNotIn("none offered any files", r)
+        # The mix this test exists to catch: independently-widened fields
+        # would report the *winning* pass's 8 peers alongside the *other*
+        # pass's 5 files. The chosen pass's own peer count must appear, and
+        # the winning pass's must not.
+        self.assertIn("5 peer(s)", r)
+        self.assertNotIn("8 peer(s)", r)
+
+    def test_no_source_reason_widens_folders_to_the_locked_branch(self):
+        """A narrower pass found folders that were locked/unavailable; a wider
+        pass that "won" on peer count saw none at all. Reporting the winner's
+        bare `folders: 0` said "none in an accepted format" -- wrong, some
+        were, they were just locked. And the sentence must quote that pass's
+        own peer count, not the winner's."""
+        stats = {
+            "peers": 10, "files": 20, "folders": 0, "rejected_formats": [],
+            "accepted_formats": ["flac"],
+            "pass_stats": [
+                {"peers": 4, "files": 20, "folders": 6, "rejected_formats": []},
+                {"peers": 10, "files": 20, "folders": 0, "rejected_formats": []},
+            ],
+        }
+        r = bot._no_source_reason(stats)
+        self.assertIn("locked", r)
+        self.assertIn("4 peer(s)", r)
+        self.assertNotIn("10 peer(s)", r)
+
+    def test_pass_stats_accumulates_every_pass_without_losing_the_winner(self):
+        """slskd_run_search's _publish keeps whichever pass "got further" for
+        the top-level fields (unchanged), but must not drop the other passes'
+        own accounting -- that per-pass list is what _no_source_reason now
+        reads to stay truthful across a widening search."""
+        stats = {}
+
+        class _R:
+            ok = True
+            status_code = 200
+            text = ""
+
+            def __init__(self, payload):
+                self._p = payload
+
+            def json(self):
+                return self._p
+
+        def make_http(peer_count, file_ext):
+            peer = {"username": "u", "uploadSpeed": 1_000_000,
+                    "hasFreeUploadSlot": True, "queueLength": 0,
+                    "files": [{"filename": f"m\\\\A\\\\{i:02d}.{file_ext}", "size": 1}
+                              for i in range(peer_count)]}
+
+            def _get(url, **k):
+                if url.endswith("/responses"):
+                    return _R([peer])
+                return _R({"state": "Completed", "responseCount": 1, "fileCount": peer_count})
+
+            http = types.SimpleNamespace(
+                post=lambda *a, **k: _R({"id": "s1"}),
+                get=_get,
+                put=lambda *a, **k: _R({}),
+                delete=lambda *a, **k: _R({}))
+            return http
+
+        with patch.object(bot, "_http", make_http(5, "mp3")), \
+             patch.object(bot, "SEARCH_MIN_WAIT", 0), \
+             patch.object(bot, "SEARCH_POLL_INT", 0), \
+             patch.object(bot, "SEARCH_TIMEOUT", 5):
+            bot.slskd_run_search("Artist Album", 10, stats=stats)
+        first_pass_count = len(stats["pass_stats"])
+        self.assertEqual(first_pass_count, 1)
+        self.assertEqual(stats["pass_stats"][0]["rejected_formats"], ["mp3"])
+
+        with patch.object(bot, "_http", make_http(0, "mp3")), \
+             patch.object(bot, "SEARCH_MIN_WAIT", 0), \
+             patch.object(bot, "SEARCH_POLL_INT", 0), \
+             patch.object(bot, "SEARCH_TIMEOUT", 5):
+            bot.slskd_run_search("Artist Album broader", 10, stats=stats)
+        # A second, emptier pass must not erase the first pass's history.
+        self.assertEqual(len(stats["pass_stats"]), 2)
+        self.assertEqual(stats["pass_stats"][0]["rejected_formats"], ["mp3"])
+
+    @patch("listenbrainz_bot.slskd_search_album_folders")
+    def test_mp3_optin_agrees_with_the_reason_across_passes(self, mock_search):
+        """Q-013 follow-up: `_apply_group_sources` computed `mp3_would_help`
+        straight off the top-level `rejected_formats`, so it disagreed with
+        `_no_source_reason` (which now reads `pass_stats`) the moment an
+        earlier pass was the only one to see an mp3 copy -- the reason said
+        "(they were mp3)" while mp3_would_help stayed False and the caller had
+        no Allow-MP3 retry to offer for exactly the case it exists for."""
+        def search(artist, album, expected, progress=None, stats=None, **kw):
+            # The "winning" top-level fields see nothing at all; only an
+            # earlier, narrower pass (preserved in pass_stats) saw the mp3s.
+            stats.update({
+                "peers": 8, "files": 0, "folders": 0, "rejected_formats": [],
+                "accepted_formats": ["flac", "opus"],
+                "pass_stats": [
+                    {"peers": 5, "files": 5, "folders": 0,
+                     "rejected_formats": ["mp3"]},
+                    {"peers": 8, "files": 0, "folders": 0, "rejected_formats": []},
+                ],
+            })
+            return []
+
+        mock_search.side_effect = search
+        group = {"id": "g1", "artist": "Artist", "album": "Album",
+                 "canonical_mbid": "rel1",
+                 "missing_tracks": [{"title": "One", "decision": "approved"}]}
+        bot._review_state["groups"] = [group]
+        try:
+            result = bot._run_group_source_search("t1", "g1")
+        finally:
+            bot._review_state["groups"] = []
+        self.assertFalse(result["ok"])
+        self.assertIn("mp3", group["no_source_reason"])
+        # The reason and the opt-in must not contradict each other.
+        self.assertTrue(group["mp3_would_help"])
+
     @patch("listenbrainz_bot.slskd_search_album_folders")
     def test_empty_search_offers_the_mp3_optin(self, mock_search):
         def search(artist, album, expected, progress=None, stats=None, **kw):
@@ -1533,80 +1584,6 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertTrue(payload["comparison"][0]["matched"])
         self.assertEqual(payload["downloaded_files"][0]["name"], "01 One.flac")
 
-    def test_beets_skipping_structured_result_is_not_imported(self):
-        result = bot._beets_result_from_output(
-            "/downloads/Artist - Album", True,
-            "/downloads/Artist - Album (10 items)\nSkipping.",
-            "rel1", True, preview_on_skip=False)
-        self.assertTrue(result["skipped"])
-        self.assertFalse(result["imported"])
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["recommended_action"],
-                         "retry_forced_import_or_import_as_is")
-
-    @patch("listenbrainz_bot._album_action_markup", return_value=None)
-    @patch("listenbrainz_bot._save_review_state")
-    @patch("listenbrainz_bot._save_state")
-    @patch("listenbrainz_bot._nd_scan_after_import")
-    @patch("listenbrainz_bot._tg_send", new_callable=AsyncMock)
-    @patch("listenbrainz_bot.beets_import")
-    @patch("listenbrainz_bot._beets_import_preview")
-    def test_auto_reviewed_album_import_forces_reimport_and_records_skip(
-            self, mock_preview, mock_import, mock_send, mock_scan, _save_state,
-            _save_review, _markup):
-        mock_import.return_value = (True, "/downloads/Artist - Album (10 items)\nSkipping.")
-        mock_preview.return_value = (True, "preview says no confident match")
-        mock_scan.return_value = True
-        old_groups = bot.pending_album_groups.copy()
-        old_albums = bot._albums.copy()
-        old_uid = bot._uid_to_token.copy()
-        try:
-            bot.pending_album_groups.clear()
-            bot._albums.clear()
-            bot._uid_to_token.clear()
-            bot.pending_album_groups["ag1"] = {
-                "label": "Artist - Album",
-                "total": 10,
-                "completed": 10,
-                "failed": 0,
-                "local_dirs": {"/downloads/Artist - Album": 10},
-                "token": "tok",
-                "chat_id": "chat",
-                "release_mbid": "rel1",
-                "artist": "Artist",
-                "album": "Album",
-                "match_mode": "auto",
-                "review_group_id": "g1",
-            }
-            asyncio.run(bot._finalize_group(object(), "ag1"))
-            args = mock_import.call_args.args
-            self.assertEqual(args[:5], ("/downloads/Artist - Album", "rel1", False, True, True))
-            self.assertTrue(args[5])
-            self.assertTrue(args[6])
-            self.assertFalse(mock_scan.called)
-            self.assertEqual(len(bot._albums), 1)
-            rec = next(iter(bot._albums.values()))
-            self.assertIn(rec["status"], ("needs_review", "needs_match"))
-            self.assertEqual(rec["import_state"], "downloaded_not_imported")
-            self.assertIn("Skipping", rec["raw_tail"])
-        finally:
-            bot.pending_album_groups.clear()
-            bot.pending_album_groups.update(old_groups)
-            bot._albums.clear()
-            bot._albums.update(old_albums)
-            bot._uid_to_token.clear()
-            bot._uid_to_token.update(old_uid)
-
-    def test_manual_match_import_as_is_structured_result_can_import(self):
-        with patch("listenbrainz_bot.beets_import",
-                   return_value=(True, "Importing /downloads/A -> /music/A")) as mock_import:
-            result = bot._beets_import_result(
-                "/downloads/A", "", False, True, False, True, True, 900)
-        self.assertTrue(result["imported"])
-        self.assertTrue(result["ok"])
-        self.assertFalse(mock_import.call_args.args[4])
-        self.assertTrue(mock_import.call_args.args[6])
-
     def test_recovery_record_marks_downloaded_not_imported(self):
         old_albums = bot._albums.copy()
         old_uid = bot._uid_to_token.copy()
@@ -1625,83 +1602,6 @@ class AlbumReviewTests(unittest.TestCase):
             bot._uid_to_token.clear()
             bot._uid_to_token.update(old_uid)
 
-    def test_beets_base_cmd_merge_profile_writes_duplicate_merge(self):
-        cmd = bot._beets_base_cmd("merge")
-        cfg = cmd[cmd.index("-c") + 1]
-        with open(cfg) as fh:
-            text = fh.read()
-        self.assertIn("duplicate_action: merge", text)
-        self.assertIn("incremental: no", text)
-
-    def test_beets_trusted_profile_forces_only_pinned_candidate_confidence(self):
-        cmd = bot._beets_base_cmd("trusted")
-        cfg = cmd[cmd.index("-c") + 1]
-        with open(cfg) as fh:
-            text = fh.read()
-        self.assertIn("duplicate_action: merge", text)
-        self.assertIn("strong_rec_thresh: 1.0", text)
-
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_beets_input_preview_is_non_mutating_pretend(self, mock_run):
-        mock_run.return_value = (True, "/downloads/A/01.flac")
-        bot._beets_import_preview("/downloads/A", "rel1", True, True)
-        cmd = mock_run.call_args.args[0]
-        self.assertIn("--pretend", cmd)
-        self.assertNotIn("-p", cmd)
-
-    @patch("listenbrainz_bot._audio_file_tags")
-    @patch("listenbrainz_bot.mbz_release_tracks")
-    def test_pinned_validation_maps_each_file_once(self, mock_tracks, mock_tags):
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        mock_tracks.return_value = [
-            {"title": "One", "mbid": "rec1", "position": 1},
-            {"title": "Two", "mbid": "rec2", "position": 2},
-        ]
-        mock_tags.return_value = {"title": "One", "tracknumber": "1"}
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.SLSKD_DOWNLOAD_DIR = td
-                path = os.path.join(td, "01 One.flac")
-                with open(path, "wb") as fh:
-                    fh.write(b"x")
-                result = bot._validate_pinned_import_paths(
-                    [path], "rel1", expected_tracks=[{"title": "One", "mbid": "rec1", "position": 1}])
-                self.assertTrue(result["ok"])
-                self.assertEqual(result["mappings"][0]["recording_mbid"], "rec1")
-            finally:
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-
-    @patch("listenbrainz_bot._audio_file_tags", return_value={"title": "One"})
-    @patch("listenbrainz_bot.mbz_release_tracks",
-           return_value=[{"title": "One", "mbid": "rec1", "position": 1}])
-    def test_pinned_validation_rejects_title_only_guess(self, _tracks, _tags):
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.SLSKD_DOWNLOAD_DIR = td
-                path = os.path.join(td, "mystery.flac")
-                with open(path, "wb") as fh:
-                    fh.write(b"x")
-                result = bot._validate_pinned_import_paths([path], "rel1")
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["error_code"], "match_validation_failed")
-            finally:
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-
-    def test_diagnostic_profile_disables_all_real_file_mutations(self):
-        with tempfile.TemporaryDirectory() as td:
-            cfg = os.path.join(td, "diag.yaml")
-            bot._diagnostic_profile_config(
-                cfg, os.path.join(td, "library.db"), os.path.join(td, "music"), True)
-            with open(cfg) as fh:
-                text = fh.read()
-        self.assertIn("move: no", text)
-        self.assertIn("copy: no", text)
-        self.assertIn("write: no", text)
-        self.assertIn("delete: no", text)
-        self.assertIn("plugins: []", text)
-        self.assertIn("strong_rec_thresh: 1.0", text)
-
     def test_atomic_json_write_survives_concurrent_writers(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "state.json")
@@ -1717,43 +1617,6 @@ class AlbumReviewTests(unittest.TestCase):
             self.assertIn(saved["writer"], range(20))
             self.assertEqual(saved["rows"], list(range(20)))
             self.assertFalse([name for name in os.listdir(td) if name.endswith(".tmp")])
-
-    @patch("listenbrainz_bot.subprocess.run")
-    def test_beets_import_merge_duplicates_uses_merge_profile(self, mock_run):
-        mock_run.return_value = types.SimpleNamespace(returncode=0, stdout="Imported", stderr="")
-        bot.beets_import("/downloads/A", "rel1", False, True, True, True, True, 900)
-        cmd = mock_run.call_args.args[0]
-        cfg = cmd[cmd.index("-c") + 1]
-        with open(cfg) as fh:
-            text = fh.read()
-        self.assertIn("duplicate_action: merge", text)
-
-    @patch("listenbrainz_bot._beets_ls")
-    def test_skip_output_classifies_duplicate_skip_when_existing_album_matches(self, mock_ls):
-        mock_ls.return_value = (True, "Artist - Album - One")
-        result = bot._beets_result_from_output(
-            "/downloads/Artist - Album", True, "Skipping.",
-            "rel1", True, preview_on_skip=False, merge_duplicates=True,
-            artist="Artist", album="Album")
-        self.assertEqual(result["skipped_reason"], "duplicate_skip")
-        self.assertEqual(result["duplicate_mode"], "merge")
-        self.assertTrue(result["merge_attempted"])
-
-    @patch("listenbrainz_bot._beets_ls")
-    def test_existing_album_queries_order(self, _mock_ls):
-        self.assertEqual(
-            bot._beets_existing_album_queries("rel1", "Artist", "Album"),
-            [["mb_albumid:rel1"],
-             ["album:Album", "albumartist:Artist"],
-             ["album:Album", "artist:Artist"]])
-
-    def test_import_result_exposes_merge_fields(self):
-        result = bot._beets_result_from_output(
-            "/downloads/A", True, "Importing /downloads/A -> /music/A",
-            "", True, preview_on_skip=False, merge_duplicates=True)
-        self.assertEqual(result["duplicate_mode"], "merge")
-        self.assertTrue(result["merge_attempted"])
-        self.assertIn("skipped_reason", result)
 
     def test_reconcile_downloaded_files_marks_failed_track_downloaded(self):
         old_download_dir = bot.SLSKD_DOWNLOAD_DIR
@@ -1788,27 +1651,6 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertNotIn("download_error", group["missing_tracks"][0])
         self.assertEqual(bot._review_group_next_action(group)["bucket"], "downloaded")
 
-    @patch("listenbrainz_bot._trusted_pinned_merge")
-    def test_selected_import_uses_only_checked_files_and_rejects_escape(self, mock_import):
-        mock_import.return_value = {"ok": True, "imported": True, "raw_tail": "Imported"}
-        with tempfile.TemporaryDirectory() as td:
-            album = os.path.join(td, "Album")
-            os.mkdir(album)
-            one = os.path.join(album, "01 One.flac")
-            two = os.path.join(album, "02 Two.flac")
-            with open(one, "wb") as fh:
-                fh.write(b"x")
-            with open(two, "wb") as fh:
-                fh.write(b"x")
-            result = bot._beets_import_selected_result(
-                album, ["01 One.flac"], "rel1", True, True, 900,
-                "Artist", "Album")
-            self.assertTrue(result["imported"])
-            self.assertEqual(mock_import.call_args.args[0], [one])
-            self.assertTrue(mock_import.call_args.kwargs["allow_partial"])
-            with self.assertRaises(ValueError):
-                bot._selected_paths_under_album(album, ["../escape.flac"])
-
     @patch("listenbrainz_bot.mbz_resolve_album")
     @patch("listenbrainz_bot.mbz_search_release_groups")
     @patch("listenbrainz_bot._manual_match_candidate")
@@ -1824,94 +1666,38 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(cands[0]["release_mbid"], "rel1")
         mock_search.assert_called()
 
-    def test_create_repair_job_from_review_group_and_projection(self):
-        old_jobs = bot.repair_jobs.copy()
-        try:
-            bot.repair_jobs.clear()
-            group = {
-                "id": "g1",
-                "artist": "Artist",
-                "album": "Album",
-                "canonical_album_id": "alb1",
-                "canonical_mbid": "rel1",
-                "albums": [{"id": "alb1", "artist": "Artist", "name": "Album",
-                            "musicBrainzId": "rel1", "tracks": []}],
-                "missing_tracks": [{
-                    "artist": "Artist", "title": "One", "mbid": "rec1",
-                    "position": 1, "decision": "approved",
-                }],
-            }
-            job = bot._create_or_update_repair_job_from_group(group)
-            self.assertEqual(job["group_id"], "g1")
-            self.assertEqual(job["canonical_release_mbid"], "rel1")
-            self.assertEqual(job["tracks"][0]["status"], "approved")
-            group["missing_tracks"][0]["decision"] = "pending"
-            bot._apply_repair_job_projection_to_group(group)
-            self.assertEqual(group["missing_tracks"][0]["decision"], "approved")
-            self.assertEqual(group["repair_job_id"], job["id"])
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    def test_repair_job_survives_review_group_rebuild(self):
-        old_jobs = bot.repair_jobs.copy()
-        try:
-            bot.repair_jobs.clear()
-            job = {
-                "id": "jobx",
-                "group_id": "missing-group",
-                "artist": "Artist",
-                "album": "Album",
-                "canonical_album_id": "alb1",
-                "canonical_release_mbid": "rel1",
-                "canonical_release_group_mbid": "",
-                "canonical_tracklist": [],
-                "status": "downloaded_unmatched",
-                "tracks": [{"id": "t1", "group_track_index": 0,
-                            "recording_mbid": "rec1", "artist": "Artist",
-                            "title": "One", "position": 1,
-                            "status": "downloaded",
-                            "local_path": "/downloads/A/01 One.flac"}],
-                "downloads": [],
-                "source_pools": [],
-                "file_matches": [],
-                "import_attempts": [],
-                "verification": {},
-                "messages": [],
-                "created_at": 1,
-                "updated_at": 2,
-            }
-            bot.repair_jobs[job["id"]] = job
-            merged = bot._merge_review_groups([])
-            self.assertEqual(len(merged), 1)
-            self.assertEqual(merged[0]["id"], "missing-group")
-            self.assertEqual(merged[0]["missing_tracks"][0]["decision"], "downloaded")
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    def test_repair_job_save_load_round_trip(self):
-        old_state = bot.STATE_FILE
-        old_jobs = bot.repair_jobs.copy()
+    def test_a_state_file_with_repair_jobs_is_loaded_ignored_and_kept(self):
+        """B-022: the retired pipeline's `repair_jobs` key still loads without
+        complaint, drives nothing — an active job no longer comes back as an
+        origin-`repair` group — and is written back unchanged, so the previous
+        release still finds its jobs after a rollback. A file without the key
+        does not grow one."""
+        jobs = {"job1": {"id": "job1", "group_id": "rg1", "artist": "A", "album": "B",
+                         "status": "downloaded_unmatched",
+                         "tracks": [{"id": "t1", "title": "One", "status": "downloaded",
+                                     "local_path": "/downloads/A/01 One.flac"}]}}
+        old = bot._retired_repair_jobs
+        self.addCleanup(setattr, bot, "_retired_repair_jobs", old)
         with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.STATE_FILE = os.path.join(td, "state.json")
-                bot.repair_jobs.clear()
-                bot.repair_jobs["job1"] = {
-                    "id": "job1", "group_id": "g1", "artist": "A",
-                    "album": "B", "status": "needs_review", "tracks": [],
-                    "downloads": [], "source_pools": [], "file_matches": [],
-                    "import_attempts": [], "verification": {}, "messages": [],
-                    "created_at": 1, "updated_at": 1,
-                }
-                bot._save_state()
-                bot.repair_jobs.clear()
-                bot._load_state()
-                self.assertIn("job1", bot.repair_jobs)
-            finally:
-                bot.STATE_FILE = old_state
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
+            self._state_files(td)
+            bot._save_state()
+            with open(bot.STATE_FILE, encoding="utf-8") as fh:
+                state = json.load(fh)
+            self.assertNotIn("repair_jobs", state)
+            state["repair_jobs"] = jobs
+            with open(bot.STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+
+            bot._load_state()
+            with isolated_review():
+                bot._replace_review_groups("library", [], "x")
+                self.assertEqual(bot._review_state["groups"], [])
+                bot._replace_review_groups(
+                    "library", [self._origin_group("lib0", "library", album="L")], "x")
+                self.assertEqual([g["id"] for g in bot._review_state["groups"]], ["lib0"])
+            bot._save_state()
+            with open(bot.STATE_FILE, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["repair_jobs"], jobs)
 
     def _state_files(self, td):
         """Point both persistence paths at a temp dir and restore them after."""
@@ -2075,17 +1861,17 @@ class AlbumReviewTests(unittest.TestCase):
             text = ""
 
         listing = [{"_username": "peer", "id": "guid-1",
-                    "filename": "@@x\Music\Album\01 Song.flac"}]
+                    "filename": r"@@x\Music\Album\01 Song.flac"}]
         with patch.object(bot._http, "delete",
                           lambda url, **k: calls.append(url) or _Resp()),                 patch.object(bot, "_slskd_fetch_all_downloads", lambda: listing):
             # Enqueued under a different path prefix: matched by basename.
-            self.assertTrue(bot._slskd_cancel("peer", "Album\01 Song.flac"))
+            self.assertTrue(bot._slskd_cancel("peer", r"Album\01 Song.flac"))
             self.assertTrue(calls[-1].endswith("/downloads/peer/guid-1"))
             # A known id skips the lookup entirely.
             self.assertTrue(bot._slskd_cancel("peer", "whatever", "guid-9", []))
             self.assertTrue(calls[-1].endswith("/downloads/peer/guid-9"))
             # Nothing to address: reported, not pretended.
-            self.assertFalse(bot._slskd_cancel("other", "Album\01 Song.flac"))
+            self.assertFalse(bot._slskd_cancel("other", r"Album\01 Song.flac"))
             _Resp.status_code = 404
             self.assertFalse(bot._slskd_cancel("peer", "x", "guid-1", []))
 
@@ -2217,6 +2003,94 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(bot.pending_downloads, {})
         sends.assert_not_called()
 
+    def test_source_switch_stops_enqueueing_when_cancelled_during_an_enqueue(self):
+        """Fix round 1 (M5): with the enqueue awaited off the loop (Q-027(c)),
+        a cancel can land during it — and the loop went on POSTing the rest of
+        the folder, each acceptance writing `queued` over a cancelled row,
+        until the check after the loop."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        ag = bot.pending_album_groups["ag1"]
+        ag["alt_sources"] = [{"username": "peer2",
+                              "files": [{"filename": f"{n}.flac"} for n in "abc"]}]
+        enqueued = []
+
+        def enqueue_then_cancel(username, f, **k):
+            enqueued.append(f["filename"])
+            if len(enqueued) == 1:
+                bot._cancel_album_fill("rel1", "Cancelled")
+            return True
+
+        with patch.object(bot, "slskd_expand_directory", lambda u, fd, ref: fd["files"]), \
+                patch.object(bot, "slskd_enqueue", enqueue_then_cancel), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+            asyncio.run(bot._switch_album_source(None, "ag1"))
+        self.assertEqual(enqueued, ["a.flac"])
+        self.assertNotIn("ag1", bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def _poll_once_with(self, states, **patches):
+        """One poll of the `_group()` fixture's three files, in `states`."""
+        listing = [{"_username": "slowpeer", "filename": f"Album\\0{n}.flac", "state": st}
+                   for n, st in zip((1, 2, 3), states)]
+        app = type("App", (), {"bot": AsyncMock()})()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(bot, "slskd_get_all_downloads",
+                                             lambda force=False: listing))
+            stack.enter_context(patch.object(bot, "_tg_send", new_callable=AsyncMock))
+            for name, value in patches.items():
+                stack.enter_context(patch.object(bot, name, value))
+            asyncio.run(bot._poll_downloads_once({"tok": app}))
+
+    def test_the_poller_skips_a_finished_file_whose_transfer_was_let_go_of(self):
+        """Fix round 1 (M3): a rescan that drops a row lets go of its transfer
+        (Q-027(a)) from another thread, possibly while the poller walks
+        /downloads for that very file. `del pending_downloads[key]` then raised
+        and aborted the tick; a bare pop would have counted the file towards a
+        `total` it had just been taken out of."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        ag = bot.pending_album_groups["ag1"]
+        key = ("slowpeer", "Album\\01.flac")
+
+        def resolve_and_lose_it(filename):
+            bot._detach_transfer(key, bot.pending_downloads[key])
+            ag["total"] -= 1
+            return "/downloads/Album/01.flac"
+
+        self._poll_once_with(
+            ["Completed, Succeeded", "InProgress", "InProgress"],
+            _resolve_local_path=resolve_and_lose_it,
+            _finalize_group=AsyncMock(side_effect=AssertionError("must not finalize")))
+        self.assertEqual((ag["completed"], ag["total"]), (0, 2))
+        self.assertEqual(ag["local_dirs"], {})
+        self.assertNotIn(key, bot.pending_downloads)
+
+    def test_the_poller_never_fails_over_a_file_whose_transfer_was_let_go_of(self):
+        """The failure branch's twin: the transfer went while the poller waited
+        on the review lock to write the row — failing it over would re-download
+        a track the rescan says is no longer missing."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        ag = bot.pending_album_groups["ag1"]
+        ag["alt_sources"] = [{"username": "peer2", "files": [{"filename": "a.flac"}]}]
+        key = ("slowpeer", "Album\\01.flac")
+        bot.pending_downloads[key].update(review_group_id="g1", review_track_index=0)
+
+        def write_but_lose_it(gid, idx, decision, **k):
+            bot.pending_downloads.pop(key, None)
+            return False
+
+        self._poll_once_with(
+            ["Completed, Errored", "InProgress", "InProgress"],
+            _set_review_track_state=write_but_lose_it,
+            _switch_album_source=AsyncMock(side_effect=AssertionError("must not fail over")),
+            _retry_file_from_alt_source=lambda *a, **k: self.fail("must not retry the file"))
+        self.assertEqual((ag["completed"], ag["failed"]), (0, 0))
+
     def test_source_switch_stops_when_the_fill_is_cancelled_mid_walk(self):
         """A cancel landing while the switch is parked on an await used to let
         it enqueue the next peer's files under a group nothing tracked."""
@@ -2239,6 +2113,44 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertNotIn("ag1", bot.pending_album_groups)
         self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
 
+    def test_source_switch_keeps_its_slskd_calls_off_the_event_loop(self):
+        """Q-027(c): the failover ran `slskd_enqueue` (a 30 s POST per file)
+        and `_abandon_group_downloads` (synchronous DELETEs) on the poller's
+        event loop, stalling every other transfer's bookkeeping meanwhile."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        ag = bot.pending_album_groups["ag1"]
+        ag["alt_sources"] = [{"username": "peer2", "files": [{"filename": "a.flac"}]},
+                             {"username": "peer3", "files": [{"filename": "b.flac"}]}]
+        ag["allow_mp3"] = True
+        calls, on_loop, mp3 = [], [], []
+
+        def off_loop(name, answer=None):
+            def stub(*a, **k):
+                try:
+                    asyncio.get_running_loop()
+                    on_loop.append(name)
+                except RuntimeError:
+                    pass
+                calls.append(name)
+                # The fill's MP3 opt-in is a contextvar; the worker must see it.
+                mp3.append(bot._mp3_fallback_on.get())
+                return answer(*a) if answer else None
+            return stub
+
+        with patch.object(bot, "slskd_expand_directory", lambda u, fd, ref: fd["files"]), \
+                patch.object(bot, "slskd_enqueue",
+                             off_loop("enqueue", lambda username, f: username == "peer3")), \
+                patch.object(bot, "_abandon_group_downloads", off_loop("abandon")), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+            asyncio.run(bot._switch_album_source(None, "ag1"))
+        # The switch's own abandon, peer2 refusing, its abandon, peer3 accepting.
+        self.assertEqual(calls, ["abandon", "enqueue", "abandon", "enqueue"])
+        self.assertEqual(on_loop, [])
+        self.assertEqual(mp3[1:], [True, True, True])
+        self.assertFalse(ag["switching"])
+
     def test_gap_cancel_pops_the_album_group_and_records_the_cancel(self):
         """The gap route cancelled by filename, never popped the album group and
         wrote nothing — so the orphan sweep finalized and PLACED it minutes
@@ -2260,6 +2172,115 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(len(cancels), 3)
         self.assertEqual(set(marks), {"cancelled"})
         self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
+
+    def test_gap_cancel_track_rows_read_cancelled_on_the_wire(self):
+        """B-004, seen live 2026-09-23: after a gap cancel every track row read
+        `failed` with no error text. The cancel did mark each track — the gap
+        view then mapped decision `cancelled` to wire state `failed`, and read
+        only `download_error`, while every per-track state write puts its text
+        in `error`. The text is the one every user-initiated cancel records,
+        rows and ledger alike (Q-029: it was "cancelled by user" here and
+        "Cancelled" on the album route)."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        bot.pending_album_groups["ag1"]["review_group_id"] = "g1"
+        for n, info in enumerate(bot.pending_downloads.values()):
+            info["review_group_id"] = "g1"
+            info["review_track_index"] = n
+            # A transfer carries a copy of its review row (the enqueue's
+            # `dict(track)`), mbid included — the key a write finds it by.
+            info["track"]["mbid"] = f"r{n + 1}"
+        group = {"id": "g1", "artist": "Artist", "album": "Album",
+                 "missing_tracks": [
+                     {"title": f"T{n}", "mbid": f"r{n}", "position": n,
+                      "decision": "downloading", "download_state": "InProgress"}
+                     for n in (1, 2, 3)]}
+        with isolated_review(), patch.object(bot, "_push_gap", lambda *a, **k: None):
+            with bot._review_lock:
+                bot._review_state["groups"] = [group]
+            bot._album_fill_set("rel1", "downloading")
+            self.assertEqual(bot._gap_cancel("g1"), 1)
+            with bot._review_lock:
+                snapshot = json.loads(json.dumps(bot._find_review_group("g1")))
+        view = bot._gap_detail_view(snapshot)
+        self.assertEqual([t["state"] for t in view["tracks"]], ["cancelled"] * 3)
+        self.assertEqual({t["downloadError"] for t in view["tracks"]}, {"Cancelled"})
+        self.assertEqual(bot._album_fill_get("rel1").get("reason"), "Cancelled")
+
+    def test_cancel_album_fill_marks_review_tracks_cancelled(self):
+        """B-021: `_cancel_album_fill` detached the transfers but, unlike
+        `_gap_cancel`, never touched the review track behind them — a track
+        cancelled from the album route or the sweep kept reading
+        queued/downloading with no error text while the group-level status
+        quietly recovered on its own."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        bot.pending_album_groups["ag1"]["review_group_id"] = "g1"
+        for n, info in enumerate(bot.pending_downloads.values()):
+            info["review_group_id"] = "g1"
+            info["review_track_index"] = n
+        marks = []
+        with patch.object(bot, "_set_review_track_state",
+                          lambda gid, idx, decision, **k:
+                          marks.append((gid, idx, decision, k.get("error")))):
+            bot._album_fill_set("rel1", "downloading")
+            self.assertTrue(bot._cancel_album_fill("rel1", "Removed from slskd"))
+        self.assertEqual(len(marks), 3)
+        self.assertEqual({m[2] for m in marks}, {"cancelled"})
+        self.assertEqual({m[3] for m in marks}, {"Removed from slskd"},
+                         "the caller's own reason text, not a hardcoded one")
+
+    def test_cancel_album_fill_leaves_a_settled_track_alone_after_a_losing_cas(self):
+        """The detach happens before the ledger CAS, so a CAS that loses
+        (the row already `placing`/`placed`/`verified`/`needs_match`) still
+        leaves the detached transfers gone. Their still-open tracks must read
+        `cancelled`; a track that already settled (e.g. `placed`) must not be
+        dragged back to `cancelled` just because it shared the batch."""
+        self._fill_ledger()
+        self._isolated_transfers()
+        self._group()
+        bot.pending_album_groups["ag1"]["review_group_id"] = "g1"
+        infos = list(bot.pending_downloads.values())
+        for n, info in enumerate(infos):
+            info["review_group_id"] = "g1"
+            info["review_track_index"] = n
+        group = {"id": "g1", "artist": "Artist", "album": "Album", "missing_tracks": [
+            {"title": "T1", "decision": "downloading"},
+            {"title": "T2", "decision": "placed"},
+            {"title": "T3", "decision": "downloading"},
+        ]}
+        with isolated_review(), patch.object(bot, "_push_gap", lambda *a, **k: None):
+            with bot._review_lock:
+                bot._review_state["groups"] = [group]
+            # Simulate the losing race directly: the ledger already claimed
+            # for placement by the time the CAS below runs.
+            bot._album_fill_set("rel1", "placing")
+            result = bot._cancel_album_fill("rel1", "Cancelled")
+            with bot._review_lock:
+                snapshot = json.loads(json.dumps(bot._find_review_group("g1")))
+        self.assertFalse(result, "the ledger CAS lost to the placement claim")
+        self.assertNotIn("ag1", bot.pending_album_groups, "the group is detached either way")
+        self.assertEqual(bot.pending_downloads, {}, "and so are its transfers")
+        decisions = {t["title"]: t["decision"] for t in snapshot["missing_tracks"]}
+        self.assertEqual(decisions["T1"], "cancelled")
+        self.assertEqual(decisions["T3"], "cancelled")
+        self.assertEqual(decisions["T2"], "placed",
+                         "a settled track must not be dragged back to cancelled")
+
+    def test_gap_view_error_text_only_on_a_failed_or_cancelled_track(self):
+        """A retried track keeps its old `error` until something overwrites it;
+        a row that is queued again must not still show the last failure."""
+        group = {"id": "g1", "artist": "A", "album": "B", "missing_tracks": [
+            {"title": "One", "mbid": "r1", "decision": "failed", "error": "Completed, Errored"},
+            {"title": "Two", "mbid": "r2", "decision": "queued", "error": "Completed, Errored"},
+            {"title": "Three", "mbid": "r3", "decision": "failed",
+             "error": "Completed, Errored", "download_error": "placement failed: x"}]}
+        rows = {t["title"]: t for t in bot._gap_detail_view(group)["tracks"]}
+        self.assertEqual(rows["One"]["downloadError"], "Completed, Errored")
+        self.assertEqual(rows["Two"]["downloadError"], "")
+        self.assertEqual(rows["Three"]["downloadError"], "placement failed: x")
 
     def test_dismissing_a_live_album_group_ends_its_fill(self):
         """The SPA's ✕ dropped tracking and left the ledger on `queued` forever."""
@@ -2368,6 +2389,36 @@ class AlbumReviewTests(unittest.TestCase):
             bot._album_download_search_and_enqueue("t1", "rel1", "A", "B", 3, None, "",
                                                    ("slowpeer",))
         self.assertEqual(chosen, ["fast"])
+
+    def test_fill_path_mp3_optin_agrees_with_reason_across_passes(self):
+        """Q-013 follow-up: the fill task's own mp3_would_help/format_rejected
+        classification (listenbrainz_bot.py, in
+        _album_download_search_and_enqueue) read only the winning pass's
+        rejected_formats, same bug as _apply_group_sources. A search where
+        only an earlier pass saw mp3 must fail `format_rejected` with
+        `mp3WouldHelp: true`, not `no_source` with no retry offered."""
+        self._fill_ledger()
+        self._isolated_transfers()
+
+        def search(artist, album, expected, progress=None, stats=None, **kw):
+            stats.update({
+                "peers": 8, "files": 0, "folders": 0, "rejected_formats": [],
+                "accepted_formats": ["flac", "opus"],
+                "pass_stats": [
+                    {"peers": 5, "files": 5, "folders": 0,
+                     "rejected_formats": ["mp3"]},
+                    {"peers": 8, "files": 0, "folders": 0, "rejected_formats": []},
+                ],
+            })
+            return []
+
+        with patch.object(bot, "slskd_search_album_folders", search), \
+                patch.object(bot, "_task_finish", lambda *a, **k: None):
+            bot._album_download_search_and_enqueue("t1", "rel1", "A", "B", 3, None, "")
+        view = bot._album_fill_view("rel1")
+        self.assertIn("mp3", view["reason"])
+        self.assertEqual(view["failureKind"], "format_rejected")
+        self.assertTrue(view["mp3WouldHelp"])
 
     def _poll_once(self, downloads):
         app = type("App", (), {"bot": AsyncMock()})()
@@ -2608,6 +2659,39 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertGreater(out["serverTime"], 0)
         self.assertEqual(out["gaps"], {})
 
+    def test_gap_fill_frame_counts_follow_the_progress_rule(self):
+        """Q-025, PROTOCOL §15.2 "Progress counts" (B-024): finished is
+        downloaded|done|skipped|cancelled, failed is counted apart, and total is
+        every track that isn't present. The frame counted downloaded|placed|
+        verified — but the gap view never emits placed/verified (both are
+        `done`), so a placed track counted as neither done nor failed."""
+        titles = ["Have", "Also", "Dl", "Placed", "Verified", "Extra", "Skip",
+                  "Cancel", "Fail", "Queued", "Missing"]
+        decisions = {"Dl": "downloaded", "Placed": "placed", "Verified": "verified",
+                     "Extra": "filed_extra", "Skip": "skipped", "Cancel": "cancelled",
+                     "Fail": "failed", "Queued": "queued", "Missing": "pending"}
+        mbid = {t: f"r{i}" for i, t in enumerate(titles)}
+        group = {"id": "g1", "artist": "A", "album": "B", "canonical_album_id": "al1",
+                 "present": 2, "total": len(titles),
+                 "albums": [{"id": "al1", "tracks": [
+                     {"title": t, "musicBrainzId": mbid[t]} for t in titles]}],
+                 "missing_tracks": [{"title": t, "mbid": mbid[t], "decision": d}
+                                    for t, d in decisions.items()]}
+        frame = bot._gap_fill_frame(group)
+        self.assertEqual((frame["done"], frame["failed"], frame["total"]), (6, 1, 9))
+
+        # /api/fills copies the frame's counts onto the gap summary.
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [group]
+            summary = bot._fills_view([], ["g1"])["gaps"]["g1"]
+        self.assertEqual((summary["done"], summary["failed"]), (6, 1))
+
+        # No track rows at all: the group's own counts, still without the present ones.
+        bare = {"id": "g2", "artist": "A", "album": "C", "present": 7, "total": 10,
+                "missing_tracks": []}
+        self.assertEqual(bot._gap_fill_frame(bare)["total"], 3)
+
     def test_fill_ledger_survives_a_restart(self):
         """The whole point of §1: pending_album_groups and pending_downloads are
         restored, so the download really does resume — only its ledger row used
@@ -2712,19 +2796,7 @@ class AlbumReviewTests(unittest.TestCase):
         import shutil
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
-        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-        bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
-        bot._index_conn = None
-
-        def restore():
-            try:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-            except Exception:
-                pass
-            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
-
-        self.addCleanup(restore)
+        scratch_index(self, os.path.join(td, "index.db"))
 
     def test_strict_mbz_get_retries_then_raises_instead_of_answering_empty(self):
         """A failed browse used to come back as {}, which a scan read as "no
@@ -2845,6 +2917,230 @@ class AlbumReviewTests(unittest.TestCase):
                 bot.mbz_get("artist-bad", {"inc": "release-groups"}, strict=True)
             # Non-strict keeps its old, quiet contract: {} and no exception.
             self.assertEqual(bot.mbz_get("artist-bad", {"inc": "release-groups"}), {})
+
+    def test_mbz_get_refuses_empty_entity_id_no_request_no_cache(self):
+        """B-010: the live-observed failure was `release/` -- a release lookup
+        with an empty id (most likely an album whose Navidrome mbid came back
+        blank). Answering it through the ordinary permanent-4xx path
+        negative-cached the *shared, id-less* key, poisoning it for every
+        other empty-id caller with the same `inc`, and spent a request
+        finding out MusicBrainz agrees. Neither should happen."""
+        key = bot._mbz_cache_key("release/", {"inc": "recordings"})
+        self.addCleanup(bot._mbz_cache.pop, key, None)
+        self.addCleanup(bot._mbz_fail_until.pop, key, None)
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            self.assertEqual(bot.mbz_get("release/", {"inc": "recordings"}), {})
+        self.assertNotIn(key, bot._mbz_cache, "must not negative-cache an empty id")
+        self.assertNotIn(key, bot._mbz_fail_until)
+
+    def test_mbz_get_refuses_double_slash_empty_id(self):
+        """`<entity>//…` is the same bug shaped differently — the id segment
+        between the slashes is still empty."""
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            self.assertEqual(bot.mbz_get("recording//"), {})
+
+    def test_mbz_get_strict_empty_entity_id_raises_no_such_entity(self):
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            with self.assertRaises(bot.MusicBrainzNoSuchEntity):
+                bot.mbz_get("artist/", strict=True)
+
+    def test_mbz_get_refuses_a_blank_search_query_no_request_no_cache(self):
+        """Q-030: the same caller bug as `release/`, shaped as a search — a
+        blank `query` used to spend a request and cache the failure under the
+        shared, query-less key."""
+        no_request = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))
+        for path, params in (("release-group", {"query": "", "limit": "5"}),
+                             ("artist", {"query": "   ", "limit": "8"})):
+            key = bot._mbz_cache_key(path, params)
+            self.addCleanup(bot._mbz_cache.pop, key, None)
+            self.addCleanup(bot._mbz_fail_until.pop, key, None)
+            with patch.object(bot._http, "get", no_request), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bot.mbz_get(path, params), {})
+                with self.assertRaises(bot.MusicBrainzNoSuchEntity):
+                    bot.mbz_get(path, params, strict=True)
+            self.assertNotIn(key, bot._mbz_cache, "must not negative-cache a blank query")
+            self.assertNotIn(key, bot._mbz_fail_until)
+
+    def test_mbz_get_refuses_a_blank_browse_id_no_request_no_cache(self):
+        """A browse names its linked entity in a parameter (`release-group?artist=`);
+        a blank one is the empty-id bug again."""
+        params = {"artist": "", "type": "album", "limit": "100", "offset": "0"}
+        key = bot._mbz_cache_key("release-group", params)
+        self.addCleanup(bot._mbz_cache.pop, key, None)
+        self.addCleanup(bot._mbz_fail_until.pop, key, None)
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bot.mbz_get("release-group", params), {})
+            with self.assertRaises(bot.MusicBrainzNoSuchEntity):
+                bot.mbz_get("release-group", params, strict=True)
+        self.assertNotIn(key, bot._mbz_cache)
+        self.assertNotIn(key, bot._mbz_fail_until)
+
+    def test_mbz_get_search_and_browse_with_real_values_are_unaffected(self):
+        calls = []
+
+        def fake_get(url, params=None, **k):
+            calls.append(url.rsplit("/", 1)[-1])
+            return _FakeMbzResponse({"count": 1})
+
+        searches = (("release-group", {"query": "Discovery", "limit": "5"}),
+                    ("release-group", {"artist": "amb", "limit": "100", "offset": "0"}),
+                    ("recording", {"isrcs": "GBAYE0000001"}))
+        for path, params in searches:
+            self.addCleanup(bot._mbz_cache.pop, bot._mbz_cache_key(path, params), None)
+        with patch.object(bot._http, "get", fake_get), \
+                patch.object(bot.time, "sleep", lambda s: None):
+            for path, params in searches:
+                self.assertEqual(bot.mbz_get(path, params), {"count": 1})
+        self.assertEqual(calls, ["release-group", "release-group", "recording"])
+
+    def test_mbz_get_normal_path_with_a_real_id_is_unaffected(self):
+        """The guard must not touch an ordinary, well-formed request."""
+        key = bot._mbz_cache_key("release/real-id", {"inc": "recordings"})
+        self.addCleanup(bot._mbz_cache.pop, key, None)
+        with patch.object(bot._http, "get",
+                          lambda url, **k: _FakeMbzResponse({"id": "ok"})), \
+                patch.object(bot.time, "sleep", lambda s: None):
+            data = bot.mbz_get("release/real-id", {"inc": "recordings"})
+        self.assertEqual(data, {"id": "ok"})
+        self.assertEqual(bot._mbz_cache[key], {"id": "ok"})
+
+    def test_mbz_best_release_skips_lookup_for_empty_recording_id(self):
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            self.assertEqual(bot.mbz_best_release(""), {})
+
+    def test_mbz_release_tracks_skips_lookup_for_empty_release_id(self):
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            self.assertEqual(bot.mbz_release_tracks(""), [])
+
+    def test_canonical_release_fields_skips_lookup_for_empty_release_id(self):
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request"))):
+            self.assertEqual(bot._canonical_release_fields(""), {})
+
+    def test_atomic_json_write_leaves_no_temp_file_when_replace_fails(self):
+        """B-028: `_atomic_json_write`'s own `finally` must clean up any temp
+        file it created when a later step (here, `os.replace`) raises -- the
+        in-process half of the orphaned-tmp-file fix. (The other half, a
+        process that is killed outright between creating the temp file and
+        that `finally` running, is what the startup sweep exists for -- no
+        in-process code can catch that.)"""
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        path = os.path.join(td, "state.json")
+
+        def boom_replace(a, b):
+            raise OSError("simulated replace failure")
+
+        with patch.object(bot.os, "replace", boom_replace):
+            with self.assertRaises(OSError):
+                bot._atomic_json_write(path, {"a": 1})
+        self.assertEqual(os.listdir(td), [], "no leftover temp file")
+
+    def test_sweep_removes_old_orphaned_tmp_files_keeps_fresh_and_unrelated(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        state_path = os.path.join(td, "lb_bot_state.json")
+        old_tmp     = os.path.join(td, ".lb_bot_state.json.abc123.tmp")
+        fresh_tmp   = os.path.join(td, ".lb_bot_state.json.def456.tmp")
+        unrelated   = os.path.join(td, ".mbz_cache.json.xyz789.tmp")
+        for fn in (old_tmp, fresh_tmp, unrelated):
+            with open(fn, "w") as fh:
+                fh.write("{}")
+        old_ts = time.time() - (2 * bot.STATE_TMP_SWEEP_MIN_AGE)
+        os.utime(old_tmp, (old_ts, old_ts))
+        # fresh_tmp keeps "now" as its mtime -- another writer could be mid-write.
+
+        bot._sweep_orphaned_state_tmp_files(paths=(state_path,))
+
+        self.assertFalse(os.path.exists(old_tmp), "old orphan removed")
+        self.assertTrue(os.path.exists(fresh_tmp), "fresh temp file left alone")
+        self.assertTrue(os.path.exists(unrelated),
+                        "a different file's temp pattern is untouched")
+
+    def test_sweep_matches_its_own_path_literally(self):
+        """Final review M7: the directory and the basename were pasted into a
+        glob pattern as they were, so a `[` in either (a config dir like
+        `/config[1]`, or `state[old].json`) turned into a character class
+        and the sweep silently matched nothing — or another file's temps."""
+        import shutil
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        td = os.path.join(root, "config[1]")
+        os.makedirs(td)
+        state_path = os.path.join(td, "state[a].json")
+        orphan = os.path.join(td, ".state[a].json.abc123.tmp")
+        # What the unescaped pattern `.state[a].json.*.tmp` matches instead.
+        decoy = os.path.join(td, ".statea.json.abc123.tmp")
+        old_ts = time.time() - (2 * bot.STATE_TMP_SWEEP_MIN_AGE)
+        for fn in (orphan, decoy):
+            with open(fn, "w") as fh:
+                fh.write("{}")
+            os.utime(fn, (old_ts, old_ts))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            bot._sweep_orphaned_state_tmp_files(paths=(state_path,))
+
+        self.assertFalse(os.path.exists(orphan), "its own orphan removed")
+        self.assertTrue(os.path.exists(decoy), "another name's temp file left alone")
+
+    def test_sweep_covers_state_review_and_mbz_cache_files_by_default(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        state_path  = os.path.join(td, "lb_bot_state.json")
+        review_path = os.path.join(td, "missing_album_review.json")
+        mbz_path    = os.path.join(td, "mbz_cache.json")
+        old_ts = time.time() - (2 * bot.STATE_TMP_SWEEP_MIN_AGE)
+        orphans = []
+        for base in (state_path, review_path, mbz_path):
+            fn = os.path.join(td, f".{os.path.basename(base)}.orphan.tmp")
+            with open(fn, "w") as fh:
+                fh.write("{}")
+            os.utime(fn, (old_ts, old_ts))
+            orphans.append(fn)
+
+        with patch.object(bot, "STATE_FILE", state_path), \
+             patch.object(bot, "REVIEW_FILE", review_path), \
+             patch.object(bot, "MBZ_CACHE_FILE", mbz_path):
+            bot._sweep_orphaned_state_tmp_files()
+
+        for fn in orphans:
+            self.assertFalse(os.path.exists(fn), f"{fn} should have been swept")
+
+    def test_a_stop_signal_flushes_and_then_exits(self):
+        """B-032: as PID 1 the handler's old re-raise was dropped by the kernel,
+        so `docker stop` ended in SIGKILL. It must exit explicitly, after the flush."""
+        calls = []
+        with patch.object(bot, "_flush_all_state",
+                          lambda reason="": calls.append(("flush", reason))), \
+             patch.object(bot.os, "_exit", lambda code: calls.append(("exit", code))):
+            bot._on_shutdown_signal(15, None)
+        self.assertEqual(calls, [("flush", "signal 15"), ("exit", 0)])
+
+    def test_a_stop_signal_exits_even_when_the_flush_hangs(self):
+        """A signal can land while the main thread holds a lock the flush needs;
+        the exit must not wait on it past the timeout."""
+        release = threading.Event()
+        exits = []
+        with patch.object(bot, "_flush_all_state", lambda reason="": release.wait(5)), \
+             patch.object(bot, "SHUTDOWN_FLUSH_TIMEOUT", 0.05), \
+             patch.object(bot.os, "_exit", exits.append):
+            started = time.monotonic()
+            bot._on_shutdown_signal(15, None)
+            elapsed = time.monotonic() - started
+        release.set()
+        self.assertEqual(exits, [0])
+        self.assertLess(elapsed, 2)
 
     def test_mbz_release_full_fills_both_cache_keys_from_one_request(self):
         """Task 6: the release-group lookup and the tracklist of the same
@@ -3122,6 +3418,51 @@ class AlbumReviewTests(unittest.TestCase):
                          bot.PLACEMENT_VERIFY_FAST_INTERVAL)
         self.assertEqual(bot._placement_verify_delay(now - bot.PLACEMENT_VERIFY_FAST_WINDOW - 1),
                          bot.PLACEMENT_VERIFY_INTERVAL)
+
+    def test_a_row_placed_into_a_running_verifier_gets_the_fast_window(self):
+        """Q-024(3): one worker runs per group and a later placement joins it,
+        so the fast window counted from the worker's start had long closed for
+        a row placed minutes in — it was polled every 30 s from the outset. The
+        window counts from the newest outstanding row's placement."""
+        now = time.time()
+        old_start = now - bot.PLACEMENT_VERIFY_FAST_WINDOW - 60
+        rows = [(0, {"imported_at": old_start}), (1, {"imported_at": now - 5})]
+        clock = bot._placement_verify_clock(old_start, rows)
+        self.assertEqual(clock, now - 5)
+        self.assertEqual(bot._placement_verify_delay(clock),
+                         bot.PLACEMENT_VERIFY_FAST_INTERVAL)
+        # Rows older than the worker (a resumed pass): the worker's own start.
+        self.assertEqual(bot._placement_verify_clock(now, [(0, {"imported_at": old_start})]), now)
+        self.assertEqual(bot._placement_verify_clock(now, [(0, {})]), now)
+
+    def test_the_mbid_probe_wants_the_recording_and_prefers_the_groups_album(self):
+        """Q-024(2): the probe took Navidrome's first hit for the MBID — which
+        can be the same recording on a compilation, or not that recording at
+        all — and the verifier then announced that hit's album."""
+        asked = []
+        hits = [{"id": "s0", "musicBrainzId": "other", "albumId": "x", "title": "T"},
+                {"id": "s1", "musicBrainzId": "m1", "albumId": "comp", "title": "T"},
+                {"id": "s2", "musicBrainzId": "M1", "albumId": "al1", "title": "T"}]
+
+        def search(u, p, query, count=5, _retry=True):
+            asked.append((query, count))
+            return hits if query == "m1" else []
+
+        with patch.object(bot, "_nd_search", search):
+            self.assertEqual(bot.nd_track_match("A", "T", "m1", "u", "p",
+                                                prefer_album_ids={"al1"})["id"], "s2")
+            self.assertEqual(bot.nd_track_match("A", "T", "m1", "u", "p")["id"], "s1")
+            self.assertGreater(asked[0][1], 1, "more than one hit to choose from")
+            # A hit that is another recording is no evidence; with no title
+            # match either, nothing is found.
+            hits[:] = [{"id": "s0", "musicBrainzId": "other", "albumId": "x"}]
+            self.assertIsNone(bot.nd_track_match("A", "T", "m1", "u", "p"))
+        # nd_track_present stays sane: the text probe still finds the song.
+        texts = {"m1": [{"id": "s0", "musicBrainzId": "other"}],
+                 "T A": [{"id": "s3", "title": "T", "artist": "A"}]}
+        with patch.object(bot, "_nd_search",
+                          lambda u, p, q, count=5, _retry=True: texts.get(q, [])):
+            self.assertTrue(bot.nd_track_present("A", "T", "m1", "u", "p"))
 
     def test_present_row_backfill_never_asks_navidrome_with_nothing_to_do(self):
         """Called from the post-`albumIndexed` kick and the periodic sweep
@@ -3526,522 +3867,17 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertEqual(untagged["navidrome_album_ids"], ["nd1"])
         self.assertIsNone(group)
 
-    def test_normalized_download_error_timeout_and_cancel_states(self):
-        old_jobs = bot.repair_jobs.copy()
-        try:
-            bot.repair_jobs.clear()
-            job = {"id": "job1", "group_id": "g1", "artist": "A",
-                   "album": "B", "status": "needs_source",
-                   "tracks": [{"id": "t1", "title": "One",
-                               "recording_mbid": "rec1", "status": "approved"}],
-                   "downloads": [], "source_pools": [], "file_matches": [],
-                   "import_attempts": [], "verification": {}, "messages": [],
-                   "created_at": 1, "updated_at": 1}
-            bot.repair_jobs["job1"] = job
-            bot._repair_record_download_queued(
-                "job1", "t1", "user", {"filename": "A/01 One.flac"})
-            bot._repair_update_download(
-                "job1", "user", "A/01 One.flac", "timeout",
-                "transfer timed out", "transfer_timeout")
-            self.assertEqual(job["tracks"][0]["status"], "download_timeout")
-            self.assertEqual(job["status"], "blocked_slskd_timeout")
-            self.assertTrue(job["downloads"][0]["retry_available"])
-            bot._repair_update_download(
-                "job1", "user", "A/01 One.flac", "cancelled",
-                "cancelled by user")
-            self.assertEqual(job["tracks"][0]["status"], "cancelled")
-            bot._repair_update_download(
-                "job1", "user", "A/01 One.flac", "error",
-                "slskd rejected")
-            self.assertEqual(job["tracks"][0]["status"], "download_error")
-            self.assertEqual(job["status"], "blocked_slskd_error")
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    def test_match_downloaded_files_to_job_by_track_number_and_title(self):
-        old_jobs = bot.repair_jobs.copy()
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.repair_jobs.clear()
-                path = os.path.join(td, "01 One.flac")
-                with open(path, "wb") as fh:
-                    fh.write(b"x")
-                job = {"id": "job1", "group_id": "g1", "artist": "Artist",
-                       "album": "Album", "status": "downloaded_unmatched",
-                       "tracks": [{"id": "t1", "title": "One",
-                                   "artist": "Artist", "position": 1,
-                                   "recording_mbid": "rec1",
-                                   "status": "downloaded"}],
-                       "downloads": [], "source_pools": [{
-                           "id": "pool1", "path": td, "status": "downloaded"}],
-                       "file_matches": [], "import_attempts": [],
-                       "verification": {}, "messages": [],
-                       "created_at": 1, "updated_at": 1}
-                bot.repair_jobs["job1"] = job
-                result = bot.match_downloaded_files_to_job("job1")
-                self.assertTrue(result["ok"])
-                self.assertEqual(job["status"], "matched_ready_to_import")
-                self.assertEqual(job["tracks"][0]["status"], "file_matched")
-                self.assertEqual(job["file_matches"][0]["source_path"], path)
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-
-    @patch("listenbrainz_bot._audio_file_tags")
-    def test_match_downloaded_files_to_job_by_mbid_and_ambiguous(self, mock_tags):
-        old_jobs = bot.repair_jobs.copy()
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.repair_jobs.clear()
-                one = os.path.join(td, "x.flac")
-                two = os.path.join(td, "y.flac")
-                for p in (one, two):
-                    with open(p, "wb") as fh:
-                        fh.write(b"x")
-                mock_tags.return_value = {"musicbrainz_trackid": "rec1"}
-                job = {"id": "job1", "group_id": "g1", "artist": "Artist",
-                       "album": "Album", "status": "downloaded_unmatched",
-                       "tracks": [{"id": "t1", "title": "One",
-                                   "artist": "Artist", "position": 1,
-                                   "recording_mbid": "rec1",
-                                   "status": "downloaded"}],
-                       "downloads": [], "source_pools": [{
-                           "id": "pool1", "path": td, "status": "downloaded"}],
-                       "file_matches": [], "import_attempts": [],
-                       "verification": {}, "messages": [],
-                       "created_at": 1, "updated_at": 1}
-                bot.repair_jobs["job1"] = job
-                result = bot.match_downloaded_files_to_job("job1")
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["ambiguous"], 1)
-                self.assertEqual(job["status"], "blocked_ambiguous_files")
-                self.assertEqual(job["tracks"][0]["status"], "match_ambiguous")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-
-    def test_match_downloaded_files_ignores_unapproved_missing_tracks(self):
-        old_jobs = bot.repair_jobs.copy()
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.repair_jobs.clear()
-                path = os.path.join(td, "01 One.flac")
-                with open(path, "wb") as fh:
-                    fh.write(b"x")
-                job = {"id": "job1", "group_id": "g1", "artist": "Artist",
-                       "album": "Album", "status": "needs_review",
-                       "tracks": [{"id": "t1", "title": "One",
-                                   "artist": "Artist", "position": 1,
-                                   "recording_mbid": "rec1",
-                                   "status": "missing"}],
-                       "downloads": [], "source_pools": [{
-                           "id": "pool1", "path": td, "status": "downloaded"}],
-                       "file_matches": [], "import_attempts": [],
-                       "verification": {}, "messages": [],
-                       "created_at": 1, "updated_at": 1}
-                bot.repair_jobs["job1"] = job
-                result = bot.match_downloaded_files_to_job("job1")
-                self.assertTrue(result["ok"])
-                self.assertEqual(result["matched"], 0)
-                self.assertEqual(job["tracks"][0]["status"], "missing")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-
-    def test_manual_repair_file_match_assigns_visible_download(self):
-        old_jobs = bot.repair_jobs.copy()
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                downloads = os.path.join(td, "downloads")
-                os.mkdir(downloads)
-                path = os.path.join(downloads, "01 One.flac")
-                with open(path, "wb") as fh:
-                    fh.write(b"x")
-                bot.SLSKD_DOWNLOAD_DIR = downloads
-                bot.repair_jobs.clear()
-                job = {"id": "job1", "group_id": "g1", "artist": "Artist",
-                       "album": "Album", "status": "blocked_no_match",
-                       "tracks": [{"id": "t1", "title": "One",
-                                   "artist": "Artist", "position": 1,
-                                   "recording_mbid": "rec1",
-                                   "status": "match_missing"}],
-                       "downloads": [], "source_pools": [{
-                           "id": "pool1", "path": downloads, "status": "downloaded"}],
-                       "file_matches": [], "import_attempts": [],
-                       "verification": {}, "messages": [],
-                       "created_at": 1, "updated_at": 1}
-                bot.repair_jobs["job1"] = job
-                candidates = bot.repair_job_candidate_files("job1")
-                self.assertEqual(candidates["files"][0]["path"], path)
-                result = bot.manually_match_repair_job_files(
-                    "job1", [{"track_id": "t1", "source_path": path}])
-                self.assertTrue(result["ok"])
-                self.assertEqual(job["tracks"][0]["status"], "file_matched")
-                self.assertEqual(job["file_matches"][0]["confidence"], "manual")
-                self.assertEqual(job["status"], "matched_ready_to_import")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-
-    def test_manual_repair_file_match_rejects_hidden_path(self):
-        old_jobs = bot.repair_jobs.copy()
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                downloads = os.path.join(td, "downloads")
-                outside = os.path.join(td, "outside")
-                os.mkdir(downloads)
-                os.mkdir(outside)
-                hidden = os.path.join(outside, "01 One.flac")
-                with open(hidden, "wb") as fh:
-                    fh.write(b"x")
-                bot.SLSKD_DOWNLOAD_DIR = downloads
-                bot.repair_jobs.clear()
-                bot.repair_jobs["job1"] = {
-                    "id": "job1", "group_id": "g1", "artist": "Artist",
-                    "album": "Album", "status": "blocked_no_match",
-                    "tracks": [{"id": "t1", "title": "One", "position": 1,
-                                "recording_mbid": "rec1", "status": "match_missing"}],
-                    "downloads": [], "source_pools": [{
-                        "id": "pool1", "path": downloads, "status": "downloaded"}],
-                    "file_matches": [], "import_attempts": [],
-                    "verification": {}, "messages": [],
-                    "created_at": 1, "updated_at": 1}
-                result = bot.manually_match_repair_job_files(
-                    "job1", [{"track_id": "t1", "source_path": hidden}])
-                self.assertFalse(result["ok"])
-                self.assertEqual(bot.repair_jobs["job1"]["tracks"][0]["status"],
-                                 "match_missing")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-
-    def test_stage_matched_files_copies_only_safe_download_sources(self):
-        old_jobs = bot.repair_jobs.copy()
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        old_staging = bot.LB_BOT_STAGING_DIR
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                downloads = os.path.join(td, "downloads")
-                staging = os.path.join(td, "staging")
-                os.mkdir(downloads)
-                src = os.path.join(downloads, "01 One.flac")
-                with open(src, "wb") as fh:
-                    fh.write(b"x")
-                bot.SLSKD_DOWNLOAD_DIR = downloads
-                bot.LB_BOT_STAGING_DIR = staging
-                bot.repair_jobs.clear()
-                job = {"id": "job1", "group_id": "g1", "artist": "Artist",
-                       "album": "Album", "status": "matched_ready_to_import",
-                       "tracks": [{"id": "t1", "title": "One",
-                                   "artist": "Artist", "position": 1,
-                                   "recording_mbid": "rec1",
-                                   "status": "file_matched"}],
-                       "downloads": [], "source_pools": [], "import_attempts": [],
-                       "verification": {}, "messages": [],
-                       "file_matches": [{"track_id": "t1", "recording_mbid": "rec1",
-                                         "source_path": src, "confidence": "high",
-                                         "status": "matched", "reason": "test"}],
-                       "created_at": 1, "updated_at": 1}
-                bot.repair_jobs["job1"] = job
-                result = bot.stage_matched_files("job1")
-                self.assertTrue(result["ok"])
-                staged = result["staged"][0]["staged_path"]
-                self.assertTrue(os.path.exists(src))
-                self.assertTrue(os.path.exists(staged))
-                self.assertTrue(bot._path_inside(staged, staging))
-                self.assertEqual(job["tracks"][0]["status"], "staged")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-                bot.LB_BOT_STAGING_DIR = old_staging
-
-    def test_stage_matched_files_blocks_source_outside_downloads(self):
-        old_jobs = bot.repair_jobs.copy()
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        old_staging = bot.LB_BOT_STAGING_DIR
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                downloads = os.path.join(td, "downloads")
-                staging = os.path.join(td, "staging")
-                outside = os.path.join(td, "outside")
-                os.mkdir(downloads)
-                os.mkdir(outside)
-                src = os.path.join(outside, "01 One.flac")
-                with open(src, "wb") as fh:
-                    fh.write(b"x")
-                bot.SLSKD_DOWNLOAD_DIR = downloads
-                bot.LB_BOT_STAGING_DIR = staging
-                bot.repair_jobs.clear()
-                bot.repair_jobs["job1"] = {
-                    "id": "job1", "group_id": "g1", "artist": "Artist",
-                    "album": "Album", "status": "matched_ready_to_import",
-                    "tracks": [{"id": "t1", "title": "One", "position": 1,
-                                "recording_mbid": "rec1", "status": "file_matched"}],
-                    "downloads": [], "source_pools": [], "import_attempts": [],
-                    "verification": {}, "messages": [],
-                    "file_matches": [{"track_id": "t1", "source_path": src,
-                                      "status": "matched"}],
-                    "created_at": 1, "updated_at": 1}
-                result = bot.stage_matched_files("job1")
-                self.assertFalse(result["ok"])
-                self.assertEqual(bot.repair_jobs["job1"]["status"], "blocked_permission")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-                bot.LB_BOT_STAGING_DIR = old_staging
-
-    def test_defer_unresolved_allows_matched_subset_and_resume(self):
-        old_jobs = bot.repair_jobs.copy()
-        try:
-            bot.repair_jobs.clear()
-            bot.repair_jobs["job1"] = {
-                "id": "job1", "status": "blocked_slskd_error",
-                "tracks": [
-                    {"id": "t1", "title": "Ready", "status": "file_matched"},
-                    {"id": "t2", "title": "Missing", "status": "download_error",
-                     "error": "rejected"},
-                ],
-                "file_matches": [{"track_id": "t1", "status": "matched",
-                                  "source_path": "/downloads/01.flac"}],
-                "messages": [],
-            }
-            result = bot.defer_unresolved_repair_tracks("job1")
-            self.assertTrue(result["ok"])
-            self.assertEqual(bot.repair_jobs["job1"]["tracks"][1]["status"], "deferred")
-            self.assertEqual(bot.repair_jobs["job1"]["status"], "matched_ready_to_import")
-            resumed = bot.resume_deferred_repair_tracks("job1")
-            self.assertTrue(resumed["ok"])
-            self.assertEqual(bot.repair_jobs["job1"]["tracks"][1]["status"], "missing")
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    @patch("listenbrainz_bot._verify_trusted_beets_import")
-    @patch("listenbrainz_bot.mbz_release_tracks")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_repair_import_uses_staged_folder_and_canonical_metadata(
-            self, mock_run, mock_tracks, mock_verify):
-        old_jobs = bot.repair_jobs.copy()
-        old_staging = bot.LB_BOT_STAGING_DIR
-        mock_run.return_value = (True, "ok")
-        mock_tracks.return_value = [{"title": "One", "mbid": "rec1", "position": 1}]
-        mock_verify.return_value = {"ok": True, "recordings": []}
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.LB_BOT_STAGING_DIR = os.path.join(td, "staging")
-                bot.repair_jobs.clear()
-                staged_dir = os.path.join(bot.LB_BOT_STAGING_DIR, "job1")
-                os.makedirs(staged_dir)
-                staged = os.path.join(staged_dir, "01 One.flac")
-                with open(staged, "wb") as fh:
-                    fh.write(b"x")
-                bot.repair_jobs["job1"] = {
-                    "id": "job1", "group_id": "g1", "artist": "Artist",
-                    "album": "Album", "canonical_release_mbid": "rel1",
-                    "canonical_release_group_mbid": "",
-                    "canonical_tracklist": [{"title": "One"}],
-                    "status": "matched_ready_to_import",
-                    "staging_dir": staged_dir,
-                    "tracks": [{"id": "t1", "title": "One", "artist": "Artist",
-                                "position": 1, "recording_mbid": "rec1",
-                                "status": "staged"}],
-                    "downloads": [], "source_pools": [], "import_attempts": [],
-                    "verification": {}, "messages": [],
-                    "file_matches": [{"track_id": "t1", "source_path": "/downloads/A/01.flac",
-                                      "staged_path": staged, "status": "matched"}],
-                    "created_at": 1, "updated_at": 1}
-                result = bot.repair_import_matched_tracks("job1")
-                self.assertTrue(result["ok"])
-                calls = [c.args[0] for c in mock_run.call_args_list]
-                self.assertEqual(len(calls), 1)
-                self.assertIn("import", calls[0])
-                self.assertIn("--flat", calls[0])
-                self.assertIn("--search-id", calls[0])
-                self.assertIn("rel1", calls[0])
-                self.assertEqual(calls[0][-1], staged)
-                self.assertTrue(all("/downloads/A" not in " ".join(cmd) for cmd in calls))
-                self.assertEqual(result["attempt"]["commands"][0]["kind"], "merge_import")
-                self.assertEqual(bot.repair_jobs["job1"]["tracks"][0]["status"],
-                                 "navidrome_pending")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.LB_BOT_STAGING_DIR = old_staging
-
-    @patch("listenbrainz_bot.mbz_release_tracks")
-    @patch("listenbrainz_bot._run_beets_cmd")
-    def test_repair_import_treats_beets_skipping_as_failure(self, mock_run, mock_tracks):
-        old_jobs = bot.repair_jobs.copy()
-        old_staging = bot.LB_BOT_STAGING_DIR
-        mock_run.return_value = (True, "Skipping.")
-        mock_tracks.return_value = [{"title": "One", "mbid": "rec1", "position": 1}]
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                bot.LB_BOT_STAGING_DIR = os.path.join(td, "staging")
-                bot.repair_jobs.clear()
-                staged_dir = os.path.join(bot.LB_BOT_STAGING_DIR, "job1")
-                os.makedirs(staged_dir)
-                staged = os.path.join(staged_dir, "01 One.flac")
-                with open(staged, "wb") as fh:
-                    fh.write(b"x")
-                bot.repair_jobs["job1"] = {
-                    "id": "job1", "group_id": "g1", "artist": "Artist",
-                    "album": "Album", "canonical_release_mbid": "rel1",
-                    "canonical_tracklist": [], "status": "matched_ready_to_import",
-                    "staging_dir": staged_dir,
-                    "tracks": [{"id": "t1", "title": "One", "position": 1,
-                                "recording_mbid": "rec1", "status": "staged"}],
-                    "downloads": [], "source_pools": [], "import_attempts": [],
-                    "verification": {}, "messages": [],
-                    "file_matches": [{"track_id": "t1", "staged_path": staged,
-                                      "status": "matched"}],
-                    "created_at": 1, "updated_at": 1}
-                result = bot.repair_import_matched_tracks("job1")
-                self.assertFalse(result["ok"])
-                self.assertEqual(bot.repair_jobs["job1"]["status"], "blocked_beets_error")
-                self.assertEqual(result["attempt"]["error_code"], "beets_skipped")
-            finally:
-                bot.repair_jobs.clear()
-                bot.repair_jobs.update(old_jobs)
-                bot.LB_BOT_STAGING_DIR = old_staging
-
-    def test_selected_file_import_ignores_unselected_download_leftovers(self):
-        old_downloads = bot.SLSKD_DOWNLOAD_DIR
-        old_relocates = bot._BEETS_RELOCATES
-        old_moves = bot._BEETS_MOVES
-        with tempfile.TemporaryDirectory() as td:
-            try:
-                downloads = os.path.join(td, "downloads")
-                os.mkdir(downloads)
-                selected = os.path.join(downloads, "01 One.flac")
-                leftover = os.path.join(downloads, "02 Two.flac")
-                with open(selected, "wb") as fh:
-                    fh.write(b"x")
-                with open(leftover, "wb") as fh:
-                    fh.write(b"x")
-                os.remove(selected)
-                bot.SLSKD_DOWNLOAD_DIR = downloads
-                bot._BEETS_RELOCATES = True
-                bot._BEETS_MOVES = True
-                result = bot._beets_result_from_output(
-                    downloads, True, "imported", "rel1", True, True, True,
-                    source_paths=[selected])
-                self.assertTrue(result["imported"])
-                self.assertFalse(result["still_in_downloads"])
-            finally:
-                bot.SLSKD_DOWNLOAD_DIR = old_downloads
-                bot._BEETS_RELOCATES = old_relocates
-                bot._BEETS_MOVES = old_moves
-
-    @patch("listenbrainz_bot._nd_search")
-    @patch("listenbrainz_bot.nd_get_scan_status")
-    @patch("listenbrainz_bot.nd_start_scan")
-    def test_verify_repair_job_requires_navidrome_visibility(
-            self, mock_scan, mock_status, mock_search):
-        old_jobs = bot.repair_jobs.copy()
-        mock_scan.return_value = True
-        mock_status.return_value = {"scanning": False}
-        mock_search.return_value = [{
-            "id": "song1", "musicBrainzId": "rec1", "title": "One",
-            "album": "Album", "albumArtist": "Artist"}]
-        try:
-            bot.repair_jobs.clear()
-            bot.repair_jobs["job1"] = {
-                "id": "job1", "group_id": "g1", "artist": "Artist",
-                "album": "Album", "status": "imported_unverified",
-                "tracks": [{"id": "t1", "title": "One", "artist": "Artist",
-                            "recording_mbid": "rec1",
-                            "status": "navidrome_pending"}],
-                "downloads": [], "source_pools": [], "file_matches": [],
-                "import_attempts": [], "verification": {}, "messages": [],
-                "created_at": 1, "updated_at": 1}
-            user = {"navidrome_user": "u", "navidrome_password": "p"}
-            result = bot.verify_repair_job_in_navidrome(
-                "job1", user=user, poll_attempts=1, poll_interval=0)
-            self.assertTrue(result["ok"])
-            self.assertEqual(bot.repair_jobs["job1"]["status"], "verified_complete")
-            self.assertEqual(bot.repair_jobs["job1"]["tracks"][0]["status"],
-                             "navidrome_verified")
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    @patch("listenbrainz_bot._nd_search")
-    @patch("listenbrainz_bot.nd_get_scan_status")
-    @patch("listenbrainz_bot.nd_start_scan")
-    def test_verify_repair_job_marks_deferred_run_partial(
-            self, mock_scan, mock_status, mock_search):
-        old_jobs = bot.repair_jobs.copy()
-        mock_scan.return_value = True
-        mock_status.return_value = {"scanning": False}
-        mock_search.return_value = [{
-            "id": "song1", "musicBrainzId": "rec1", "title": "One",
-            "album": "Album", "albumArtist": "Artist"}]
-        try:
-            bot.repair_jobs.clear()
-            bot.repair_jobs["job1"] = {
-                "id": "job1", "artist": "Artist", "album": "Album",
-                "status": "imported_unverified",
-                "tracks": [
-                    {"id": "t1", "title": "One", "recording_mbid": "rec1",
-                     "status": "navidrome_pending"},
-                    {"id": "t2", "title": "Two", "recording_mbid": "rec2",
-                     "status": "deferred"},
-                ],
-                "verification": {}, "messages": [],
-            }
-            result = bot.verify_repair_job_in_navidrome(
-                "job1", user={"navidrome_user": "u", "navidrome_password": "p"},
-                poll_attempts=1, poll_interval=0)
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "verified_partial")
-            self.assertFalse(bot.repair_jobs["job1"]["verification"]["complete"])
-            self.assertTrue(bot.repair_jobs["job1"]["verification"]["subset_complete"])
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
-    @patch("listenbrainz_bot.nd_start_scan")
-    def test_verify_repair_job_does_not_scan_before_moved_files(self, mock_scan):
-        old_jobs = bot.repair_jobs.copy()
-        try:
-            bot.repair_jobs.clear()
-            bot.repair_jobs["job1"] = {
-                "id": "job1", "group_id": "g1", "artist": "Artist",
-                "album": "Album", "status": "matched_ready_to_import",
-                "tracks": [{"id": "t1", "title": "One",
-                            "recording_mbid": "rec1", "status": "staged"}],
-                "downloads": [], "source_pools": [], "file_matches": [],
-                "import_attempts": [], "verification": {}, "messages": [],
-                "created_at": 1, "updated_at": 1}
-            user = {"navidrome_user": "u", "navidrome_password": "p"}
-            result = bot.verify_repair_job_in_navidrome(
-                "job1", user=user, poll_attempts=0, poll_interval=0)
-            self.assertFalse(result["ok"])
-            self.assertFalse(mock_scan.called)
-        finally:
-            bot.repair_jobs.clear()
-            bot.repair_jobs.update(old_jobs)
-
     def test_operation_create_finish_and_payload(self):
         old_review = bot._review_state
         try:
             bot._review_state = bot._empty_review_state()
-            op = bot._operation_create("match_files", "Matching", "job1")
+            op = bot._operation_create("match_files", "Matching")
             self.assertEqual(op["status"], "running")
             done = bot._operation_finish(op["id"], True, "Matched")
             self.assertEqual(done["status"], "success")
             payload = bot._with_operation({"ok": True}, op)
             self.assertEqual(payload["operation_id"], op["id"])
             self.assertEqual(payload["operation"]["status"], "success")
-            self.assertEqual(payload["job_id"], "job1")
         finally:
             bot._review_state = old_review
 
@@ -4063,8 +3899,7 @@ class AlbumReviewTests(unittest.TestCase):
     def test_operations_survive_a_scan_replacing_its_origin(self):
         with isolated_review():
             op = bot._operation_create("scan", "Scanning")
-            with patch.object(bot, "repair_jobs", {}):
-                bot._replace_review_groups("library", [], "done")
+            bot._replace_review_groups("library", [], "done")
             self.assertIn(op["id"], bot._review_state["operations"])
 
     def test_move_does_not_inherit_source_mtime_or_mode(self):
@@ -4337,8 +4172,7 @@ class AlbumReviewTests(unittest.TestCase):
         group = {"id": "g1", "missing_tracks": [
             {"title": "One", "recording_mbid": "r1", "decision": "downloaded",
              "manual_pick": {"username": "peer", "filename": "01 - One.flac"}}]}
-        with patch.object(bot, "_repair_job_for_group", lambda gid: None), \
-             patch.object(bot, "_pop_album_groups_for_review_group", lambda gid: None):
+        with patch.object(bot, "_pop_album_groups_for_review_group", lambda gid: None):
             bot._mark_group_tracks_placed(group, result)
         track = group["missing_tracks"][0]
         self.assertTrue(track["can_force_place"])
@@ -4362,7 +4196,6 @@ class AlbumReviewTests(unittest.TestCase):
              patch.object(bot, "rgid_from_release", lambda *a, **k: ""), \
              patch.object(bot, "_default_web_user", lambda *a, **k: None), \
              patch.object(bot, "_find_review_group", lambda gid: group), \
-             patch.object(bot, "_repair_job_for_group", lambda gid: None), \
              patch.object(bot, "_pop_album_groups_for_review_group", lambda gid: None), \
              patch.object(bot, "_start_placement_verification", lambda gid: None), \
              patch.object(bot, "_nd_scan_after_import", lambda token: False), \
@@ -5631,8 +5464,7 @@ class AlbumSearchPassTests(unittest.TestCase):
         plan = {"mode": "album", "query": "planned but never run"}
         folders = [{"username": "u", "folder": "F", "score": 1, "files": []}]
         stats = {"queries": ["Future Zone 2016", "Future Zone"]}
-        with patch.object(bot, "LB_BOT_REPAIR_JOBS", False):
-            res = bot._apply_group_sources(group, plan, folders, stats)
+        res = bot._apply_group_sources(group, plan, folders, stats)
         self.assertTrue(res["ok"])
         self.assertEqual(group["source_results"]["query"], "Future Zone 2016")
         self.assertEqual(group["source_results"]["queries"], stats["queries"])
@@ -5967,19 +5799,7 @@ class EditorialMetadataTests(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
         self.db_path = os.path.join(td, "index.db")
-        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-        bot.LIBRARY_INDEX_FILE = self.db_path
-        bot._index_conn = None
-
-        def restore():
-            try:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-            except Exception:
-                pass
-            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
-
-        self.addCleanup(restore)
+        scratch_index(self, self.db_path)
         bot._wiki_cache.clear()
         self.addCleanup(bot._wiki_cache.clear)
 
@@ -6300,7 +6120,7 @@ class EditorialMetadataTests(unittest.TestCase):
         """)
         old.commit()
         old.close()
-        bot._index_conn = None
+        swap_index(self.db_path)
 
         conn = bot._index_db()
         tables = {r[0] for r in conn.execute(
@@ -6947,6 +6767,16 @@ class ResolveLinkTests(unittest.TestCase):
         self.assertEqual(out["mbid"], "rec-2")
         self.assertLess(out["confidence"], 0.95)
 
+    def test_mbid_from_isrc_sends_no_empty_inc_param(self):
+        """B-010: an empty `inc=""` reached MusicBrainz verbatim -- harmless,
+        but not what the route meant to ask, and the caller reads only the
+        recording id, so there is nothing worth including."""
+        with patch("listenbrainz_bot.mbz_get",
+                   return_value={"recordings": [{"id": "rec-1"}]}) as mock_get:
+            mbid = bot._mbid_from_isrc("GBDUW0000059")
+        self.assertEqual(mbid, "rec-1")
+        mock_get.assert_called_once_with("recording", {"isrcs": "GBDUW0000059"})
+
     def test_an_unrecognised_url_is_a_plain_answer(self):
         out = bot.resolve_music_link("https://example.com/not-music")
         self.assertEqual(out["kind"], "unknown")
@@ -7330,19 +7160,7 @@ class IndexSeqTests(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
         self.db_path = os.path.join(td, "index.db")
-        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-        bot.LIBRARY_INDEX_FILE = self.db_path
-        bot._index_conn = None
-
-        def restore():
-            try:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-            except Exception:
-                pass
-            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
-
-        self.addCleanup(restore)
+        scratch_index(self, self.db_path)
 
     # -- helpers -------------------------------------------------------------
 
@@ -7360,8 +7178,7 @@ class IndexSeqTests(unittest.TestCase):
 
     def reboot(self):
         """Close the shared connection so the next _index_db() is a fresh boot."""
-        bot._index_conn.close()
-        bot._index_conn = None
+        swap_index(bot.LIBRARY_INDEX_FILE)
 
     @staticmethod
     def rel(rgid, title="T", status="missing", **extra):
@@ -7651,7 +7468,7 @@ class IndexSeqTests(unittest.TestCase):
         old.commit()
         old.close()
         owned_before = {"rg-a", "rg-o", "rg-n"}
-        bot._index_conn = None
+        swap_index(self.db_path)
 
         conn = bot._index_db()
         seqs = {r["artist_key"]: r["seq"] for r in conn.execute(
@@ -7694,19 +7511,12 @@ class IndexChangesFeedTests(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
         self.db_path = os.path.join(td, "index.db")
-        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-        bot.LIBRARY_INDEX_FILE = self.db_path
-        bot._index_conn = None
-
-        def restore():
-            try:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-            except Exception:
-                pass
-            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
-
-        self.addCleanup(restore)
+        scratch_index(self, self.db_path)
+        # B-013's truncation-warning dedup is process-global; a leftover entry
+        # from one test's artist key/seq must not silence another's warning.
+        old_warned = bot._index_truncation_warned.copy()
+        bot._index_truncation_warned.clear()
+        self.addCleanup(bot._index_truncation_warned.update, old_warned)
 
     @staticmethod
     def rel(rgid, title="T", status="missing", **extra):
@@ -7804,6 +7614,87 @@ class IndexChangesFeedTests(unittest.TestCase):
         self.assertEqual(page["items"][0]["key"], "mb-big")
         self.assertTrue(page["more"])
         self.assertEqual(page["nextSince"], page["items"][0]["seq"])
+
+    def test_an_oversized_first_artist_has_its_own_rows_bounded(self):
+        """B-013: the "always at least one item" exemption used to be
+        unconditional, so a single prolific artist's release-groups alone
+        could make the page (and the hub's PROXY_MAX_RESPONSE above it)
+        arbitrarily large -- a deterministic 502 tooLarge no retry could
+        clear. The oversized artist must still be the page's one item, but
+        its own rows are now bounded to the same page budget, with
+        rowsTruncated/rowsTotal saying so rather than silently handing back
+        a partial "every release_groups row"."""
+        big_releases = [self.rel(f"rg{i}", title="T" * 200) for i in range(50)]
+        self.store("mb-big", "Big", big_releases)
+        self.store("mb-small", "Small", [self.rel("rgx")])
+        with patch.object(bot, "INDEX_CHANGES_MAX_BYTES", 4000):
+            page, status = bot._index_changes_view(0, "")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page["items"]), 1)
+        item = page["items"][0]
+        self.assertEqual(item["key"], "mb-big")
+        self.assertTrue(item["rowsTruncated"])
+        self.assertEqual(item["rowsTotal"], 50)
+        self.assertLess(len(item["rows"]), 50)
+        # The bound is real, not cosmetic: the artist alone must fit the cap.
+        self.assertLessEqual(len(json.dumps(item).encode("utf-8")),
+                             bot.INDEX_CHANGES_MAX_BYTES)
+        self.assertTrue(page["more"])
+        self.assertEqual(page["nextSince"], item["seq"])
+
+    def test_oversized_first_artist_truncation_logs_a_warning(self):
+        """R13: the truncation is silent otherwise -- nothing else flags a
+        client's mirror missing rows for this artist (artistCount/seqSum
+        still match). One WARNING line, naming the artist key/name and how
+        many rows were kept out of the total."""
+        big_releases = [self.rel(f"rg{i}", title="T" * 200) for i in range(50)]
+        self.store("mb-big", "Big", big_releases)
+        out = io.StringIO()
+        with patch.object(bot, "INDEX_CHANGES_MAX_BYTES", 4000), \
+                contextlib.redirect_stdout(out):
+            page, status = bot._index_changes_view(0, "")
+        self.assertEqual(status, 200)
+        kept = len(page["items"][0]["rows"])
+        logged = out.getvalue()
+        self.assertIn("Warning", logged)
+        self.assertIn("mb-big", logged)
+        self.assertIn("Big", logged)
+        self.assertIn(f"{kept}/50", logged)
+
+    def test_truncation_warning_is_not_repeated_for_the_same_build(self):
+        """A client that hasn't consumed this artist yet re-requests the same
+        page on every poll; the warning must fire once per seq (per "build"
+        of the item), not once per poll."""
+        big_releases = [self.rel(f"rg{i}", title="T" * 200) for i in range(50)]
+        self.store("mb-big", "Big", big_releases)
+        with patch.object(bot, "INDEX_CHANGES_MAX_BYTES", 4000):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                bot._index_changes_view(0, "")
+            self.assertIn("Warning", out.getvalue())
+
+            # Same underlying row (same seq): re-polling from since=0 again
+            # must not print a second warning.
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2):
+                bot._index_changes_view(0, "")
+            self.assertNotIn("Warning", out2.getvalue())
+
+            # The artist changes (a rescan bumps its seq): the new version is
+            # a different "build" and is warned about again.
+            self.store("mb-big", "Big", big_releases + [self.rel("rg-new")])
+            out3 = io.StringIO()
+            with contextlib.redirect_stdout(out3):
+                bot._index_changes_view(0, "")
+            self.assertIn("Warning", out3.getvalue())
+
+    def test_a_normal_sized_first_artist_is_not_marked_truncated(self):
+        self.store("mb-a", "A", [self.rel("rg1"), self.rel("rg2")])
+        page, status = bot._index_changes_view(0, "")
+        self.assertEqual(status, 200)
+        self.assertNotIn("rowsTruncated", page["items"][0])
+        self.assertNotIn("rowsTotal", page["items"][0])
+        self.assertEqual(len(page["items"][0]["rows"]), 2)
 
     def test_byte_cap_splits_across_pages_and_a_full_pull_still_gets_everything(self):
         self.store("mb-a", "A", [self.rel(f"rg{i}", title="T" * 100) for i in range(20)])
@@ -7974,19 +7865,7 @@ class IndexHwmBootBestEffortTests(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
         self.db_path = os.path.join(td, "index.db")
-        old_path, old_conn = bot.LIBRARY_INDEX_FILE, bot._index_conn
-        bot.LIBRARY_INDEX_FILE = self.db_path
-        bot._index_conn = None
-
-        def restore():
-            try:
-                if bot._index_conn is not None:
-                    bot._index_conn.close()
-            except Exception:
-                pass
-            bot.LIBRARY_INDEX_FILE, bot._index_conn = old_path, old_conn
-
-        self.addCleanup(restore)
+        scratch_index(self, self.db_path)
 
     def test_unwritable_hwm_path_at_boot_still_yields_a_working_index_db(self):
         bot._index_store_artist(
@@ -7996,8 +7875,7 @@ class IndexHwmBootBestEffortTests(unittest.TestCase):
         # Force the boot-time epoch rotation to fire on the next open: a
         # persisted HWM strictly above the current head, under the same epoch.
         bot._index_persist_hwm(seq + 5, epoch)
-        bot._index_conn.close()
-        bot._index_conn = None
+        swap_index(bot.LIBRARY_INDEX_FILE)
         with patch.object(bot, "_atomic_json_write", side_effect=OSError("read-only /config")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -8029,9 +7907,7 @@ class IndexPushSenderTests(unittest.TestCase):
         import shutil
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, True)
-        old_path = bot.LIBRARY_INDEX_FILE
-        bot.LIBRARY_INDEX_FILE = os.path.join(td, "index.db")
-        self.addCleanup(lambda: setattr(bot, "LIBRARY_INDEX_FILE", old_path))
+        scratch_index(self, os.path.join(td, "index.db"))
 
     @staticmethod
     def _state():
@@ -9068,6 +8944,16 @@ class LogTeeTests(unittest.TestCase):
         self.assertEqual(sorted(msgs), ["first half of a line",
                                         "slskd enqueue exception: peer refused"])
 
+    def test_ansi_colour_codes_are_stripped_before_recording(self):
+        sink = io.StringIO()
+        tee = bot._LogTee(sink)
+        with patch.object(bot, "_stdout_events", []) as ring:
+            tee.write("\x1b[32mplacement: 2 track(s) landed\x1b[0m\n")
+            msgs = [e["msg"] for e in ring]
+        # The raw stream is untouched -- only the recorded copy is cleaned.
+        self.assertEqual(sink.getvalue(), "\x1b[32mplacement: 2 track(s) landed\x1b[0m\n")
+        self.assertEqual(msgs, ["placement: 2 track(s) landed"])
+
     def test_stderr_access_log_lines_are_skipped(self):
         tee = bot._LogTee(io.StringIO(), src="stderr")
         with patch.object(bot, "_stdout_events", []) as ring:
@@ -9222,7 +9108,7 @@ class ReviewFixRoundTests(unittest.TestCase):
 
     # ── review merges ───────────────────────────────────────────────────────
     @contextlib.contextmanager
-    def _review(self, groups, jobs=None):
+    def _review(self, groups):
         old_file, old_state = bot.REVIEW_FILE, bot._review_snapshot()
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -9230,8 +9116,7 @@ class ReviewFixRoundTests(unittest.TestCase):
                 with bot._review_lock:
                     bot._review_state = bot._empty_review_state()
                     bot._review_state["groups"] = groups
-                with patch.object(bot, "repair_jobs", jobs or {}), \
-                        patch.object(bot, "_index_db", side_effect=RuntimeError("no db")):
+                with patch.object(bot, "_index_db", side_effect=RuntimeError("no db")):
                     yield
         finally:
             bot.REVIEW_FILE = old_file
@@ -9258,17 +9143,6 @@ class ReviewFixRoundTests(unittest.TestCase):
         self.assertEqual(g["no_source_reason"], "only mp3")
         self.assertEqual(g["missing_tracks"][0]["manual_pick"]["username"], "u")
         self.assertTrue(g["missing_tracks"][0]["can_force_place"])
-
-    def test_a_replace_does_not_duplicate_a_group_another_origin_holds(self):
-        live = self._g("G", origin="library", canonical_mbid="rel-1",
-                       albums=[{"id": "al"}], canonical_album_id="al")
-        job = {"id": "job-G", "group_id": "G", "status": "needs_source",
-               "canonical_release_mbid": "rel-drifted", "tracks": []}
-        with self._review([live], {"job-G": job}), \
-                patch.object(bot, "LB_BOT_REPAIR_JOBS", True):
-            bot._replace_review_groups("playlist", [], "done")
-            ids = [g["id"] for g in bot._review_snapshot()["groups"]]
-        self.assertEqual(ids, ["G"])
 
     def test_a_union_folds_a_second_origin_into_the_richer_row(self):
         playlist = self._g("P", origin="playlist", canonical_mbid="rel-1",
@@ -9342,6 +9216,2648 @@ class ReviewFixRoundTests(unittest.TestCase):
             with bot._review_lock:
                 bot._review_state = old
 
+
+def _web_app():
+    """The real Flask app `start_web_dashboard` builds, without serving it or
+    starting its background threads. The app is local to that function, so the
+    Flask class is swapped for one that records the instance."""
+    import flask
+
+    apps = []
+
+    class _Recording(flask.Flask):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            apps.append(self)
+
+    class _NoThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            pass
+
+    with patch.object(flask, "Flask", _Recording), \
+            patch.object(bot, "WEB_UI_ENABLED", True), \
+            patch.object(bot.threading, "Thread", _NoThread):
+        bot.start_web_dashboard()
+    return apps[0]
+
+
+class DownloadsCancelRouteTests(unittest.TestCase):
+    """B-021: `/api/downloads/cancel` detached the transfer but never touched
+    the review track behind it, so a track cancelled from the Downloads page
+    kept reading queued/downloading on the wire."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _web_app().test_client()
+
+    def setUp(self):
+        old_pending = bot.pending_downloads.copy()
+
+        def restore():
+            bot.pending_downloads.clear()
+            bot.pending_downloads.update(old_pending)
+
+        self.addCleanup(restore)
+        bot.pending_downloads.clear()
+        for name, value in (("_slskd_cancel", lambda *a, **k: True),
+                            ("_save_state", lambda *a, **k: None)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_cancel_marks_the_review_track_cancelled(self):
+        bot.pending_downloads[("peer", "Album\\01.flac")] = {
+            "review_group_id": "g1", "review_track_index": 0}
+        group = {"id": "g1", "artist": "A", "album": "B",
+                 "missing_tracks": [{"title": "T1", "decision": "downloading"}]}
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [group]
+            r = self.client.post("/api/downloads/cancel",
+                                 json={"username": "peer", "filename": "Album\\01.flac"})
+            self.assertEqual(r.status_code, 200)
+            with bot._review_lock:
+                snapshot = json.loads(json.dumps(bot._find_review_group("g1")))
+        self.assertEqual(snapshot["missing_tracks"][0]["decision"], "cancelled")
+        self.assertEqual(snapshot["missing_tracks"][0]["error"], "Cancelled",
+                         "one text for every user-initiated cancel (Q-029)")
+        self.assertNotIn(("peer", "Album\\01.flac"), bot.pending_downloads)
+
+    def test_album_cancel_records_the_same_text(self):
+        reasons = []
+        with patch.object(bot, "_cancel_album_fill",
+                          lambda mbid, reason: reasons.append(reason) or True), \
+                patch.object(bot, "_album_fill_view", lambda mbid: {}):
+            r = self.client.post("/api/album/cancel", json={"release_mbid": "rel1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(reasons, ["Cancelled"])
+
+    def test_cancel_with_no_review_link_still_works(self):
+        """Most Downloads-page rows carry no review group at all — the fix
+        must not require one."""
+        bot.pending_downloads[("peer", "solo.flac")] = {}
+        r = self.client.post("/api/downloads/cancel",
+                             json={"username": "peer", "filename": "solo.flac"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(("peer", "solo.flac"), bot.pending_downloads)
+
+
+class DecisionsRouteTests(unittest.TestCase):
+    """B-022: re-approving a track by hand must shed its old failure, or the
+    retry reads as already failed. The repair-job rebuild used to do that as a
+    side effect of every route that touched a job; the route does it itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _web_app().test_client()
+
+    def test_reapproving_a_failed_track_clears_its_error(self):
+        group = {"id": "g1", "artist": "A", "album": "B", "missing_tracks": [
+            {"title": "T1", "decision": "failed", "download_error": "peer rejected"},
+            {"title": "T2", "decision": "failed", "download_error": "peer rejected"}]}
+        with isolated_review(), \
+                patch.object(bot, "_save_state", lambda *a, **k: None):
+            with bot._review_lock:
+                bot._review_state["groups"] = [group]
+            r = self.client.post("/api/groups/g1/decisions",
+                                 json={"tracks": [{"index": 0, "decision": "approved"}]})
+            self.assertEqual(r.status_code, 200)
+            with bot._review_lock:
+                tracks = json.loads(json.dumps(
+                    bot._find_review_group("g1")["missing_tracks"]))
+        self.assertEqual(tracks[0]["decision"], "approved")
+        self.assertNotIn("download_error", tracks[0])
+        # The track that was not touched keeps its failure.
+        self.assertEqual(tracks[1]["download_error"], "peer rejected")
+
+class ArtistReleaseRouteTests(unittest.TestCase):
+    """B-018: `/api/artist/release` resolved the artist key by mbid, then by the
+    Navidrome id — and Navidrome keys artists by name, so a same-name library
+    artist's nd id filed the release under the other artist's key."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _web_app().test_client()
+
+    def setUp(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        for name, value in (
+                ("mbz_release_group_row",
+                 lambda rgid: {"rgid": rgid, "title": "Bleach",
+                               "artist_mbid": "mbid-us"}),
+                ("_classify_release_group",
+                 lambda rg, *a: ({"rgid": rg["rgid"], "title": rg["title"],
+                                  "status": "missing"}, None))):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _stored_under(self, rgid):
+        with bot._index_lock:
+            rows = bot._index_db().execute(
+                "SELECT artist_key FROM release_groups WHERE rgid = ?",
+                (rgid,)).fetchall()
+        return [r["artist_key"] for r in rows]
+
+    def test_refuses_a_same_name_artist_with_a_different_mbid(self):
+        # The library's "Nirvana" (nd1) is the UK band; the release is the US one's.
+        bot._index_ensure_artist("mbid-uk", artist_mbid="mbid-uk",
+                                 nd_artist_id="nd1", name="Nirvana")
+        r = self.client.post("/api/artist/release", json={
+            "rgid": "rg1", "mbid": "mbid-us", "nd_id": "nd1", "external": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["code"], "artist_conflict")
+        self.assertIn("error", r.get_json())
+        self.assertEqual(self._stored_under("rg1"), [])
+
+    def test_the_same_artist_is_still_filed(self):
+        bot._index_ensure_artist("mbid-us", artist_mbid="mbid-us",
+                                 nd_artist_id="nd1", name="Nirvana")
+        r = self.client.post("/api/artist/release", json={
+            "rgid": "rg1", "mbid": "mbid-us", "nd_id": "nd1", "external": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._stored_under("rg1"), ["mbid-us"])
+
+    def test_an_nd_only_artist_with_no_mbid_on_record_is_no_conflict(self):
+        bot._index_ensure_artist("nd:nd1", nd_artist_id="nd1", name="Nirvana")
+        r = self.client.post("/api/artist/release", json={
+            "rgid": "rg1", "mbid": "mbid-us", "nd_id": "nd1", "external": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._stored_under("rg1"), ["nd:nd1"])
+
+    def test_no_mbid_in_the_request_is_not_checked(self):
+        """The release-group's credit is not the caller's claim — a
+        collaboration credits someone else first."""
+        bot._index_ensure_artist("mbid-uk", artist_mbid="mbid-uk",
+                                 nd_artist_id="nd1", name="Nirvana")
+        r = self.client.post("/api/artist/release", json={
+            "rgid": "rg1", "nd_id": "nd1", "external": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._stored_under("rg1"), ["mbid-uk"])
+
+
+class ArtistReindexReconcileTests(unittest.TestCase):
+    """B-040: a re-index only unions the groups it produces, so the artist's
+    other groups were never looked at again — one completed by hand kept its
+    missing track, one whose album was deleted stayed listed forever."""
+
+    RESULT = {"artist_name": "The Beatles", "review_groups": [{"id": "made"}],
+              "releases": [{"status": "complete", "navidrome_album_ids": ["al-1"]}]}
+
+    def setUp(self):
+        review = isolated_review()
+        review.__enter__()
+        self.addCleanup(review.__exit__, None, None, None)
+        self.fresh, self.live, self.refreshed = ["al-1", "al-2"], {}, []
+
+        def refresh(gid, live_albums=None):
+            self.refreshed.append((gid, sorted(live_albums or {})))
+            return True
+        for name, value in (
+                ("_nd_album_index", lambda force=False: [{"id": i} for i in self.fresh]),
+                ("_live_transfer_indexes_by_group", lambda: self.live),
+                ("refresh_group_albums_from_navidrome", refresh)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _g(gid, album_id, artist="The Beatles", origin="library", decision="pending"):
+        return {"id": gid, "origin": origin, "artist": artist, "album": gid,
+                "albums": [{"id": album_id}],
+                "missing_tracks": [{"title": "t", "decision": decision}]}
+
+    def _ids(self):
+        return [g["id"] for g in bot._review_snapshot()["groups"]]
+
+    def _seed(self, *groups):
+        with bot._review_lock:
+            bot._review_state["groups"] = list(groups)
+
+    def test_existing_albums_are_refreshed_and_gone_ones_retired(self):
+        self._seed(self._g("stale", "al-1"),
+                   self._g("dead", "al-gone", decision="downloaded"),
+                   self._g("made", "al-2"),               # the scan just rebuilt it
+                   self._g("other", "al-gone2", artist="Someone Else"),
+                   self._g("list", "al-gone3", origin="playlist"))
+        out = bot._reconcile_artist_review_groups(self.RESULT)
+        self.assertEqual(out, {"dropped": ["dead"], "refreshed": ["stale"]})
+        self.assertEqual(self._ids(), ["stale", "made", "other", "list"])
+        # One fresh album list, handed to every refresh.
+        self.assertEqual(self.refreshed, [("stale", ["al-1", "al-2"])])
+        # The flusher deletes a marked id that is no longer live.
+        self.assertIn("dead", bot._review_dirty_groups)
+
+    def test_the_scans_complete_verdict_never_drops_a_group(self):
+        """Revolver (Super Deluxe) on the NAS: the index called its album complete
+        while Navidrome held 1 of 63 tracks. The group's own matcher decides."""
+        self._seed(self._g("deluxe", "al-1"))
+        out = bot._reconcile_artist_review_groups(self.RESULT)
+        self.assertEqual(out["dropped"], [])
+        self.assertEqual(self._ids(), ["deluxe"])
+
+    def test_no_album_list_changes_nothing(self):
+        self.fresh = []
+        self._seed(self._g("dead", "al-gone"), self._g("stale", "al-1"))
+        self.assertEqual(bot._reconcile_artist_review_groups(self.RESULT),
+                         {"dropped": [], "refreshed": []})
+        self.assertEqual(self._ids(), ["dead", "stale"])
+
+    def test_work_in_flight_is_left_alone(self):
+        self.live = {"moving": {0}}
+        self._seed(self._g("moving", "al-gone"),
+                   self._g("queued", "al-gone2", decision="downloading"))
+        self.assertEqual(bot._reconcile_artist_review_groups(self.RESULT),
+                         {"dropped": [], "refreshed": []})
+        self.assertEqual(self._ids(), ["moving", "queued"])
+
+    def test_only_a_library_scan_reconciles(self):
+        calls = []
+        user = {"navidrome_user": "u", "navidrome_password": "p"}
+        for name, value in (
+                ("build_artist_discography", lambda *a, **k: dict(self.RESULT)),
+                ("_reconcile_artist_review_groups", calls.append),
+                ("_union_review_groups", lambda *a, **k: None),
+                ("_index_store_artist", lambda *a, **k: None),
+                ("_artist_scan_set", lambda *a, **k: None),
+                ("_task_update", lambda *a, **k: None),
+                ("_task_finish", lambda *a, **k: None),
+                ("_notify_hub_library_change", lambda *a, **k: None)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        bot._artist_discography_task("t1", "mbid", "The Beatles", user, "mb:x",
+                                     skip_library=True)
+        self.assertEqual(calls, [])
+        bot._artist_discography_task("t2", "mbid", "The Beatles", user, "nd-1")
+        self.assertEqual(len(calls), 1)
+
+
+class PlaylistLooseGroupIdTests(unittest.TestCase):
+    """B-033: the playlist scan's "Loose tracks" group id was salted with the
+    clock, so each rescan built a fresh all-`pending` group and deleted the old
+    one — every carry keyed by group id (decisions, verified/filed_extra rows,
+    live transfers) was lost."""
+
+    SOLO = [{"title": "One", "artist": "A", "mbid": "r1"},
+            {"title": "Two", "artist": "B", "mbid": "r2"}]
+
+    def setUp(self):
+        review = isolated_review()
+        review.__enter__()
+        self.addCleanup(review.__exit__, None, None, None)
+        for name, value in (
+                ("_default_web_user",
+                 lambda: {"listenbrainz_user": "lbuser", "navidrome_user": "u",
+                          "navidrome_password": "p"}),
+                ("scan_user", lambda user: list(self.SOLO)),
+                ("group_missing_by_album",
+                 lambda missing, *a, **k: ([], [dict(t) for t in self.SOLO])),
+                ("_task_update", lambda *a, **k: None),
+                ("_task_finish", lambda *a, **k: None)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _loose(self):
+        groups = [g for g in bot._review_snapshot()["groups"]
+                  if g.get("group_type") == "tracks"]
+        self.assertEqual(len(groups), 1)
+        return groups[0]
+
+    def _scan_at(self, clock):
+        with patch.object(bot.time, "time", return_value=clock):
+            bot._playlist_scan_task("t1")
+
+    def test_a_rescan_keeps_the_loose_group_and_its_settled_rows(self):
+        self._scan_at(1000.0)
+        first = self._loose()
+        with bot._review_lock:
+            live = bot._find_review_group(first["id"])
+            live["missing_tracks"][0]["decision"] = "verified"
+            live["missing_tracks"][1]["decision"] = "filed_extra"
+        self._scan_at(2000.0)
+        second = self._loose()
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual([t["decision"] for t in second["missing_tracks"]],
+                         ["verified", "filed_extra"])
+
+    def test_a_group_minted_under_the_old_clock_id_keeps_its_id(self):
+        with bot._review_lock:
+            bot._review_state["groups"] = [{
+                "id": "0ldc10ck5a1t3d00", "group_type": "tracks", "origin": "playlist",
+                "artist": "Loose tracks", "album": "Playlist tracks",
+                "canonical_album_id": "", "canonical_mbid": "", "albums": [],
+                "merge_mode": "logical", "match_mode": "auto", "messages": [],
+                "missing_tracks": [{**self.SOLO[0], "decision": "verified"},
+                                   {**self.SOLO[1], "decision": "pending"}]}]
+        self._scan_at(3000.0)
+        g = self._loose()
+        self.assertEqual(g["id"], "0ldc10ck5a1t3d00")
+        self.assertEqual(g["missing_tracks"][0]["decision"], "verified")
+
+
+class LooseTrackPlacementTests(unittest.TestCase):
+    """B-017: a playlist's "Loose tracks" row (no recording MBID, or one with no
+    MusicBrainz release) downloaded per track and then sat in /downloads. Filing
+    its folder by hand through "Pick the release" worked, but nothing moved the
+    row; and nothing ever filed it automatically, even when the file's own tags
+    named its release."""
+
+    RELEASE = "0b0b0b0b-1111-2222-3333-444455556666"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _web_app().test_client()
+
+    def setUp(self):
+        import shutil
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.downloads = os.path.join(tmp, "downloads")
+        self.folder = os.path.join(self.downloads, "peer folder")
+        self.other_folder = os.path.join(self.downloads, "another peer")
+        self.lib = os.path.join(tmp, "music")
+        for d in (self.folder, self.other_folder, self.lib):
+            os.makedirs(d)
+        self.file = os.path.join(self.folder, "01 - One.flac")
+        self.other_file = os.path.join(self.other_folder, "Other.flac")
+        for path in (self.file, self.other_file):
+            with open(path, "wb") as fh:
+                fh.write(b"\0" * 16)
+        review = isolated_review()
+        review.__enter__()
+        self.addCleanup(review.__exit__, None, None, None)
+        self.verified = []
+        for name, value in (
+                ("SLSKD_DOWNLOAD_DIR", self.downloads),
+                ("MUSIC_LIBRARY_PATH", self.lib),
+                ("_default_web_user", lambda *a, **k: {}),
+                ("mbz_release_tracks",
+                 lambda mbid, *a, **k: [{"title": "One", "mbid": "r1", "position": 1},
+                                        {"title": "Two", "mbid": "r2", "position": 2}]),
+                ("mbz_release_display", lambda *a, **k: {}),
+                ("rgid_from_release", lambda *a, **k: ""),
+                ("mbz_get", lambda *a, **k: {"title": "Album",
+                                             "artist-credit": [{"name": "Artist"}]}),
+                ("_audio_signature", lambda path: {}),
+                ("_nd_scan_after_import", lambda *a, **k: False),
+                ("_push_gap", lambda *a, **k: None),
+                ("_start_placement_verification", self.verified.append),
+                # Placement runs as a background task; run it inline.
+                ("_task_run", lambda kind, label, target, **k: target("t1") or "t1")):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        now = time.time()
+        with bot._review_lock:
+            bot._review_state["groups"] = [{
+                "id": "loose1", "group_type": "tracks", "origin": "playlist",
+                "artist": "Loose tracks", "album": "Playlist tracks",
+                "canonical_mbid": "", "canonical_album_id": "", "albums": [],
+                "missing_tracks": [
+                    {"title": "One", "artist": "Artist", "mbid": "r1",
+                     "decision": "downloaded", "local_path": self.file,
+                     "downloaded_at": now - 2 * bot.DOWNLOADED_STALE_SECS},
+                    {"title": "Other", "artist": "Someone Else", "mbid": "r9",
+                     "decision": "downloaded", "local_path": self.other_file,
+                     "downloaded_at": now - 2 * bot.DOWNLOADED_STALE_SECS},
+                ]}]
+
+    def _rows(self):
+        with bot._review_lock:
+            return json.loads(json.dumps(
+                bot._find_review_group("loose1")["missing_tracks"]))
+
+    # --- the manual path: "Pick the release" ---------------------------------
+
+    def test_pick_the_release_moves_the_loose_row_to_placed(self):
+        """The SPA's Pick-the-release posts the folder and a release — no group."""
+        r = self.client.post("/api/place-folder", json={
+            "path": self.folder, "release_mbid": self.RELEASE,
+            "artist": "Artist", "album": "Album"})
+        self.assertEqual(r.status_code, 200)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "placed")
+        self.assertTrue(os.path.isfile(os.path.join(self.lib, "Artist", "Album", "01 - One.flac")))
+        # The row in the folder nobody placed is untouched.
+        self.assertEqual(rows[1]["decision"], "downloaded")
+        self.assertEqual(self.verified, ["loose1"])
+
+    def test_confirm_with_the_loose_group_moves_only_the_placed_row(self):
+        """With the group id sent, the album path's _mark_group_tracks_placed
+        judged every in-flight row against this one folder's result and marked
+        the unrelated download failed "not included in placement result"."""
+        import hashlib
+        pid = hashlib.sha1(self.folder.encode("utf-8")).hexdigest()[:12]
+        with patch.object(bot, "_download_folders_cached",
+                          lambda force=False: [{"path": self.folder, "name": "peer folder",
+                                                "file_count": 1}]):
+            r = self.client.post(f"/api/placements/{pid}/confirm", json={
+                "releaseMbid": self.RELEASE, "groupId": "loose1"})
+        self.assertEqual(r.status_code, 200)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "placed")
+        self.assertEqual(rows[1]["decision"], "downloaded")
+        self.assertNotIn("download_error", rows[1])
+
+    def test_a_refused_file_keeps_its_row_and_says_why(self):
+        with patch.object(bot, "_audio_signature",
+                          lambda path: {"md5": "same", "own_mbids": set(),
+                                        "own_title": "", "own_title_key": ""}):
+            os.makedirs(os.path.join(self.lib, "Artist", "Album"))
+            with open(os.path.join(self.lib, "Artist", "Album", "one.flac"), "wb") as fh:
+                fh.write(b"\0" * 16)
+            self.client.post("/api/place-folder", json={
+                "path": self.folder, "release_mbid": self.RELEASE,
+                "artist": "Artist", "album": "Album"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertIn("already in the album", row["download_error"])
+        self.assertTrue(os.path.isfile(self.file))
+
+    def test_an_early_failure_with_no_per_file_still_stamps_the_row(self):
+        """Q-017(d): the linker returns 0 for every early failure that produces
+        an empty `per_file` (no MusicBrainz tracklist for the tagged release,
+        here). Only the task got the error and the review row kept its old
+        text -- worse, no text at all, since this row had never failed before.
+        The row must stay `downloaded` (still pickable/placeable) but say why."""
+        with patch.object(bot, "mbz_release_tracks_insisting", lambda *a, **k: []):
+            r = self.client.post("/api/place-folder", json={
+                "path": self.folder, "release_mbid": self.RELEASE,
+                "artist": "Artist", "album": "Album"})
+        self.assertEqual(r.status_code, 200)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "downloaded")
+        self.assertIn("tracklist", rows[0]["download_error"])
+        self.assertTrue(os.path.isfile(self.file))
+        # The row in the other folder, never touched by this placement, is
+        # left exactly as it was.
+        self.assertNotIn("download_error", rows[1])
+
+    def test_an_early_failure_stamps_only_the_selected_file_when_narrowed(self):
+        """`only_relpaths` (the loose-track "Pick the release" case) narrows
+        which rows the early failure is written onto, same as a normal
+        per-file refusal does."""
+        stranger = self._add_stranger()
+        with patch.object(bot, "mbz_release_tracks_insisting", lambda *a, **k: []):
+            r = self.client.post("/api/place-folder", json={
+                "path": self.folder, "release_mbid": self.RELEASE,
+                "artist": "Artist", "album": "Album",
+                "only_relpaths": ["01 - One.flac"]})
+        self.assertEqual(r.status_code, 200)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "downloaded")
+        self.assertIn("tracklist", rows[0]["download_error"])
+        # Row 2 (Stranger, same folder but not selected) is untouched.
+        self.assertNotIn("download_error", rows[2])
+        self.assertTrue(os.path.isfile(stranger))
+
+    def test_an_early_failure_stamps_every_downloaded_row_of_an_album_group(self):
+        """An album (non-loose) group's failure used to write nothing on any
+        row -- the group's whole point of tracking several tracks toward one
+        release means every `downloaded` row of that release was left stale."""
+        album_dir = os.path.join(self.downloads, "empty peer")
+        os.makedirs(album_dir)
+        with bot._review_lock:
+            bot._review_state["groups"].append({
+                "id": "album1", "group_type": "", "origin": "library",
+                "artist": "Artist", "album": "Album",
+                "canonical_mbid": self.RELEASE, "canonical_album_id": "",
+                "albums": [{"release_mbid": self.RELEASE}],
+                "missing_tracks": [
+                    {"title": "One", "mbid": "r1", "decision": "downloaded",
+                     "local_path": os.path.join(album_dir, "01.flac")},
+                    {"title": "Two", "mbid": "r2", "decision": "downloaded",
+                     "local_path": os.path.join(album_dir, "02.flac")},
+                    {"title": "Three", "mbid": "r3", "decision": "placed"},
+                ]})
+        # No audio files at all in the download folder -- an early failure
+        # with a genuinely empty per_file.
+        bot._deterministic_import_task("t1", album_dir, self.RELEASE,
+                                       "Artist", "Album", group_id="album1")
+        with bot._review_lock:
+            tracks = json.loads(json.dumps(
+                bot._find_review_group("album1")["missing_tracks"]))
+        self.assertEqual(tracks[0]["decision"], "downloaded")
+        # Q-021: the folder's own name, never its /downloads path.
+        self.assertEqual(tracks[0]["download_error"], "No audio files found in empty peer")
+        self.assertEqual(tracks[1]["decision"], "downloaded")
+        self.assertEqual(tracks[1]["download_error"], "No audio files found in empty peer")
+        # The already-placed row is untouched.
+        self.assertNotIn("download_error", tracks[2])
+
+    def test_an_album_groups_early_failure_stamps_only_rows_from_that_folder(self):
+        """Final review M4: an album gap's downloaded rows can come from more
+        than one download folder (a rescued leftover, a hand-picked file from
+        another peer). A failure placing one folder said nothing about a row
+        whose file sits in another — and stamping it pointed the user at the
+        wrong folder's problem. And the stamp reached clients only on their
+        next poll: one push per affected group now."""
+        album_dir = os.path.join(self.downloads, "empty peer")
+        os.makedirs(album_dir)
+        with bot._review_lock:
+            bot._review_state["groups"].append({
+                "id": "album1", "group_type": "", "origin": "library",
+                "artist": "Artist", "album": "Album",
+                "canonical_mbid": self.RELEASE, "canonical_album_id": "",
+                "albums": [{"release_mbid": self.RELEASE}],
+                "missing_tracks": [
+                    {"title": "One", "mbid": "r1", "decision": "downloaded",
+                     "local_path": os.path.join(album_dir, "01.flac")},
+                    {"title": "Two", "mbid": "r2", "decision": "downloaded",
+                     "local_path": os.path.join(album_dir, "CD2", "02.flac")},
+                    {"title": "Three", "mbid": "r3", "decision": "downloaded",
+                     "local_path": os.path.join(self.other_folder, "03.flac")},
+                    {"title": "Four", "mbid": "r4", "decision": "needs_match"},
+                ]})
+        pushed = []
+        with patch.object(bot, "_push_gap", pushed.append):
+            bot._deterministic_import_task("t1", album_dir, self.RELEASE,
+                                           "Artist", "Album", group_id="album1")
+        with bot._review_lock:
+            tracks = json.loads(json.dumps(
+                bot._find_review_group("album1")["missing_tracks"]))
+        self.assertIn("No audio files found", tracks[0]["download_error"])
+        # A subfolder of the failed folder (a disc) is that folder's.
+        self.assertIn("No audio files found", tracks[1]["download_error"])
+        # Another peer's folder, and a row with no file at all: untouched.
+        self.assertNotIn("download_error", tracks[2])
+        self.assertNotIn("download_error", tracks[3])
+        self.assertEqual(pushed.count("album1"), 1, pushed)
+
+    # --- Q-019: every file refused, so `per_file` is full but nothing placed ---
+
+    @staticmethod
+    def _sig_by_name(md5s):
+        """`_audio_signature` with an md5 per file name: a download whose md5
+        equals a library file's is refused as audio already in the album."""
+        return lambda path: {"md5": md5s.get(os.path.basename(path), ""),
+                             "own_mbids": set(), "own_title": "", "own_title_key": ""}
+
+    def _duplicate_album(self, dirs):
+        """Album gap `album1`: One and Two downloaded into `dirs` (one or two
+        download folders), each a copy of a different file already in the
+        album; Three in another peer's folder; Four with no file at all."""
+        album_lib = os.path.join(self.lib, "Artist", "Album")
+        os.makedirs(album_lib)
+        for name in ("one.flac", "two.flac"):
+            with open(os.path.join(album_lib, name), "wb") as fh:
+                fh.write(b"\0" * 16)
+        one = os.path.join(dirs[0], "01 - One.flac")
+        two = os.path.join(dirs[-1], "CD2", "02 - Two.flac")
+        for path in (one, two):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"\0" * 16)
+        with bot._review_lock:
+            bot._review_state["groups"].append({
+                "id": "album1", "group_type": "", "origin": "library",
+                "artist": "Artist", "album": "Album",
+                "canonical_mbid": self.RELEASE, "canonical_album_id": "",
+                "albums": [{"release_mbid": self.RELEASE}],
+                "missing_tracks": [
+                    {"title": "One", "mbid": "r1", "decision": "downloaded",
+                     "local_path": one},
+                    {"title": "Two", "mbid": "r2", "decision": "downloaded",
+                     "local_path": two},
+                    {"title": "Three", "mbid": "r3", "decision": "downloaded",
+                     "local_path": os.path.join(self.other_folder, "03.flac")},
+                    {"title": "Four", "mbid": "r4", "decision": "needs_match"},
+                ]})
+        return self._sig_by_name({"one.flac": "a", "01 - One.flac": "a",
+                                  "two.flac": "b", "02 - Two.flac": "b"})
+
+    def _album1_tracks(self):
+        with bot._review_lock:
+            return json.loads(json.dumps(
+                bot._find_review_group("album1")["missing_tracks"]))
+
+    def _assert_each_row_says_its_own_refusal(self, tracks):
+        # Each row its own reason — Two's names two.flac, which the result's
+        # one-line error ("Nothing placed: <first reason>") never does.
+        self.assertEqual(tracks[0]["download_error"],
+                         "placement failed: this audio is already in the album as one.flac")
+        self.assertEqual(tracks[1]["download_error"],
+                         "placement failed: this audio is already in the album as two.flac")
+        # The decision is the user's to act on, unchanged (Q-017(d)).
+        self.assertEqual([t["decision"] for t in tracks[:2]], ["downloaded", "downloaded"])
+        self.assertNotIn("can_force_place", tracks[0])
+        # Another peer's folder, and a row with no file: untouched.
+        self.assertNotIn("download_error", tracks[2])
+        self.assertNotIn("download_error", tracks[3])
+
+    def test_an_album_groups_full_refusal_stamps_each_row_with_its_own_reason(self):
+        """Q-019: an album placement whose every file was refused (the
+        duplicate-audio guard here) fails with a FULL `per_file`, so the
+        Q-017(d) stamp — gated on an empty one — never ran, and no row said
+        why its file was still in /downloads."""
+        album_dir = os.path.join(self.downloads, "dup peer")
+        sig = self._duplicate_album([album_dir])
+        pushed = []
+        with patch.object(bot, "_audio_signature", sig), \
+                patch.object(bot, "_push_gap", pushed.append):
+            bot._deterministic_import_task("t1", album_dir, self.RELEASE,
+                                           "Artist", "Album", group_id="album1")
+        self._assert_each_row_says_its_own_refusal(self._album1_tracks())
+        self.assertEqual(pushed.count("album1"), 1, pushed)
+
+    def test_a_finalized_album_fill_that_places_nothing_stamps_its_rows(self):
+        """Q-019, the poller's path: `_finalize_group`'s failure branch wrote
+        only the ledger. One stamp per import dir it tried — a file that failed
+        over to another peer lands in that peer's folder."""
+        dirs = [os.path.join(self.downloads, "dup peer"),
+                os.path.join(self.downloads, "second peer")]
+        sig = self._duplicate_album(dirs)
+        saved = (bot.pending_album_groups.copy(), bot._album_fill_status.copy(),
+                 dict(bot._albums))
+
+        def restore():
+            for live, old in zip((bot.pending_album_groups, bot._album_fill_status,
+                                  bot._albums), saved):
+                live.clear()
+                live.update(old)
+
+        self.addCleanup(restore)
+        bot.pending_album_groups.clear()
+        bot._album_fill_status.clear()
+        bot.pending_album_groups["ag1"] = {
+            "label": "Artist - Album", "total": 2, "completed": 2, "failed": 0,
+            "local_dirs": {dirs[0]: 1, dirs[1]: 1}, "token": "tok", "chat_id": "chat",
+            "release_mbid": self.RELEASE, "artist": "Artist", "album": "Album",
+            "review_group_id": "album1", "match_mode": "auto"}
+        with patch.object(bot, "_audio_signature", sig), \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_album_action_markup", lambda *a, **k: None), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+            bot._album_fill_set(self.RELEASE, "downloading")
+            asyncio.run(bot._finalize_group(None, "ag1"))
+        self.assertEqual(bot._album_fill_get(self.RELEASE)["state"], "failed")
+        self._assert_each_row_says_its_own_refusal(self._album1_tracks())
+
+    def test_a_loose_early_failure_pushes_the_rows_group(self):
+        pushed = []
+        with patch.object(bot, "mbz_release_tracks_insisting", lambda *a, **k: []), \
+                patch.object(bot, "_push_gap", pushed.append):
+            r = self.client.post("/api/place-folder", json={
+                "path": self.folder, "release_mbid": self.RELEASE,
+                "artist": "Artist", "album": "Album"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("tracklist", self._rows()[0]["download_error"])
+        self.assertEqual(pushed.count("loose1"), 1, pushed)
+
+    def _add_stranger(self):
+        """A second peer's unrelated loose track, dropped by slskd into the same
+        download folder as row 0's file."""
+        stranger = os.path.join(self.folder, "Stranger.flac")
+        with open(stranger, "wb") as fh:
+            fh.write(b"\1" * 16)
+        with bot._review_lock:
+            bot._find_review_group("loose1")["missing_tracks"].append(
+                {"title": "Stranger", "artist": "Nobody Related", "mbid": "r7",
+                 "decision": "downloaded", "local_path": stranger,
+                 "downloaded_at": time.time()})
+        return stranger
+
+    def test_pick_the_release_for_one_loose_file_files_only_that_file(self):
+        """Review A3 #2: picking release A for track A used to file the whole
+        folder — the other peer's track B too, retagged as A's."""
+        stranger = self._add_stranger()
+        r = self.client.post("/api/place-folder", json={
+            "path": self.folder, "release_mbid": self.RELEASE,
+            "artist": "Artist", "album": "Album",
+            "only_relpaths": ["01 - One.flac"]})
+        self.assertEqual(r.status_code, 200)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "placed")
+        self.assertTrue(os.path.isfile(stranger), "the unrelated file stays put")
+        self.assertEqual(rows[2]["decision"], "downloaded")
+        self.assertNotIn("download_error", rows[2])
+
+    def test_place_folder_refuses_a_selection_outside_the_folder(self):
+        r = self.client.post("/api/place-folder", json={
+            "path": self.folder, "release_mbid": self.RELEASE,
+            "only_relpaths": ["../another peer/Other.flac"]})
+        self.assertEqual(r.status_code, 400)
+        self.assertTrue(os.path.isfile(self.other_file))
+        self.assertEqual(self._rows()[1]["decision"], "downloaded")
+
+    def test_a_bonus_file_is_never_linked_as_placed(self):
+        """Filing the whole folder files the stranger as a bonus track of the
+        picked release. That is a misfile, and must not read as a placement the
+        verifier then confirms by title — but the file IS in the library now.
+        B-025 (c): it used to stay `downloaded` with its `local_path` pointing
+        at a moved file, and the next fetch re-approved and downloaded it again.
+        It settles instead, `done` on the wire, with a note naming the release
+        (ruling R-A: artist – album, never a path)."""
+        self._add_stranger()
+        self.client.post("/api/place-folder", json={
+            "path": self.folder, "release_mbid": self.RELEASE,
+            "artist": "Artist", "album": "Album"})
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "placed")
+        self.assertEqual(rows[2]["decision"], "filed_extra")
+        self.assertIn("as an extra track", rows[2]["download_error"])
+        self.assertIn("Artist – Album", rows[2]["download_error"])
+        self.assertNotIn(self.lib, rows[2]["download_error"])
+        self.assertNotIn(os.sep, rows[2]["download_error"])
+        self.assertEqual(self.verified, ["loose1"], "a bonus filing starts no verifier")
+
+        with bot._review_lock:
+            group = bot._find_review_group("loose1")
+            view = bot._gap_detail_view(json.loads(json.dumps(group)))
+            by_title = {t["title"]: t for t in view["tracks"]}
+            self.assertEqual(by_title["Stranger"]["state"], "done")
+            self.assertIn("Artist – Album", by_title["Stranger"]["downloadError"])
+            self.assertEqual(by_title["Stranger"]["placeFolder"], "")
+            # Not re-approvable, even on a stalled group (row 1 is stuck).
+            self.assertTrue(bot._group_placement_stalled(group))
+            bot._approve_pending_missing_tracks(group)
+            self.assertEqual(group["missing_tracks"][2]["decision"], "filed_extra")
+            # Settled: a group of settled rows is complete.
+            settled = json.loads(json.dumps(group))
+            settled["missing_tracks"][1]["decision"] = "verified"
+            self.assertEqual(bot._review_group_next_action(settled)["bucket"], "completed")
+
+        # And the verifier leaves it alone, while resetting the unconfirmed row 0.
+        with patch.object(bot, "PLACEMENT_VERIFY_TIMEOUT", 0), \
+                patch.object(bot, "_default_web_user",
+                             lambda: {"navidrome_user": "u", "navidrome_password": "p"}), \
+                patch.object(bot, "nd_get_scan_status", lambda u, p: {"scanning": False}), \
+                patch.object(bot, "_nd_search", lambda *a, **k: []), \
+                patch.object(bot, "refresh_group_albums_from_navidrome", lambda gid: False):
+            bot._verify_placement_worker("loose1")
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "pending")
+        self.assertEqual(rows[2]["decision"], "filed_extra")
+
+    def test_stuck_loose_group_points_at_pick_the_release(self):
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        view = bot._gap_detail_view(group)
+        self.assertTrue(view["stalledPlacement"])
+        self.assertIn("Pick the release", view["failDetail"])
+        self.assertEqual([t["placeFolder"] for t in view["tracks"]],
+                         [self.folder, self.other_folder])
+        self.assertEqual([t["placeFile"] for t in view["tracks"]],
+                         ["01 - One.flac", "Other.flac"])
+        # An album group's stuck card still says Reconcile, with no folder hint.
+        group.update({"group_type": "", "canonical_mbid": "rel-x"})
+        view = bot._gap_detail_view(group)
+        self.assertIn("Reconcile", view["failDetail"])
+        self.assertEqual({t["placeFolder"] for t in view["tracks"]}, {""})
+
+    def test_stuck_loose_group_with_files_gone_says_so_not_pick_the_release(self):
+        """Q-017(e): `placeFolder` requires the file to still exist; `failDetail`
+        always said "Use Pick the release on each track" regardless. When every
+        downloaded row's file is gone there is no folder left to pick a release
+        for -- the message must say the file is gone and to fetch it again, not
+        point at a step that cannot work."""
+        os.remove(self.file)
+        os.remove(self.other_file)
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        view = bot._gap_detail_view(group)
+        self.assertTrue(view["stalledPlacement"])
+        self.assertNotIn("Pick the release", view["failDetail"])
+        self.assertIn("no longer", view["failDetail"])
+        self.assertEqual([t["placeFolder"] for t in view["tracks"]], ["", ""])
+
+    def test_stuck_loose_group_with_files_gone_says_where_to_fetch(self):
+        """Final review M3: `failDetail` reaches Feishin and Navic too, and on a
+        stalled gap they offer no fetch (R10/R15/R17) — "Fetch them again" has
+        to say where."""
+        os.remove(self.file)
+        os.remove(self.other_file)
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        self.assertIn("in lb-bot", bot._gap_detail_view(group)["failDetail"])
+
+    def test_the_gap_view_says_whether_the_group_is_loose(self):
+        """Final review M1: the SPA hid Reconcile on an empty `releaseMbid` as a
+        stand-in for "loose" — so an album gap with no MBID lost the button its
+        own `failDetail` tells the user to press. The server says which it is."""
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        view = bot._gap_detail_view(group)
+        self.assertIs(view["loose"], True)
+        self.assertEqual(view["releaseMbid"], "")
+        # An album gap with no release MBID on record: not loose.
+        group.update({"group_type": "", "canonical_mbid": ""})
+        view = bot._gap_detail_view(group)
+        self.assertIs(view["loose"], False)
+        self.assertEqual(view["releaseMbid"], "")
+        self.assertIn("Reconcile", view["failDetail"])
+
+    def test_stuck_loose_group_mixed_files_still_offers_pick_the_release(self):
+        """One row's file survives; the other's is gone. As long as one row can
+        still be fixed with Pick the release, the message stays that one."""
+        os.remove(self.other_file)
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        view = bot._gap_detail_view(group)
+        self.assertIn("Pick the release", view["failDetail"])
+        self.assertEqual([t["placeFolder"] for t in view["tracks"]],
+                         [self.folder, ""])
+
+    def test_fills_view_drops_host_paths_from_gap_summaries(self):
+        """Q-017(c2): both clients poll `/lb/fills` (via `/api/fills`) with
+        group_ids every 30s; `_fills_view` answered each gap with the full
+        `_gap_detail_view` minus `sources`, so an absolute `/downloads/...`
+        path (placeFolder) and a peer's filename (placeFile) reached devices
+        unstripped on the most-polled route. The SPA's own `/api/gaps/<id>`
+        route still needs them."""
+        out = bot._fills_view([], ["loose1"])
+        tracks = out["gaps"]["loose1"]["tracks"]
+        self.assertTrue(tracks, "fixture has tracks")
+        for t in tracks:
+            self.assertNotIn("placeFolder", t)
+            self.assertNotIn("placeFile", t)
+            # Other fields survive untouched.
+            self.assertIn("title", t)
+            self.assertIn("state", t)
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        direct = bot._gap_detail_view(group)["tracks"]
+        self.assertEqual(direct[0]["placeFolder"], self.folder)
+        self.assertEqual(direct[0]["placeFile"], "01 - One.flac")
+
+    def test_host_path_prefixes_come_off_stored_error_text(self):
+        """Q-021: the read-side strip, on every shape a stored text has — a
+        prefix configured with or without a trailing slash, a path under it, a
+        path that IS it — and nothing else touched."""
+        cases = {
+            "No audio files found in /downloads/peer folder/CD1":
+                "No audio files found in peer folder/CD1",
+            "No audio files found in /downloads": "No audio files found in downloads",
+            "No audio files found in /downloads/": "No audio files found in downloads",
+            "Could not create /music/A/B: [Errno 13] Permission denied: '/music/A/B'":
+                "Could not create A/B: [Errno 13] Permission denied: 'A/B'",
+            "/music": "music",
+            # Unrelated text: other folders that merely start or end alike,
+            # the words themselves, and a mount nested under another path.
+            "/downloadsx/a, /music-videos/b, /music.old/c and /mnt/downloads/d":
+                "/downloadsx/a, /music-videos/b, /music.old/c and /mnt/downloads/d",
+            "music from downloads": "music from downloads",
+            "Completed, Errored": "Completed, Errored",
+            "": "",
+        }
+        for dl, lib in (("/downloads", "/music"), ("/downloads/", "/music/")):
+            with patch.object(bot, "SLSKD_DOWNLOAD_DIR", dl), \
+                    patch.object(bot, "MUSIC_LIBRARY_PATH", lib):
+                for text, want in cases.items():
+                    self.assertEqual(bot._strip_host_paths(text), want, (dl, text))
+        # Nested mounts: the longer prefix wins, the shorter still applies.
+        with patch.object(bot, "SLSKD_DOWNLOAD_DIR", "/data/downloads"), \
+                patch.object(bot, "MUSIC_LIBRARY_PATH", "/data"):
+            self.assertEqual(bot._strip_host_paths("/data/downloads/x and /data/y"),
+                             "x and y")
+        self.assertEqual(bot._strip_host_paths(None), "")
+
+    def test_placement_error_texts_name_no_host_path(self):
+        """Q-021 (b): the three texts that carried a host path say the folder's
+        own name, or the OS's reason, instead."""
+        empty = os.path.join(self.downloads, "empty peer")
+        os.makedirs(empty)
+        result = bot._deterministic_album_import(empty, self.RELEASE, "Artist", "Album")
+        self.assertEqual(result["error"], "No audio files found in empty peer")
+
+        # A file where the artist folder should be: makedirs fails for real.
+        with open(os.path.join(self.lib, "Artist"), "wb"):
+            pass
+        result = bot._deterministic_album_import(self.folder, self.RELEASE,
+                                                 "Artist", "Album")
+        self.assertEqual(result["error"],
+                         "Could not create album folder Album: Not a directory")
+        os.remove(os.path.join(self.lib, "Artist"))
+
+        def refuse(src, dest):
+            raise PermissionError(13, "Permission denied", dest)
+
+        with patch.object(bot, "_place_file", refuse):
+            result = bot._deterministic_album_import(self.folder, self.RELEASE,
+                                                     "Artist", "Album")
+        self.assertEqual(result["error"],
+                         "Nothing placed: could not move into the library: Permission denied")
+        for text in [result["error"]] + [r.get("reason", "") for r in result["per_file"]]:
+            self.assertNotIn(self.lib, text)
+            self.assertNotIn(self.downloads, text)
+
+    def test_an_error_with_no_os_reason_keeps_its_text_without_paths(self):
+        """Final review M-3: `shutil.Error` (an OSError with no `strerror`) and
+        other exceptions read as their bare class name — "could not move into
+        the library: Error". Their own text now, with the mounts taken off."""
+        import shutil
+        exc = shutil.Error(f"Destination path '{self.lib}/Artist/Album/01.flac' already exists")
+        self.assertEqual(bot._os_error_text(exc),
+                         "Destination path 'Artist/Album/01.flac' already exists")
+        self.assertEqual(bot._os_error_text(PermissionError(13, "Permission denied",
+                                                            f"{self.lib}/x")),
+                         "Permission denied")
+        self.assertEqual(bot._os_error_text(ValueError()), "ValueError")
+
+    def test_no_host_path_reaches_a_wire_error_text(self):
+        """Q-021: `download_error` and the ledger's `reason` could carry
+        "/downloads/<peer folder>" or "/music/..." — stamped verbatim, then
+        served as `tracks[].downloadError` (gap view, `/api/fills`) and as an
+        album fill's `reason` (`/api/album/status`, `/api/fills`). Rows stored
+        before the rewording keep their text, so the views strip it."""
+        old = bot._album_fill_status.copy()
+        self.addCleanup(lambda: (bot._album_fill_status.clear(),
+                                 bot._album_fill_status.update(old)))
+        bot._album_fill_status.clear()
+        with bot._review_lock:
+            rows = bot._find_review_group("loose1")["missing_tracks"]
+            rows[0]["download_error"] = f"No audio files found in {self.folder}"
+            rows[1].update(decision="failed", download_error=(
+                f"placement failed: Could not create {self.lib}/Artist/Album: "
+                f"[Errno 13] Permission denied: '{self.lib}/Artist/Album'"))
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        with patch.object(bot, "_save_state", lambda *a, **k: None):
+            bot._album_fill_set(self.RELEASE, "failed", reason=(
+                f"Nothing placed: could not move into the library: [Errno 13] "
+                f"Permission denied: '{self.lib}/Artist/Album/01 - One.flac'"))
+        fills = bot._fills_view([self.RELEASE], ["loose1"])
+        texts = ([t["downloadError"] for t in bot._gap_detail_view(group)["tracks"]]
+                 + [t["downloadError"] for t in fills["gaps"]["loose1"]["tracks"]]
+                 + [bot._album_fill_view(self.RELEASE)["reason"],
+                    fills["albums"][self.RELEASE]["reason"]])
+        for text in texts:
+            self.assertNotIn(self.downloads, text)
+            self.assertNotIn(self.lib, text)
+        self.assertEqual(texts[0], "No audio files found in peer folder")
+        self.assertEqual(texts[1], "placement failed: Could not create Artist/Album: "
+                                   "[Errno 13] Permission denied: 'Artist/Album'")
+        self.assertEqual(texts[-1], "Nothing placed: could not move into the library: "
+                                    "[Errno 13] Permission denied: 'Artist/Album/01 - One.flac'")
+
+    # --- the automatic path: the poller's loose-track branch -----------------
+
+    def _finish_download(self, tags):
+        """Run one poll in which the loose row's transfer completes."""
+        with bot._review_lock:
+            track = bot._find_review_group("loose1")["missing_tracks"][0]
+            track.update({"decision": "downloading", "local_path": ""})
+            # What the enqueue registered: a copy of the row as it stood.
+            copy = {k: track.get(k) for k in ("artist", "title", "mbid")}
+        old_pending = bot.pending_downloads.copy()
+        self.addCleanup(lambda: (bot.pending_downloads.clear(),
+                                 bot.pending_downloads.update(old_pending)))
+        bot.pending_downloads.clear()
+        bot.pending_downloads[("peer", "Music\\01 - One.flac")] = {
+            "token": "tok", "chat_id": "chat", "candidates": [],
+            "album_group_id": None, "review_group_id": "loose1",
+            "review_track_index": 0, "track": copy}
+        written = []
+        app = type("App", (), {"bot": AsyncMock()})()
+        with patch.object(bot, "slskd_get_all_downloads",
+                          lambda force=False: [{"_username": "peer",
+                                               "filename": "Music\\01 - One.flac",
+                                               "state": "Completed, Succeeded"}]), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock) as tg, \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_resolve_local_path", lambda f: self.file), \
+                patch.object(bot, "_audio_file_tags",
+                             tags if callable(tags) else (lambda path: dict(tags))), \
+                patch.object(bot, "_mutagen_write_tags",
+                             lambda path, t: written.append((path, t)) or True):
+            asyncio.run(bot._poll_downloads_once({"tok": app}))
+        # _tg_send(bot, chat_id, text): what Telegram was told.
+        self.telegram = [c.args[2] for c in tg.call_args_list]
+        return written
+
+    def test_embedded_release_tag_files_the_loose_track(self):
+        self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "placed")
+        self.assertFalse(os.path.exists(self.file))
+        self.assertTrue(os.path.isfile(os.path.join(self.lib, "Artist", "Album", "01 - One.flac")))
+        self.assertEqual(self.verified, ["loose1"])
+
+    def test_musicbrainz_failure_does_not_scatter_the_auto_placed_file(self):
+        """Review A3 #1: with no album/artist of its own, the import filled them
+        from a non-strict MusicBrainz fetch that answers {} on an outage — and
+        the file landed unattended in Unknown Artist/Unknown Album."""
+        def down(*a, **k):
+            raise bot.MusicBrainzUnavailable("503")
+
+        with patch.object(bot, "mbz_get", down):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertTrue(os.path.isfile(self.file))
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "Unknown Artist")))
+        self.assertIn("MusicBrainz didn't name", row["download_error"])
+
+    def test_the_files_own_album_tags_file_it_without_musicbrainz(self):
+        def down(*a, **k):
+            raise bot.MusicBrainzUnavailable("503")
+
+        with patch.object(bot, "mbz_get", down):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One",
+                                   "albumartist": "Tagged Artist",
+                                   "album": "Tagged Album"})
+        self.assertEqual(self._rows()[0]["decision"], "placed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.lib, "Tagged Artist", "Tagged Album", "01 - One.flac")))
+
+    def test_no_release_tag_leaves_the_file_and_says_why(self):
+        written = self._finish_download({"title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertTrue(os.path.isfile(self.file))
+        self.assertIn("no single MusicBrainz release tag", row["download_error"])
+        # Today's behaviour, unchanged: the file is tagged where it lies.
+        self.assertEqual(written, [(self.file, {"title": "One", "artist": "Artist",
+                                                "mb_trackid": "r1"})])
+
+    def test_a_miss_is_written_on_its_own_row_after_a_rescan_moved_it(self):
+        """B-022 final review I1: the poller deletes the transfer before it
+        auto-places, so a rescan during the placement (a tag read, a strict
+        MusicBrainz lookup) re-points nothing — and the miss, written by the
+        index read before, landed on whichever row a rescan put there: here a
+        track never downloaded, which then read `downloaded`."""
+        def tags(path):
+            with bot._review_lock:
+                fresh = json.loads(json.dumps(bot._find_review_group("loose1")))
+            fresh["missing_tracks"].insert(0, {"title": "New", "artist": "X",
+                                               "mbid": "r0", "decision": "pending"})
+            fresh.setdefault("merge_mode", "")
+            bot._union_review_groups([fresh], "playlist")
+            return {"title": "One"}
+
+        self._finish_download(tags)
+        rows = {t["title"]: t for t in self._rows()}
+        self.assertEqual(rows["New"]["decision"], "pending")
+        self.assertNotIn("download_error", rows["New"])
+        self.assertNotIn("placement_missed_at", rows["New"])
+        self.assertEqual(rows["One"]["decision"], "downloaded")
+        self.assertIn("no single MusicBrainz release tag", rows["One"]["download_error"])
+        self.assertTrue(rows["One"].get("placement_missed_at"))
+
+    def test_a_release_tag_that_will_not_place_leaves_the_file_and_says_why(self):
+        # MusicBrainz answers no tracklist for the tagged release.
+        with patch.object(bot, "mbz_release_tracks_insisting", lambda *a, **k: []):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertTrue(os.path.isfile(self.file))
+        self.assertIn("not filed under its tagged release", row["download_error"])
+        self.assertIn("tracklist", row["download_error"])
+
+    def test_an_album_groups_single_file_is_not_auto_placed(self):
+        """A hand-picked or rescued file for an album gap takes the same branch;
+        it belongs to the album's own placement, not to this one."""
+        with bot._review_lock:
+            bot._find_review_group("loose1").update(
+                {"group_type": "", "canonical_mbid": "rel-x"})
+        with patch.object(bot, "_deterministic_album_import",
+                          lambda *a, **k: self.fail("an album gap's file must not be auto-placed")):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertNotIn("download_error", row)
+
+    # --- B-025 (b): a miss is not "working" ----------------------------------
+
+    def _make_row_1_pending(self):
+        with bot._review_lock:
+            row = bot._find_review_group("loose1")["missing_tracks"][1]
+            for field in ("local_path", "downloaded_at"):
+                row.pop(field, None)
+            row["decision"] = "pending"
+
+    def test_an_auto_place_miss_stalls_the_group_at_once(self):
+        """A miss left the row `downloaded`, so the group read "downloading" for
+        DOWNLOADED_STALE_SECS — and meanwhile fetch and auto answered
+        `alreadyActive` and a finished source search was thrown away, so the
+        group's other rows could not be fetched either."""
+        self._make_row_1_pending()
+        self._finish_download({"title": "One"})          # no release tag: a miss
+        self.assertEqual(self._rows()[0]["decision"], "downloaded")
+        with bot._review_lock:
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        self.assertEqual(bot._gap_status_for_group(group), "failed")
+        view = bot._gap_detail_view(group)
+        self.assertTrue(view["stalledPlacement"])
+        self.assertIn("Pick the release", view["failDetail"])
+        # The list rail reads the same, from its own snapshot.
+        listed = {g["id"]: g for g in bot._review_list_snapshot()["groups"]}
+        self.assertEqual(bot._gap_status_for_group(listed["loose1"]), "failed")
+
+        # And the pending row is fetchable now — without touching the missed
+        # row: its file is still in /downloads and "Pick the release" is its
+        # fix (review fix round 1). Re-approving it cleared its local_path and
+        # downloaded the file a second time.
+        r, enqueued = self._fetch_loose_group()
+        body = r.get_json()
+        self.assertNotIn("alreadyActive", body)
+        self.assertEqual(r.status_code, 200, body)
+        self.assertEqual(enqueued, [["downloaded", "approved"]])
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertEqual(row["local_path"], self.file)
+        self.assertTrue(os.path.isfile(self.file))
+        self.assertIn("Pick the release", row["download_error"])
+
+    def _fetch_loose_group(self):
+        """POST the fetch route with one source on offer; returns the response
+        and each enqueue's row decisions."""
+        with bot._review_lock:
+            bot._find_review_group("loose1")["source_results"] = {
+                "folders": [{"username": "p", "folder": "f", "files": []}]}
+        enqueued = []
+
+        def enqueue(group, idx):
+            enqueued.append([t.get("decision") for t in group["missing_tracks"]])
+            return {"ok": True, "message": "Source queued"}
+
+        with patch.object(bot, "_enqueue_group_source", enqueue), \
+                patch.object(bot, "_save_state", lambda *a, **k: None):
+            r = self.client.post("/api/gaps/loose1/fetch", json={"sourceId": 0})
+        return r, enqueued
+
+    def test_a_miss_whose_file_is_gone_is_fetched_with_the_rest(self):
+        """Final review M2: a missed row is held back so its file in /downloads
+        keeps its "Pick the release" — but once that file is gone there is
+        nothing to keep, and holding it back made "Fetch them again" take two
+        clicks: this fetch for the other rows, the next for the miss."""
+        self._make_row_1_pending()
+        self._finish_download({"title": "One"})          # no release tag: a miss
+        os.remove(self.file)
+        r, enqueued = self._fetch_loose_group()
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(enqueued, [["approved", "approved"]])
+        self.assertNotIn("local_path", self._rows()[0])
+
+    def test_download_again_still_refetches_a_miss_with_nothing_else_to_get(self):
+        """When the missed row is the only thing to fetch, the Stuck card's
+        "Download again from another source" re-approves it, as before."""
+        with bot._review_lock:
+            bot._find_review_group("loose1")["missing_tracks"][1]["decision"] = "verified"
+        self._finish_download({"title": "One"})          # no release tag: a miss
+        r, enqueued = self._fetch_loose_group()
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(enqueued, [["approved", "verified"]])
+        self.assertNotIn("local_path", self._rows()[0])
+
+    def test_a_loose_row_still_placing_keeps_the_group_working(self):
+        """Only a miss is immediate: a download that has not been through
+        auto-placement yet (or was re-downloaded since an older miss) still
+        reads as work in progress."""
+        now = time.time()
+        with bot._review_lock:
+            rows = bot._find_review_group("loose1")["missing_tracks"]
+            rows[0].update({"downloaded_at": now})
+            rows[1].update({"downloaded_at": now - 60,
+                            "placement_missed_at": now - 120})   # an older miss
+            group = json.loads(json.dumps(bot._find_review_group("loose1")))
+        self.assertEqual(bot._gap_status_for_group(group), "downloading")
+        self.assertFalse(bot._gap_detail_view(group)["stalledPlacement"])
+        # A current miss on one row does not stall a row still being placed.
+        group["missing_tracks"][1]["placement_missed_at"] = now
+        self.assertEqual(bot._gap_status_for_group(group), "downloading")
+        # Once that row is placed, the miss is all that is left.
+        group["missing_tracks"][0]["decision"] = "placed"
+        self.assertEqual(bot._gap_status_for_group(group), "failed")
+
+    # --- B-025 (a): the verifier, after a loose placement --------------------
+
+    def _nd(self, songs_by_query):
+        """Patches for one verifier run against a fake Navidrome."""
+        return [patch.object(bot, "_default_web_user",
+                             lambda: {"navidrome_user": "u", "navidrome_password": "p"}),
+                patch.object(bot, "nd_get_scan_status", lambda u, p: {"scanning": False}),
+                # Navidrome answers an MBID query with songs carrying that
+                # recording MBID, which the probe requires since Q-024; the
+                # fixtures below name songs by the query that finds them.
+                patch.object(bot, "_nd_search",
+                             lambda u, p, query, count=5, _retry=True:
+                             [{"musicBrainzId": query, **song}
+                              for song in songs_by_query(query)]),
+                patch.object(bot, "refresh_group_albums_from_navidrome", lambda gid: False),
+                patch.object(bot, "_notify_hub_library_change",
+                             lambda *a, **k: self.notified.append(k))]
+
+    def _run_verifier(self, songs_by_query, timeout=0, clock=None):
+        self.notified = []
+        patches = self._nd(songs_by_query) + [
+            patch.object(bot, "PLACEMENT_VERIFY_TIMEOUT", timeout)]
+        if clock is not None:
+            patches.append(patch.object(bot, "time", clock))
+        else:
+            patches.append(patch.object(bot.time, "sleep", lambda s: None))
+        for p in patches:
+            p.start()
+        try:
+            bot._verify_placement_worker("loose1")
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_the_link_records_the_slot_the_file_was_placed_into(self):
+        """The import rewrites the file's title and recording MBID to the
+        release slot's; the row has only its playlist spelling."""
+        with bot._review_lock:
+            bot._find_review_group("loose1")["missing_tracks"][0].update(
+                {"title": "One (2011 Remaster)", "mbid": ""})
+        self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "placed")
+        self.assertEqual(row["placed_title"], "One")
+        self.assertEqual(row["placed_recording_mbid"], "r1")
+
+    def test_the_verifier_matches_a_loose_row_by_its_placed_slot(self):
+        """It searched by the row's own title and MBID, found neither — the
+        import retagged the file — and at the deadline reset the row to
+        `pending`, which the next fetch re-downloaded into the library again."""
+        with bot._review_lock:
+            bot._find_review_group("loose1")["missing_tracks"][0].update(
+                {"title": "One (2011 Remaster)", "mbid": "", "decision": "placed",
+                 "imported_at": time.time(), "placed_title": "One",
+                 "placed_recording_mbid": "r1"})
+        song = {"id": "s1", "title": "One", "artist": "Artist", "album": "Album",
+                "albumId": "al-1", "artistId": "ar-1"}
+        self._run_verifier(lambda q: [song] if q == "r1" else [])
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "verified")
+        self.assertEqual(row.get("download_error", ""), "")
+
+    def test_a_row_placed_late_in_a_running_verifier_gets_its_own_window(self):
+        """The deadline was the worker's: a row placed 30 s before it (joining
+        the running worker, since a second one never starts) was reset to
+        `pending` 30 s after placement."""
+        placed_at = 1000.0
+        timeout = 600
+
+        class Clock:
+            def __init__(clock):
+                clock.now = placed_at
+
+            def time(clock):
+                return clock.now
+
+            def sleep(clock, secs):
+                clock.now += secs
+                with bot._review_lock:
+                    row = bot._find_review_group("loose1")["missing_tracks"][1]
+                    if row["decision"] == "downloaded" and \
+                            clock.now >= placed_at + timeout - 30:
+                        row.update({"decision": "placed", "imported_at": clock.now,
+                                    "placed_title": "Other",
+                                    "placed_recording_mbid": "r9"})
+
+            def __getattr__(clock, name):
+                return getattr(time, name)
+
+        clock = Clock()
+        with bot._review_lock:
+            bot._find_review_group("loose1")["missing_tracks"][0].update(
+                {"decision": "placed", "imported_at": placed_at})
+        other = {"id": "s9", "title": "Other", "artist": "Someone Else",
+                 "album": "Elsewhere", "albumId": "al-9", "artistId": "ar-9"}
+        # Navidrome indexes row 1 a minute after it was placed; row 0 never.
+        self._run_verifier(
+            lambda q: [other] if q == "r9" and clock.now >= placed_at + timeout + 30 else [],
+            timeout=timeout, clock=clock)
+        rows = self._rows()
+        self.assertEqual(rows[0]["decision"], "pending")
+        self.assertIn("never appeared in Navidrome", rows[0]["download_error"])
+        self.assertEqual(rows[1]["decision"], "verified")
+
+    def test_each_loose_song_is_announced_under_its_own_album(self):
+        """One `albumIndexed` said artist "Loose tracks", album "Playlist
+        tracks", and carried the ids of two unrelated albums."""
+        now = time.time()
+        with bot._review_lock:
+            rows = bot._find_review_group("loose1")["missing_tracks"]
+            rows[0].update({"decision": "placed", "imported_at": now,
+                            "placed_title": "One", "placed_recording_mbid": "r1"})
+            rows[1].update({"decision": "placed", "imported_at": now,
+                            "placed_title": "Other", "placed_recording_mbid": "r9"})
+        songs = {"r1": {"id": "s1", "title": "One", "artist": "Artist",
+                        "album": "Album", "albumId": "al-1", "artistId": "ar-1"},
+                 "r9": {"id": "s9", "title": "Other", "artist": "Someone Else",
+                        "album": "Elsewhere", "albumId": "al-9", "artistId": "ar-9"}}
+        self._run_verifier(lambda q: [songs[q]] if q in songs else [])
+        self.assertEqual([r["decision"] for r in self._rows()], ["verified", "verified"])
+        announced = sorted((k["artist"], k["album"], tuple(k["nd_album_ids"]),
+                            k["nd_artist_id"])
+                           for k in self.notified if k.get("event") == "albumIndexed")
+        self.assertEqual(announced, [("Artist", "Album", ("al-1",), "ar-1"),
+                                     ("Someone Else", "Elsewhere", ("al-9",), "ar-9")])
+
+    def test_an_album_group_is_still_announced_once_under_its_own_name(self):
+        """Regression guard: only the Loose-tracks announcement changed."""
+        now = time.time()
+        with bot._review_lock:
+            group = bot._find_review_group("loose1")
+            group.update({"group_type": "", "artist": "Band", "album": "Record",
+                          "canonical_mbid": "rel-x"})
+            for row in group["missing_tracks"]:
+                row.update({"decision": "placed", "imported_at": now})
+        songs = {"r1": {"id": "s1", "title": "One", "artist": "Band",
+                        "album": "Record", "albumId": "al-1", "artistId": "ar-1"},
+                 "r9": {"id": "s9", "title": "Other", "artist": "Band",
+                        "album": "Record", "albumId": "al-1", "artistId": "ar-1"}}
+        self._run_verifier(lambda q: [songs[q]] if q in songs else [])
+        announced = [(k["artist"], k["album"], k["nd_album_ids"])
+                     for k in self.notified if k.get("event") == "albumIndexed"]
+        self.assertEqual(announced, [("Band", "Record", ["al-1"])])
+
+    # --- Q-017(f): what Telegram is told --------------------------------------
+
+    def test_a_linker_failure_is_never_reported_as_filed(self):
+        """The import had already moved the file, so `not os.path.isfile(...)`
+        read the exception as success: "filed under its tagged release", and a
+        scan, for a row that was never linked."""
+        def boom(*a, **k):
+            raise RuntimeError("linker broke")
+
+        with patch.object(bot, "_link_loose_track_placements", boom):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        self.assertEqual(len(self.telegram), 1)
+        self.assertNotIn("filed under", self.telegram[0])
+        self.assertIn("failed", self.telegram[0])
+        # Q-026: the row says why and carries the miss stamp — and, the file
+        # having moved, it no longer points at a path with nothing there.
+        self.assertFalse(os.path.exists(self.file))
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertEqual(row["download_error"],
+                         "not filed: auto-placement failed (RuntimeError) after the "
+                         "file was moved — it was not linked to this row")
+        self.assertEqual(row["local_path"], "")
+        self.assertTrue(bot._placement_missed(row))
+
+    def test_an_auto_place_that_raises_before_the_move_says_why(self):
+        """Q-026: the poller's except branch left the row `downloaded` with no
+        reason and no miss stamp, so it read as in progress for 30 minutes."""
+        def boom(*a, **k):
+            raise OSError("disk went away")
+
+        with patch.object(bot, "_deterministic_album_import", boom):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "downloaded")
+        self.assertEqual(row["download_error"],
+                         "not filed: auto-placement failed (OSError) — use Pick the release")
+        self.assertEqual(row["local_path"], self.file)
+        self.assertTrue(os.path.isfile(self.file))
+        self.assertTrue(bot._placement_missed(row))
+
+    def test_a_bonus_only_auto_place_says_extra_track(self):
+        """A file matching no slot of its tagged release is filed as an extra
+        track — not "under its tagged release" as if it had landed in a slot."""
+        with patch.object(bot, "mbz_release_tracks",
+                          lambda mbid, *a, **k: [{"title": "Two", "mbid": "r2",
+                                                  "position": 5}]):
+            self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
+        row = self._rows()[0]
+        self.assertEqual(row["decision"], "filed_extra")
+        self.assertIn("Artist – Album", row["download_error"])
+        self.assertEqual(self.verified, [])
+        self.assertEqual(len(self.telegram), 1)
+        self.assertNotIn("under its tagged release", self.telegram[0])
+        self.assertIn("extra track", self.telegram[0])
+
+
+class RescanKeepsLiveTransfersTests(unittest.TestCase):
+    """B-022: a rescan resets queued/downloading to pending (ba8b83e — a row
+    with nothing behind it must be retryable), and the repair-job projection
+    was the only thing that put a row with a *live* transfer back. Without it a
+    rescan dropped both in-flight rows of a fill to pending: the gap read
+    `ready`, the fetch route's alreadyActive dedupe stopped firing and
+    `_approve_pending_missing_tracks` re-approved both transfers for a second
+    download. The rescan paths now ask the transfer registry itself.
+
+    Each runs through all three rebuild paths."""
+
+    GID = "lib0"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _web_app().test_client()
+
+    def setUp(self):
+        # Persistence is not what these tests are about, and a deferred save
+        # wakes the background review flusher, which then races
+        # isolated_review's teardown (it closes the index connection the
+        # flusher may be writing through — an intermittent SIGSEGV in the suite).
+        for patcher in (patch.object(bot, "_push_gap", lambda gid: None),
+                        patch.object(bot, "_save_review_state", lambda **k: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _row(title, decision="pending"):
+        return {"mbid": "m-" + title, "title": title, "decision": decision}
+
+    def _group(self, rows, present=()):
+        g = AlbumReviewTests._origin_group(
+            self.GID, "library", canonical_mbid="rel-1", canonical_album_id="al1",
+            albums=[{"id": "al1", "musicBrainzId": "rel-1", "artist": "A", "name": "B",
+                     "tracks": [{"title": t, "musicBrainzId": "m-" + t}
+                                for t in present]}])
+        g["missing_tracks"] = rows
+        return g
+
+    def _transfer(self, title, index):
+        """A live transfer for one row, registered the way slskd_enqueue does."""
+        track = {"title": title, "mbid": "m-" + title,
+                 "_review_group_id": self.GID, "_review_track_index": index}
+        info = {"review_group_id": self.GID, "review_track_index": index,
+                "track": track, "album_group_id": "ag1"}
+        bot.pending_downloads[("peer", f"x/{title}.flac")] = info
+        return info
+
+    @contextlib.contextmanager
+    def _world(self, rows):
+        """Each subtest gets its own review, transfers and album fills."""
+        with isolated_review(), \
+                patch.dict(bot.pending_downloads, {}, clear=True), \
+                patch.dict(bot.pending_album_groups, {}, clear=True):
+            with bot._review_lock:
+                bot._review_state["groups"] = [self._group(rows)]
+            yield
+
+    def _rescan(self, path, titles, present=()):
+        """Rebuild the group through one of the three rescan paths, the scan
+        reporting `titles` (in that order) still missing."""
+        if path == "refresh":
+            tracklist = [{"title": t, "mbid": "m-" + t, "position": i + 1}
+                         for i, t in enumerate(list(present) + list(titles))]
+            with patch.object(bot, "mbz_release_tracks", lambda *a, **k: tracklist), \
+                    bot._review_lock:
+                group = bot._find_review_group(self.GID)
+                group["albums"] = self._group([], present)["albums"]
+                bot.refresh_group_missing(group)
+            return
+        fresh = self._group([self._row(t) for t in titles], present)
+        if path == "replace":
+            bot._replace_review_groups("library", [fresh], "x")
+        else:
+            bot._union_review_groups([fresh], "library")
+
+    def _decisions(self):
+        with bot._review_lock:
+            return {t["title"]: t["decision"]
+                    for t in bot._find_review_group(self.GID)["missing_tracks"]}
+
+    PATHS = ("replace", "union", "refresh")
+
+    def test_rows_with_live_transfers_stay_in_flight(self):
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "queued"),
+                                 self._row("Two", "downloading")]):
+                self._transfer("One", 0)
+                self._transfer("Two", 1)
+                self._rescan(path, ["One", "Two"])
+
+                self.assertEqual(self._decisions(),
+                                 {"One": "queued", "Two": "downloading"})
+                with bot._review_lock:
+                    group = bot._find_review_group(self.GID)
+                    self.assertEqual(bot._gap_status_for_group(group), "downloading")
+                r = self.client.post(f"/api/gaps/{self.GID}/fetch", json={})
+                self.assertTrue(r.get_json().get("alreadyActive"), r.get_json())
+                with bot._review_lock:
+                    flipped = bot._approve_pending_missing_tracks(
+                        bot._find_review_group(self.GID))
+                self.assertEqual(flipped, 0)
+                self.assertEqual(self._decisions(),
+                                 {"One": "queued", "Two": "downloading"})
+
+    def test_a_live_row_keeps_its_transfer_fields(self):
+        """The projection used to restore these from the job row; a rescan
+        builds the row fresh, so the merge has to carry them itself."""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "downloading")]):
+                with bot._review_lock:
+                    bot._find_review_group(self.GID)["missing_tracks"][0].update(
+                        download_percent=40, source_user="peer",
+                        filename="x/One.flac", download_state="InProgress")
+                self._transfer("One", 0)
+                self._rescan(path, ["One"])
+                with bot._review_lock:
+                    row = bot._find_review_group(self.GID)["missing_tracks"][0]
+                self.assertEqual((row["decision"], row.get("download_percent"),
+                                  row.get("source_user"), row.get("filename")),
+                                 ("downloading", 40, "peer", "x/One.flac"))
+
+    def test_a_row_with_no_transfer_still_goes_stale(self):
+        """ba8b83e's rule stands: queued/downloading with nothing behind it is a
+        phantom and a rescan makes it retryable. (Before B-022 the repair-job
+        projection put phantoms back.)"""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "queued"),
+                                 self._row("Two", "downloading")]):
+                self._transfer("Two", 1)
+                self._rescan(path, ["One", "Two"])
+                self.assertEqual(self._decisions(),
+                                 {"One": "pending", "Two": "downloading"})
+
+    def test_placed_goes_stale_but_verified_and_filed_extra_are_kept(self):
+        """ba8b83e's rule is for claims nobody has checked: a `placed` row the
+        scan still reports missing resets to pending (outside its verify
+        window). A `verified` row was matched in Navidrome and a `filed_extra`
+        row is a file already in the library; when the scan disagrees it is the
+        scan's matching that missed (an album split, a playlist spelling), and
+        resetting them re-downloaded a file the library has. The repair-job
+        projection kept both settled in every group that could hold them, so
+        that is the behaviour production has had since July."""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "placed"),
+                                 self._row("Two", "verified"),
+                                 self._row("Three", "filed_extra"),
+                                 self._row("Four", "skipped"),
+                                 self._row("Five", "navidrome_verified")]):
+                self._rescan(path, ["One", "Two", "Three", "Four", "Five"])
+                self.assertEqual(self._decisions(),
+                                 {"One": "pending", "Two": "verified",
+                                  "Three": "filed_extra", "Four": "skipped",
+                                  "Five": "navidrome_verified"})
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _recheck_by_hand():
+        """Run the verified re-check only when the test drains it: a queue and a
+        wake event of its own, so a worker an earlier test started stays asleep."""
+        with patch.object(bot, "_verified_recheck_queue", {}), \
+                patch.object(bot, "_verified_recheck_wake", threading.Event()), \
+                patch.object(bot, "_ensure_verified_rechecker", lambda: None):
+            yield
+
+    def test_a_disputed_verified_row_is_rechecked_and_reset_only_when_gone(self):
+        """Q-023: a `verified` row was kept whatever a rescan said, so a file
+        deleted after verification read done forever. The verifier now records
+        the Navidrome song it matched; a rescan that still lists the row hands
+        it to one re-check worker, which asks Navidrome for that song off the
+        lock and resets the row only on a positive "no such song" (Subsonic
+        error 70). Present, or Navidrome down: kept. A legacy row with no song
+        id, and `filed_extra`, are kept unchecked, as before."""
+        answers = {"s-gone": None, "s-here": {"id": "s-here"},
+                   "s-down": OSError("Navidrome did not answer")}
+        asked = []
+
+        def get_song(u, p, song_id):
+            asked.append(song_id)
+            answer = answers[song_id]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        rows = lambda: [dict(self._row("Gone", "verified"), nd_song_id="s-gone"),
+                        dict(self._row("Here", "verified"), nd_song_id="s-here"),
+                        dict(self._row("Down", "verified"), nd_song_id="s-down"),
+                        self._row("Legacy", "verified"),
+                        self._row("Extra", "filed_extra")]
+        titles = ["Gone", "Here", "Down", "Legacy", "Extra"]
+        for path in self.PATHS:
+            asked.clear()
+            with self.subTest(path=path), self._world(rows()), \
+                    self._recheck_by_hand(), \
+                    patch.object(bot, "nd_get_song", get_song), \
+                    patch.object(bot, "nd_track_match", lambda *a, **k: None), \
+                    patch.object(bot, "nd_get_scan_status", lambda u, p: {"scanning": False}), \
+                    patch.object(bot, "_default_web_user",
+                                 lambda *a, **k: {"navidrome_user": "u",
+                                                  "navidrome_password": "p"}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self._rescan(path, titles)
+                # The rescan itself still keeps every settled row ...
+                self.assertEqual(self._decisions(),
+                                 {"Gone": "verified", "Here": "verified",
+                                  "Down": "verified", "Legacy": "verified",
+                                  "Extra": "filed_extra"})
+                # ... and the re-check, off the rescan, resets only the gone one.
+                bot._drain_verified_rechecks()
+                self.assertEqual(sorted(asked), ["s-down", "s-gone", "s-here"])
+                self.assertEqual(self._decisions(),
+                                 {"Gone": "pending", "Here": "verified",
+                                  "Down": "verified", "Legacy": "verified",
+                                  "Extra": "filed_extra"})
+                with bot._review_lock:
+                    gone = bot._find_review_group(self.GID)["missing_tracks"][0]
+                self.assertFalse(gone.get("nd_song_id"))
+                self.assertIn("Navidrome", gone["download_error"])
+
+    def test_a_recheck_never_resets_a_row_that_moved_on(self):
+        """The re-check writes after a Navidrome round trip: a row re-fetched
+        (or re-verified as another song) in the meantime is not its to reset."""
+        with self._world([dict(self._row("One", "verified"), nd_song_id="s-old")]), \
+                self._recheck_by_hand(), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self._rescan("union", ["One"])
+
+            def gone_but_meanwhile(u, p, song_id):
+                with bot._review_lock:
+                    bot._find_review_group(self.GID)["missing_tracks"][0].update(
+                        decision="queued")
+                return None
+
+            with patch.object(bot, "nd_get_song", gone_but_meanwhile):
+                bot._drain_verified_rechecks()
+            self.assertEqual(self._decisions(), {"One": "queued"})
+
+    def _gone_by_id(self, match, status):
+        """One verified row whose song id Navidrome no longer knows; drain with
+        the library-wide match answering `match` and the scan status `status`."""
+        with self._world([dict(self._row("One", "verified"), nd_song_id="s-old",
+                               artist="A")]), \
+                self._recheck_by_hand(), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self._rescan("union", ["One"])
+            asked = []
+            with patch.object(bot, "nd_get_song", lambda u, p, song_id: None), \
+                    patch.object(bot, "nd_track_match",
+                                 lambda *a, **k: asked.append((a[:3], k)) or match), \
+                    patch.object(bot, "nd_get_scan_status", lambda u, p: status):
+                reset = bot._drain_verified_rechecks()
+            with bot._review_lock:
+                row = dict(bot._find_review_group(self.GID)["missing_tracks"][0])
+        return reset, row, asked
+
+    def test_a_song_navidrome_re_ided_is_followed_not_reset(self):
+        """Fix round 1 (M2): error 70 means "no song with that id", not "the
+        recording is gone" — a re-id (a rescan of moved files) answers it too,
+        and resetting then fetched a duplicate. The verifier's own library-wide
+        match runs first; finding the song re-records its new id."""
+        reset, row, asked = self._gone_by_id({"id": "s-new", "albumId": "al1"},
+                                             {"scanning": False})
+        self.assertEqual(reset, 0)
+        self.assertEqual((row["decision"], row["nd_song_id"]), ("verified", "s-new"))
+        # The verifier's own match: the row's title and recording MBID (the
+        # harness's rescanned rows carry no artist), preferring the group's albums.
+        self.assertEqual(asked[0][0][1:], ("One", "m-One"))
+        self.assertEqual(asked[0][1].get("prefer_album_ids"), {"al1"})
+
+    def test_a_gone_song_the_library_match_cannot_find_is_reset(self):
+        reset, row, _asked = self._gone_by_id(None, {"scanning": False})
+        self.assertEqual(reset, 1)
+        self.assertEqual(row["decision"], "pending")
+        self.assertFalse(row.get("nd_song_id"))
+
+    def test_a_gone_song_is_kept_when_the_match_could_not_really_look(self):
+        """The text/MBID match swallows a failed search as "no hits", so an
+        empty answer counts only while Navidrome is answering and not mid-scan
+        (ids and the search index are in flux during one)."""
+        for status in ({}, {"scanning": True}):
+            with self.subTest(status=status):
+                reset, row, _asked = self._gone_by_id(None, status)
+                self.assertEqual(reset, 0)
+                self.assertEqual((row["decision"], row["nd_song_id"]), ("verified", "s-old"))
+
+    def test_the_recheck_stops_at_the_first_transport_error(self):
+        """Fix round 1 (M8): with Navidrome down, every queued row waited out
+        its own 10 s timeout. The pass stops at the first transport error and
+        keeps that row and the rest queued for the next pass; an answered
+        refusal (a bad id, say) only skips its own row."""
+        rows = [dict(self._row(t, "verified"), nd_song_id="s-" + t)
+                for t in ("One", "Two", "Three")]
+        with self._world(rows), self._recheck_by_hand(), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self._rescan("union", ["One", "Two", "Three"])
+            asked = []
+
+            def refuse_then_time_out(u, p, song_id):
+                asked.append(song_id)
+                if song_id == "s-One":
+                    raise bot.NavidromeRefusal("error 0")
+                raise OSError("timed out")
+
+            with patch.object(bot, "nd_get_song", refuse_then_time_out):
+                self.assertEqual(bot._drain_verified_rechecks(), 0)
+            self.assertEqual(asked, ["s-One", "s-Two"])
+            self.assertEqual(sorted(song for _i, song in bot._verified_recheck_queue.values()),
+                             ["s-Three", "s-Two"])
+            self.assertEqual(self._decisions(),
+                             {"One": "verified", "Two": "verified", "Three": "verified"})
+
+    def test_nd_get_song_says_gone_only_for_subsonic_error_70(self):
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def json(self):
+                if isinstance(self.body, Exception):
+                    raise self.body
+                return self.body
+
+        def answer(body):
+            return patch.object(bot._http, "get", lambda *a, **k: Resp(body))
+
+        ok = {"subsonic-response": {"status": "ok", "song": {"id": "s1"}}}
+        with answer(ok):
+            self.assertEqual(bot.nd_get_song("u", "p", "s1"), {"id": "s1"})
+        gone = {"subsonic-response": {"status": "failed",
+                                      "error": {"code": 70, "message": "not found"}}}
+        with answer(gone):
+            self.assertIsNone(bot.nd_get_song("u", "p", "s1"))
+        for body in ({"subsonic-response": {"status": "failed",
+                                            "error": {"code": 40, "message": "bad auth"}}},
+                     {"subsonic-response": {"status": "ok"}},
+                     {}, ValueError("not json")):
+            with self.subTest(body=body), answer(body), \
+                    self.assertRaises(bot.NavidromeRefusal):
+                bot.nd_get_song("u", "p", "s1")
+        # No answer at all is not a refusal: the drain stops on it (M8).
+        with patch.object(bot._http, "get",
+                          lambda *a, **k: (_ for _ in ()).throw(OSError("timed out"))):
+            with self.assertRaises(OSError) as raised:
+                bot.nd_get_song("u", "p", "s1")
+        self.assertNotIsInstance(raised.exception, bot.NavidromeRefusal)
+
+    def test_the_verifiers_closing_refresh_keeps_what_it_verified_after_a_split(self):
+        """The verifier matches library-wide; its closing
+        `_refresh_group_counts_after_fill` re-reads only the group's own album
+        ids. When Navidrome files the placed tracks under a different album
+        record, that refresh still sees them missing — and used to reset the
+        rows it had just verified to pending, for the next fetch to download
+        again."""
+        tracklist = [{"title": t, "mbid": "m-" + t, "position": i + 1}
+                     for i, t in enumerate(["Zero", "One", "Two"])]
+        # The group's own album record: only the track that was always there.
+        record = {"id": "al1", "musicBrainzId": "rel-1", "artist": "A", "name": "B",
+                  "tracks": [{"title": "Zero", "musicBrainzId": "m-Zero"}]}
+        with self._world([self._row("One", "placed"), self._row("Two", "placed")]), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                patch.object(bot, "_nd_scanning", lambda *a, **k: False), \
+                patch.object(bot, "nd_track_match",
+                             # Found — but on the split-off album record.
+                             lambda artist, title, *a, **k: {"id": "s-" + title,
+                                                            "albumId": "al-split"}), \
+                patch.object(bot, "_album_fill_mark_group_verified", lambda *a, **k: None), \
+                patch.object(bot, "_announce_album_indexed", lambda *a, **k: None), \
+                patch.object(bot, "_placement_verify_delay", lambda started: 0), \
+                patch.object(bot, "_nd_album_index", lambda *a, **k: [{"id": "al1"}]), \
+                patch.object(bot, "_album_record", lambda *a, **k: record), \
+                patch.object(bot, "mbz_release_tracks", lambda *a, **k: tracklist), \
+                self._recheck_by_hand():
+            bot._verify_placement_worker(self.GID)
+            self.assertEqual(self._decisions(), {"One": "verified", "Two": "verified"})
+            # Q-023: the refresh disputes both rows, so both are re-checked —
+            # and Navidrome still has the songs (on the split record), so both
+            # stay verified.
+            self.assertEqual(len(bot._verified_recheck_queue), 2)
+            with patch.object(bot, "nd_get_song",
+                              lambda u, p, song_id: {"id": song_id, "albumId": "al-split"}):
+                self.assertEqual(bot._drain_verified_rechecks(), 0)
+            self.assertEqual(self._decisions(), {"One": "verified", "Two": "verified"})
+
+    def test_a_verifier_that_verifies_everything_refreshes_the_counts_once(self):
+        """Q-024(1): the pass that verified the last row refreshed the counts,
+        and the next loop found nothing outstanding and refreshed them again —
+        two forced crawls of Navidrome's whole album list per completion.
+        Q-024(2): the probe is told which albums are the group's own."""
+        refreshes, prefer = [], []
+
+        def match(artist, title, mbid, *a, **k):
+            prefer.append(k.get("prefer_album_ids"))
+            return {"id": "s-" + title, "albumId": "al1", "title": title}
+
+        with self._world([self._row("One", "placed"), self._row("Two", "placed")]), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                patch.object(bot, "_nd_scanning", lambda *a, **k: False), \
+                patch.object(bot, "nd_track_match", match), \
+                patch.object(bot, "_refresh_group_counts_after_fill", refreshes.append), \
+                patch.object(bot, "_album_fill_mark_group_verified", lambda *a, **k: None), \
+                patch.object(bot, "_announce_album_indexed", lambda *a, **k: None), \
+                patch.object(bot, "_placement_verify_delay", lambda started: 0):
+            bot._verify_placement_worker(self.GID)
+            self.assertEqual(self._decisions(), {"One": "verified", "Two": "verified"})
+            # Q-023: the song it matched, for a later re-check.
+            with bot._review_lock:
+                self.assertEqual([t.get("nd_song_id") for t in
+                                  bot._find_review_group(self.GID)["missing_tracks"]],
+                                 ["s-One", "s-Two"])
+        self.assertEqual(refreshes, [self.GID])
+        self.assertEqual(prefer, [{"al1"}, {"al1"}])
+
+    def test_a_row_placed_after_the_refresh_gets_its_own_refresh(self):
+        """Fix round 1 (M1): `refreshed` was never reset, so a row placed into
+        the running worker after its in-pass refresh was verified with no
+        count refresh at all."""
+        refreshes, placed_two = [], []
+
+        def delay_and_place_two(clock):
+            if not placed_two:
+                placed_two.append(True)
+                with bot._review_lock:
+                    bot._find_review_group(self.GID)["missing_tracks"][1].update(
+                        decision="placed", imported_at=time.time())
+            return 0
+
+        with self._world([self._row("One", "placed"), self._row("Two")]), \
+                patch.object(bot, "_default_web_user",
+                             lambda *a, **k: {"navidrome_user": "u",
+                                              "navidrome_password": "p"}), \
+                patch.object(bot, "_nd_scanning", lambda *a, **k: False), \
+                patch.object(bot, "nd_track_match",
+                             lambda artist, title, *a, **k: {"id": "s-" + title,
+                                                            "albumId": "al1"}), \
+                patch.object(bot, "_refresh_group_counts_after_fill", refreshes.append), \
+                patch.object(bot, "_album_fill_mark_group_verified", lambda *a, **k: None), \
+                patch.object(bot, "_announce_album_indexed", lambda *a, **k: None), \
+                patch.object(bot, "_placement_verify_delay", delay_and_place_two):
+            bot._verify_placement_worker(self.GID)
+            self.assertEqual(self._decisions(), {"One": "verified", "Two": "verified"})
+        self.assertEqual(refreshes, [self.GID, self.GID])
+
+    def test_resumed_verifiers_run_a_few_at_a_time_but_all_hold_their_groups(self):
+        """Q-024(4): a restart resumed one verifier thread per group with
+        placed rows, all at once — each polling Navidrome every 2 s. They now
+        take turns (PLACEMENT_VERIFY_RESUME_CONCURRENCY at a time), and every
+        group is registered from the start, so a rescan keeps its placed rows
+        whether its turn has come or not."""
+        gate = threading.Event()
+        running, peak, done = [], [], []
+        lock = threading.Lock()
+
+        def pass_(gid):
+            with lock:
+                running.append(gid)
+                peak.append(len(running))
+            gate.wait(10)
+            with lock:
+                running.remove(gid)
+                done.append(gid)
+            with bot._placement_verify_lock:
+                bot._placement_verifiers.discard(gid)
+
+        groups = []
+        for n in range(4):
+            g = AlbumReviewTests._origin_group(f"g{n}", "library", album=f"A{n}")
+            g["missing_tracks"] = [self._row("One", "placed")]
+            groups.append(g)
+        with isolated_review(), \
+                patch.object(bot, "_placement_verifiers", set()), \
+                patch.object(bot, "_verify_placement_worker", pass_), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with bot._review_lock:
+                bot._review_state["groups"] = groups
+            self.assertEqual(bot._resume_placement_verification(), 4)
+            try:
+                deadline = time.time() + 5
+                while len(running) < bot.PLACEMENT_VERIFY_RESUME_CONCURRENCY \
+                        and time.time() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.1)
+                self.assertEqual(len(running), bot.PLACEMENT_VERIFY_RESUME_CONCURRENCY)
+                self.assertEqual(bot._placement_verifiers, {"g0", "g1", "g2", "g3"})
+            finally:
+                gate.set()
+                for t in threading.enumerate():
+                    if t.name.startswith("verify-g"):
+                        t.join(5)
+        self.assertEqual(sorted(done), ["g0", "g1", "g2", "g3"])
+        self.assertLessEqual(max(peak), bot.PLACEMENT_VERIFY_RESUME_CONCURRENCY)
+
+    def test_a_placed_row_its_verifier_is_watching_stays_placed(self):
+        """The same hole as a live transfer, one step later: until Navidrome
+        indexes a placed file (PLACEMENT_VERIFY_TIMEOUT), a rescan still reports
+        the track missing, and resetting the row to pending took it away from
+        the verifier and offered it for a second download. The verifier is the
+        authority while it runs — it verifies the row or resets it itself at
+        the deadline — so a placed row survives a rescan exactly while one is
+        running for its group. (The projection used to restore it.)"""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "placed"),
+                                 self._row("Two", "verified")]), \
+                    patch.object(bot, "_placement_verifiers", {self.GID}):
+                self._rescan(path, ["One", "Two"])
+                self.assertEqual(self._decisions(),
+                                 {"One": "placed", "Two": "verified"})
+
+    def test_a_moved_row_takes_its_transfer_with_it(self):
+        """The poller, the source switch and the cancel paths address a row by
+        index. A rescan that lists a new track first moves every row down one;
+        left alone, the poller's "downloaded" for One would land on the new
+        track and One would sit on queued forever."""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "queued"),
+                                 self._row("Two", "downloading")]):
+                one, two = self._transfer("One", 0), self._transfer("Two", 1)
+                # The album fill's own bookkeeping holds the same track
+                # dicts the transfers do — a re-point must move each once.
+                bot.pending_album_groups["ag1"] = {
+                    "review_group_id": self.GID, "review_track_indexes": [0, 1],
+                    "missing_tracks": [one["track"], two["track"]]}
+                self._rescan(path, ["New", "One", "Two"])
+
+                self.assertEqual((one["review_track_index"], two["review_track_index"]),
+                                 (1, 2))
+                ag = bot.pending_album_groups["ag1"]
+                self.assertEqual(ag["review_track_indexes"], [1, 2])
+                self.assertEqual([t["_review_track_index"] for t in ag["missing_tracks"]],
+                                 [1, 2])
+                # What the poller does next, with what it now reads.
+                bot._set_review_track_state(self.GID, one["review_track_index"],
+                                            "downloaded", local_path="/d/One.flac")
+                self.assertEqual(self._decisions(),
+                                 {"New": "pending", "One": "downloaded",
+                                  "Two": "downloading"})
+
+    def test_a_row_the_rescan_drops_lets_go_of_its_transfer(self):
+        """A row the rescan no longer lists (the track turned up in the
+        library) has no index any more; keeping the old one would aim the
+        poller at whichever track now sits there.
+
+        Q-027(a): and the transfer itself goes. It used to keep downloading
+        into /downloads with nothing pointing at it, and its album fill kept
+        waiting for it. It is detached, cancelled in slskd and taken out of
+        the fill's total — never below what already completed. The transfer
+        that merely moved keeps going."""
+        for path in self.PATHS:
+            for total, completed, want in ((3, 1, 2), (2, 2, 2)):
+                abandoned = []
+                with self.subTest(path=path, total=total, completed=completed), \
+                        self._world([self._row("One", "queued"),
+                                     self._row("Two", "downloading")]), \
+                        patch.object(bot, "_abandon_transfers_async", abandoned.extend):
+                    one, two = self._transfer("One", 0), self._transfer("Two", 1)
+                    bot.pending_album_groups["ag1"] = {
+                        "review_group_id": self.GID, "review_track_indexes": [0, 1],
+                        "missing_tracks": [one["track"], two["track"]],
+                        "total": total, "completed": completed, "failed": 0}
+                    self._rescan(path, ["Two"], present=["One"])
+
+                    self.assertIsNone(one["review_track_index"])
+                    self.assertEqual(two["review_track_index"], 0)
+                    self.assertEqual(bot.pending_album_groups["ag1"]["review_track_indexes"], [0])
+                    bot._set_review_track_state(self.GID, one["review_track_index"], "downloaded")
+                    self.assertEqual(self._decisions(), {"Two": "downloading"})
+
+                    self.assertNotIn(("peer", "x/One.flac"), bot.pending_downloads)
+                    self.assertIs(bot.pending_downloads[("peer", "x/Two.flac")], two)
+                    self.assertEqual([(e["username"], e["filename"]) for e in abandoned],
+                                     [("peer", "x/One.flac")])
+                    self.assertEqual(bot.pending_album_groups["ag1"]["total"], want)
+
+    def test_an_empty_tracklist_read_leaves_the_group_and_its_fill_alone(self):
+        """Fix round 1: `_missing_for_album_records` answers `missing=[]` when
+        the tracklist read comes back empty — a MusicBrainz outage inside the
+        5-minute cooldown, an evicted cache entry, a canonical record with no
+        MBID — and `refresh_group_missing` took that as "nothing is missing":
+        every row dropped, and with Q-027(a) every transfer of the running fill
+        was cancelled. An empty read says nothing; the group is left as it was
+        (the rule `_reconcile_artist_review_groups` already follows)."""
+        abandoned = []
+        with self._world([self._row("One", "queued"), self._row("Two", "downloading")]), \
+                patch.object(bot, "_abandon_transfers_async", abandoned.extend), \
+                contextlib.redirect_stdout(io.StringIO()):
+            one, two = self._transfer("One", 0), self._transfer("Two", 1)
+            bot.pending_album_groups["ag1"] = {
+                "review_group_id": self.GID, "review_track_indexes": [0, 1],
+                "missing_tracks": [one["track"], two["track"]],
+                "total": 2, "completed": 0, "failed": 0}
+            with bot._review_lock:
+                before = json.loads(json.dumps(bot._find_review_group(self.GID)))
+            self._rescan("refresh", [])           # the tracklist read is empty
+            with bot._review_lock:
+                after = json.loads(json.dumps(bot._find_review_group(self.GID)))
+            for field in ("missing_tracks", "present", "total", "canonical_mbid"):
+                self.assertEqual(after.get(field), before.get(field), field)
+            self.assertEqual(abandoned, [])
+            self.assertEqual(set(bot.pending_downloads),
+                             {("peer", "x/One.flac"), ("peer", "x/Two.flac")})
+            self.assertEqual((one["review_track_index"], two["review_track_index"]), (0, 1))
+            self.assertEqual(bot.pending_album_groups["ag1"]["total"], 2)
+
+    def _pinned_world(self, rows):
+        """The group the discography classifier pinned to `rel-pinned` (a
+        release in the matched release-group), while its album record's own
+        tag points at `rel-wrong` — and a two-file fill of the pinned release
+        in flight."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(self._world(rows))
+        with bot._review_lock:
+            g = bot._find_review_group(self.GID)
+            g["canonical_mbid"] = "rel-pinned"
+            g["albums"] = [{"id": "al1", "musicBrainzId": "rel-wrong",
+                            "artist": "A", "name": "B", "tracks": []}]
+        one, two = self._transfer("One", 0), self._transfer("Two", 1)
+        bot.pending_album_groups["ag1"] = {
+            "review_group_id": self.GID, "review_track_indexes": [0, 1],
+            "missing_tracks": [one["track"], two["track"]],
+            "total": 2, "completed": 0, "failed": 0}
+        lists = {"rel-pinned": [{"title": t, "mbid": "m-" + t, "position": i + 1}
+                                for i, t in enumerate(["One", "Two"])],
+                 "rel-wrong": [{"title": t, "mbid": "m-" + t, "position": i + 1}
+                               for i, t in enumerate(["Live1", "Live2", "Live3"])]}
+        stack.enter_context(patch.object(bot, "mbz_release_tracks",
+                                          lambda mbid, *a, **k: lists.get(mbid, [])))
+        return stack
+
+    def test_a_refresh_never_swaps_a_pinned_release_under_a_running_fill(self):
+        """Final review I-1: the wrong-release guard pins `canonical_mbid` to a
+        release in the matched release-group, but `refresh_group_missing`
+        rebuilt from the record's own (wrong) tag — every in-flight row of the
+        pinned release read as dropped, and Q-027(a) cancelled its transfer.
+        While a fill is running, a refresh that would switch releases leaves
+        the group as it was."""
+        abandoned = []
+        with self._pinned_world([self._row("One", "queued"),
+                                 self._row("Two", "downloading")]), \
+                patch.object(bot, "_abandon_transfers_async", abandoned.extend), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with bot._review_lock:
+                bot.refresh_group_missing(bot._find_review_group(self.GID))
+                g = bot._find_review_group(self.GID)
+                self.assertEqual(g["canonical_mbid"], "rel-pinned")
+                self.assertEqual([(t["title"], t["decision"]) for t in g["missing_tracks"]],
+                                 [("One", "queued"), ("Two", "downloading")])
+            self.assertEqual(abandoned, [])
+            self.assertEqual(set(bot.pending_downloads),
+                             {("peer", "x/One.flac"), ("peer", "x/Two.flac")})
+            self.assertEqual(bot.pending_album_groups["ag1"]["total"], 2)
+
+    def test_a_canonical_pick_that_cannot_be_applied_is_refused_whole(self):
+        """Final review M-1: the route set the new `canonical_album_id` and
+        then the refresh left everything else as it was (a record with no
+        MBID, a MusicBrainz cooldown) — the new id beside the old release's
+        MBID, name and rows, reported as "Canonical album updated". The pick
+        is refused, the previous id kept, and the reply says why."""
+        with self._world([self._row("One")]), \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with bot._review_lock:
+                bot._find_review_group(self.GID)["albums"].append(
+                    {"id": "al2", "musicBrainzId": "", "artist": "A",
+                     "name": "B (another copy)", "tracks": []})
+            r = self.client.post(f"/api/groups/{self.GID}/canonical",
+                                 json={"album_id": "al2"})
+            self.assertEqual(r.status_code, 409)
+            body = r.get_json()
+            self.assertIn("not changed", body["error"])
+            self.assertIn("no MusicBrainz release", body["error"])
+            self.assertEqual(body["operation"]["status"], "error")
+            with bot._review_lock:
+                g = bot._find_review_group(self.GID)
+                self.assertEqual((g["canonical_album_id"], g["canonical_mbid"]),
+                                 ("al1", "rel-1"))
+                self.assertEqual([t["title"] for t in g["missing_tracks"]], ["One"])
+                self.assertNotEqual(g.get("last_action"), "canonical")
+
+    def test_a_missing_rescan_that_could_not_run_says_so(self):
+        """M-1's other route: "Missing tracks rescanned" for a refresh that
+        read no tracklist and changed nothing."""
+        with self._world([self._row("One")]), \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "mbz_release_tracks", lambda *a, **k: []), \
+                contextlib.redirect_stdout(io.StringIO()):
+            r = self.client.post(f"/api/groups/{self.GID}/missing", json={})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("not rescanned", r.get_json()["error"])
+            self.assertIn("no tracklist", r.get_json()["error"])
+            with bot._review_lock:
+                g = bot._find_review_group(self.GID)
+                self.assertEqual([t["title"] for t in g["missing_tracks"]], ["One"])
+                self.assertNotEqual(g.get("last_action"), "missing_scan")
+            # And a refresh that does run still answers as before.
+            tracklist = [{"title": "One", "mbid": "m-One", "position": 1}]
+            with patch.object(bot, "mbz_release_tracks", lambda *a, **k: tracklist):
+                r = self.client.post(f"/api/groups/{self.GID}/missing", json={})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()["message"], "Missing tracks rescanned")
+
+    def test_with_nothing_in_flight_a_refresh_still_follows_the_record(self):
+        """The guard is only for a running fill: with no live transfer the
+        refresh behaves as it always did (the root cause is backlog work)."""
+        with self._world([self._row("One"), self._row("Two")]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with bot._review_lock:
+                g = bot._find_review_group(self.GID)
+                g["canonical_mbid"] = "rel-pinned"
+                g["albums"] = [{"id": "al1", "musicBrainzId": "rel-wrong",
+                                "artist": "A", "name": "B", "tracks": []}]
+            with patch.object(bot, "mbz_release_tracks",
+                              lambda mbid, *a, **k: [{"title": "Live1", "mbid": "m-Live1",
+                                                      "position": 1}]
+                              if mbid == "rel-wrong" else []), bot._review_lock:
+                bot.refresh_group_missing(bot._find_review_group(self.GID))
+                g = bot._find_review_group(self.GID)
+                self.assertEqual(g["canonical_mbid"], "rel-wrong")
+                self.assertEqual([t["title"] for t in g["missing_tracks"]], ["Live1"])
+
+    def test_a_dropped_twin_lets_go_of_its_own_transfer_only(self):
+        """Q-027(a) with (b)'s twins: two rows under one key, the rescan lists
+        one. Paired in order, the second twin is the dropped one — its transfer
+        goes, the first's stays where it was."""
+        for path in self.PATHS:
+            abandoned = []
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "queued"),
+                                 self._row("One", "downloading")]), \
+                    patch.object(bot, "_abandon_transfers_async", abandoned.extend):
+                first = self._transfer("One", 0)
+                second = {"review_group_id": self.GID, "review_track_index": 1,
+                          "track": {"title": "One", "mbid": "m-One"}}
+                bot.pending_downloads[("peer2", "y/One.flac")] = second
+                self._rescan(path, ["One"])
+                self.assertEqual(first["review_track_index"], 0)
+                self.assertIsNone(second["review_track_index"])
+                self.assertEqual(list(bot.pending_downloads), [("peer", "x/One.flac")])
+                self.assertEqual([e["username"] for e in abandoned], ["peer2"])
+                with bot._review_lock:
+                    self.assertEqual(
+                        [t["decision"] for t in
+                         bot._find_review_group(self.GID)["missing_tracks"]], ["queued"])
+
+    # --- final review I1: a write that held its index across a slow step -----
+
+    def test_an_identity_checked_write_follows_its_row_or_is_dropped(self):
+        """The re-point reaches indexes held in the transfer registry and the
+        album fills. A writer that read an index and then waited (the verifier
+        on Navidrome, the poller on the disk, a cancel whose transfer is already
+        detached) names its row too; when the row at the index is not that row
+        any more, the write lands on the row that is, or nowhere."""
+        with self._world([self._row("New"), self._row("One", "queued"),
+                          self._row("Two", "queued")]):
+            # Index 0 held One before a rescan listed New first.
+            bot._set_review_track_state(self.GID, 0, "downloaded",
+                                        expect_key=("m-One", "One"),
+                                        local_path="/d/One.flac")
+            self.assertEqual(self._decisions(),
+                             {"New": "pending", "One": "downloaded", "Two": "queued"})
+            with bot._review_lock:
+                rows = bot._find_review_group(self.GID)["missing_tracks"]
+                self.assertEqual(rows[1].get("local_path"), "/d/One.flac")
+                self.assertNotIn("expect_key", rows[0])
+                self.assertNotIn("local_path", rows[0])
+
+            # A row the group no longer lists: nothing is written, said once.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                for _ in range(3):
+                    bot._set_review_track_state(self.GID, 2, "downloaded",
+                                                expect_key=("m-Gone", "Gone"))
+            self.assertEqual(self._decisions(),
+                             {"New": "pending", "One": "downloaded", "Two": "queued"})
+            self.assertEqual(out.getvalue().count("Gone"), 1, out.getvalue())
+
+            # The index still holding its row is written as before.
+            bot._set_review_track_state(self.GID, 2, "downloading",
+                                        expect_key=("m-Two", "Two"))
+            self.assertEqual(self._decisions()["Two"], "downloading")
+
+    def test_twin_rows_each_keep_their_own_state_across_a_rescan(self):
+        """Q-027(b): two missing rows sharing one (mbid, title) — the previous
+        rows were a dict on that key, last wins, so both twins inherited the
+        second's state: the live one lost its flag and went pending, or the
+        idle one took the live one's `queued` with nothing behind it. Paired in
+        order now, like `_repoint_transfer_indexes` pairs their transfers."""
+        for path in self.PATHS:
+            for decisions, live_at in ((["queued", "pending"], 0),
+                                       (["pending", "downloading"], 1)):
+                with self.subTest(path=path, decisions=decisions), \
+                        self._world([self._row("One", d) for d in decisions]):
+                    info = self._transfer("One", live_at)
+                    self._rescan(path, ["One", "One"])
+                    with bot._review_lock:
+                        rows = bot._find_review_group(self.GID)["missing_tracks"]
+                        self.assertEqual([t["decision"] for t in rows], decisions)
+                    self.assertEqual(info["review_track_index"], live_at)
+
+    def test_an_identity_checked_write_never_guesses_between_twins(self):
+        """Two rows under one key (M5) and the index on neither: which one the
+        writer meant is unknowable, and a guess is someone else's row."""
+        with self._world([self._row("New"), self._row("One"), self._row("One")]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                bot._set_review_track_state(self.GID, 0, "downloaded",
+                                            expect_key=("m-One", "One"))
+            with bot._review_lock:
+                self.assertEqual(
+                    [t["decision"] for t in
+                     bot._find_review_group(self.GID)["missing_tracks"]],
+                    ["pending", "pending", "pending"])
+
+    def test_the_verifier_never_verifies_the_row_a_rescan_moved_under_it(self):
+        """The reviewer's probe. The verifier snapshots (index, row), asks
+        Navidrome, then writes `verified` by index. When the auto-index worker's
+        union drops two now-present tracks in between, index 0 holds a track
+        that was never downloaded — and it read `verified`, the group
+        `completed`, for good: nothing ever revisits a verified row."""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("A", "placed"), self._row("B", "placed"),
+                                 self._row("C")]), \
+                    patch.object(bot, "_default_web_user",
+                                 lambda *a, **k: {"navidrome_user": "u",
+                                                  "navidrome_password": "p"}), \
+                    patch.object(bot, "_nd_scanning", lambda *a, **k: False), \
+                    patch.object(bot, "_album_fill_mark_group_verified",
+                                 lambda *a, **k: None), \
+                    patch.object(bot, "_announce_album_indexed", lambda *a, **k: None), \
+                    patch.object(bot, "_refresh_group_counts_after_fill",
+                                 lambda gid: None), \
+                    patch.object(bot, "_placement_verify_delay", lambda started: 0):
+                rebuilt = []
+
+                def match(artist, title, mbid, *a, **k):
+                    # Navidrome has indexed A and B; while the verifier is on
+                    # the network a rescan sees them present.
+                    if not rebuilt:
+                        rebuilt.append(True)
+                        self._rescan(path, ["C"], present=["A", "B"])
+                    return {"id": "s-" + title, "albumId": "al1", "title": title}
+
+                with patch.object(bot, "nd_track_match", match), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    bot._verify_placement_worker(self.GID)
+                self.assertEqual(self._decisions(), {"C": "pending"})
+                with bot._review_lock:
+                    group = bot._find_review_group(self.GID)
+                    self.assertNotEqual(
+                        bot._review_group_next_action(group)["bucket"], "completed")
+
+    def _poll(self, listing, resolve):
+        """One poll of `_poll_downloads_once` against `listing`, with
+        `_resolve_local_path` replaced by `resolve`."""
+        with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing), \
+                patch.object(bot, "_resolve_local_path", resolve), \
+                patch.object(bot, "_remember_download_origin", lambda *a, **k: None), \
+                patch.object(bot, "_push_fill_progress", lambda *a, **k: None), \
+                patch.object(bot, "_update_group_progress", new_callable=AsyncMock), \
+                patch.object(bot, "_tg_send", new_callable=AsyncMock), \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "_sweep_album_fill_zombies", lambda *a, **k: 0):
+            asyncio.run(bot._poll_downloads_once({}))
+
+    def test_the_pollers_downloaded_lands_on_the_row_a_rescan_moved(self):
+        """The poller reads the transfer's index, then awaits
+        `_resolve_local_path` (an os.walk of /downloads, seconds on the NAS). A
+        rescan in that await re-points the transfer — but the poller wrote
+        "downloaded" to the index it had read, i.e. onto the neighbour."""
+        for path in self.PATHS:
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "downloading"),
+                                 self._row("Two", "downloading")]):
+                one, two = self._transfer("One", 0), self._transfer("Two", 1)
+                for info in (one, two):
+                    info.update(token="tok", chat_id="chat", candidates=[])
+                    info["track"]["artist"] = "A"
+                bot.pending_album_groups["ag1"] = {
+                    "review_group_id": self.GID, "review_track_indexes": [0, 1],
+                    "missing_tracks": [one["track"], two["track"]],
+                    "token": "tok", "chat_id": "chat", "label": "B",
+                    "total": 2, "completed": 0, "failed": 0, "local_dirs": {},
+                    "ts": time.time()}
+
+                def resolve(filename):
+                    self._rescan(path, ["New", "One", "Two"])
+                    return "/d/Two.flac"
+
+                self._poll([{"_username": "peer", "filename": "x/Two.flac",
+                             "state": "Completed, Succeeded"}], resolve)
+                self.assertEqual(self._decisions(),
+                                 {"New": "pending", "One": "downloading",
+                                  "Two": "downloaded"})
+                with bot._review_lock:
+                    rows = bot._find_review_group(self.GID)["missing_tracks"]
+                    self.assertEqual(rows[2].get("local_path"), "/d/Two.flac")
+                    self.assertFalse(rows[1].get("local_path"))
+
+    def test_a_cancel_marks_the_row_its_detached_transfer_was_for(self):
+        """A cancel detaches its transfers first (out of the registry, so out
+        of the re-point's reach) and marks their rows after. A rescan between
+        the two marked the neighbour `cancelled` and left the cancelled track
+        reading `downloading`."""
+        with self._world([self._row("One", "downloading"),
+                          self._row("Two", "downloading")]):
+            self._transfer("One", 0)
+            key = ("peer", "x/One.flac")
+            entries = [bot._detach_transfer(key, bot.pending_downloads[key])]
+            self._rescan("union", ["New", "One", "Two"])
+            bot._mark_detached_entries_cancelled(entries, bot.USER_CANCEL_REASON)
+            self.assertEqual(self._decisions(),
+                             {"New": "pending", "One": "cancelled",
+                              "Two": "pending"})
+
+    def test_a_transfer_registers_at_the_index_its_row_has_after_the_enqueue(self):
+        """`slskd_enqueue` registers the transfer only after slskd answers (up
+        to 30 s). A rescan in that call re-points everything registered — not
+        this one, which then registered the index read before the call."""
+        with self._world([self._row("One", "approved"),
+                          self._row("Two", "approved")]):
+            track = {"title": "Two", "mbid": "m-Two",
+                     "_review_group_id": self.GID, "_review_track_index": 1}
+
+            class _Resp:
+                ok, status_code, text = True, 200, ""
+
+            def post(*a, **k):
+                self._rescan("union", ["New", "One", "Two"])
+                return _Resp()
+
+            with patch.object(bot._http, "post", post), \
+                    patch.object(bot, "_source_is_rejected", lambda *a, **k: False):
+                self.assertTrue(bot.slskd_enqueue(
+                    "peer", {"filename": "x/Two.flac", "size": 1}, track=track,
+                    token="tok", chat_id="chat", review_group_id=self.GID,
+                    review_track_index=1))
+            info = bot.pending_downloads[("peer", "x/Two.flac")]
+            self.assertEqual(info["review_track_index"], 2)
+            # The caller's follow-up "queued" reads the track's own index.
+            self.assertEqual(track["_review_track_index"], 2)
+
+    # --- final review I3: a restart ends every verifier ----------------------
+
+    def test_a_restart_resumes_a_verifier_for_each_group_with_placed_rows(self):
+        """Verifiers are threads a placement starts, so a restart ends them all
+        and nothing started them again: the rescan's "keep placed while a
+        verifier watches" rule (f7409a2) then protected nothing, and the first
+        rescan after a deploy reset every placed row to pending."""
+        started = []
+        with isolated_review(), \
+                patch.object(bot, "_start_placement_verification",
+                             lambda gid, **k: started.append((gid, k.get("resumed")))):
+            groups = []
+            for gid, rows in (("g1", [self._row("One", "placed"), self._row("Two")]),
+                              ("g2", [self._row("One", "verified"), self._row("Two")]),
+                              ("g3", [self._row("One", "placed"),
+                                      self._row("Two", "placed")]),
+                              ("g4", [])):
+                g = AlbumReviewTests._origin_group(gid, "library", album=gid)
+                g["missing_tracks"] = rows
+                groups.append(g)
+            with bot._review_lock:
+                bot._review_state["groups"] = groups
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bot._resume_placement_verification(), 2)
+        # Resumed: each takes its turn at the resume gate (Q-024).
+        self.assertEqual(started, [("g1", True), ("g3", True)])
+
+    def test_a_rescan_in_the_resumed_window_keeps_placed_rows(self):
+        release = threading.Event()
+
+        def watching(gid):
+            # A verifier still inside its window: it holds the group.
+            release.wait(10)
+            with bot._placement_verify_lock:
+                bot._placement_verifiers.discard(gid)
+
+        for path in self.PATHS:
+            release.clear()
+            with self.subTest(path=path), \
+                    self._world([self._row("One", "placed"),
+                                 self._row("Two", "verified"), self._row("Three")]), \
+                    patch.object(bot, "_placement_verifiers", set()), \
+                    patch.object(bot, "_verify_placement_worker", watching), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bot._resume_placement_verification()
+                try:
+                    self._rescan(path, ["One", "Two", "Three"])
+                    self.assertEqual(self._decisions(),
+                                     {"One": "placed", "Two": "verified",
+                                      "Three": "pending"})
+                finally:
+                    release.set()
+                    for t in threading.enumerate():
+                        if t.name == f"verify-{self.GID[:16]}":
+                            t.join(5)
+
+    def test_main_resumes_verifiers_once_the_review_is_loaded(self):
+        """Before anything can rescan: the auto-index worker, the scheduler and
+        the routes all start later in main()."""
+        src = inspect.getsource(bot.main)
+        loaded = src.index("_load_review_state()")
+        resumed = src.index("_resume_placement_verification()")
+        self.assertLess(loaded, resumed)
+        self.assertLess(resumed, src.index("start_web_dashboard()"))
+        self.assertLess(resumed, src.index("tuesday_scheduler"))
+
+    def test_the_linker_writes_the_rows_it_matched_even_after_a_rescan(self):
+        """The loose-track linker collects (index, outcome) under the lock and
+        writes after releasing it; a rescan in between moved the outcome onto
+        another row."""
+        with self._world([]):
+            loose = self._group([dict(self._row("One", "downloaded"),
+                                      local_path="/d/f/One.flac")])
+            loose.update(group_type="tracks", origin="playlist",
+                         canonical_mbid="", canonical_album_id="", albums=[])
+            with bot._review_lock:
+                bot._review_state["groups"] = [loose]
+            real = bot._set_review_track_state
+            moved = []
+
+            def racing(*a, **k):
+                if not moved:
+                    moved.append(True)
+                    fresh = self._group([self._row("New"), self._row("One")])
+                    fresh.update(group_type="tracks", origin="playlist",
+                                 canonical_mbid="", canonical_album_id="", albums=[])
+                    bot._union_review_groups([fresh], "playlist")
+                return real(*a, **k)
+
+            with patch.object(bot, "_set_review_track_state", racing), \
+                    patch.object(bot, "_start_placement_verification", lambda gid: None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bot._link_loose_track_placements("/d/f", {"per_file": [
+                    {"status": "matched", "file": "One.flac", "title": "One",
+                     "recording_mbid": "m-One"}]})
+            with bot._review_lock:
+                rows = {t["title"]: t["decision"] for t in
+                        bot._find_review_group(self.GID)["missing_tracks"]}
+            self.assertEqual(rows, {"New": "pending", "One": "placed"})
+
+
+
+class RetiredRepairGroupsMigrationTests(unittest.TestCase):
+    """B-022: the groups the repair-job resurrection left behind (origin
+    `repair`, no albums, nothing that can clear them — 58 on the NAS) are
+    hidden once at startup, not deleted: unhide is one tap, and their files
+    stay reachable from Placement."""
+
+    @staticmethod
+    def _g(gid, origin, hidden=False):
+        g = AlbumReviewTests._origin_group(gid, origin, album=gid, hidden=hidden)
+        g["missing_tracks"] = [{"mbid": "m", "title": "T", "decision": "downloaded"}]
+        return g
+
+    def _seed(self, groups):
+        with bot._review_lock:
+            bot._review_state["groups"] = groups
+        bot._mark_review_groups_dirty(groups)
+        bot._save_review_state(urgent=True)
+
+    def _reload(self):
+        swap_index(bot.LIBRARY_INDEX_FILE)
+        with bot._review_lock:
+            bot._review_state = bot._empty_review_state()
+        bot._load_review_state()
+        return {g["id"]: g for g in bot._review_state["groups"]}
+
+    def _run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            n = bot._hide_retired_repair_groups()
+        return n, out.getvalue()
+
+    def test_hides_only_visible_repair_groups_and_logs_the_count(self):
+        with isolated_review():
+            self._seed([self._g("r1", "repair"), self._g("r2", "repair"),
+                        self._g("r3", "repair", hidden=True),
+                        self._g("lib0", "library"), self._g("pl0", "playlist")])
+            n, log = self._run()
+            self.assertEqual(n, 2)
+            self.assertIn("2 ", log)
+            groups = self._reload()
+            self.assertEqual({gid: bool(g.get("hidden")) for gid, g in groups.items()},
+                             {"r1": True, "r2": True, "r3": True,
+                              "lib0": False, "pl0": False})
+            # Hidden, not deleted: the rows and their downloaded tracks are all there.
+            self.assertEqual(groups["r1"]["missing_tracks"][0]["decision"], "downloaded")
+            # The column the gap list filters on says so too, not just the payload.
+            with bot._index_lock:
+                rows = dict(bot._index_db().execute(
+                    "SELECT id, hidden FROM review_groups").fetchall())
+            self.assertEqual(rows, {"r1": 1, "r2": 1, "r3": 1, "lib0": 0, "pl0": 0})
+
+    def test_runs_once_so_an_unhide_sticks(self):
+        with isolated_review():
+            self._seed([self._g("r1", "repair")])
+            self.assertEqual(self._run()[0], 1)
+            # The user unhides it; the next start must not hide it again.
+            bot._find_review_group("r1")["hidden"] = False
+            bot._save_review_state(urgent=True)
+            n, log = self._run()
+            self.assertEqual((n, log), (0, ""))
+            self.assertFalse(self._reload()["r1"].get("hidden"))
+
+    def test_a_failed_write_records_nothing_and_retries(self):
+        """The flag is written only after the rows landed, like the JSON import:
+        a start whose flush fails must try again at the next one."""
+        import sqlite3
+        with isolated_review():
+            self._seed([self._g("r1", "repair")])
+
+            def broken(writes, drops):
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+
+            with patch.object(bot, "_review_groups_write", broken):
+                self.assertEqual(self._run()[0], 0)
+            with bot._review_lock:
+                bot._review_dirty_groups.clear()
+                bot._find_review_group("r1")["hidden"] = False
+            self.assertEqual(self._run()[0], 1)
+            self.assertTrue(self._reload()["r1"].get("hidden"))
+
+    def test_a_review_with_no_repair_groups_is_a_no_op(self):
+        with isolated_review():
+            self._seed([self._g("lib0", "library")])
+            n, log = self._run()
+            self.assertEqual(n, 0)
+            self.assertIn("0 ", log)
+            self.assertFalse(self._reload()["lib0"].get("hidden"))
+            self.assertEqual(self._run(), (0, ""))
+
+
+
+class RetiredRepairRowsDoNotShadowTests(unittest.TestCase):
+    """B-022 fix round 1: a retired origin-`repair` row carries the id of the
+    group its job was for (`_review_group_from_repair_job` used
+    `job["group_id"]`) and, since the migration, `hidden=True`. When a scan
+    produces that album again the real group must come back visible — not
+    inherit the zombie's `hidden` (union), not be dropped behind it (replace),
+    and not be folded into it by identity."""
+
+    def setUp(self):
+        for patcher in (patch.object(bot, "_push_gap", lambda gid: None),
+                        patch.object(bot, "_save_review_state", lambda **k: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _zombie(gid="rg1"):
+        g = AlbumReviewTests._origin_group(gid, "repair", album="Record",
+                                           hidden=True, group_type="repair_job",
+                                           canonical_mbid="rel-1", albums=[])
+        g["missing_tracks"] = [{"mbid": "m1", "title": "One", "decision": "downloaded"}]
+        return g
+
+    @staticmethod
+    def _real(gid, origin="library", albums=True):
+        g = AlbumReviewTests._origin_group(gid, origin, album="Record",
+                                           canonical_mbid="rel-1")
+        if albums:
+            g.update(albums=[{"id": "al1"}], canonical_album_id="al1")
+        g["missing_tracks"] = [{"mbid": "m1", "title": "One", "decision": "pending"},
+                               {"mbid": "m2", "title": "Two", "decision": "pending"}]
+        return g
+
+    def _rows(self):
+        with bot._review_lock:
+            return sorted((g["id"], bot._review_group_origin(g), bool(g.get("hidden")),
+                           tuple(t["title"] for t in g.get("missing_tracks", [])))
+                          for g in bot._review_state["groups"])
+
+    def _scan(self, path, group):
+        if path == "union":
+            bot._union_review_groups([group], group["origin"])
+        else:
+            bot._replace_review_groups(group["origin"], [group], "x")
+
+    def test_the_real_group_reclaims_the_zombies_id_visibly(self):
+        for path in ("union", "replace"):
+            with self.subTest(path=path), isolated_review():
+                with bot._review_lock:
+                    bot._review_state["groups"] = [self._zombie()]
+                self._scan(path, self._real("rg1"))
+                self.assertEqual(self._rows(),
+                                 [("rg1", "library", False, ("One", "Two"))])
+
+    def test_a_zombie_never_absorbs_or_hides_an_album_by_identity(self):
+        """Same album under another id (the release drifted, or another
+        origin): folding into the hidden zombie hid the album, and the zombie's
+        tracks folded into the real row would list a placed track as missing."""
+        for path, origin, albums in (("union", "library", True),
+                                     ("replace", "library", True),
+                                     ("replace", "playlist", False)):
+            with self.subTest(path=path, origin=origin), isolated_review():
+                with bot._review_lock:
+                    bot._review_state["groups"] = [self._zombie()]
+                self._scan(path, self._real("rg2", origin, albums))
+                self.assertEqual(self._rows(),
+                                 [("rg1", "repair", True, ("One",)),
+                                  ("rg2", origin, False, ("One", "Two"))])
+
+    def test_a_hidden_real_group_stays_hidden(self):
+        """The control: only a zombie's `hidden` is not the user's statement."""
+        for path in ("union", "replace"):
+            with self.subTest(path=path), isolated_review():
+                hidden = self._real("rg1")
+                hidden["hidden"] = True
+                with bot._review_lock:
+                    bot._review_state["groups"] = [hidden]
+                self._scan(path, self._real("rg1"))
+                self.assertEqual(self._rows(),
+                                 [("rg1", "library", True, ("One", "Two"))])
 
 if __name__ == "__main__":
     unittest.main()

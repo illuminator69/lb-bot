@@ -19,6 +19,7 @@ Features:
 
 import re
 import os
+import glob
 import json
 import time
 import hashlib
@@ -152,7 +153,6 @@ LB_BOT_TRASH_DIR = os.environ.get(
     "LB_BOT_TRASH_DIR", os.path.join(MUSIC_LIBRARY_PATH, ".lb-bot-trash"))
 FUZZY_DUPLICATES_DEFAULT = os.environ.get(
     "LB_BOT_FUZZY_DUPES", "0").lower() in ("1", "true", "yes")
-LB_BOT_REPAIR_JOBS = os.environ.get("LB_BOT_REPAIR_JOBS", "1").lower() not in ("0", "false", "no")
 # Optional: the navi-connect hub, told when an album lands so its clients can
 # refresh a page they already have open. Purely a nicety — every client re-reads
 # the index on its own soon enough — so an unset URL, a wrong token or a hub that
@@ -365,8 +365,10 @@ _pending_album:       dict = {}
 _albums:              dict = {}
 # pickid -> {recid, kind: 'release'|'art', candidates:[...]}  (Adjust sub-pickers)
 _pending_pick:        dict = {}
-# job_id -> durable repair state. Album Review is a projection over these jobs.
-repair_jobs:          dict = {}
+# The retired repair-job pipeline's `repair_jobs` (B-022), exactly as the state
+# file had it, or None when it had none. Nothing reads it; it is only written
+# back unchanged, so the previous release still finds its jobs on a rollback.
+_retired_repair_jobs = None
 
 _uid_to_token   = {}   # uid -> token
 _uid_to_playlist = {}  # uid -> playlist_name
@@ -516,6 +518,66 @@ def _atomic_json_write(path: str, snapshot, *, indent=None,
                 except FileNotFoundError:
                     pass
 
+# Age (seconds) before a leftover `_atomic_json_write` temp file is swept at
+# startup. Never zero: a fresh temp file may belong to another writer that is
+# mid-write right now (see _sweep_orphaned_state_tmp_files).
+STATE_TMP_SWEEP_MIN_AGE = 24 * 3600  # 1 day
+
+def _sweep_orphaned_state_tmp_files(paths=None,
+                                    min_age: float = STATE_TMP_SWEEP_MIN_AGE) -> None:
+    """Remove leftover `_atomic_json_write` temp files at startup (B-028).
+
+    `_atomic_json_write`'s own `finally` already unlinks its temp file on any
+    *Python* exception in the write or the replace — that path was already
+    covered. What it cannot cover is the process ending between the
+    `tempfile.NamedTemporaryFile` call and that `finally`: an OOM kill, a
+    `docker stop` that outran its grace period, a power cut. Nothing running
+    inside the process can guard against that, and nothing else ever revisits
+    the file afterwards, so it sits forever — on the NAS, five of them
+    (Aug 5 - Sep 22, up to 23 MB each) under `.lb_bot_state.json.*.tmp`.
+
+    Every `_atomic_json_write` caller names its own file with the same shape,
+    `.<basename>.<random>.tmp` in the target's own directory, so the sweep
+    just needs each file's final path (`STATE_FILE`, `REVIEW_FILE`,
+    `MBZ_CACHE_FILE` by default, since all three go through the shared
+    helper) to build its temp-file glob. `min_age` protects a temp file that
+    is mid-write right now: the age is the file's own mtime, not a guess.
+    """
+    removed_count = 0
+    removed_bytes = 0
+    now = time.time()
+    seen_patterns = set()
+    for path in paths if paths is not None else (STATE_FILE, REVIEW_FILE, MBZ_CACHE_FILE):
+        if not path:
+            continue
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        # Escaped: a `[` in the directory or the name is a character class to
+        # glob, which matched nothing — or another file's temps.
+        pattern = os.path.join(glob.escape(parent),
+                               f".{glob.escape(os.path.basename(path))}.*.tmp")
+        if pattern in seen_patterns:
+            continue
+        seen_patterns.add(pattern)
+        for fn in glob.glob(pattern):
+            try:
+                st = os.stat(fn)
+            except FileNotFoundError:
+                continue
+            if now - st.st_mtime < min_age:
+                continue  # too fresh — another writer may be mid-write
+            try:
+                os.unlink(fn)
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"  state tmp sweep: could not remove {fn}: {e}")
+                continue
+            removed_count += 1
+            removed_bytes += st.st_size
+    if removed_count:
+        print(f"  state tmp sweep: removed {removed_count} orphaned temp "
+              f"file(s), {removed_bytes} byte(s)")
+
 def _save_state_unlocked() -> None:
     """Write durable state to STATE_FILE. Called periodically and on shutdown."""
     try:
@@ -535,7 +597,6 @@ def _save_state_unlocked() -> None:
             "pending_album":        _pending_album,
             "albums":               _albums,
             "pending_pick":         _pending_pick,
-            "repair_jobs":          repair_jobs,
             "imported_folders":     sorted(_imported_folders),
             "dismissed_folders":    sorted(_dismissed_folders),
             "folder_identity":      _folder_identity,
@@ -552,6 +613,8 @@ def _save_state_unlocked() -> None:
             # tuple-keyed dict -> list of [ [username, filename], value ]
             "pending_downloads":    [[list(k), v] for k, v in pending_downloads.items()],
         }
+        if _retired_repair_jobs is not None:
+            snapshot["repair_jobs"] = _retired_repair_jobs
         _atomic_json_write(STATE_FILE, snapshot)
     except Exception as e:
         print(f"  state save failed: {e}")
@@ -599,7 +662,7 @@ def _save_state() -> None:
 
 def _load_state() -> None:
     """Restore state from STATE_FILE if present. Safe to call once at startup."""
-    global _uid_counter, _mbz_cache_rev
+    global _uid_counter, _mbz_cache_rev, _retired_repair_jobs
     # Before the early return below: the MB cache is a separate file now, and a
     # bot whose volatile state file is missing (fresh install, wiped appdata)
     # should still keep the entity lookups it already paid for.
@@ -627,7 +690,8 @@ def _load_state() -> None:
     _pending_album.update(s.get("pending_album", {}))
     _albums.update(s.get("albums", {}))
     _pending_pick.update(s.get("pending_pick", {}))
-    repair_jobs.update(s.get("repair_jobs", {}))
+    # Loaded and ignored — carried for the rollback (see _retired_repair_jobs).
+    _retired_repair_jobs = s.get("repair_jobs")
     _imported_folders.update(s.get("imported_folders", []))
     _dismissed_folders.update(s.get("dismissed_folders", []))
     _folder_identity.update(s.get("folder_identity", {}))
@@ -685,6 +749,10 @@ _LOG_PROGRESS_PREFIXES = ("checking", "incomplete:", "album group:",
 # Werkzeug's access log goes to stderr: one line per request, i.e. several per
 # second from the SPA's polls. It would evict everything else in the ring.
 _LOG_ACCESS_RE = re.compile(r'"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ HTTP/[\d.]+" \d{3}')
+# Some libraries (Werkzeug's reloader, colored subprocess output) write ANSI
+# colour codes straight to stdout/stderr. The Logs view renders `msg` as plain
+# text, so an unstripped code showed up as a literal `\x1b[32m` in the UI.
+_LOG_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 def _log_severity(text: str, src: str) -> str:
     low = text.lower()
@@ -772,7 +840,7 @@ class _LogTee:
             if getattr(_tee_suppress, "on", False):
                 return n
             for line in lines:
-                text = line.strip()
+                text = _LOG_ANSI_RE.sub("", line).strip()
                 if not text:
                     continue
                 if self._src == "stderr" and _LOG_ACCESS_RE.search(text):
@@ -980,6 +1048,68 @@ def _load_review_state() -> None:
         print(f"  review state restored ({n_groups} group(s), "
               f"{n_dups} duplicate group(s))")
 
+_RETIRED_REPAIR_GROUPS_MIGRATION = "b022_hide_repair_groups"
+
+def _hide_retired_repair_groups() -> int:
+    """Hide, once, the review groups the retired repair-job pipeline left behind.
+
+    Until B-022 `_merge_review_groups` turned every active repair job whose group
+    a scan no longer listed into a group of origin `repair`: no albums, no
+    sources, tracks stuck on `downloaded`, nothing that could ever clear them
+    (58 on the NAS). Nothing creates them any more. They are hidden rather than
+    deleted: unhide is one tap in Fill gaps (`/api/gaps?hidden=1`), and their
+    files are still in /downloads, reachable from Placement.
+
+    Runs after `_load_review_state`, on the live groups, through the ordinary
+    flush — the row's `hidden` column is derived from the payload, which is what
+    a load reads back, so both must say it. The `migrations` row is written only
+    once the rows landed (the same order as the JSON-to-SQLite import): a failed
+    flush leaves no row, and the next start tries again. After that it never
+    runs again, so a group the user unhides stays unhidden. Returns the number
+    of groups hidden, logged with the count; 0 on a review with none.
+    """
+    try:
+        with _index_lock:
+            done = _index_db().execute(
+                "SELECT 1 FROM migrations WHERE name = ?",
+                (_RETIRED_REPAIR_GROUPS_MIGRATION,)).fetchone()
+    except Exception as e:
+        print(f"  migration {_RETIRED_REPAIR_GROUPS_MIGRATION}: skipped, "
+              f"index unavailable: {e}")
+        return 0
+    if done:
+        return 0
+    with _review_lock:
+        targets = [g for g in _review_state.get("groups") or []
+                   if _review_group_origin(g) == "repair" and not g.get("hidden")]
+        for group in targets:
+            group["hidden"] = True
+    _mark_review_groups_dirty(targets)
+    _review_flush_groups()
+    ids = {g.get("id") for g in targets}
+    with _review_lock:
+        unwritten = ids & _review_dirty_groups
+    if unwritten:
+        print(f"  migration {_RETIRED_REPAIR_GROUPS_MIGRATION}: {len(unwritten)} "
+              f"group(s) not written; will retry at the next start")
+        return 0
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute(
+                "INSERT OR IGNORE INTO migrations (name, applied_at, detail) "
+                "VALUES (?, ?, ?)",
+                (_RETIRED_REPAIR_GROUPS_MIGRATION, time.time(),
+                 json.dumps({"hidden": len(targets)})))
+            conn.commit()
+    except Exception as e:
+        print(f"  migration {_RETIRED_REPAIR_GROUPS_MIGRATION}: hid {len(targets)} "
+              f"group(s) but could not record it ({e}); the next start re-checks")
+        return len(targets)
+    print(f"  migration {_RETIRED_REPAIR_GROUPS_MIGRATION}: hid {len(targets)} "
+          f"retired repair-origin review group(s)")
+    return len(targets)
+
 def _review_flush_groups() -> None:
     """Write the groups marked since the last flush to library_index.db.
 
@@ -1112,6 +1242,39 @@ def _flush_all_state(reason: str = "") -> None:
     if reason:
         print(f"  state flushed ({reason})")
 
+# How long a stop signal waits for the flush before exiting anyway — inside
+# `docker stop`'s 10 s grace, so a stuck flush still ends in our exit, not a SIGKILL.
+SHUTDOWN_FLUSH_TIMEOUT = 8.0
+
+def _on_shutdown_signal(signum, _frame) -> None:
+    """SIGTERM/SIGINT: flush, then exit — explicitly.
+
+    It used to restore SIG_DFL and re-raise the signal. In the container this
+    process is PID 1, and the kernel drops a default-action signal sent to PID 1,
+    so the re-raise did nothing: the handler returned, the bot kept running, and
+    every `docker stop` waited out its 10 s and ended in SIGKILL (exit 137) — a
+    hard kill that could land mid-write (B-032; B-028's orphaned temp files).
+
+    The flush runs on a helper thread because the signal interrupts the main
+    thread wherever it is — possibly holding `_state_save_lock` or `_index_lock`,
+    which the flush takes; waiting on it from here would deadlock. `os._exit`
+    rather than `sys.exit`: interpreter teardown joins the executor's workers, and
+    a long scan in one would stall the stop into the SIGKILL again. It skips only
+    atexit's `_flush_all_state`, which has just run.
+    """
+    flusher = threading.Thread(target=_flush_all_state, args=(f"signal {signum}",),
+                               name="shutdown-flush", daemon=True)
+    flusher.start()
+    flusher.join(SHUTDOWN_FLUSH_TIMEOUT)
+    if flusher.is_alive():
+        print(f"  state flush still running after {SHUTDOWN_FLUSH_TIMEOUT:.0f}s — exiting anyway")
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(0)
+
 def _install_shutdown_flush() -> None:
     """Flush coalesced state on the ways this process actually dies.
 
@@ -1125,16 +1288,11 @@ def _install_shutdown_flush() -> None:
     import signal
     atexit.register(_flush_all_state)
 
-    def _on_signal(signum, _frame):
-        _flush_all_state(f"signal {signum}")
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-
     for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
         if sig is None:
             continue
         try:
-            signal.signal(sig, _on_signal)
+            signal.signal(sig, _on_shutdown_signal)
         except (ValueError, OSError):
             # Not the main thread, or the platform refuses it — atexit still covers
             # the ordinary exit path.
@@ -1337,10 +1495,11 @@ def _review_list_snapshot() -> dict:
             # item, and `albums` only for truthiness.
             row["missing_tracks"] = [
                 {"decision": t.get("decision", "pending"),
-                 # Only a downloaded track's age is read (_downloaded_is_stale).
-                 **({"downloaded_at": t["downloaded_at"]}
-                    if t.get("decision") == "downloaded" and t.get("downloaded_at")
-                    else {})}
+                 # Only a downloaded track's age and placement miss are read
+                 # (_downloaded_is_stale).
+                 **({k: t[k] for k in ("downloaded_at", "placement_missed_at")
+                     if t.get(k)}
+                    if t.get("decision") == "downloaded" else {})}
                 for t in (group.get("missing_tracks") or [])]
             # Read by _suggest_review_group_for_folder, which the needs-placement
             # view runs on every summary poll. Not columns of review_groups.
@@ -1370,38 +1529,11 @@ def _review_list_snapshot() -> dict:
         scope.__dict__["_lb_review_list_snap"] = snap
     return snap
 
-REPAIR_JOB_ACTIVE_STATUSES = {
-    "needs_review", "needs_source", "source_selected", "downloading",
-    "downloaded_unmatched", "matching", "matched_ready_to_import", "staging",
-    "importing", "imported_unverified", "verifying", "blocked_no_source",
-    "blocked_no_match", "blocked_ambiguous_files", "blocked_slskd_error",
-    "blocked_slskd_timeout", "blocked_permission",
-}
-
-def _find_repair_job(job_id: str) -> dict | None:
-    return repair_jobs.get(job_id)
-
-def _repair_job_for_group(group_id: str) -> dict | None:
-    for job in repair_jobs.values():
-        if job.get("group_id") == group_id and job.get("status") != "archived":
-            return job
-    return None
-
-def _save_repair_jobs() -> None:
-    _save_state()
-
-def _repair_job_touch(job: dict, message=None) -> dict:
-    now = time.time()
-    job["updated_at"] = now
-    if message:
-        msg = message if isinstance(message, dict) else {"kind": "info", "message": str(message)}
-        msg.setdefault("ts", now)
-        if msg.get("message"):
-            msg["message"] = _redact_secrets(msg["message"])
-        job.setdefault("messages", []).append(msg)
-    return job
-
-def _repair_track_id(group_id: str, idx: int, track: dict) -> str:
+def _review_track_id(group_id: str, idx: int, track: dict) -> str:
+    """A stable id for one tracklist row of a group: `track_id` on
+    `_canonical_tracklist_from_group`'s rows. (It was `_repair_track_id`, the
+    repair-job pipeline's track key, before B-022 retired the pipeline; the
+    hash is unchanged, so ids already handed out still match.)"""
     raw = "|".join([
         group_id or "",
         str(track.get("mbid", "") or track.get("recording_mbid", "")),
@@ -1409,45 +1541,6 @@ def _repair_track_id(group_id: str, idx: int, track: dict) -> str:
         track.get("title", ""),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-def _repair_track_status_from_decision(decision: str) -> str:
-    return {
-        "pending": "missing",
-        "approved": "approved",
-        "source_pending": "approved",
-        "queued": "queued",
-        "downloading": "downloading",
-        "downloaded": "downloaded",
-        "failed": "download_error",
-        "cancelled": "cancelled",
-        "skipped": "skipped",
-        "needs_match": "downloaded",
-        "placed": "moved",
-        "verified": "navidrome_verified",
-    }.get(decision or "pending", decision or "missing")
-
-def _review_decision_from_repair_track(status: str) -> str:
-    return {
-        "missing": "pending",
-        "approved": "approved",
-        "queued": "queued",
-        "downloading": "downloading",
-        "downloaded": "downloaded",
-        "download_error": "failed",
-        "download_timeout": "failed",
-        "cancelled": "cancelled",
-        "file_matched": "downloaded",
-        "match_ambiguous": "failed",
-        "match_missing": "failed",
-        "staged": "downloaded",
-        "tagged": "downloaded",
-        "moved": "placed",
-        "navidrome_pending": "placed",
-        "navidrome_verified": "verified",
-        "deferred": "pending",
-        "skipped": "skipped",
-        "error": "failed",
-    }.get(status or "missing", "pending")
 
 def _canonical_album_for_group(group: dict) -> dict:
     return next((a for a in group.get("albums", [])
@@ -1466,7 +1559,7 @@ def _canonical_tracklist_from_group(group: dict) -> list:
             continue
         seen.add(key)
         rows.append({
-            "track_id": _repair_track_id(group.get("id", ""), idx, {
+            "track_id": _review_track_id(group.get("id", ""), idx, {
                 "mbid": mbid, "title": title, "position": idx + 1}),
             "recording_mbid": mbid,
             "title": title,
@@ -1482,7 +1575,7 @@ def _canonical_tracklist_from_group(group: dict) -> list:
             continue
         seen.add(key)
         rows.append({
-            "track_id": _repair_track_id(group.get("id", ""), idx, track),
+            "track_id": _review_track_id(group.get("id", ""), idx, track),
             "recording_mbid": mbid,
             "title": title,
             "artist": track.get("artist", "") or group.get("artist", ""),
@@ -1491,185 +1584,14 @@ def _canonical_tracklist_from_group(group: dict) -> list:
         })
     return rows
 
-def _repair_job_track_from_group(group: dict, idx: int, track: dict,
-                                 previous: dict = None) -> dict:
-    previous = previous or {}
-    decision = track.get("decision", "pending")
-    # A re-approved track must shed its old failure: keeping the previous status
-    # left it stuck at download_error/timeout, which then projected straight back
-    # over the fresh "approved" decision and made the retry look already-failed.
-    if decision in ("approved", "source_pending", "pending"):
-        status = _repair_track_status_from_decision(decision)
-        track.pop("download_error", None)
-        track.pop("download_timeout", None)
-        previous = {k: v for k, v in previous.items() if k not in ("error",)}
-    else:
-        status = previous.get("status") or _repair_track_status_from_decision(decision)
-    row = {
-        "id": previous.get("id") or _repair_track_id(group.get("id", ""), idx, track),
-        "group_track_index": idx,
-        "recording_mbid": track.get("mbid", "") or previous.get("recording_mbid", ""),
-        "artist": track.get("artist", "") or group.get("artist", ""),
-        "title": track.get("title", ""),
-        "position": track.get("position", idx + 1),
-        "duration": track.get("duration", previous.get("duration", 0)),
-        "status": status,
-        "source_user": track.get("source_user", previous.get("source_user", "")),
-        "source_folder": track.get("source_folder", previous.get("source_folder", "")),
-        "local_path": track.get("local_path", previous.get("local_path", "")),
-        "error": track.get("error") or track.get("download_error") or previous.get("error", ""),
-        "updated_at": previous.get("updated_at", time.time()),
-    }
-    for key in ("download_percent", "download_state", "filename", "matched_relpath"):
-        if track.get(key) is not None or previous.get(key) is not None:
-            row[key] = track.get(key, previous.get(key))
-    return row
-
-def _repair_job_status_from_tracks(job: dict) -> str:
-    statuses = [t.get("status", "missing") for t in job.get("tracks", [])]
-    if not statuses:
-        return "needs_review"
-    if any(s == "match_ambiguous" for s in statuses):
-        return "blocked_ambiguous_files"
-    if any(s == "match_missing" for s in statuses):
-        return "blocked_no_match"
-    if any(s == "download_timeout" for s in statuses):
-        return "blocked_slskd_timeout"
-    if any(s == "download_error" for s in statuses):
-        return "blocked_slskd_error"
-    if any(s == "cancelled" for s in statuses):
-        return "cancelled"
-    if all(s in ("moved", "navidrome_pending", "navidrome_verified",
-                 "skipped", "deferred") for s in statuses):
-        return ("verified_complete"
-                if all(s in ("navidrome_verified", "skipped", "deferred")
-                       for s in statuses) else "placed")
-    if all(s in ("file_matched", "staged", "skipped", "deferred") for s in statuses):
-        return "matched_ready_to_import"
-    if any(s == "downloaded" for s in statuses):
-        return "downloaded_unmatched"
-    if any(s == "downloading" for s in statuses):
-        return "downloading"
-    if any(s == "queued" for s in statuses):
-        return "downloading"
-    if any(s == "approved" for s in statuses):
-        return "needs_source"
-    return "needs_review"
-
-def _create_or_update_repair_job_from_group(group: dict, approved_tracks=None) -> dict:
-    if not LB_BOT_REPAIR_JOBS or not group:
-        return {}
-    now = time.time()
-    job = _repair_job_for_group(group.get("id", ""))
-    if not job:
-        job_id = _uid("job")
-        job = {
-            "id": job_id,
-            "group_id": group.get("id", ""),
-            "artist": group.get("artist", ""),
-            "album": group.get("album", ""),
-            "canonical_album_id": group.get("canonical_album_id", ""),
-            "canonical_release_mbid": group.get("canonical_mbid", ""),
-            "canonical_release_group_mbid": "",
-            "canonical_tracklist": [],
-            "status": "needs_review",
-            "tracks": [],
-            "downloads": [],
-            "source_pools": [],
-            "file_matches": [],
-            "import_attempts": [],
-            "verification": {},
-            "messages": [],
-            "created_at": now,
-            "updated_at": now,
-        }
-        repair_jobs[job_id] = job
-        _repair_job_touch(job, {"kind": "created", "message": "Repair job created"})
-    old_release = job.get("canonical_release_mbid", "")
-    new_release = group.get("canonical_mbid", "")
-    if old_release and new_release and old_release != new_release:
-        _repair_job_touch(job, {
-            "kind": "canonical_release_changed",
-            "message": f"Canonical release changed from {old_release} to {new_release}",
-            "from": old_release,
-            "to": new_release,
-        })
-    job.update({
-        "group_id": group.get("id", job.get("group_id", "")),
-        "artist": group.get("artist", job.get("artist", "")),
-        "album": group.get("album", job.get("album", "")),
-        "canonical_album_id": group.get("canonical_album_id", job.get("canonical_album_id", "")),
-        "canonical_release_mbid": new_release or job.get("canonical_release_mbid", ""),
-        "canonical_tracklist": _canonical_tracklist_from_group(group),
-    })
-    previous = {t.get("id"): t for t in job.get("tracks", [])}
-    approved_keys = None
-    if approved_tracks is not None:
-        approved_keys = {
-            (t.get("mbid") or t.get("recording_mbid", ""), t.get("title", ""))
-            for t in approved_tracks
-        }
-    tracks = []
-    for idx, track in enumerate(group.get("missing_tracks", []) or []):
-        tid = _repair_track_id(group.get("id", ""), idx, track)
-        row = _repair_job_track_from_group(group, idx, track, previous.get(tid))
-        if approved_keys and (row.get("recording_mbid", ""), row.get("title", "")) in approved_keys:
-            if row["status"] == "missing":
-                row["status"] = "approved"
-        tracks.append(row)
-        track["repair_job_id"] = job["id"]
-        track["repair_track_id"] = row["id"]
-    job["tracks"] = tracks
-    if job.get("status") not in ("archived", "verified_complete"):
-        job["status"] = _repair_job_status_from_tracks(job)
-    _repair_job_touch(job)
-    return job
-
 def _stamp_downloaded(track: dict, previous_decision: str, at: float | None = None) -> None:
     """Record when a track *entered* "downloaded". Only the transition counts:
     _downloaded_is_stale reads this stamp, and re-marking a track that already
-    sat there (a reconcile pass, a projection) is not progress — stamping it
+    sat there (a reconcile pass) is not progress — stamping it
     made a stuck album read "working" again for another half hour each time."""
     if track.get("decision") == "downloaded" and (
             previous_decision != "downloaded" or not track.get("downloaded_at")):
         track["downloaded_at"] = at or time.time()
-
-def _apply_repair_job_projection_to_group(group: dict) -> dict:
-    if not LB_BOT_REPAIR_JOBS or not group:
-        return group
-    job = _repair_job_for_group(group.get("id", ""))
-    if not job:
-        return group
-    group["repair_job_id"] = job.get("id", "")
-    group["repair_status"] = job.get("status", "")
-    by_id = {t.get("id"): t for t in job.get("tracks", [])}
-    by_key = {(t.get("recording_mbid", ""), t.get("title", "")): t
-              for t in job.get("tracks", [])}
-    for idx, track in enumerate(group.get("missing_tracks", []) or []):
-        tid = track.get("repair_track_id") or _repair_track_id(group.get("id", ""), idx, track)
-        jt = by_id.get(tid) or by_key.get((track.get("mbid", ""), track.get("title", "")))
-        if not jt:
-            continue
-        track["repair_job_id"] = job.get("id", "")
-        track["repair_track_id"] = jt.get("id", "")
-        projected = _review_decision_from_repair_track(jt.get("status", "missing"))
-        # One-directional: a track the user has just re-approved is a *newer*
-        # statement than the job row it was built from, and overwriting it with
-        # the job's stale "failed" was what made a failed track un-retryable —
-        # every re-approve was undone by the next projection pass.
-        if track.get("decision") in ("approved", "source_pending"):
-            projected = track["decision"]
-            track.pop("download_error", None)
-        previous_decision = track.get("decision", "")
-        track["decision"] = projected
-        _stamp_downloaded(track, previous_decision, jt.get("updated_at"))
-        for key in ("local_path", "source_user", "source_folder", "download_percent",
-                    "download_state", "filename", "matched_relpath"):
-            if jt.get(key):
-                track[key] = jt[key]
-        if jt.get("error") and projected not in ("approved", "source_pending"):
-            track["download_error"] = jt["error"]
-    return group
 
 def _placement_outcomes(result: dict) -> dict:
     """Index a _deterministic_album_import result's per_file rows by the track
@@ -1697,9 +1619,7 @@ def _placement_outcomes(result: dict) -> dict:
 def _mark_group_tracks_placed(group: dict, result: dict = None) -> int:
     """
     After a deterministic import, advance in-flight track decisions so the group
-    stops reporting as downloading. The repair-job track statuses advance too —
-    otherwise _apply_repair_job_projection_to_group would overwrite the decision
-    back to "downloaded" on the next refresh.
+    stops reporting as downloading.
 
     When the import `result` is supplied, each track is marked from its own
     per_file outcome; tracks that were ambiguous, unmatched or failed to move
@@ -1709,11 +1629,10 @@ def _mark_group_tracks_placed(group: dict, result: dict = None) -> int:
     """
     if not group:
         return 0
-    job = _repair_job_for_group(group.get("id", "")) if LB_BOT_REPAIR_JOBS else None
     outcomes = _placement_outcomes(result) if result else None
     flipped = 0
     failed_tracks = 0
-    for idx, track in enumerate(group.get("missing_tracks", []) or []):
+    for track in group.get("missing_tracks", []) or []:
         if track.get("decision") not in ("downloaded", "needs_match"):
             continue
         placed, reason = True, ""
@@ -1738,36 +1657,17 @@ def _mark_group_tracks_placed(group: dict, result: dict = None) -> int:
                 track.pop("can_force_place", None)
                 track.pop("force_place_conflict", None)
             failed_tracks += 1
-            if job:
-                tid = track.get("repair_track_id") or _repair_track_id(
-                    group.get("id", ""), idx, track)
-                jt = _repair_track_by_id(job, tid)
-                if jt:
-                    jt["status"] = _repair_track_status_from_decision("failed")
-                    jt["error"] = track["download_error"]
-                    jt["updated_at"] = time.time()
             continue
         track["decision"] = "placed"
         track["imported_at"] = time.time()
         track.pop("download_error", None)
         flipped += 1
-        if job:
-            tid = track.get("repair_track_id") or _repair_track_id(
-                group.get("id", ""), idx, track)
-            jt = _repair_track_by_id(job, tid)
-            if jt:
-                jt["status"] = "moved"
-                jt["updated_at"] = time.time()
     if failed_tracks:
         print(f"  placement: {failed_tracks} track(s) in group "
               f"{group.get('id', '')} did not land in the library")
     if flipped:
         group["status"] = "placed"
         group["updated_at"] = time.time()
-        if job:
-            job["status"] = _repair_job_status_from_tracks(job)
-            _repair_job_touch(job, {"kind": "placed",
-                                    "message": f"Placed {flipped} track(s) into library"})
     # The album is in the library — its transfer rows are done regardless of
     # whether the download watcher ever observed slskd finishing (it misses
     # completions after restarts or when slskd's history was cleared, which
@@ -1776,6 +1676,230 @@ def _mark_group_tracks_placed(group: dict, result: dict = None) -> int:
     if flipped:
         _start_placement_verification(group.get("id", ""))
     return flipped
+
+def _is_loose_tracks_group(group: dict | None) -> bool:
+    """A playlist or Spotify scan's "Loose tracks" group: the `solo_tracks` of
+    `group_missing_by_album`, i.e. tracks with no recording MBID or one that
+    MusicBrainz puts on no release. Each row is its own download and its own
+    placement, so nothing that happens to one row says anything about another."""
+    return (group or {}).get("group_type") == "tracks"
+
+def _download_folder_of(path: str) -> str:
+    """The download folder holding `path` — the immediate subdirectory of
+    SLSKD_DOWNLOAD_DIR, spelled as `_list_download_folders` spells it, because
+    that is the path "Pick the release" is routed by. "" when outside one."""
+    if not path:
+        return ""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(SLSKD_DOWNLOAD_DIR))
+    parts = rel.split(os.sep)
+    if len(parts) < 2 or parts[0] in ("", ".", ".."):
+        return ""
+    return os.path.join(SLSKD_DOWNLOAD_DIR, parts[0])
+
+def _link_loose_track_placements(album_dir, result: dict) -> int:
+    """Move the Loose-tracks rows whose downloaded file this placement handled.
+
+    `_mark_group_tracks_placed` is the album path's version and the wrong tool
+    here: it judges every in-flight row of one group against one result, and a
+    Loose-tracks group is a dozen unrelated downloads — filing one folder marked
+    all the others failed, "not included in placement result". A loose row is
+    linked by its file instead: `local_path` is where the poller recorded it
+    landing, and `per_file` names every file the import touched. So a folder
+    filed through "Pick the release", which sends no group id, moves exactly the
+    rows it filed (B-017).
+
+    A refused file keeps its decision — it is still in /downloads, and picking a
+    release is still the fix — and the row says why.
+
+    A placed row records the slot it went into (`placed_title`,
+    `placed_recording_mbid`): the import rewrote the file's title and recording
+    MBID to the slot's, so the verifier has to look for those, not for the
+    playlist's spelling of the song (B-025).
+
+    A `bonus` file is never linked as placed. It matched no slot of the release
+    and was filed on its own tags with the release's album tags written over
+    them — which, for a loose track that happened to share a download folder
+    with the one the user picked a release for, is a misfile, and reading it as
+    `placed` (then `verified`, by artist and title) would hide it. But the file
+    is in the library now, so the row settles as `filed_extra` (`done` on the
+    wire) and names the release it went into, as words — never a path (ruling
+    R-A). Left `downloaded`, its `local_path` pointed at a moved file and the
+    next fetch re-approved it and downloaded it again.
+    """
+    if not album_dir or not isinstance(album_dir, str):
+        return 0
+    outcomes = {}
+    release = " – ".join(p for p in ((result or {}).get("artist", ""),
+                                     (result or {}).get("album", "")) if p)
+    for row in (result or {}).get("per_file", []) or []:
+        status = row.get("status", "")
+        # "unmatched" and "ambiguous" rows are about a tracklist slot, not a file.
+        if status not in ("matched", "bonus", "rejected") or not row.get("file"):
+            continue
+        path = os.path.normpath(os.path.join(album_dir, row["file"]))
+        if status == "matched":
+            outcomes[path] = ("placed", "", {
+                "placed_title": row.get("title", ""),
+                "placed_recording_mbid": row.get("recording_mbid", "")})
+        elif status == "bonus":
+            outcomes[path] = ("filed_extra",
+                              f"filed into {release or 'the library'} as an extra "
+                              f"track: it matched nothing on that release's "
+                              f"tracklist — check it in the library", {})
+        else:
+            outcomes[path] = ("", "placement refused: "
+                                  + (row.get("reason", "") or status), {})
+    if not outcomes:
+        return 0
+    hits = []
+    with _review_lock:
+        for group in _review_state.get("groups", []) or []:
+            if not _is_loose_tracks_group(group):
+                continue
+            for idx, track in enumerate(group.get("missing_tracks", []) or []):
+                local = track.get("local_path", "")
+                if not local or track.get("decision") not in (
+                        "downloaded", "needs_match", "failed"):
+                    continue
+                hit = outcomes.get(os.path.normpath(local))
+                if hit:
+                    hits.append((group.get("id", ""), idx, track.get("decision"),
+                                 _rescan_track_key(track), hit))
+    # Written after the lock is released, so each write names its row by key
+    # too: a rescan in between moves rows (B-022 final review I1).
+    placed_groups = []
+    for gid, idx, decision, key, (settled, reason, slot) in hits:
+        if settled == "placed":
+            _set_review_track_state(gid, idx, "placed", expect_key=key,
+                                    imported_at=time.time(),
+                                    download_error="", **slot)
+            if gid not in placed_groups:
+                placed_groups.append(gid)
+        elif settled:
+            _set_review_track_state(gid, idx, settled, expect_key=key,
+                                    imported_at=time.time(),
+                                    download_error=reason)
+        else:
+            _set_review_track_state(gid, idx, decision, expect_key=key,
+                                    download_error=reason)
+    for gid in placed_groups:
+        _start_placement_verification(gid)
+    if hits:
+        print(f"  placement: linked {len(hits)} loose track(s) to "
+              f"{os.path.basename(album_dir)}")
+        _save_review_state()
+    return len(hits)
+
+def _placement_missed(track: dict) -> bool:
+    """True when auto-placement already ran on this row's current download and
+    missed (B-025): the row is not waiting on anything, so it counts as stalled
+    at once rather than after DOWNLOADED_STALE_SECS. A miss stamped before the
+    row last *entered* `downloaded` was about an earlier download."""
+    missed = float(track.get("placement_missed_at") or 0)
+    return bool(missed) and missed >= float(track.get("downloaded_at") or 0)
+
+def _loose_place_miss(group_id: str, track_index, reason: str,
+                      expect_key=None, **fields) -> str:
+    """Leave the row `downloaded` with why, and stamp the miss. The transfer
+    that carried `track_index` is gone from the registry by now, so a rescan
+    during the placement re-pointed nothing: `expect_key` finds the row.
+    `fields` are written with it."""
+    _set_review_track_state(group_id, track_index, "downloaded",
+                            expect_key=expect_key,
+                            download_error=reason, placement_missed_at=time.time(),
+                            **fields)
+    return ""
+
+def _loose_place_crashed(group_id: str, track_index, local_path: str,
+                         exc: Exception, expect_key=None) -> None:
+    """`_auto_place_loose_track` raised: still a miss, said as one (Q-026). The
+    row used to keep no reason and no miss stamp, so it read as in progress for
+    DOWNLOADED_STALE_SECS. The import may already have moved the file before
+    the raise (Q-017(f)); then `local_path` points at nothing and is blanked,
+    and the reason says the file moved without being linked — "Pick the
+    release" has no file left in /downloads to pick."""
+    name = type(exc).__name__
+    if os.path.isfile(local_path):
+        _loose_place_miss(
+            group_id, track_index,
+            f"not filed: auto-placement failed ({name}) — use Pick the release",
+            expect_key=expect_key)
+    else:
+        _loose_place_miss(
+            group_id, track_index,
+            f"not filed: auto-placement failed ({name}) after the file was "
+            f"moved — it was not linked to this row",
+            expect_key=expect_key, local_path="")
+
+def _auto_place_loose_track(local_path: str, group_id: str, track_index,
+                            expect_key=None) -> str:
+    """File a finished Loose-tracks download under the release its own tags name.
+
+    The one automatic case for a track with no release on record (B-017). An
+    embedded `musicbrainz_albumid` is the file stating which release it came
+    off — the tier `_identify_download_folder` treats as unambiguous — and
+    nothing weaker is tried: a fuzzy tier, or `mbz_best_release`'s pick for the
+    recording, would create a one-track Artist/<Release> folder unattended on a
+    guess, often a compilation's. On a miss the file stays in /downloads, as it
+    always did, and the row says why, so "Pick the release" reads as the next
+    step rather than as a mystery.
+
+    Only for a Loose-tracks row: an album gap's hand-picked or rescued file
+    takes the same poller branch, and belongs to that album's own placement.
+    Returns "filed" when the file landed in a slot of its release, "extra" when
+    it matched no slot and was filed as an extra track, and "" when it was not
+    filed.
+    """
+    with _review_lock:
+        if not _is_loose_tracks_group(_find_review_group(group_id)):
+            return ""
+    tags = _audio_file_tags(local_path)
+    release_mbid = (tags.get("musicbrainz_albumid") or "").strip()
+    if not re.fullmatch(_UUID_RE, release_mbid):
+        return _loose_place_miss(
+            group_id, track_index,
+            "not filed: the file carries no single MusicBrainz "
+            "release tag to file it under — use Pick the release",
+            expect_key=expect_key)
+    release_mbid = release_mbid.lower()
+    # The destination folder and the album tags are built from these. Left
+    # empty, _deterministic_album_import fills them from a non-strict
+    # MusicBrainz fetch that answers {} on a 503 or inside a cooldown — and a
+    # file filed unattended into "Unknown Artist/Unknown Album" with blank album
+    # tags is the scatter placement exists to refuse. So: the file's own tags,
+    # as _identify_download_folder's tier 1 reads them, then a strict fetch for
+    # whatever they lack, and any failure is a miss.
+    artist = (tags.get("albumartist") or tags.get("artist") or "").strip()
+    album = (tags.get("album") or "").strip()
+    if not (artist and album):
+        try:
+            raw = mbz_get(f"release/{release_mbid}", {"inc": "artist-credits"},
+                          strict=True)
+            artist = artist or _artist_credit_str(raw.get("artist-credit", []))
+            album = album or (raw.get("title") or "")
+        except Exception as e:  # noqa: BLE001 — any failure is a miss
+            print(f"  loose track: release {release_mbid} lookup failed: {e}")
+    if not (artist and album):
+        return _loose_place_miss(
+            group_id, track_index,
+            "not filed: MusicBrainz didn't name the artist and album "
+            "of the file's tagged release — use Pick the release",
+            expect_key=expect_key)
+    album_dir = os.path.dirname(local_path)
+    result = _deterministic_album_import(album_dir, release_mbid, artist, album,
+                                         group_id=group_id,
+                                         only_relpaths=[os.path.basename(local_path)])
+    if result.get("ok"):
+        _link_loose_track_placements(album_dir, result)
+        # One file was imported, so a matched row anywhere in per_file is it.
+        return ("filed" if any(r.get("status") == "matched"
+                               for r in result.get("per_file") or [])
+                else "extra")
+    return _loose_place_miss(
+        group_id, track_index,
+        f"not filed under its tagged release: "
+        f"{result.get('error') or 'placement failed'} — use Pick the release",
+        expect_key=expect_key)
 
 # ---------------------------------------------------------------------------
 # Post-placement verification
@@ -1799,6 +1923,15 @@ def _placement_verify_delay(started: float) -> float:
     if time.time() - started < PLACEMENT_VERIFY_FAST_WINDOW:
         return PLACEMENT_VERIFY_FAST_INTERVAL
     return PLACEMENT_VERIFY_INTERVAL
+
+def _placement_verify_clock(started: float, outstanding: list) -> float:
+    """What the fast window counts from: the worker's start, or the newest
+    outstanding row's placement if that is later (Q-024). One worker runs per
+    group and a later placement joins it, so a row placed minutes in would
+    otherwise be polled at the slow cadence from the outset."""
+    newest = max((float((track or {}).get("imported_at") or 0)
+                  for _idx, track in outstanding or []), default=0.0)
+    return max(started, newest)
 
 def _nd_scanning(nd_user: str, nd_pass: str) -> bool:
     """True only when Navidrome positively says a scan is running.
@@ -1857,8 +1990,22 @@ def _announce_album_indexed(release_mbid: str, rgid: str, group_id: str,
 
 _placement_verifiers: set = set()
 _placement_verify_lock = threading.Lock()
+# How many resumed verification passes run at once after a restart (Q-024).
+# Every resumed group is registered in `_placement_verifiers` at once — that is
+# what keeps its placed rows across a rescan — but only this many poll
+# Navidrome at a time; the rest wait their turn. Placements made while the
+# process runs are not gated.
+PLACEMENT_VERIFY_RESUME_CONCURRENCY = 2
+_placement_resume_gate = threading.BoundedSemaphore(PLACEMENT_VERIFY_RESUME_CONCURRENCY)
 
-def _start_placement_verification(group_id: str) -> None:
+def _verify_placement_resumed(group_id: str) -> None:
+    """A resumed group's pass, taking its turn at `_placement_resume_gate`. It
+    stays registered while it waits: `_verify_placement_worker`'s own `finally`
+    is what lets go of the group."""
+    with _placement_resume_gate:
+        _verify_placement_worker(group_id)
+
+def _start_placement_verification(group_id: str, resumed: bool = False) -> None:
     """Kick off (at most one) background verification pass for a group."""
     if not group_id:
         return
@@ -1866,8 +2013,35 @@ def _start_placement_verification(group_id: str) -> None:
         if group_id in _placement_verifiers:
             return
         _placement_verifiers.add(group_id)
-    threading.Thread(target=_verify_placement_worker, args=(group_id,),
+    target = _verify_placement_resumed if resumed else _verify_placement_worker
+    threading.Thread(target=target, args=(group_id,),
                      name=f"verify-{group_id[:16]}", daemon=True).start()
+
+def _resume_placement_verification() -> int:
+    """Start a verifier for every group with `placed` rows; `main()` calls it
+    once the review is loaded, before anything can rescan (B-022 final review
+    I3). Returns how many were started.
+
+    A verifier is a thread, so a restart ends it, and only a placement starts
+    one. The repair-job projection used to put a placed row back after a
+    rescan; since B-022 `_inherited_decision` keeps one only while a verifier
+    watches its group — so the first rescan after a restart (a deploy, minutes
+    after a placement, is exactly this) reset every placed row the scan still
+    reported missing to `pending`, to be fetched again. Each resumed row gets
+    its window again from the worker's start (`_placement_verify_deadline`): a
+    row placed before the restart is verified if Navidrome has it, and reset by
+    the verifier itself if it still does not when the window closes — what the
+    lost verifier would have done."""
+    with _review_lock:
+        group_ids = [g.get("id", "") for g in _review_state.get("groups", []) or []
+                     if any(t.get("decision") == "placed"
+                            for t in g.get("missing_tracks") or [])]
+    for group_id in group_ids:
+        _start_placement_verification(group_id, resumed=True)
+    if group_ids:
+        print(f"  placement verify: resumed for {len(group_ids)} group(s) "
+              f"with placed tracks, {PLACEMENT_VERIFY_RESUME_CONCURRENCY} at a time")
+    return len(group_ids)
 
 def _placed_track_indexes(group_id: str) -> list:
     """(index, track-copy) for tracks claiming to be placed but not yet verified."""
@@ -1894,6 +2068,34 @@ def _refresh_group_counts_after_fill(group_id: str) -> None:
     except Exception as e:
         print(f"  group {group_id}: count refresh failed: {e}")
 
+def _placement_verify_deadline(track: dict, started: float) -> float:
+    """When the verifier gives up on one placed row: PLACEMENT_VERIFY_TIMEOUT
+    after the row was placed, and never sooner than that after this worker
+    began watching it. It used to be one deadline per worker, and a second
+    placement into the same group joins the running worker (only one runs per
+    group) — so a row placed 590 s in was reset to `pending` ten seconds later
+    (B-025). A row placed before the worker started keeps the window it always
+    had: the worker's."""
+    return max(float(track.get("imported_at") or 0), started) + PLACEMENT_VERIFY_TIMEOUT
+
+def _announce_loose_songs_indexed(songs: list) -> None:
+    """A Loose-tracks group is unrelated songs, each filed under its own
+    release: announce each song's own album. One announcement under the group's
+    "Loose tracks" / "Playlist tracks" name carried several unrelated albums'
+    ids and named none of them (B-025)."""
+    by_album: dict = {}
+    for song in songs:
+        song = song or {}
+        key = song.get("albumId") or (song.get("artist", ""), song.get("album", ""))
+        by_album.setdefault(key, []).append(song)
+    for album_songs in by_album.values():
+        first = album_songs[0]
+        # No group id: the loose group owns no discography row to write ids on.
+        _announce_album_indexed(
+            "", "", "", album_songs,
+            artist=first.get("displayAlbumArtist") or first.get("artist", ""),
+            album=first.get("album", ""))
+
 def _verify_placement_worker(group_id: str) -> None:
     try:
         user = _default_web_user()
@@ -1902,34 +2104,64 @@ def _verify_placement_worker(group_id: str) -> None:
         nd_user = user.get("navidrome_user", "")
         nd_pass = user.get("navidrome_password", "")
         started = time.time()
-        deadline = started + PLACEMENT_VERIFY_TIMEOUT
         announced = False
+        # Each refresh is a forced crawl of Navidrome's whole album list; the
+        # pass that verified the last row already did it (Q-024).
+        refreshed = False
+        with _review_lock:
+            group = _find_review_group(group_id) or {}
+            loose = _is_loose_tracks_group(group)
+            # The group's own album records: an MBID probe prefers a hit on one
+            # of them over the same recording on another album (Q-024).
+            own_albums = ({a.get("id") for a in group.get("albums") or []}
+                          | {group.get("canonical_album_id")}) - {None, ""}
         while True:
             outstanding = _placed_track_indexes(group_id)
-            if not outstanding:
-                _refresh_group_counts_after_fill(group_id)
+            if outstanding:
+                # Rows placed since the last refresh (one joining this running
+                # worker) need a refresh of their own once they settle.
+                refreshed = False
+            else:
+                if not refreshed:
+                    _refresh_group_counts_after_fill(group_id)
                 _save_review_state()
                 return
             matched = []
             if not _nd_scanning(nd_user, nd_pass):
                 for idx, track in outstanding:
                     try:
+                        # A loose row is looked for as the slot it was filed
+                        # into: the import rewrote the file's title and
+                        # recording MBID to that slot's (B-025).
                         song = nd_track_match(
-                            track.get("artist", ""), track.get("title", ""),
-                            track.get("mbid", ""), nd_user, nd_pass, retry=False)
+                            track.get("artist", ""),
+                            track.get("placed_title") or track.get("title", ""),
+                            track.get("placed_recording_mbid") or track.get("mbid", ""),
+                            nd_user, nd_pass, retry=False,
+                            prefer_album_ids=own_albums)
                     except Exception as e:
                         print(f"  placement verify: Navidrome check failed: {e}")
                         song = None
                     if song is not None:
                         matched.append(song)
+                        # By key as well as index: a rescan while Navidrome was
+                        # asked can have put another track at `idx` — one never
+                        # downloaded, which would read `verified` for good.
+                        # `nd_song_id`: the song it matched, so a later rescan
+                        # that disputes the row can ask whether it is still
+                        # there rather than keep it blindly (Q-023).
                         _set_review_track_state(group_id, idx, "verified",
-                                                download_error="")
-            if matched and not announced:
-                # The first pass that sees the new tracks is when a client can
-                # show them. Later passes only confirm stragglers.
+                                                expect_key=_rescan_track_key(track),
+                                                download_error="",
+                                                nd_song_id=song.get("id") or None)
+            # The first pass that sees an album's new tracks is when a client
+            # can show them; later passes only confirm stragglers. A loose
+            # group's stragglers are other albums, so each pass announces.
+            if matched and (loose or not announced):
                 announced = True
                 if not _placed_track_indexes(group_id):
                     _refresh_group_counts_after_fill(group_id)
+                    refreshed = True
                 with _review_lock:
                     group = _find_review_group(group_id) or {}
                     g_artist, g_album = group.get("artist", ""), group.get("album", "")
@@ -1939,24 +2171,31 @@ def _verify_placement_worker(group_id: str) -> None:
                 # wrote the row, so gap rows sat on `placed` forever.
                 _album_fill_mark_group_verified(group_id, g_mbids - {""},
                                                 _album_ids_of(matched))
-                _announce_album_indexed("", "", group_id, matched,
-                                        artist=g_artist, album=g_album)
-            if time.time() >= deadline:
-                break
-            time.sleep(_placement_verify_delay(started))
-        stranded = _placed_track_indexes(group_id)
-        for idx, track in stranded:
-            # Back to pending, not failed: nothing is known to be broken, the
-            # track simply isn't in the library — which is exactly the state a
-            # fresh fill should act on.
-            _set_review_track_state(
-                group_id, idx, "pending",
-                download_error="placed but never appeared in Navidrome — "
-                               "the file may have landed in the wrong folder")
-        if stranded:
-            print(f"  placement verify: {len(stranded)} track(s) in group "
-                  f"{group_id} never appeared in Navidrome — reset to pending")
-        _refresh_group_counts_after_fill(group_id)
+                if loose:
+                    _announce_loose_songs_indexed(matched)
+                else:
+                    _announce_album_indexed("", "", group_id, matched,
+                                            artist=g_artist, album=g_album)
+            now = time.time()
+            stranded = [(idx, track) for idx, track in _placed_track_indexes(group_id)
+                        if now >= _placement_verify_deadline(track, started)]
+            for idx, track in stranded:
+                # Back to pending, not failed: nothing is known to be broken, the
+                # track simply isn't in the library — which is exactly the state a
+                # fresh fill should act on.
+                _set_review_track_state(
+                    group_id, idx, "pending", expect_key=_rescan_track_key(track),
+                    download_error="placed but never appeared in Navidrome — "
+                                   "the file may have landed in the wrong folder")
+            if stranded:
+                print(f"  placement verify: {len(stranded)} track(s) in group "
+                      f"{group_id} never appeared in Navidrome — reset to pending")
+                if not _placed_track_indexes(group_id):
+                    break
+            time.sleep(_placement_verify_delay(
+                _placement_verify_clock(started, _placed_track_indexes(group_id))))
+        if not refreshed:
+            _refresh_group_counts_after_fill(group_id)
         _save_review_state()
     finally:
         with _placement_verify_lock:
@@ -2283,6 +2522,67 @@ def _schedule_album_fill_retry(release_mbid: str, prior: dict,
     threading.Thread(target=_worker, daemon=True,
                      name=f"album-retry-{release_mbid[:8]}").start()
 
+# Decisions a cancel must never overwrite: the file is already in the library
+# (or was skipped/filed on purpose), so it must not read `cancelled` on the
+# wire just because it shared a detach batch with tracks that were still
+# in flight. `_set_review_track_state` has no such guard itself — it is every
+# caller's job.
+_SETTLED_TRACK_DECISIONS = ("placed", "verified", "skipped", "filed_extra")
+
+# The reason every user-initiated cancel records, on the review rows and the
+# ledger alike (Q-029): `_gap_cancel`, `/api/album/cancel`, `/api/downloads/cancel`.
+# They used to say "cancelled by user" or "Cancelled" depending on the route.
+# The slskd-origin cancels keep their own texts ("Cancelled in slskd", "Removed
+# from slskd"), because those say who cancelled.
+USER_CANCEL_REASON = "Cancelled"
+
+def _mark_detached_entries_cancelled(entries: list, reason: str) -> None:
+    """Mark the review track behind each detached transfer `cancelled`, and
+    push each affected group once. Shared by every cancel path that detaches
+    transfers (`_gap_cancel`, `_cancel_album_fill`, `/api/downloads/cancel`) —
+    before this only `_gap_cancel` did it, so a cancel from the album route or
+    the Downloads page left `tracks[].state` reading `queued`/`downloading`
+    with no error text while the group-level status quietly recovered.
+
+    Grouped by each entry's own `review_group_id` — a batch of entries
+    detached together is not guaranteed to be one review group.
+
+    A detached transfer is out of `_repoint_transfer_indexes`' reach, so a
+    rescan between the detach and this mark moves its row without it: each
+    entry's `review_track_key` (its row's `_rescan_track_key`, from
+    `_detach_transfer`) finds the row, and a row the rescan dropped is not
+    marked at all (B-022 final review I1).
+    """
+    affected_groups = set()
+    for entry in entries:
+        group_id = entry.get("review_group_id")
+        track_index = entry.get("review_track_index")
+        if not group_id or track_index is None:
+            continue
+        expect_key = entry.get("review_track_key")
+        # Unknown group/index (or no group to check yet, e.g. under test
+        # stubs) is not "settled" — the old unconditional mark is the safe
+        # default; only a *known* settled decision skips the mark.
+        settled = False
+        with _review_lock:
+            group = _find_review_group(group_id)
+            if group is not None:
+                idx = _review_row_index(group, track_index, expect_key)
+                if idx is not None:
+                    track_index = idx
+                    settled = (group["missing_tracks"][idx].get("decision")
+                               in _SETTLED_TRACK_DECISIONS)
+        if settled:
+            continue
+        _set_review_track_state(group_id, track_index, "cancelled",
+                                expect_key=expect_key,
+                                download_state="Cancelled", error=reason,
+                                source_user=entry.get("username"),
+                                filename=entry.get("filename"))
+        affected_groups.add(group_id)
+    for group_id in affected_groups:
+        _push_gap(group_id)
+
 def _cancel_album_fill(release_mbid: str, reason: str) -> bool:
     """Stop one album fill wherever it has got to, and record it as cancelled.
 
@@ -2337,6 +2637,11 @@ def _cancel_album_fill(release_mbid: str, reason: str) -> bool:
         reason=reason, failureKind="", retryable=False, retryAt=0)
     if entries:
         _abandon_transfers_async(entries)
+        # Mark from `entries`, not from `applied`: they were detached before
+        # the CAS above, so a losing CAS (the ledger already `placing` etc.)
+        # still leaves these transfers gone — their tracks must not keep
+        # reading `downloading` just because the album-level claim lost.
+        _mark_detached_entries_cancelled(entries, reason)
     if not applied:
         return False
     try:
@@ -2395,20 +2700,14 @@ def _gap_cancel(group_id: str) -> int:
         _album_fill_transition(
             fill_mbid, "cancelled",
             unless=("placing", "placed", "verified", "needs_match"),
-            reason="Cancelled", failureKind="", retryable=False)
+            reason=USER_CANCEL_REASON, failureKind="", retryable=False)
         cancelled += 1
     for key, info in list(pending_downloads.items()):
         if info.get("review_group_id") != group_id:
             continue
         entries.append(_detach_transfer(key, info))
         cancelled += 1
-    for entry in entries:
-        if entry.get("review_group_id") == group_id:
-            _set_review_track_state(group_id, entry.get("review_track_index"),
-                                    "cancelled", download_state="Cancelled",
-                                    error="cancelled by user",
-                                    source_user=entry["username"],
-                                    filename=entry["filename"])
+    _mark_detached_entries_cancelled(entries, USER_CANCEL_REASON)
     if entries:
         _abandon_transfers_async(entries)
     _push_gap(group_id)
@@ -2518,6 +2817,38 @@ def _running_album_download_task(release_mbid: str) -> str:
                 return tid
     return ""
 
+def _strip_host_paths(text) -> str:
+    """`text` with the download and library mount prefixes taken off every path
+    in it (Q-021) — the read-side half of keeping host paths off the device, the
+    principle `_strip_place_paths` applies to fields. Error texts were stamped
+    verbatim ("No audio files found in /downloads/<peer folder>") and rows keep
+    what they were written with, so the views strip what they serve:
+    `/downloads/peer/x` reads `peer/x`, and a path that IS a mount reads as the
+    mount's own name (`downloads`). A prefix only counts as a whole path
+    segment at the start of a path: `/downloadsx`, `/music-videos` and
+    `/mnt/downloads` are left alone. The prefixes are read at call time, with
+    or without a trailing slash; the longer one goes first, so nested mounts
+    both come off."""
+    text = text or ""
+    prefixes = {(p or "").rstrip("/") for p in (SLSKD_DOWNLOAD_DIR, MUSIC_LIBRARY_PATH)}
+    for prefix in sorted((p for p in prefixes if p), key=len, reverse=True):
+        p = re.escape(prefix)
+        # A path under the mount: drop the mount and its slash.
+        text = re.sub(rf"(?<![\w./-]){p}/+(?=[^\s'\"),:;])", "", text)
+        # The mount itself, maybe with a trailing slash: its own name.
+        name = os.path.basename(prefix)
+        text = re.sub(rf"(?<![\w./-]){p}/*(?![\w.-])", lambda _m: name, text)
+    return text
+
+def _os_error_text(e: Exception) -> str:
+    """The OS's own reason ("Permission denied") when there is one — an
+    OSError's `str(e)` names the paths involved. Otherwise the exception's own
+    text with the mount prefixes taken off (`shutil.Error`, an OSError with no
+    `strerror`, says "Destination path '…' already exists"; final review M-3),
+    and only for an empty one its type."""
+    return (getattr(e, "strerror", None) or _strip_host_paths(str(e)).strip()
+            or type(e).__name__)
+
 def _album_fill_view(release_mbid: str, include_files: bool = True) -> dict:
     """The wire shape of a fill's progress, for /api/album/status.
 
@@ -2550,7 +2881,8 @@ def _album_fill_view(release_mbid: str, include_files: bool = True) -> dict:
         "failed": int(entry.get("failed") or 0),
         "percent": 0,
         "bytesDone": 0, "bytesTotal": 0, "speedBps": 0, "activeFiles": 0,
-        "reason": entry.get("reason", "") or "",
+        # Stored rows keep the text they were written with (Q-021).
+        "reason": _strip_host_paths(entry.get("reason", "")),
         "mp3WouldHelp": bool(entry.get("mp3WouldHelp")),
         "allowMp3": bool(entry.get("allowMp3")),
         # What kind of failure, whether a plain Retry is worth offering, and how
@@ -2742,7 +3074,12 @@ def _push_gap(group_id: str) -> None:
     _push_enqueue("gap", group_id)
 
 def _gap_fill_frame(group: dict) -> dict:
-    """The flat gap summary a fill frame carries (and /api/fills answers)."""
+    """The flat gap summary a fill frame carries (and /api/fills answers).
+
+    The counts are PROTOCOL §15.2's "Progress counts" rule (B-024), the one both
+    clients' progress uses: finished is `downloaded|done|skipped|cancelled` (the
+    wire states — the gap view folds placed/verified/filed_extra into `done`),
+    `failed` is counted apart, and `total` is every track that isn't `present`."""
     view = _gap_detail_view(group, 0)
     view.pop("sources", None)
     tracks = view.get("tracks") or []
@@ -2752,9 +3089,12 @@ def _gap_fill_frame(group: dict) -> dict:
         "kind": "gap", "key": view.get("id", ""), "groupId": view.get("id", ""),
         "status": view.get("status", ""), "taskStatus": task.get("status", ""),
         "artist": view.get("artist", ""), "album": view.get("album", ""),
-        "done": sum(1 for s in states if s in ("downloaded", "placed", "verified")),
-        "failed": sum(1 for s in states if s in ("failed", "cancelled")),
-        "total": len(tracks) or int(view.get("total") or 0),
+        "done": sum(1 for s in states
+                    if s in ("downloaded", "done", "skipped", "cancelled")),
+        "failed": sum(1 for s in states if s == "failed"),
+        "total": (sum(1 for s in states if s != "present") if tracks
+                  else max(0, int(view.get("total") or 0)
+                           - int(view.get("present") or 0))),
         "reason": view.get("failDetail") or view.get("noSourceReason") or "",
         "failureKind": view.get("failReason", ""),
         "mp3WouldHelp": bool(view.get("mp3WouldHelp")),
@@ -2808,6 +3148,24 @@ def _recent_album_fill_mbids(limit: int = 20) -> list:
                       reverse=True)
     return [mbid for mbid, _ in rows[:limit]]
 
+def _strip_place_paths(tracks: list) -> list:
+    """A copy of `tracks` with `placeFolder`/`placeFile` dropped from every row
+    (Q-017(c2)/(c)). Copies rather than mutating: `tracks` came off a
+    `_gap_detail_view` this call built fresh, but the two writers of a summary
+    view (this and `/api/gaps/<id>`) must not be able to step on each other's
+    copy by sharing dicts.
+
+    `placeFolder` is an absolute `/downloads/...` host path and `placeFile` a
+    peer's filename off slskd — the same two fields the hub already strips
+    from `GET /lb/gap` (hub commit 8b15138). `GET /api/fills` (both clients'
+    most-polled route, every 30s) answered each gap with the full
+    `_gap_detail_view` minus `sources` and neither field was ever stripped
+    from it, so they still reached devices unstripped on the one route
+    nothing scrubs on the way in. lb-bot's own SPA reads `/api/gaps/<id>`
+    for these, never `/api/fills`, so it keeps them."""
+    return [{k: v for k, v in t.items() if k not in ("placeFolder", "placeFile")}
+            for t in tracks]
+
 def _fills_view(release_mbids: list, group_ids: list) -> dict:
     """`GET /api/fills` — every fill a client watches, in one answer.
 
@@ -2826,7 +3184,9 @@ def _fills_view(release_mbids: list, group_ids: list) -> dict:
             group = _find_review_group(gid)
             frame = _gap_fill_frame(group) if group else None
         if frame:
-            gaps[gid] = frame.pop("summary")
+            summary = frame.pop("summary")
+            summary["tracks"] = _strip_place_paths(summary.get("tracks") or [])
+            gaps[gid] = summary
             gaps[gid].update({k: frame[k] for k in ("done", "failed", "taskStatus")})
     return {"albums": albums, "gaps": gaps, "serverTime": time.time()}
 
@@ -2890,166 +3250,6 @@ def _pop_album_groups_for_review_group(review_group_id: str) -> int:
         _save_state()
     return removed
 
-def _review_group_from_repair_job(job: dict) -> dict:
-    missing = []
-    for idx, track in enumerate(job.get("tracks", []) or []):
-        missing.append({
-            "artist": track.get("artist", job.get("artist", "")),
-            "title": track.get("title", ""),
-            "mbid": track.get("recording_mbid", ""),
-            "position": track.get("position", idx + 1),
-            "decision": _review_decision_from_repair_track(track.get("status", "missing")),
-            "repair_job_id": job.get("id", ""),
-            "repair_track_id": track.get("id", ""),
-            "local_path": track.get("local_path", ""),
-            "source_user": track.get("source_user", ""),
-            "source_folder": track.get("source_folder", ""),
-            "download_error": track.get("error", ""),
-        })
-    return {
-        "id": job.get("group_id", job.get("id", "")),
-        "group_type": "repair_job",
-        "origin": "repair",
-        "artist": job.get("artist", ""),
-        "album": job.get("album", ""),
-        "artist_key": _norm_album_text(job.get("artist", "")),
-        "album_key": _norm_album_text(job.get("album", "")),
-        "created_at": job.get("created_at", time.time()),
-        "updated_at": job.get("updated_at", time.time()),
-        "status": job.get("status", "needs_review"),
-        "repair_job_id": job.get("id", ""),
-        "repair_status": job.get("status", ""),
-        "merge_mode": "logical",
-        "match_mode": "auto",
-        "canonical_album_id": job.get("canonical_album_id", ""),
-        "canonical_mbid": job.get("canonical_release_mbid", ""),
-        "albums": [],
-        "missing_tracks": missing,
-        "present": 0,
-        "total": len(missing),
-        "last_action": "repair_job",
-        "messages": job.get("messages", []),
-    }
-
-def _repair_track_by_id(job: dict, track_id: str) -> dict | None:
-    return next((t for t in job.get("tracks", []) if t.get("id") == track_id), None)
-
-def _repair_download_id(job_id: str, username: str, filename: str) -> str:
-    return hashlib.sha1(f"{job_id}|{username}|{filename}".encode("utf-8")).hexdigest()[:16]
-
-def _repair_download_for_file(job: dict, username: str, filename: str) -> dict | None:
-    did = _repair_download_id(job.get("id", ""), username, filename)
-    return next((d for d in job.get("downloads", []) if d.get("id") == did), None)
-
-def _repair_record_download_queued(job_id: str, track_id: str, username: str,
-                                   file: dict, source_folder: str = "") -> dict:
-    job = _find_repair_job(job_id)
-    if not job:
-        return {}
-    filename = file.get("filename", "")
-    now = time.time()
-    rec = _repair_download_for_file(job, username, filename)
-    if not rec:
-        rec = {
-            "id": _repair_download_id(job_id, username, filename),
-            "job_id": job_id,
-            "track_ids": [track_id] if track_id else [],
-            "source_user": username,
-            "source_folder": source_folder or _folder(filename),
-            "files": [file],
-            "status": "queued",
-            "error": "",
-            "timeout_kind": "",
-            "retry_available": True,
-            "created_at": now,
-            "updated_at": now,
-        }
-        job.setdefault("downloads", []).append(rec)
-    else:
-        if track_id and track_id not in rec.setdefault("track_ids", []):
-            rec["track_ids"].append(track_id)
-        rec["status"] = "queued"
-        rec["error"] = ""
-        rec["updated_at"] = now
-    track = _repair_track_by_id(job, track_id)
-    if track:
-        track["status"] = "queued"
-        track["source_user"] = username
-        track["source_folder"] = rec.get("source_folder", "")
-        track["filename"] = filename
-        track["updated_at"] = now
-    job["status"] = "downloading"
-    _repair_job_touch(job, {"kind": "download_queued", "message": f"Queued {filename}"})
-    return rec
-
-def _repair_update_download(job_id: str, username: str, filename: str,
-                            status: str, error: str = "", timeout_kind: str = "",
-                            local_path: str = "", percent=None, raw_state: str = "") -> dict:
-    job = _find_repair_job(job_id)
-    if not job:
-        return {}
-    rec = _repair_download_for_file(job, username, filename)
-    if not rec:
-        rec = {
-            "id": _repair_download_id(job_id, username, filename),
-            "job_id": job_id,
-            "track_ids": [],
-            "source_user": username,
-            "source_folder": _folder(filename),
-            "files": [{"filename": filename}],
-            "status": status,
-            "error": "",
-            "timeout_kind": "",
-            "retry_available": True,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-        job.setdefault("downloads", []).append(rec)
-    rec["status"] = status
-    rec["updated_at"] = time.time()
-    rec["error"] = _redact_secrets(error or "")
-    rec["timeout_kind"] = timeout_kind or ""
-    rec["retry_available"] = status in ("error", "timeout", "cancelled")
-    if local_path:
-        rec["local_path"] = local_path
-        rec.setdefault("files", [{"filename": filename}])[0]["local_path"] = local_path
-        pool_path = os.path.dirname(local_path)
-        if pool_path and pool_path not in [p.get("path") for p in job.setdefault("source_pools", [])]:
-            job["source_pools"].append({
-                "id": hashlib.sha1(pool_path.encode("utf-8")).hexdigest()[:16],
-                "path": pool_path,
-                "status": "downloaded",
-                "created_at": time.time(),
-            })
-    if raw_state:
-        rec["last_slskd_state"] = raw_state
-    for track_id in rec.get("track_ids", []):
-        track = _repair_track_by_id(job, track_id)
-        if not track:
-            continue
-        if status == "complete":
-            track["status"] = "downloaded"
-            track["local_path"] = local_path or track.get("local_path", "")
-        elif status == "downloading":
-            track["status"] = "downloading"
-        elif status == "error":
-            track["status"] = "download_error"
-            track["error"] = rec["error"] or raw_state
-        elif status == "timeout":
-            track["status"] = "download_timeout"
-            track["error"] = rec["error"] or timeout_kind
-        elif status == "cancelled":
-            track["status"] = "cancelled"
-            track["error"] = rec["error"] or "cancelled"
-        if percent is not None:
-            track["download_percent"] = percent
-        if raw_state:
-            track["download_state"] = raw_state
-        track["updated_at"] = time.time()
-    job["status"] = _repair_job_status_from_tracks(job)
-    _repair_job_touch(job, {"kind": f"download_{status}", "message": error or raw_state or status})
-    return rec
-
 def _nd_find_album_folder_by(album_name: str, release_mbid: str, nd_user: str, nd_pass: str) -> str:
     """
     Resolve the on-disk folder for an album by querying Navidrome.
@@ -3092,10 +3292,6 @@ def _nd_find_album_folder_by(album_name: str, release_mbid: str, nd_user: str, n
             if os.path.isdir(folder):
                 return folder
     return ""
-
-
-def _nd_find_album_folder(job: dict, nd_user: str, nd_pass: str) -> str:
-    return _nd_find_album_folder_by(job.get("album", ""), job.get("canonical_release_mbid", ""), nd_user, nd_pass)
 
 
 def _mutagen_write_tags(path: str, tags: dict) -> bool:
@@ -3280,13 +3476,12 @@ def _task_finish(task_id: str, summary: str = "", error: str = "", **extra) -> N
     _task_update(task_id, status="error" if error else "complete",
                  summary=summary, error=error, percent=100, **extra)
 
-def _operation_create(kind: str, message: str = "", job_id: str = "",
+def _operation_create(kind: str, message: str = "",
                       status: str = "running", **extra) -> dict:
     op_id = _uid("op")
     now = time.time()
     op = {
         "id": op_id,
-        "job_id": job_id or "",
         "kind": kind,
         "status": status,
         "message": message or kind.replace("_", " "),
@@ -3345,7 +3540,6 @@ def _with_operation(payload: dict, operation: dict) -> dict:
     if latest:
         payload["operation_id"] = latest.get("id", "")
         payload["operation"] = latest
-        payload.setdefault("job_id", latest.get("job_id", ""))
         payload.setdefault("message", latest.get("message", ""))
     return payload
 
@@ -3620,6 +3814,47 @@ def _mbz_error_text(e: Exception) -> str:
         return "connection failed"
     return name
 
+# Matches "release/" and "release//…" — an entity segment followed by an
+# empty id (immediately another "/" or the end of the path). Deliberately not
+# scoped to a whitelist of entity names: any MusicBrainz path shaped
+# "<entity>/<id>" is wrong with the id missing, whatever the entity.
+_MBZ_EMPTY_ENTITY_ID_RE = re.compile(r'^[^/]+/(?=/|$)')
+
+# The parameters that carry the id on a collection path (no "/"): `query` for
+# a search, and the linked entity of a browse (`release-group?artist=<mbid>`),
+# per MusicBrainz's browse table. Blank, they are the empty-id bug above in a
+# different shape (Q-030).
+_MBZ_ID_PARAMS = frozenset((
+    "query", "area", "artist", "collection", "editor", "event", "label",
+    "place", "recording", "release", "release-group", "track", "track_artist",
+    "work"))
+
+def _mbz_blank_id(path: str, params: dict) -> str:
+    """What makes this request id-less ("" when nothing does): an empty entity
+    segment in `path`, or a blank search query / browse id on a collection path."""
+    if _MBZ_EMPTY_ENTITY_ID_RE.match(path):
+        return path
+    if "/" not in path:
+        for name, value in (params or {}).items():
+            if name in _MBZ_ID_PARAMS and not str(value or "").strip():
+                return f"{path}?{name}="
+    return ""
+
+# One log line per distinct caller (B-010) rather than once per occurrence —
+# a hot path hitting this every scan would otherwise flood the log with an
+# identical line.
+_mbz_empty_id_logged_callers: set = set()
+
+def _log_mbz_empty_entity_id(path: str) -> None:
+    import traceback
+    frame = traceback.extract_stack()[-3]  # caller of the mbz_get() call site
+    caller = f"{frame.name} ({os.path.basename(frame.filename)}:{frame.lineno})"
+    if caller in _mbz_empty_id_logged_callers:
+        return
+    _mbz_empty_id_logged_callers.add(caller)
+    print(f"  MBZ: refusing empty entity id in {path!r} from {caller} — "
+          f"no request, no cache write")
+
 def mbz_get(path: str, params: dict = None, strict: bool = False,
            bypass_cache: bool = False) -> dict:
     """
@@ -3665,8 +3900,31 @@ def mbz_get(path: str, params: dict = None, strict: bool = False,
     rescan from memory forever and auto-refresh could never see it. It never
     bypasses the permanent-fail marker above — that one is durable regardless,
     the whole point of caching a bad mbid being to stop asking about it.
+
+    `path` with an empty entity-id segment (`"release/"`, `"release//…"`,
+    `"recording/"`, …) is refused before any of the above: it is never a real
+    MusicBrainz answer, so a `_mbz_cache_key` of e.g. `"release/?inc=…"` is a
+    caller bug (a Navidrome album whose mbid came back blank is the one seen
+    live), never "this entity doesn't exist". Answering it through the normal
+    404/400 path would negative-cache that *shared, id-less* key — poisoning
+    it for every other caller who happens to pass an empty id with the same
+    `inc` — and spend a request finding out MusicBrainz agrees. It costs no
+    request and writes neither the durable cache nor `_mbz_fail_until`; a
+    strict caller gets `MusicBrainzNoSuchEntity` immediately, same as a real
+    permanent 4xx. Logged once per call site (B-010): the message names the
+    caller so a repeat tells you where to fix the id, not just that it
+    happened again. A search with a blank `query` and a browse with a blank
+    linked-entity id (`release-group?artist=`) are the same bug and get the
+    same refusal (Q-030, `_mbz_blank_id`).
     """
     global _mbz_last_req
+    blank = _mbz_blank_id(path, params)
+    if blank:
+        _log_mbz_empty_entity_id(blank)
+        if strict:
+            raise MusicBrainzNoSuchEntity(
+                f"MusicBrainz request has an empty entity id: {blank!r}")
+        return {}
     key    = _mbz_cache_key(path, params)
     cached = _mbz_cache.get(key)
     if cached is not None:
@@ -3742,6 +4000,8 @@ def mbz_best_release(recording_mbid: str) -> dict:
     Given a recording MBID, return the best official non-compilation album release.
     Prefers: official status > album primary type > earliest date.
     """
+    if not recording_mbid:
+        return {}
     data     = mbz_get(f"recording/{recording_mbid}", {"inc": "releases release-groups"})
     releases = data.get("releases", [])
 
@@ -3794,6 +4054,8 @@ def mbz_release_tracks_insisting(release_mbid: str, attempts: int = 3) -> list:
 
 def mbz_release_tracks(release_mbid: str) -> list:
     """Return [{title, mbid, position}] for all tracks in a release."""
+    if not release_mbid:
+        return []
     data   = mbz_get(f"release/{release_mbid}", {"inc": "recordings"})
     tracks = []
     for medium in data.get("media", []):
@@ -4229,7 +4491,7 @@ def spotify_get_playlist_tracks(playlist_id: str) -> list:
 
 def _mbid_from_isrc(isrc: str) -> str:
     """Look up a MusicBrainz recording MBID by ISRC (most reliable)."""
-    data = mbz_get("recording", {"isrcs": isrc, "inc": ""})
+    data = mbz_get("recording", {"isrcs": isrc})
     recs = data.get("recordings", [])
     return recs[0]["id"] if recs else ""
 
@@ -5354,8 +5616,13 @@ def _nd_index_is_warm(nd_user: str, nd_pass: str) -> bool:
         return False
     return bool(_nd_search(nd_user, nd_pass, term, 1, _retry=False))
 
+# How many hits the MBID probe asks Navidrome for: the recording can sit on
+# several albums (the original, a compilation, a deluxe), and Navidrome's order
+# says nothing about which one a caller means (Q-024).
+ND_MBID_SEARCH_HITS = 10
+
 def nd_track_match(artist: str, title: str, mbid: str, nd_user: str, nd_pass: str,
-                   retry: bool = True) -> dict | None:
+                   retry: bool = True, prefer_album_ids=None) -> dict | None:
     """The Navidrome song `nd_track_present` would accept, or None.
 
     Returning the song rather than a bool hands the verifiers the album's
@@ -5365,11 +5632,24 @@ def nd_track_match(artist: str, title: str, mbid: str, nd_user: str, nd_pass: st
     `retry=False` skips `_nd_search`'s 3 s warm-up retry. A verifier polling a
     scan that hasn't finished expects misses, and three probes each paying that
     sleep turned a 2 s poll into an 18 s one.
+
+    The MBID probe (Q-024) takes only a hit that IS that recording
+    (`musicBrainzId` equal, case aside) — Navidrome's first hit used to be taken
+    whatever it was — and, of those, one on `prefer_album_ids` (the verifier's
+    group's own albums) before the first: the same recording on a compilation
+    is still that recording, but announcing the compilation's album id told
+    every client the wrong album had landed. A probe with no such hit falls
+    through to the title + artist match, as a miss always did.
     """
     if mbid:
-        hits = _nd_search(nd_user, nd_pass, mbid, 1, _retry=retry)
+        want = mbid.lower()
+        hits = [s for s in _nd_search(nd_user, nd_pass, mbid, ND_MBID_SEARCH_HITS,
+                                      _retry=retry)
+                if (s.get("musicBrainzId") or "").lower() == want]
         if hits:
-            return hits[0]
+            preferred = [s for s in hits
+                         if prefer_album_ids and s.get("albumId") in prefer_album_ids]
+            return (preferred or hits)[0]
     title_q  = (title or "").lower().strip()
     artist_q = (artist or "").lower().strip()
     if not title_q:
@@ -5478,6 +5758,36 @@ def nd_get_scan_status(nd_user: str, nd_pass: str) -> dict:
     except Exception as e:
         print(f"  nd_get_scan_status error: {e}")
         return {}
+
+# Subsonic's "requested data was not found" — the one answer that means a song
+# is gone, as opposed to Navidrome being down, slow or refusing the login.
+SUBSONIC_NOT_FOUND = 70
+
+class NavidromeRefusal(RuntimeError):
+    """Navidrome answered, but with neither the song nor a "not found": a
+    refused login, another error code, an unreadable body. About this request;
+    unlike a timeout, it says nothing about the next one."""
+
+def nd_get_song(nd_user: str, nd_pass: str, song_id: str) -> dict | None:
+    """Navidrome's song `song_id`, or None when Navidrome positively answers
+    that there is no song with that id (Subsonic error 70). An answer that is
+    neither raises `NavidromeRefusal`; no answer at all (a timeout, a refused
+    connection) raises whatever the transport raised. The caller acts on a
+    positive "not found" only (Q-023)."""
+    r = _http.get(f"{NAVIDROME_URL}/rest/getSong",
+                  params={**_nd_auth_params(nd_user, nd_pass), "id": song_id},
+                  timeout=10)
+    try:
+        body = (r.json() or {}).get("subsonic-response") or {}
+    except Exception as e:  # noqa: BLE001 — answered, but not Subsonic
+        raise NavidromeRefusal(f"Navidrome getSong {song_id}: unreadable answer") from e
+    if body.get("status") == "ok" and body.get("song"):
+        return body["song"]
+    error = body.get("error") or {}
+    if body.get("status") == "failed" and str(error.get("code")) == str(SUBSONIC_NOT_FOUND):
+        return None
+    raise NavidromeRefusal(f"Navidrome getSong {song_id}: "
+                           f"{error.get('message') or body.get('status') or 'no answer'}")
 
 def _nd_scan_after_import(token: str) -> bool:
     """Best-effort quick scan for the user behind `token` (post-import hook)."""
@@ -6864,6 +7174,14 @@ WIRE_VERSION = 1
 # for whatever else the page carries.
 INDEX_CHANGES_MAX_BYTES = 2_000_000
 
+# artist_key -> the seq last logged as truncated (B-013, ruling R13). A page
+# is built fresh on every /api/index/changes poll, and the same oversized
+# artist stays "next up" for every client whose cursor hasn't passed it yet —
+# without this, one un-consumed truncation would print a line per poll. Keyed
+# on seq, not just presence, so a rescan that changes the row (and so the
+# rows actually cut) logs again.
+_index_truncation_warned: dict = {}
+
 # The `index-push` sender's poll and throttle (contract §1a, plan §1
 # propagation 1). Poll is fast because it only reads a counter under a lock;
 # the gap is what keeps a steady library build to one hub POST every two
@@ -7332,6 +7650,16 @@ def _index_db():
               got          TEXT NOT NULL DEFAULT '',
               rejected_at  REAL NOT NULL DEFAULT 0,
               PRIMARY KEY (username, filename)
+            );
+            -- One-time data migrations that must not repeat: a row per name,
+            -- written only after the migration's own writes landed. Unlike a
+            -- schema change these cannot be re-derived from the data — hiding
+            -- a group is undone by the user's unhide, and running it again
+            -- would override them. An older release ignores the table.
+            CREATE TABLE IF NOT EXISTS migrations (
+              name        TEXT PRIMARY KEY,
+              applied_at  REAL NOT NULL DEFAULT 0,
+              detail      TEXT NOT NULL DEFAULT ''
             );
             PRAGMA user_version = 1;
         """)
@@ -8245,6 +8573,29 @@ def _index_existing_artist_key(artist_mbid: str = "", nd_artist_id: str = "") ->
         print(f"  index: existing artist key lookup failed: {e}")
     return ""
 
+def _index_artist_mbid_conflict(artist_key: str, artist_mbid: str) -> str:
+    """The MBID stored for `artist_key` when it is a *different* artist's than
+    `artist_mbid`, else "".
+
+    `_index_existing_artist_key` falls back from the mbid to the Navidrome id,
+    and Navidrome keys artists by name — so a request naming one artist's mbid
+    and a same-name library artist's nd id resolves to the other artist's row.
+    A key with no mbid on record (`nd:<id>`, never resolved) is no conflict.
+    """
+    if not artist_key or not artist_mbid or artist_key == artist_mbid:
+        return ""
+    stored = "" if artist_key.startswith("nd:") else artist_key
+    try:
+        with _index_lock:
+            row = _index_db().execute(
+                "SELECT artist_mbid FROM artists WHERE artist_key = ?",
+                (artist_key,)).fetchone()
+        if row and row["artist_mbid"]:
+            stored = row["artist_mbid"]
+    except Exception as e:  # noqa: BLE001 — same as the key lookup above
+        print(f"  index: artist mbid lookup failed: {e}")
+    return stored if stored and stored != artist_mbid else ""
+
 def _index_ensure_artist(artist_key: str, artist_mbid: str = "",
                          nd_artist_id: str = "", name: str = "") -> None:
     """Make sure a `release_groups` row has an `artists` parent to hang off.
@@ -8469,7 +8820,42 @@ def _index_changes_view(since: int, epoch: str) -> tuple:
                 item_size = len(json.dumps(item).encode("utf-8"))
                 # The cap stops the NEXT item, never the first: a page must
                 # always carry at least one item when any exist, even one
-                # artist alone bigger than the whole cap.
+                # artist alone bigger than the whole cap. That exemption used
+                # to be unconditional, so a single prolific artist's own rows
+                # could blow past INDEX_CHANGES_MAX_BYTES — and the hub's 4 MB
+                # PROXY_MAX_RESPONSE above it — turning one mirror pull into a
+                # deterministic 502 tooLarge no retry could ever clear (B-013).
+                # Bound *that* artist's own rows instead of exempting it
+                # outright: keep as many as fit the same page budget, and say
+                # so, rather than silently handing back a partial "every
+                # release_groups row" as documented.
+                if not items and item_size > INDEX_CHANGES_MAX_BYTES:
+                    full_rows = item["rows"]
+                    base_size = len(json.dumps({**item, "rows": []}).encode("utf-8"))
+                    budget = INDEX_CHANGES_MAX_BYTES - base_size
+                    kept, used = [], 0
+                    for wire_row in full_rows:
+                        row_size = len(json.dumps(wire_row).encode("utf-8")) + 1
+                        if used + row_size > budget:
+                            break
+                        kept.append(wire_row)
+                        used += row_size
+                    item["rows"] = kept
+                    item["rowsTruncated"] = True
+                    item["rowsTotal"] = len(full_rows)
+                    item_size = len(json.dumps(item).encode("utf-8"))
+                    # Non-silent (R13): a client's mirror is now missing rows
+                    # for this artist with nothing else to flag the gap (the
+                    # artistCount/seqSum drift check still matches). Once per
+                    # seq, not once per poll -- every client with an
+                    # un-consumed cursor rebuilds this same page.
+                    if _index_truncation_warned.get(r["key"]) != r["seq"]:
+                        _index_truncation_warned[r["key"]] = r["seq"]
+                        print(f"  Warning: index/changes truncated artist "
+                              f"{r['key']} ({r['name'] or 'unnamed'}): kept "
+                              f"{len(kept)}/{len(full_rows)} release-group row(s) "
+                              f"to stay under the {INDEX_CHANGES_MAX_BYTES}-byte "
+                              f"page cap")
                 if items and size + item_size > INDEX_CHANGES_MAX_BYTES:
                     more = True
                     break
@@ -8690,13 +9076,24 @@ def _index_push_worker(clock=time.time, sleeper=time.sleep, poster=None) -> None
             print(f"  index push: tick failed: {e}")
         sleeper(INDEX_PUSH_POLL_SECS)
 
-# Decisions that claim the track is handled. A fresh scan that still reports the
-# track missing from Navidrome proves otherwise, so they must not be inherited —
-# a placement that silently failed used to leave the track "placed" forever, and
-# nothing would ever try again. The user's own skipped/dismissed always survive:
-# those are statements of intent, not claims about the library.
-_STALE_ON_RESCAN_DECISIONS = ("placed", "queued", "downloading", "verified",
-                              "navidrome_pending", "navidrome_verified")
+# Decisions that claim the track is handled without anyone having checked. A
+# fresh scan that still reports the track missing from Navidrome proves
+# otherwise, so they must not be inherited — a placement that silently failed
+# used to leave the track "placed" forever, and nothing would ever try again.
+# (`_inherited_decision` exempts a queued/downloading row with a live transfer,
+# and a placed row while its verifier runs.) The user's own skipped/dismissed
+# always survive: statements of intent, not claims about the library.
+#
+# `verified` (and the legacy `navidrome_verified`) and `filed_extra` are NOT
+# here: the first was matched in Navidrome, the second is a file already filed
+# into the library. When a scan disagrees it is the scan's matching that missed
+# — the verifier searches library-wide, while a rescan reads only the group's
+# own album records (so an album Navidrome split under another record reads
+# missing), and a playlist scan uses the playlist's spelling — and resetting
+# them re-downloaded a file the library already has. B-022: the repair-job
+# projection had kept both settled in every group that could hold them; this is
+# that behaviour, stated.
+_STALE_ON_RESCAN_DECISIONS = ("placed", "queued", "downloading", "navidrome_pending")
 
 # ---------------------------------------------------------------------------
 # EDITORIAL METADATA  (artist/album "About", credits, relations, links)
@@ -9140,42 +9537,371 @@ def meta_for_album(rgid: str, release_mbid: str = "", refresh: bool = False) -> 
     _meta_cache_write("album", rgid, payload, _meta_has_content(payload))
     return payload
 
-def _inherited_decision(previous: dict, fallback: str = "pending") -> str:
+# The in-flight decisions _STALE_ON_RESCAN_DECISIONS resets, and the one case
+# a rescan keeps them: a row with a live transfer behind it. "Live" is
+# `_live_transfer_track_indexes` — the same test `_review_group_next_action`
+# and `_approve_pending_missing_tracks` apply — so a phantom still goes stale
+# (ba8b83e) while a real download stays "downloading". Before B-022 the
+# repair-job projection put a live row back from its shadow copy; without it a
+# rescan read "ready", the fetch route's alreadyActive dedupe stopped firing and
+# the transfer was approved for a second download.
+_IN_FLIGHT_DECISIONS = ("queued", "downloading")
+# Per-track fields that describe the running transfer: carried with a kept
+# in-flight decision and only then (on a row reset to pending they would
+# describe a transfer that is not there).
+_IN_FLIGHT_TRACK_FIELDS = ("download_percent", "download_state", "filename",
+                           "source_user", "source_folder")
+
+def _inherited_decision(previous: dict, fallback: str = "pending",
+                        live: bool = False, verifying: bool = False) -> str:
     decision = previous.get("decision", fallback) or fallback
+    if live and decision in _IN_FLIGHT_DECISIONS:
+        return decision
+    # The same hole one step later: until Navidrome indexes a placed file a
+    # rescan still reports it missing, and resetting the row took it away from
+    # the verifier and offered it for a second download. While a verifier runs
+    # for the group it is the authority — it verifies the row, or resets it to
+    # pending itself at the deadline — so ba8b83e's rule still holds after it.
+    if verifying and decision == "placed":
+        return decision
     if decision in _STALE_ON_RESCAN_DECISIONS:
         return "pending"
     return decision
+
+def _rescan_track_key(track: dict) -> tuple:
+    """How a rebuild recognises a row it had before — the (mbid, title) key
+    _merge_review_groups and refresh_group_missing carry decisions by."""
+    return (track.get("mbid"), track.get("title"))
+
+def _rescan_previous_rows(group_id: str, old_tracks: list, live=None) -> dict:
+    """{key: [(copy of a previous row, whether a live transfer backs it), ...]},
+    in row order. A list, not one row per key: two missing rows can share an
+    (mbid, title), and with last-wins both twins inherited the second's state —
+    the live one lost its flag, or the idle one took a `queued` with nothing
+    behind it (Q-027(b)). Consumers take rows with `_take_previous_row`, in
+    order, the way `_repoint_transfer_indexes` pairs the twins' transfers.
+    `live` is the group's live indexes when the caller already has them — a
+    scan-all merges ~3000 groups, and one pass over the transfers serves all."""
+    if live is None:
+        live = _live_transfer_track_indexes(group_id)
+    rows: dict = {}
+    for i, t in enumerate(old_tracks or []):
+        rows.setdefault(_rescan_track_key(t), []).append((dict(t), i in live))
+    return rows
+
+def _take_previous_row(previous_rows: dict, track: dict) -> tuple:
+    """The next unused (previous row, live) for `track`'s key, or ({}, False)."""
+    queue = previous_rows.get(_rescan_track_key(track))
+    return queue.pop(0) if queue else ({}, False)
+
+def _live_transfer_indexes_by_group() -> dict:
+    """{review group id: set of live row indexes} — `_live_transfer_track_indexes`
+    for every group in one pass over the transfers."""
+    out = {}
+    for info in list(pending_downloads.values()):
+        gid, idx = info.get("review_group_id"), info.get("review_track_index")
+        if not gid or idx is None:
+            continue
+        try:
+            out.setdefault(gid, set()).add(int(idx))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+def _inherit_track_state(track: dict, previous: dict, live: bool,
+                         carried: tuple, verifying: bool = False) -> None:
+    """Carry one row's state across a rebuild: its decision (an in-flight one
+    only if `live`, a placed one only while its group's verifier runs), the
+    `carried` fields, and — when it is still in flight — the transfer's own
+    fields."""
+    track["decision"] = _inherited_decision(
+        previous, track.get("decision", "pending"), live=live, verifying=verifying)
+    for field in carried:
+        if previous.get(field):
+            track[field] = previous[field]
+    if live and track["decision"] in _IN_FLIGHT_DECISIONS:
+        for field in _IN_FLIGHT_TRACK_FIELDS:
+            if previous.get(field) is not None:
+                track[field] = previous[field]
+
+def _repoint_transfer_indexes(group_id: str, old_tracks: list,
+                              new_tracks: list) -> int:
+    """Once a rebuild has replaced `group_id`'s missing_tracks, point every
+    transfer that addressed one of its rows by index at that row's new index —
+    or at None when the rebuild no longer lists the row.
+
+    The poller, the source switch and the cancel paths all name a review row
+    by `review_track_index` (on the transfer, on the track dict it carries, and
+    in the album fill's `review_track_indexes` / `missing_tracks`). A rebuild
+    that lists a new track first moves every row down one, and left alone the
+    poller's "downloaded" for one track lands on its neighbour. Rows are paired
+    by `_rescan_track_key`, duplicates in order. A dropped row gets None, which
+    `_set_review_track_state` ignores: no index is better than someone else's.
+
+    The caller holds `_review_lock` and has just made `new_tracks` live, so for
+    every writer that resolves an index under that lock the swap and the
+    re-point are one step. Returns the number of transfers re-pointed.
+
+    A transfer whose row was dropped is let go of in the same step (Q-027(a)):
+    it used to keep downloading into /downloads with nothing pointing at it,
+    and its album fill kept counting it. It is detached, cancelled in slskd off
+    this thread (`_abandon_transfers_async`) and taken out of its fill's
+    `total` — never below the files already completed. A transfer whose row
+    merely moved is untouched.
+    """
+    slots = {}
+    for i, t in enumerate(new_tracks or []):
+        slots.setdefault(_rescan_track_key(t), []).append(i)
+    moves = {}
+    for i, t in enumerate(old_tracks or []):
+        free = slots.get(_rescan_track_key(t))
+        j = free.pop(0) if free else None
+        if j != i:
+            moves[i] = j
+    if not moves or not group_id:
+        return 0
+
+    def moved(idx):
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            return idx, False
+        return (moves[i], True) if i in moves else (idx, False)
+
+    # The transfers and the album fill hold the same track dicts: move each
+    # once, or 0→1 then 1→2 walks a row two places.
+    seen = set()
+
+    def repoint_track(track):
+        if not isinstance(track, dict) or id(track) in seen:
+            return
+        seen.add(id(track))
+        if "_review_track_index" in track:
+            track["_review_track_index"] = moved(track["_review_track_index"])[0]
+
+    count = 0
+    dropped = []
+    for key, info in list(pending_downloads.items()):
+        if info.get("review_group_id") != group_id:
+            continue
+        new, hit = moved(info.get("review_track_index"))
+        if hit:
+            info["review_track_index"] = new
+            count += 1
+            if new is None:
+                dropped.append((key, info))
+        repoint_track(info.get("track"))
+    for ag in list(pending_album_groups.values()):
+        if ag.get("review_group_id") != group_id:
+            continue
+        if ag.get("review_track_indexes"):
+            ag["review_track_indexes"] = [
+                n for n in (moved(i)[0] for i in ag["review_track_indexes"])
+                if n is not None]
+        for t in ag.get("missing_tracks") or []:
+            repoint_track(t)
+    if dropped:
+        entries = []
+        for key, info in dropped:
+            entries.append(_detach_transfer(key, info))
+            ag = pending_album_groups.get(info.get("album_group_id") or "")
+            if ag is not None and "total" in ag:
+                ag["total"] = max(int(ag.get("completed") or 0), int(ag["total"]) - 1)
+        _abandon_transfers_async(entries)
+        print(f"  review: group {group_id}: a rescan dropped {len(entries)} row(s) "
+              f"with a transfer in flight — cancelled them")
+    return count
+
+# ---------------------------------------------------------------------------
+# Verified rows a rescan disputes (Q-023)
+#
+# A `verified` row was matched in Navidrome, so a rescan that still lists the
+# track as missing is usually the rescan's own matching missing it (an album
+# Navidrome splits under another record, a playlist's spelling) — resetting it
+# re-downloaded a file the library has. But kept unconditionally, a file
+# deleted after verification read done forever. So a rebuild that makes such a
+# row live hands it here, and one worker asks Navidrome for the song the
+# verifier matched (`nd_song_id`), off every lock, and resets the row only on a
+# positive "no such song". An outage, a refused login or any other answer keeps
+# it. Rows with no song id (verified before this, and `filed_extra`) are kept
+# unchecked, as they always were.
+# ---------------------------------------------------------------------------
+
+_verified_recheck_queue: dict = {}   # (group id, row key) -> (index hint, song id)
+_verified_recheck_lock = threading.Lock()
+_verified_recheck_wake = threading.Event()
+_verified_recheck_thread = None
+
+def _queue_disputed_verified(group_id: str, tracks: list) -> int:
+    """Queue the rows of `tracks` — a rebuild's missing list, just made live —
+    that read `verified` with a recorded song: the rescan lists them missing,
+    the verifier said otherwise. Called under `_review_lock` at the swap, so the
+    re-check can only ever write onto the rows that are live. Returns how many."""
+    found = [(i, t) for i, t in enumerate(tracks or [])
+             if t.get("decision") == "verified" and t.get("nd_song_id")]
+    if not group_id or not found:
+        return 0
+    with _verified_recheck_lock:
+        for i, t in found:
+            _verified_recheck_queue[(group_id, _rescan_track_key(t))] = (i, t["nd_song_id"])
+    _verified_recheck_wake.set()
+    _ensure_verified_rechecker()
+    return len(found)
+
+def _verified_row_as_queued(group_id: str, index, key, song_id: str):
+    """(index, row copy, the group's album ids) while the row still reads
+    `verified` with `song_id`, else None: anything since (a re-fetch, a
+    re-verify) is newer than whatever Navidrome just said. Caller holds
+    `_review_lock` (reentrant) when it means to write on the answer."""
+    group = _find_review_group(group_id)
+    idx = _review_row_index(group, index, key) if group else None
+    row = group["missing_tracks"][idx] if idx is not None else {}
+    if row.get("decision") != "verified" or row.get("nd_song_id") != song_id:
+        return None
+    albums = ({a.get("id") for a in group.get("albums") or []}
+              | {group.get("canonical_album_id")}) - {None, ""}
+    return idx, dict(row), albums
+
+def _recheck_gone_song(group_id: str, index, key, song_id: str,
+                       nd_user: str, nd_pass: str) -> str:
+    """Navidrome has no song `song_id` any more. That is not yet "the recording
+    is gone": a re-id (a rescan of moved files) answers the same, and resetting
+    then fetched a duplicate. So run the verifier's own library-wide match first
+    — the check that verified the row. Found: the row follows the song's new id
+    ("moved"). Not found while Navidrome answers and is not scanning: reset
+    ("reset"). Otherwise the empty search proves nothing — `_nd_search` reads a
+    failed request as no hits, and a scan has ids and the index in flux — and
+    the row is kept ("kept")."""
+    with _review_lock:
+        found_row = _verified_row_as_queued(group_id, index, key, song_id)
+    if found_row is None:
+        return "kept"
+    _idx, row, albums = found_row
+    song = nd_track_match(row.get("artist", ""),
+                          row.get("placed_title") or row.get("title", ""),
+                          row.get("placed_recording_mbid") or row.get("mbid", ""),
+                          nd_user, nd_pass, prefer_album_ids=albums)
+    if song is None:
+        status = nd_get_scan_status(nd_user, nd_pass)
+        if not status or status.get("scanning"):
+            return "kept"
+    with _review_lock:
+        found_row = _verified_row_as_queued(group_id, index, key, song_id)
+        if found_row is None:
+            return "kept"
+        idx = found_row[0]
+        if song is not None:
+            moved = _set_review_track_state(group_id, idx, "verified", expect_key=key,
+                                            nd_song_id=song.get("id") or None)
+            return "moved" if moved else "kept"
+        reset = _set_review_track_state(
+            group_id, idx, "pending", expect_key=key, nd_song_id="",
+            download_error="verified earlier, but Navidrome no longer has "
+                           "this song — it can be fetched again")
+        return "reset" if reset else "kept"
+
+def _drain_verified_rechecks() -> int:
+    """Re-check everything queued; the number of rows reset.
+
+    A pass stops at the first transport error (fix round 1, M8): Navidrome is
+    not answering, and every later row would wait out the same 10 s timeout.
+    That row and the rest go back on the queue for the next pass (a newer
+    entry queued meanwhile wins). An answered refusal only skips its own row."""
+    with _verified_recheck_lock:
+        batch = dict(_verified_recheck_queue)
+        _verified_recheck_queue.clear()
+    if not batch:
+        return 0
+    user = _default_web_user() or {}
+    nd_user, nd_pass = user.get("navidrome_user", ""), user.get("navidrome_password", "")
+    if not (nd_user and nd_pass):
+        # No Navidrome login to ask with: every row stays exactly as it is, and
+        # this batch is dropped rather than re-queued — the next rescan that
+        # disputes a row queues it again.
+        return 0
+    counts = {"reset": 0, "moved": 0, "kept": 0}
+    items = list(batch.items())
+    deferred = 0
+    for n, ((group_id, key), (index, song_id)) in enumerate(items):
+        try:
+            song = nd_get_song(nd_user, nd_pass, song_id)
+        except NavidromeRefusal:
+            counts["kept"] += 1
+            continue
+        except Exception:  # noqa: BLE001 — no answer: stop this pass
+            with _verified_recheck_lock:
+                for entry_key, entry in items[n:]:
+                    _verified_recheck_queue.setdefault(entry_key, entry)
+            deferred = len(items) - n
+            break
+        if song is not None:
+            continue
+        counts[_recheck_gone_song(group_id, index, key, song_id, nd_user, nd_pass)] += 1
+    if counts["reset"] or counts["moved"] or counts["kept"] or deferred:
+        print(f"  verified re-check: {counts['reset']} gone from Navidrome, reset; "
+              f"{counts['moved']} followed to a new song id; {counts['kept']} kept; "
+              f"{deferred} deferred (Navidrome did not answer)")
+    if counts["reset"] or counts["moved"]:
+        _save_review_state()
+    return counts["reset"]
+
+def _verified_recheck_loop() -> None:
+    while True:
+        _verified_recheck_wake.wait()
+        _verified_recheck_wake.clear()
+        try:
+            _drain_verified_rechecks()
+        except Exception as e:  # noqa: BLE001 — the worker must outlive a bad batch
+            print(f"  verified re-check failed: {e}")
+
+def _ensure_verified_rechecker() -> None:
+    global _verified_recheck_thread
+    with _verified_recheck_lock:
+        if _verified_recheck_thread is not None and _verified_recheck_thread.is_alive():
+            return
+        _verified_recheck_thread = threading.Thread(
+            target=_verified_recheck_loop, name="verified-recheck", daemon=True)
+        _verified_recheck_thread.start()
 
 # Group fields a rescan must carry from the previous row, on top of the ones
 # _merge_review_groups names inline: user decisions and the last search's verdict.
 _REVIEW_GROUP_CARRIED_FIELDS = ("allow_mp3", "no_source_reason", "mp3_would_help",
                                 "last_action")
-# Per-track fields carried the same way, keyed by (mbid, title).
+# Per-track fields carried the same way, keyed by (mbid, title) — by both
+# rebuild paths, `_merge_review_groups` and `refresh_group_missing`, which used to
+# keep their own lists and drifted (Q-023). `nd_song_id` is the Navidrome song a
+# verified row was matched to; it is what lets a rescan re-check that row.
 _REVIEW_TRACK_CARRIED_FIELDS = ("local_path", "download_state", "download_error",
                                 "downloaded_at", "imported_at", "matched_relpath",
-                                "repair_job_id", "repair_track_id", "manual_pick",
+                                "placement_missed_at", "placed_title",
+                                "placed_recording_mbid", "manual_pick",
                                 "can_force_place", "force_place_conflict",
-                                "source_user", "source_folder", "match_mode")
+                                "source_user", "source_folder", "match_mode",
+                                "nd_song_id")
 
-def _merge_review_groups(new_groups: list, source_key: str = "groups",
-                         include_jobs: bool = True) -> list:
+def _merge_review_groups(new_groups: list, source_key: str = "groups") -> list:
     # Read the live list under the lock rather than via _review_snapshot():
     # groups are rows in library_index.db now and no longer ride in the JSON
     # state, so the snapshot does not carry them. Only ids and a handful of
     # fields are read out of `old`, and nothing here mutates it.
     with _review_lock:
         old = {g.get("id"): g for g in (_review_state.get(source_key) or [])}
-    seen = set()
+    live_by_group = _live_transfer_indexes_by_group()
+    with _placement_verify_lock:
+        verifying = set(_placement_verifiers)
     for group in new_groups:
-        seen.add(group.get("id"))
         prev = old.get(group["id"])
         if not prev:
-            _apply_repair_job_projection_to_group(group)
             continue
         group["canonical_album_id"] = prev.get("canonical_album_id", group["canonical_album_id"])
         # Carry the user's skip/hide decision across rescans — without this a
-        # rescan resurrects every album the user explicitly dismissed.
-        group["hidden"] = prev.get("hidden", group.get("hidden", False))
+        # rescan resurrects every album the user explicitly dismissed. Except
+        # from a retired `repair` row (B-022): it holds the id of the group its
+        # job was for, and its `hidden` is the migration's, not the user's — the
+        # real album coming back under that id must come back visible.
+        if not (_review_group_origin(prev) == "repair"
+                and _review_group_origin(group) != "repair"):
+            group["hidden"] = prev.get("hidden", group.get("hidden", False))
         group["merge_mode"] = prev.get("merge_mode", group["merge_mode"])
         group["match_mode"] = prev.get("match_mode", group.get("match_mode", "auto"))
         group["source_results"] = prev.get("source_results", group.get("source_results", {}))
@@ -9188,23 +9914,15 @@ def _merge_review_groups(new_groups: list, source_key: str = "groups",
         for field in _REVIEW_GROUP_CARRIED_FIELDS:
             if field in prev and field not in group:
                 group[field] = prev[field]
-        previous_tracks = {(t.get("mbid"), t.get("title")): dict(t)
-                     for t in prev.get("missing_tracks", [])}
+        # A row with a live transfer behind it keeps its in-flight decision;
+        # the caller re-points the transfer at the row's new index when it
+        # swaps this group in (`_repoint_transfer_indexes`).
+        previous_tracks = _rescan_previous_rows(group["id"], prev.get("missing_tracks", []),
+                                                live_by_group.get(group["id"], set()))
         for track in group.get("missing_tracks", []):
-            previous = previous_tracks.get((track.get("mbid"), track.get("title")), {})
-            track["decision"] = _inherited_decision(
-                previous, track.get("decision", "pending"))
-            for field in _REVIEW_TRACK_CARRIED_FIELDS:
-                if previous.get(field):
-                    track[field] = previous[field]
-        _apply_repair_job_projection_to_group(group)
-    if LB_BOT_REPAIR_JOBS and include_jobs:
-        for job in repair_jobs.values():
-            if job.get("status") not in REPAIR_JOB_ACTIVE_STATUSES:
-                continue
-            gid = job.get("group_id", "")
-            if gid and gid not in seen:
-                new_groups.append(_review_group_from_repair_job(job))
+            previous, live = _take_previous_row(previous_tracks, track)
+            _inherit_track_state(track, previous, live, _REVIEW_TRACK_CARRIED_FIELDS,
+                                 verifying=group["id"] in verifying)
     return new_groups
 
 def _find_review_group(group_id: str) -> dict | None:
@@ -9274,7 +9992,7 @@ def _source_search_claim(group_id: str):
             with _source_search_lock:
                 _source_search_inflight.discard(group_id)
 
-def refresh_group_albums_from_navidrome(group_id: str) -> bool:
+def refresh_group_albums_from_navidrome(group_id: str, live_albums: dict = None) -> bool:
     """Re-read one group's albums from Navidrome and recompute its counts.
 
     `refresh_group_missing` alone cannot do this: it recomputes from the cached
@@ -9285,7 +10003,8 @@ def refresh_group_albums_from_navidrome(group_id: str) -> bool:
     count updates" complaint.
 
     The Navidrome round trips happen outside `_review_lock`; only the swap is
-    inside it.
+    inside it. `live_albums` ({id: album}) is a fresh album list a caller
+    refreshing several groups already holds; without it one is fetched.
     """
     user = _default_web_user()
     if not user or not group_id:
@@ -9303,7 +10022,8 @@ def refresh_group_albums_from_navidrome(group_id: str) -> bool:
     # stored records carry the counts from when the group was built, and no call
     # site ever passed force=True, so /api/library and /api/summary lagged by up
     # to the index TTL on top of Navidrome's own scan latency.
-    live = {a.get("id", ""): a for a in _nd_album_index(force=True)}
+    live = (live_albums if live_albums is not None
+            else {a.get("id", ""): a for a in _nd_album_index(force=True)})
     # Warm the MusicBrainz tracklist here so the in-lock recompute below hits the
     # cache instead of a rate-limited request while holding the lock.
     if canonical_mbid:
@@ -9335,40 +10055,79 @@ def refresh_group_albums_from_navidrome(group_id: str) -> bool:
     return True
 
 def refresh_group_missing(group: dict) -> dict:
+    """Recompute `group`'s missing rows from its album records and canonical
+    tracklist; returns the group. `_refresh_group_missing` is the same pass and
+    also says whether it rebuilt anything — a caller that reports the outcome
+    (the /missing and /canonical routes) reads that instead."""
+    _refresh_group_missing(group)
+    return group
+
+def _refresh_group_missing(group: dict) -> str:
+    """`refresh_group_missing`'s pass: "" when the group was rebuilt, else why it
+    was left exactly as it was (final review M-1 — the routes used to report
+    success for a pass that changed nothing)."""
     if not group.get("albums"):
-        # Nothing to recompute from: a repair-job projection, or a playlist /
-        # Spotify group, carries its missing tracks and no album records. The
+        # Nothing to recompute from: a playlist / Spotify group (or one of the
+        # retired `repair`-origin groups) carries its missing tracks and no
+        # album records. The
         # pass below used to blank canonical_mbid and missing_tracks for these
         # (and ask MusicBrainz for "release/" under _review_lock), so a stuck
         # album read "complete" with its downloaded files still unplaced.
-        return group
+        return "the group has no album records to recompute from"
     canonical = next((a for a in group.get("albums", [])
                       if a.get("id") == group.get("canonical_album_id")), None)
     if not canonical:
         canonical = (group.get("albums") or [{}])[0]
-        group["canonical_album_id"] = canonical.get("id", "")
-    group["canonical_mbid"] = canonical.get("musicBrainzId", "")
-    group["artist"] = canonical.get("artist", group.get("artist", ""))
-    group["album"] = canonical.get("name", group.get("album", ""))
-    existing = {(t.get("mbid"), t.get("title")): dict(t)
-                for t in group.get("missing_tracks", [])}
+    canonical_mbid = canonical.get("musicBrainzId", "")
+    pinned = group.get("canonical_mbid") or ""
+    if pinned and canonical_mbid != pinned and _live_transfer_track_indexes(group.get("id", "")):
+        # The discography classifier's wrong-release guard pins `canonical_mbid`
+        # to a release in the matched release-group when the album's own tag
+        # points at another; rebuilding from the record's tag swaps releases,
+        # so every in-flight row of the pinned one reads as dropped and its
+        # transfer is cancelled (Q-027(a)). Not while a fill is running — the
+        # root cause (refresh ignoring the pin) is open work.
+        why = (f"a fill of release {pinned} is running and the album record names "
+               f"{canonical_mbid or 'no release'}")
+        print(f"  group refresh: group {group.get('id', '')}: {why} — left as it was")
+        return why
+    artist = canonical.get("artist", group.get("artist", ""))
     missing_info = _missing_for_album_records(
-        group.get("albums", []), group["canonical_mbid"], group["artist"])
+        group.get("albums", []), canonical_mbid, artist)
+    if not missing_info["total"]:
+        # An empty tracklist read says nothing about what is missing: a
+        # MusicBrainz outage inside the failure cooldown, an evicted cache
+        # entry, a canonical record with no MBID. Taken as "nothing missing", it
+        # dropped every row — and with them every transfer of a running fill,
+        # cancelled by the re-point below (Q-027(a)). Same rule as
+        # `_reconcile_artist_review_groups`: never rebuild on an empty one.
+        why = (f"no tracklist for {canonical_mbid}, MusicBrainz may be cooling down"
+               if canonical_mbid else
+               "no tracklist: the album record has no MusicBrainz release id")
+        print(f"  group refresh: group {group.get('id', '')}: {why} — left as it was")
+        return why
+    group["canonical_album_id"] = canonical.get("id", "")
+    group["canonical_mbid"] = canonical_mbid
+    group["artist"] = artist
+    group["album"] = canonical.get("name", group.get("album", ""))
+    old_tracks = group.get("missing_tracks", []) or []
+    existing = _rescan_previous_rows(group.get("id", ""), old_tracks)
+    with _placement_verify_lock:
+        verifying = group.get("id", "") in _placement_verifiers
     for track in missing_info["missing"]:
-        key = (track.get("mbid"), track.get("title"))
-        previous = existing.get(key, {})
-        track["decision"] = _inherited_decision(previous)
-        for field in ("local_path", "download_state", "download_error",
-                      "downloaded_at", "imported_at", "matched_relpath"):
-            if previous.get(field):
-                track[field] = previous[field]
+        previous, live = _take_previous_row(existing, track)
+        _inherit_track_state(track, previous, live, _REVIEW_TRACK_CARRIED_FIELDS,
+                             verifying=verifying)
     group["missing_tracks"] = missing_info["missing"]
-    _apply_repair_job_projection_to_group(group)
+    # Every caller holds _review_lock and `group` is the live row, so the
+    # transfers follow their rows in the same step.
+    _repoint_transfer_indexes(group.get("id", ""), old_tracks, group["missing_tracks"])
+    _queue_disputed_verified(group.get("id", ""), group["missing_tracks"])
     group["present"] = missing_info["present"]
     group["total"] = missing_info["total"]
     group["extra"] = missing_info.get("extra", 0)
     group["updated_at"] = time.time()
-    return group
+    return ""
 
 def preview_group_retag(group: dict) -> dict:
     canonical_id = group.get("canonical_album_id")
@@ -9402,6 +10161,8 @@ def preview_group_retag(group: dict) -> dict:
     }
 
 def _canonical_release_fields(release_mbid: str) -> dict:
+    if not release_mbid:
+        return {}
     data = mbz_get(f"release/{release_mbid}", {"inc": "release-groups artist-credits"})
     rg = data.get("release-group") or {}
     artist = _artist_credit_str(data.get("artist-credit")) or group_artist_fallback(data)
@@ -10323,6 +11084,23 @@ def _score_folder(folder: dict, expected_track_count: int = 0,
 
     return max(0, min(score, 14000))
 
+def _aggregated_rejected_formats(stats: dict) -> list:
+    """The union of `rejected_formats` across every pass `slskd_search_album_
+    folders` ran, not just the one pass whose fields "won" `_publish`'s
+    peer-count comparison (Q-013).
+
+    `_no_source_reason` and every `mp3_would_help`/`format_rejected` verdict
+    computed from the same `stats` dict must agree with each other — a reason
+    that says "(they were mp3)" while `mp3_would_help` reads False, or a fill
+    that fails `no_source` when an earlier pass plainly saw a rejected format,
+    is the two halves of one search disagreeing about what it found. This is
+    the one place that union is computed, so every reader stays consistent.
+    """
+    rejected_set = {f for f in (stats.get("rejected_formats") or []) if f}
+    for p in stats.get("pass_stats") or ():
+        rejected_set.update(f for f in (p.get("rejected_formats") or []) if f)
+    return sorted(rejected_set)
+
 def _no_source_reason(stats: dict) -> str:
     """Why a search that saw peers and files still yielded nothing to pick.
 
@@ -10330,24 +11108,69 @@ def _no_source_reason(stats: dict) -> str:
     2047 files" reads as a bug in the bot. It usually isn't: the files were all
     in a format we reject, or every peer had them locked. Both facts are known
     at the point the result is thrown away, so say which one it was.
+
+    The top-level fields only ever reflect the one pass that "won" (see
+    slskd_run_search._publish) — a later, wider pass with fewer live peers
+    used to erase an earlier pass's evidence outright. `pass_stats`, when
+    present, is every pass's own accounting (and always includes the winning
+    pass too, since `_publish` appends before deciding a winner).
+
+    The sentence is built from **one chosen pass**, whole — never the max of
+    each field independently. Widening fields separately used to let the
+    sentence state a peer count from one pass alongside a file/folder count
+    from another (e.g. "8 peer(s) offered 5 file(s)" when 8 came from a wide,
+    empty pass and 5 from a narrower one that actually saw files) — the two
+    halves of one search disagreeing about what it found. The chosen pass is
+    whichever went furthest down the same ladder this function reports on:
+    saw locked/unavailable folders > saw rejected-format files > saw peers
+    with nothing at all — ties broken by more peers, then files, then
+    folders — because that pass is the one with the most specific, most
+    informative story to tell. `_aggregated_rejected_formats` still unions
+    every pass for the "mp3 would help" verdict, which legitimately asks "did
+    any pass, ever, see a rejected format" rather than narrating one.
     """
-    peers = int(stats.get("peers") or 0)
-    files = int(stats.get("files") or 0)
-    folders = int(stats.get("folders") or 0)
-    rejected = [f for f in (stats.get("rejected_formats") or []) if f]
-    accepted = ", ".join(stats.get("accepted_formats") or ()).upper() or "an accepted format"
+    peers_top = int(stats.get("peers") or 0)
     # A failed call is not an empty library. Say what broke, and keep the peer
     # count next to it so the sentence agrees with the progress line the user
     # just watched.
     if stats.get("error"):
-        seen = f"{peers} peer(s) had answered, but " if peers else ""
+        seen = f"{peers_top} peer(s) had answered, but " if peers_top else ""
         return f"{seen}the search failed — {stats['error']}"
+
+    passes = list(stats.get("pass_stats") or ()) or [stats]
+
+    def _stage(p):
+        if int(p.get("folders") or 0):
+            return 3
+        if int(p.get("files") or 0):
+            return 2
+        if int(p.get("peers") or 0):
+            return 1
+        return 0
+
+    chosen = max(
+        passes,
+        key=lambda p: (_stage(p), int(p.get("peers") or 0),
+                        int(p.get("files") or 0), int(p.get("folders") or 0)))
+
+    peers = int(chosen.get("peers") or 0)
+    files = int(chosen.get("files") or 0)
+    folders = int(chosen.get("folders") or 0)
+    rejected = sorted({f for f in (chosen.get("rejected_formats") or []) if f})
+    accepted = ", ".join(
+        chosen.get("accepted_formats") or stats.get("accepted_formats") or ()
+    ).upper() or "an accepted format"
+
     if not peers:
         # The progress bar counts slskd's live responseCount; the sources come
         # from the responses endpoint. When those disagree, saying "no peer
         # answered" contradicts what the user just watched, and blames the wrong
-        # thing — slskd had the peers, it just didn't hand them over.
+        # thing — slskd had the peers, it just didn't hand them over. Widened
+        # across passes: "counted but not yet published" is one fact about the
+        # search as a whole, not a narrated pass, so mixing it costs nothing.
         counted = int(stats.get("counted_peers") or 0)
+        for p in stats.get("pass_stats") or ():
+            counted = max(counted, int(p.get("counted_peers") or 0))
         if counted:
             return (f"slskd counted {counted} peer(s) but returned none of their "
                     f"responses — it had not finished publishing them")
@@ -10403,12 +11226,18 @@ def slskd_run_search(query: str, expected_track_count: int = 0,
     def _publish():
         if stats is None:
             return
+        # `pass_stats` is every pass's own accounting, appended here regardless
+        # of which pass "wins" the top-level fields below — see Q-013. Captured
+        # into a local before the possible `stats.clear()`, since that clear
+        # would otherwise take the key (part of `stats`, not `acc`) with it.
+        history = (stats.get("pass_stats") or []) + [dict(acc)]
         # slskd_search_album_folders hands the same dict to both passes; keep
         # whichever got further into the network rather than letting a fallback
         # that died on the POST erase what the first pass actually saw.
         if not stats or acc["peers"] >= int(stats.get("peers") or 0):
             stats.clear()
             stats.update(acc)
+        stats["pass_stats"] = history
 
     _say(f"Asking slskd for “{query}”…")
     try:
@@ -11016,9 +11845,11 @@ def slskd_search_album_folders(artist: str, album: str,
             print(f"  Album search pass {i + 1}/{len(queries)}: '{query}'")
             if progress:
                 progress(f"Widening the search — “{query}”…")
-        # Each pass overwrites `stats`, so the accounting reflects the pass that
-        # ran last. That is deliberate and unchanged: it is the widest pass, and
-        # therefore the one that explains an empty result.
+        # `stats["pass_stats"]` accumulates every pass's own accounting (Q-013);
+        # the top-level fields are set to whichever pass "got further" (more
+        # peers), not simply the last one to run. `_no_source_reason` reads one
+        # whole pass from `pass_stats` — the most informative one — rather than
+        # trusting the top-level fields alone.
         for fd in slskd_run_search(query, expected_track_count, progress=progress,
                                    stats=stats, album=clean_album, artist=artist,
                                    year=year, track_titles=track_titles):
@@ -11069,9 +11900,7 @@ def slskd_enqueue(username: str, file: dict,
                   review_group_id: str = "",
                   review_track_index: int = None,
                   match_mode: str = "auto",
-                  target_release_mbid: str = "",
-                  repair_job_id: str = "",
-                  repair_track_id: str = "") -> bool:
+                  target_release_mbid: str = "") -> bool:
     # The single choke point every acquisition path goes through, which is why
     # the rejected-source memory is consulted here and nowhere else. Without
     # it, the ranked list hands back the same peer's same file on the next
@@ -11079,16 +11908,8 @@ def slskd_enqueue(username: str, file: dict,
     if _source_is_rejected(username, file.get("filename", "")):
         print(f"  skipping @{username}'s {file.get('filename', '')}: "
               f"a fingerprint already proved it is the wrong recording")
-        if repair_job_id:
-            _repair_update_download(
-                repair_job_id, username, file.get("filename", ""),
-                "error", "skipped: previously rejected by AcoustID")
         return False
     try:
-        download_record = {}
-        if repair_job_id:
-            download_record = _repair_record_download_queued(
-                repair_job_id, repair_track_id, username, file)
         r = _http.post(
             f"{SLSKD_URL}/api/v0/transfers/downloads/{username}",
             headers=_slskd_headers(),
@@ -11097,15 +11918,11 @@ def slskd_enqueue(username: str, file: dict,
         )
         if not r.ok:
             print(f"  slskd enqueue failed ({r.status_code}): {r.text[:200]}")
-            if repair_job_id:
-                _repair_update_download(
-                    repair_job_id, username, file.get("filename", ""),
-                    "error", f"slskd enqueue failed ({r.status_code}): {r.text[:200]}")
             return False
         # Register for polling if context provided
         if token is not None and chat_id is not None:
             key = (username, file["filename"])
-            pending_downloads[key] = {
+            entry = {
                 "track":          track,
                 "token":          token,
                 "chat_id":        chat_id or "",
@@ -11120,24 +11937,48 @@ def slskd_enqueue(username: str, file: dict,
                 "target_release_mbid": (
                     target_release_mbid or (track or {}).get("_target_release_mbid", "")
                 ),
-                "repair_job_id": repair_job_id or (track or {}).get("repair_job_id", ""),
-                "repair_track_id": repair_track_id or (track or {}).get("repair_track_id", ""),
-                "download_record_id": download_record.get("id", ""),
                 "queued_at": time.time(),
                 "latest_state": "Queued",
                 "percent": 0,
                 "error": "",
                 "local_path": "",
             }
+            if entry["review_group_id"] and entry["review_track_index"] is not None:
+                # The index was read before the slskd call above (a 30 s
+                # timeout), and until the transfer is registered a rescan's
+                # re-point cannot reach it. Resolve the row again and register
+                # in one `_review_lock` hold — the lock the rebuild swaps and
+                # re-points under — so from here on every rescan re-points it
+                # (B-022 final review I1).
+                with _review_lock:
+                    try:
+                        entry["review_track_index"] = _current_review_index(
+                            entry["review_group_id"], entry["review_track_index"], track)
+                    except Exception as e:  # noqa: BLE001 — slskd has it queued: register it
+                        print(f"  slskd enqueue: could not re-check the review row: {e}")
+                    pending_downloads[key] = entry
+            else:
+                pending_downloads[key] = entry
         return True
     except Exception as e:
         print(f"  slskd enqueue exception: {e}")
-        if repair_job_id:
-            _repair_update_download(
-                repair_job_id, username, file.get("filename", ""),
-                "timeout" if "timeout" in str(e).lower() else "error",
-                str(e), "queue_timeout" if "timeout" in str(e).lower() else "")
         return False
+
+def _current_review_index(group_id: str, track_index, track):
+    """`track_index` checked against the row `track` is a copy of, for a
+    transfer about to be registered; the caller holds `_review_lock`. A moved
+    row's new index, None for a row the group no longer lists once, and the
+    index unchanged when there is nothing to check it against (no group, no
+    row copy). The track dict's own `_review_track_index` follows, since the
+    caller's next write — "queued" — reads it from there."""
+    ident = _review_row_identity(track)
+    group = _find_review_group(group_id) if ident is not None else None
+    if group is None:
+        return track_index
+    idx = _review_row_index(group, track_index, ident)
+    if isinstance(track, dict) and "_review_track_index" in track:
+        track["_review_track_index"] = idx
+    return idx
 
 def slskd_enqueue_folder(username: str, files: list,
                          token: str = None, chat_id: str = None,
@@ -11146,7 +11987,6 @@ def slskd_enqueue_folder(username: str, files: list,
                          album: str = "", missing_tracks: list = None,
                          review_group_id: str = "",
                          match_mode: str = "auto",
-                         repair_job_id: str = "",
                          allow_mp3: bool = False,
                          quality: str = "",
                          siblings: list = None) -> tuple:
@@ -11204,9 +12044,7 @@ def slskd_enqueue_folder(username: str, files: list,
                          review_group_id=review_group_id,
                          review_track_index=(track or {}).get("_review_track_index"),
                          match_mode=match_mode,
-                         target_release_mbid=release_mbid,
-                         repair_job_id=repair_job_id or (track or {}).get("repair_job_id", ""),
-                         repair_track_id=(track or {}).get("repair_track_id", "")):
+                         target_release_mbid=release_mbid):
             ok += 1
         elif album_group_id:
             pending_album_groups[album_group_id]["failed"] += 1
@@ -11859,15 +12697,14 @@ def _detach_transfer(key: tuple, info: dict) -> dict:
     slskd cancel needs to address it. Cheap and synchronous, so the poller can
     no longer see the transfer by the time this returns."""
     username, filename = key
-    if info.get("repair_job_id"):
-        _repair_update_download(info.get("repair_job_id", ""), username, filename,
-                                "cancelled", "abandoned pending transfer",
-                                raw_state="Cancelled")
     pending_downloads.pop(key, None)
     return {"username": username, "filename": filename,
             "transfer_id": info.get("transfer_id", ""),
             "review_group_id": info.get("review_group_id", ""),
-            "review_track_index": info.get("review_track_index")}
+            "review_track_index": info.get("review_track_index"),
+            # Out of the registry, the index no longer follows a rescan; the
+            # row's key does (`_mark_detached_entries_cancelled`).
+            "review_track_key": _review_row_identity(info.get("track"))}
 
 def _detach_group_downloads(ag_id: str) -> list:
     """Detach every still-pending transfer of an album group (see above)."""
@@ -11901,8 +12738,9 @@ def _abandon_transfers_async(entries: list) -> None:
 def _abandon_group_downloads(ag_id: str):
     """Drop all still-pending transfers belonging to an album group, and
     cancel them in slskd synchronously. The failover path wants this — it
-    re-enqueues from the next peer straight after — and it runs on the
-    poller's thread with nobody waiting on an HTTP answer."""
+    re-enqueues from the next peer straight after — and calls it through
+    `asyncio.to_thread`, off the poller's event loop (Q-027(c)): the DELETEs
+    block, and nobody is waiting on an HTTP answer."""
     _abandon_transfers(_detach_group_downloads(ag_id), remove=False)
 
 def _retry_file_from_alt_source(ag: dict, ag_id: str, info: dict,
@@ -11965,9 +12803,7 @@ def _retry_file_from_alt_source_inner(ag: dict, ag_id: str, info: dict,
                              review_group_id=info.get("review_group_id", ""),
                              review_track_index=info.get("review_track_index"),
                              match_mode=info.get("match_mode", "auto"),
-                             target_release_mbid=info.get("target_release_mbid", ""),
-                             repair_job_id=info.get("repair_job_id", ""),
-                             repair_track_id=info.get("repair_track_id", "")):
+                             target_release_mbid=info.get("target_release_mbid", "")):
             # Nothing was queued from this peer, so the file isn't ours after all.
             if match.get("filename", "") in claimed:
                 claimed.remove(match.get("filename", ""))
@@ -11979,8 +12815,11 @@ def _retry_file_from_alt_source_inner(ag: dict, ag_id: str, info: dict,
             new_info["_tried_users"] = tried
         gid = info.get("review_group_id", "")
         if gid:
-            _set_review_track_state(gid, info.get("review_track_index"),
-                                    "downloading", download_percent=0,
+            # The failed transfer's index was read before the listing and the
+            # enqueue; the new one's was resolved as it registered.
+            _set_review_track_state(gid, (new_info or info).get("review_track_index"),
+                                    "downloading", expect_key=_review_row_identity(track),
+                                    download_percent=0,
                                     download_state="Queued", error="",
                                     source_user=username,
                                     filename=match["filename"])
@@ -11997,7 +12836,9 @@ async def _switch_album_source(bot, ag_id: str):
     if not ag or ag.get("switching"):
         return
     ag["switching"] = True
-    _abandon_group_downloads(ag_id)
+    # Off the event loop, like every slskd call here (Q-027(c)): the DELETEs
+    # are synchronous, and the poller's other transfers wait on this loop.
+    await asyncio.to_thread(_abandon_group_downloads, ag_id)
 
     with _mp3_fallback(ag.get("allow_mp3")), _quality_preference(ag.get("quality", "")):
         await _switch_album_source_inner(bot, ag_id, ag)
@@ -12012,7 +12853,7 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
       `missing_tracks` on the group says which slots this fill is for; matching
       against them is `slskd_enqueue_folder`'s own first step, and skipping it
       meant a switched source fetched the entire album to fill two holes.
-    * **The review and repair linkage is carried through.** Without
+    * **The review linkage is carried through.** Without
       `review_group_id` / `review_track_index`, a switched album downloads
       correctly and the gap view never hears about it — every track sits on the
       `failed` the poller wrote just before the switch, so the fill looks dead
@@ -12067,19 +12908,28 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
                    "source_user": username, "local_dirs": {}, "ts": time.time()})
         ok = 0
         for f, track in file_pairs:
-            if slskd_enqueue(username, f, track=track,
-                             token=ag["token"], chat_id=ag["chat_id"],
-                             album_group_id=ag_id,
-                             review_group_id=review_gid,
-                             review_track_index=(track or {}).get("_review_track_index"),
-                             match_mode=ag.get("match_mode", "auto"),
-                             target_release_mbid=ag.get("target_release_mbid", ""),
-                             repair_job_id=(track or {}).get("repair_job_id", ""),
-                             repair_track_id=(track or {}).get("repair_track_id", "")):
+            # Each enqueue is a slskd POST with a 30 s timeout: off the loop
+            # (Q-027(c)). The format/quality preferences are contextvars, which
+            # `to_thread` carries into the worker.
+            accepted = await asyncio.to_thread(
+                slskd_enqueue, username, f, track=track,
+                token=ag["token"], chat_id=ag["chat_id"],
+                album_group_id=ag_id,
+                review_group_id=review_gid,
+                review_track_index=(track or {}).get("_review_track_index"),
+                match_mode=ag.get("match_mode", "auto"),
+                target_release_mbid=ag.get("target_release_mbid", ""))
+            if _gone():
+                # Cancelled during that POST: no more of them, and no `queued`
+                # over a cancelled row. The check after the loop lets go of
+                # whatever registered meanwhile.
+                break
+            if accepted:
                 ok += 1
                 if review_gid and track is not None:
                     _set_review_track_state(
                         review_gid, track.get("_review_track_index"), "queued",
+                        expect_key=_review_row_identity(track),
                         download_percent=0, download_state="Queued", error="",
                         source_user=username, filename=f.get("filename", ""))
             else:
@@ -12093,7 +12943,8 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
             await _update_group_progress(bot, ag)
             ag["switching"] = False
             return
-        _abandon_group_downloads(ag_id)   # that source enqueued nothing — keep going
+        # That source enqueued nothing — keep going.
+        await asyncio.to_thread(_abandon_group_downloads, ag_id)
 
     if _gone():
         return
@@ -12274,8 +13125,11 @@ def _deterministic_album_import(album_dir, release_mbid: str,
                        "relpath": os.path.join(os.path.basename(one_dir), row["relpath"])}
             raw_files.append(row)
     if not raw_files:
+        # The folder's own name, not its /downloads path (Q-021): this text is
+        # stamped on review rows and the ledger and reaches both clients.
+        folder = os.path.basename(os.path.normpath(primary_dir)) if primary_dir else ""
         return {"ok": False, "dest_folder": "", "moved": 0, "per_file": [],
-                "error": f"No audio files found in {primary_dir}"}
+                "error": f"No audio files found in {folder or 'the download folder'}"}
     if only_relpaths:
         wanted = {os.path.normpath(p) for p in only_relpaths}
         raw_files = [f for f in raw_files if os.path.normpath(f["relpath"]) in wanted]
@@ -12363,7 +13217,8 @@ def _deterministic_album_import(album_dir, release_mbid: str,
         os.makedirs(dest_folder, exist_ok=True)
     except Exception as e:
         return {"ok": False, "dest_folder": dest_folder, "moved": 0, "per_file": [],
-                "error": f"Could not create {dest_folder}: {e}"}
+                "error": (f"Could not create album folder "
+                          f"{os.path.basename(dest_folder)}: {_os_error_text(e)}")}
     try:
         os.chmod(dest_folder, 0o775)
     except Exception as e:
@@ -12492,7 +13347,7 @@ def _deterministic_album_import(album_dir, release_mbid: str,
             return True, ""
         except Exception as e:
             print(f"  _deterministic_album_import move error {path}: {e}")
-            return False, f"could not move into the library: {e}"
+            return False, f"could not move into the library: {_os_error_text(e)}"
 
     moved = 0
     per_file = []
@@ -12638,24 +13493,142 @@ def _deterministic_album_import(album_dir, release_mbid: str,
         "moved": moved,
         "per_file": per_file,
         "error": error,
+        # The album tags just written, so a caller can name the release in
+        # words rather than by its folder (ruling R-A).
+        "artist": artist,
+        "album": album,
     }
 
 
+def _stamp_early_placement_failure(group_id: str, album_dir: str,
+                                    only_relpaths, error: str,
+                                    result: dict = None) -> int:
+    """A placement that fails before it can produce any per-file result (no
+    audio files, a bad selection, no MusicBrainz tracklist, a mkdir failure --
+    the linker returns 0 for every one of these) leaves `per_file` empty. That
+    left `_mark_group_tracks_placed` unreached (it only runs inside the `ok`
+    branch) and `_link_loose_track_placements` a no-op (it reads `per_file`),
+    so only the task's own message said why -- the review rows kept their old
+    text, or none at all.
+
+    Writes `error` onto the affected rows **without changing their decision**
+    (Q-017(d)): they stay `downloaded`/`needs_match`, i.e. still fetchable and
+    placeable, matching what a *file-level* refusal already does via
+    `_link_loose_track_placements`'s "" branch. Each affected group is pushed
+    once, so the clients see it now rather than on their next poll.
+
+    Only rows whose own file was in what failed, matched by `local_path`: one
+    download folder can hold several peers' unrelated rows, and one album gap's
+    downloaded rows can sit in several folders (a rescued leftover, a file
+    picked from another peer) -- a failure placing one folder says nothing
+    about a row whose file is in another.
+
+    - A non-loose (album) group: *that group's* rows with a file anywhere under
+      `album_dir` (a disc subfolder included) -- the whole folder is one
+      release, and the failure was placing it.
+    - A Loose-tracks group, or no group at all (e.g. "Pick the release" sends
+      none): the rows of every Loose-tracks group whose file sits directly in
+      `album_dir`, the way `_link_loose_track_placements` matches a per-file
+      outcome.
+
+    `only_relpaths`, when given, narrows either case to exactly the chosen
+    files.
+
+    A placement can also fail with a FULL `per_file` — every file refused, the
+    duplicate-audio guard above all (Q-019). Given the `result`, each row of an
+    album group then gets its own per-file reason (`_placement_outcomes`, the
+    way `_mark_group_tracks_placed` words it), falling back to `error` for a row
+    the result says nothing about; still without touching its decision. A
+    Loose-tracks row's per-file outcome is `_link_loose_track_placements`'s to
+    write — matched by its file, not by slot — so with a full `per_file` the
+    loose case is left to it.
+    """
+    outcomes = _placement_outcomes(result) if result else {}
+    if not error and not outcomes:
+        return 0
+    wanted = None
+    if only_relpaths:
+        wanted = {os.path.normpath(os.path.join(album_dir, p)) for p in only_relpaths}
+    folder = os.path.normpath(album_dir)
+
+    def failed_here(track: dict, nested: bool) -> bool:
+        if track.get("decision") not in ("downloaded", "needs_match"):
+            return False
+        local = track.get("local_path", "")
+        if not local:
+            return False
+        norm = os.path.normpath(local)
+        if wanted is not None:
+            return norm in wanted
+        if nested:
+            return norm.startswith(folder + os.sep)
+        return os.path.normpath(os.path.dirname(norm)) == folder
+
+    stamped = 0
+    touched = []
+    with _review_lock:
+        group = _find_review_group(group_id) if group_id else None
+        if group and not _is_loose_tracks_group(group):
+            candidates = [(group, True)]
+        elif (result or {}).get("per_file"):
+            candidates = []    # the linker's, see above
+        else:
+            candidates = [(g, False) for g in _review_state.get("groups", []) or []
+                          if _is_loose_tracks_group(g)]
+        for g, nested in candidates:
+            hit = 0
+            for track in g.get("missing_tracks", []) or []:
+                if not failed_here(track, nested):
+                    continue
+                own = (outcomes.get(track.get("recording_mbid")
+                                    or track.get("mbid") or "")
+                       or outcomes.get(_match_key(track.get("title", ""))))
+                text = (f"placement failed: {own['reason']}"
+                        if own and not own["placed"] else error)
+                if text:
+                    track["download_error"] = text
+                    hit += 1
+            if hit:
+                g["updated_at"] = time.time()
+                touched.append(g.get("id", ""))
+                stamped += hit
+    # Outside the lock, as `_set_review_track_state` does: the push worker
+    # takes it itself to build the frame.
+    for gid in touched:
+        _push_gap(gid)
+    if stamped:
+        _save_review_state()
+    return stamped
+
 def _deterministic_import_task(task_id: str, album_dir: str, release_mbid: str,
                                 artist: str = "", album: str = "",
-                                group_id: str = "") -> None:
+                                group_id: str = "",
+                                only_relpaths=None) -> None:
     _task_update(task_id, current=album_dir)
     result = _deterministic_album_import(album_dir, release_mbid, artist, album,
-                                         group_id=group_id)
+                                         group_id=group_id,
+                                         only_relpaths=only_relpaths)
     if result["ok"]:
-        _imported_folders.add(album_dir)
+        # A subset leaves the rest of the folder still to be filed.
+        if not only_relpaths:
+            _imported_folders.add(album_dir)
         _nd_scan_after_import(_default_web_user().get("telegram_token", ""))
         if group_id:
             with _review_lock:
                 group = _find_review_group(group_id)
-                if group:
+                # A Loose-tracks group is linked per file, below.
+                if group and not _is_loose_tracks_group(group):
                     _mark_group_tracks_placed(group, result)
             _save_review_state()
+    else:
+        # Write why onto the rows this placement was for: the failure itself
+        # when it came before any per-file result (Q-017(d)), each album row's
+        # own refusal when every file was refused (Q-019).
+        _stamp_early_placement_failure(group_id, album_dir, only_relpaths,
+                                       result.get("error", ""), result=result)
+    # Whatever group id the caller sent, if any: "Pick the release" sends none.
+    # A refusal is linked too, so the row says why its file is still here.
+    _link_loose_track_placements(album_dir, result)
     moved = result.get("moved", 0)
     dest = result.get("dest_folder", "")
     msg = (f"Placed {moved} file(s) into {os.path.basename(dest)}"
@@ -12849,6 +13822,14 @@ async def _finalize_group(bot, ag_id: str):
                 fill_mbid,
                 "mb_unavailable" if result.get("retryable") else "placement_failed",
                 result.get("error", ""))
+            # The review rows behind the fill say why too, not just the ledger
+            # (Q-019) — once per dir the import tried, since the stamp matches a
+            # row by the folder its file is in.
+            if ag.get("review_group_id"):
+                for one_dir in import_dirs:
+                    _stamp_early_placement_failure(
+                        ag["review_group_id"], one_dir, None,
+                        result.get("error", ""), result=result)
 
     if fails:
         head = (f"⚠️ Album finished with errors: {label}\n"
@@ -13072,17 +14053,17 @@ async def _poll_downloads_once(token_to_app: dict):
                 _push_fill_progress(info["album_group_id"])
             review_gid = info.get("review_group_id", "")
             review_idx = info.get("review_track_index")
-            repair_job_id = info.get("repair_job_id", "")
+            # Every write below names its row by key too: a rescan runs on its
+            # own thread and can move the rows between this read and a write
+            # (B-022 final review I1).
+            review_key = _review_row_identity(track)
             if review_gid and not _slskd_succeeded(state) and not _slskd_failed(state):
                 _set_review_track_state(review_gid, review_idx, "downloading",
+                                        expect_key=review_key,
                                         download_percent=percent,
                                         download_state=state,
                                         source_user=username,
                                         filename=filename)
-            if repair_job_id and not _slskd_succeeded(state) and not _slskd_failed(state):
-                _repair_update_download(repair_job_id, username, key[1],
-                                        "downloading", percent=percent,
-                                        raw_state=state)
             label   = (f"{track['artist']} - {track['title']}"
                        if track else key[1].split('/')[-1].split('\\')[-1])
             app     = token_to_app.get(token)
@@ -13128,23 +14109,29 @@ async def _poll_downloads_once(token_to_app: dict):
             if _slskd_succeeded(state):
                 ag_id = info.get("album_group_id")
                 local_path = await asyncio.to_thread(_resolve_local_path, filename)
+                # That await is an os.walk of /downloads — seconds on the NAS —
+                # and a rescan during it re-points the transfer, not this local.
+                review_idx = info.get("review_track_index")
                 info["local_path"] = local_path or ""
                 # Placement happens later and on another thread, by then with
                 # only a path in hand. Record the provenance now so an AcoustID
                 # rejection can be remembered against the peer that served it.
                 _remember_download_origin(local_path or "", username, filename)
-                if repair_job_id:
-                    _repair_update_download(repair_job_id, username, key[1],
-                                            "complete", local_path=local_path or "",
-                                            percent=100, raw_state=state)
                 if review_gid:
                     _set_review_track_state(review_gid, review_idx, "downloaded",
+                                            expect_key=review_key,
                                             download_percent=100,
                                             download_state=state,
                                             local_path=local_path or "",
                                             source_user=username,
                                             filename=filename)
-                del pending_downloads[key]
+                if pending_downloads.pop(key, None) is None:
+                    # Let go of while the disk walk above (or the review lock)
+                    # held us up: a cancel, or a rescan that dropped its row
+                    # (Q-027(a)) and took it out of its fill's total. It is not
+                    # this file's poll any more — counting it would over-count
+                    # the fill and could finalize it with siblings in flight.
+                    continue
                 if ag_id and ag_id not in pending_album_groups:
                     # The album this file belonged to was cancelled (or already
                     # finalized) while the transfer was still running. It is
@@ -13174,16 +14161,46 @@ async def _poll_downloads_once(token_to_app: dict):
                         await _finalize_group(bot, ag_id)
                 else:
                     # Loose individual track — tag with mutagen and trigger rescan.
-                    if local_path:
+                    #
+                    # A Loose-tracks review row whose file names its own release
+                    # is filed under it instead (B-017); any other file stays in
+                    # the downloads folder exactly as before.
+                    filed, auto_failed = "", False
+                    if local_path and review_gid:
+                        try:
+                            filed = await asyncio.to_thread(
+                                _auto_place_loose_track, local_path, review_gid,
+                                review_idx, review_key)
+                        except Exception as e:  # noqa: BLE001 — fall back to the old path
+                            print(f"  {label}: auto-placing the loose track failed: {e}")
+                            # Not "filed", whether or not the file moved: the
+                            # import may have moved it before the row was linked
+                            # (Q-017(f)), and then nothing says where it went.
+                            auto_failed = True
+                            # Its own try: a failure to record the miss must not
+                            # take the rest of the poll down with it.
+                            try:
+                                _loose_place_crashed(review_gid, review_idx,
+                                                     local_path, e, review_key)
+                            except Exception as e2:  # noqa: BLE001
+                                print(f"  {label}: could not record the failed "
+                                      f"auto-placement: {e2}")
+                    if filed:
+                        file_msg = ("filed under its tagged release" if filed == "filed"
+                                    else "filed into its tagged release as an extra track")
+                        if await asyncio.to_thread(_nd_scan_after_import, token):
+                            file_msg += " · 🔄 Navidrome scan triggered"
+                    elif local_path:
                         info_track = track or {}
                         tag_updates = {k: v for k, v in {
                             "title":      info_track.get("title", ""),
                             "artist":     info_track.get("artist", ""),
                             "mb_trackid": info_track.get("mbid", ""),
                         }.items() if v}
-                        if tag_updates:
+                        if tag_updates and os.path.isfile(local_path):
                             _mutagen_write_tags(local_path, tag_updates)
-                        file_msg = "completed"
+                        file_msg = ("completed, but filing it under its tagged "
+                                    "release failed" if auto_failed else "completed")
                         if await asyncio.to_thread(_nd_scan_after_import, token):
                             file_msg += " · 🔄 Navidrome scan triggered"
                     else:
@@ -13234,12 +14251,9 @@ async def _poll_downloads_once(token_to_app: dict):
                         continue
                     print(f"  {label}: cancelled in slskd — counting the one "
                           f"file as lost, album continues")
-                    if repair_job_id:
-                        _repair_update_download(repair_job_id, username, key[1],
-                                                "cancelled", state,
-                                                percent=percent, raw_state=state)
                     if review_gid:
                         _set_review_track_state(review_gid, review_idx, "cancelled",
+                                                expect_key=review_key,
                                                 download_percent=percent,
                                                 download_state=state, error=state,
                                                 source_user=username,
@@ -13251,22 +14265,20 @@ async def _poll_downloads_once(token_to_app: dict):
                     if ag["completed"] + ag["failed"] >= ag["total"]:
                         await _finalize_group(bot, ag_id)
                     continue
-                is_timeout = "TimedOut" in (state or "") or "Timeout" in (state or "")
-                if repair_job_id:
-                    _repair_update_download(
-                        repair_job_id, username, key[1],
-                        "cancelled" if is_cancelled else ("timeout" if is_timeout else "error"),
-                        state, "transfer_timeout" if is_timeout else "",
-                        percent=percent, raw_state=state)
                 if review_gid:
                     decision = "cancelled" if is_cancelled else "failed"
                     _set_review_track_state(review_gid, review_idx, decision,
+                                            expect_key=review_key,
                                             download_percent=percent,
                                             download_state=state,
                                             error=state,
                                             source_user=username,
                                             filename=filename)
-                del pending_downloads[key]
+                if pending_downloads.pop(key, None) is None:
+                    # Let go of while the row write waited on the review lock
+                    # (a cancel, or a rescan that dropped the row): nothing to
+                    # fail over — the track is no longer wanted from here.
+                    continue
                 if ag_id and ag_id in pending_album_groups:
                     ag = pending_album_groups[ag_id]
                     # If nothing has downloaded yet, the source is bad.
@@ -13391,9 +14403,7 @@ async def _poll_downloads_once(token_to_app: dict):
                         if await asyncio.to_thread(
                                 slskd_enqueue, next_c["username"], best_file,
                                 track=track, token=token, chat_id=chat_id,
-                                candidates=remaining[1:],
-                                repair_job_id=info.get("repair_job_id", ""),
-                                repair_track_id=info.get("repair_track_id", "")):
+                                candidates=remaining[1:]):
                             await _tg_send(bot, chat_id,
                                 f"🔁 Download failed for {label} ({state}) — "
                                 f"retrying with next source…")
@@ -15658,8 +16668,7 @@ def _scan_review_worker(fuzzy: bool, task_id: str = "", scan_all: bool = False,
                 user["navidrome_user"], user["navidrome_password"],
                 fuzzy=fuzzy, deep=deep, progress=lambda d, t: _progress(d, t),
                 cancel=_cancel, records_out=phase_one_records)
-            groups = _merge_review_groups(groups, source_key="duplicate_groups",
-                                          include_jobs=False)
+            groups = _merge_review_groups(groups, source_key="duplicate_groups")
             for group in groups:
                 group["origin"] = "duplicate"
             with _review_lock:
@@ -15753,49 +16762,83 @@ def _start_review_scan(fuzzy: bool, scan_all: bool, deep: bool = False) -> dict:
             return {"ok": False, "error": str(e), "task_id": task_id}
         return {"ok": True, "task_id": task_id}
 
-def _set_review_track_state(group_id: str, track_index, decision: str,
-                            **updates) -> None:
-    if track_index is None:
-        return
+def _review_row_identity(track) -> tuple | None:
+    """The key a writer names its row by, taken from the row copy it holds (a
+    transfer's `track`, the verifier's snapshot): `_rescan_track_key`, the key a
+    rebuild carries the row by. None when there is no row dict to take it from —
+    the write is then addressed by index alone, as it always was."""
+    if not isinstance(track, dict) or not (track.get("mbid") or track.get("title")):
+        return None
+    return _rescan_track_key(track)
+
+def _review_row_index(group: dict, track_index, expect_key=None) -> int | None:
+    """Where a write for row `track_index` of `group` lands, or None for nowhere.
+    The caller holds `_review_lock`.
+
+    Without `expect_key`, the index as it stands. With it (B-022 final review
+    I1), the index only while the row there is still that row: a writer that
+    read an index and then waited — the verifier on Navidrome, the poller on
+    the disk, a cancel whose transfer was already detached — is past the reach
+    of `_repoint_transfer_indexes`, and a rebuild in between put another track
+    at that index. The write then follows its row by key, or is dropped when
+    the group lists the row nowhere or twice: no row is better than someone
+    else's."""
+    tracks = group.get("missing_tracks", []) or []
     try:
         idx = int(track_index)
+    except (TypeError, ValueError):
+        return None
+    if expect_key is None:
+        return idx if 0 <= idx < len(tracks) else None
+    key = tuple(expect_key)
+    if 0 <= idx < len(tracks) and _rescan_track_key(tracks[idx]) == key:
+        return idx
+    found = [i for i, t in enumerate(tracks) if _rescan_track_key(t) == key]
+    return found[0] if len(found) == 1 else None
+
+# (group id, row key) pairs whose dropped write has been logged: a poller that
+# still holds a stale transfer writes every tick, and one line says it.
+_dropped_row_writes_logged: set = set()
+
+def _set_review_track_state(group_id: str, track_index, decision: str,
+                            expect_key=None, **updates) -> bool:
+    """Write one review row's decision and fields. `expect_key` is the row's
+    `_rescan_track_key` as the writer knew it (see `_review_row_index`); pass it
+    whenever the index was read before anything slow. True when a row was
+    written."""
+    if track_index is None:
+        return False
+    try:
+        int(track_index)
     except Exception:
-        return
+        return False
+    written = False
     with _review_lock:
         group = _find_review_group(group_id)
         if not group:
-            return
+            return False
         tracks = group.get("missing_tracks", [])
-        if 0 <= idx < len(tracks):
+        idx = _review_row_index(group, track_index, expect_key)
+        if idx is not None:
             previous_decision = tracks[idx].get("decision", "")
             tracks[idx]["decision"] = decision
             tracks[idx].update({k: v for k, v in updates.items() if v is not None})
             _stamp_downloaded(tracks[idx], previous_decision)
-            job = _repair_job_for_group(group_id)
-            if job:
-                tid = tracks[idx].get("repair_track_id") or _repair_track_id(group_id, idx, tracks[idx])
-                jt = _repair_track_by_id(job, tid)
-                if jt:
-                    jt["status"] = _repair_track_status_from_decision(decision)
-                    jt["updated_at"] = time.time()
-                    for src, dest in (
-                        ("local_path", "local_path"),
-                        ("source_user", "source_user"),
-                        ("source_folder", "source_folder"),
-                        ("download_percent", "download_percent"),
-                        ("download_state", "download_state"),
-                        ("filename", "filename"),
-                        ("error", "error"),
-                        ("download_error", "error"),
-                        ("matched_relpath", "matched_relpath"),
-                    ):
-                        if updates.get(src) is not None:
-                            jt[dest] = updates[src]
-                    job["status"] = _repair_job_status_from_tracks(job)
-                    _repair_job_touch(job)
             group["updated_at"] = time.time()
+            written = True
+        elif expect_key is not None:
+            tag = (group_id, tuple(expect_key))
+            if tag not in _dropped_row_writes_logged:
+                if len(_dropped_row_writes_logged) > 1000:
+                    _dropped_row_writes_logged.clear()
+                _dropped_row_writes_logged.add(tag)
+                print(f"  review: dropped a {decision!r} write for "
+                      f"“{tag[1][1] or tag[1][0]}” in group {group_id}: index "
+                      f"{track_index} no longer holds it and the group does not "
+                      f"list it exactly once (a rescan dropped or doubled it)")
     # Outside the lock: the worker takes it itself to build the frame.
     _push_gap(group_id)
+    return written
 
 def _approved_review_tracks(group: dict) -> list:
     approved = []
@@ -16065,10 +17108,6 @@ def _group_source_plan(group: dict) -> dict:
     approved = _approved_review_tracks(group)
     if not approved:
         return {"ok": False, "message": "No approved tracks"}
-    job = _create_or_update_repair_job_from_group(group, approved)
-    if job:
-        job["status"] = "needs_source"
-        _repair_job_touch(job, {"kind": "source_search", "message": "Searching for repair sources"})
     if group.get("group_type") == "tracks" or not group.get("canonical_mbid"):
         first = approved[0]
         # The same edition-noise cleaning the album path gets: a track titled
@@ -16117,9 +17156,6 @@ def _search_group_sources(plan: dict, progress=None, stats: dict = None) -> list
 def _apply_group_sources(group: dict, plan: dict, folders: list,
                          stats: dict = None) -> dict:
     """Write search results onto the group. Caller must hold _review_lock."""
-    approved = _approved_review_tracks(group)
-    # Idempotent: _group_source_plan already created it before the search.
-    job = _create_or_update_repair_job_from_group(group, approved)
     mode, query = plan.get("mode", "album"), plan.get("query", "")
     if not folders:
         reason = _no_source_reason(stats or {})
@@ -16130,10 +17166,7 @@ def _apply_group_sources(group: dict, plan: dict, folders: list,
         group["no_source_reason"] = reason
         group["mp3_would_help"] = bool(
             not group.get("allow_mp3")
-            and MP3_FALLBACK_EXT in (stats or {}).get("rejected_formats", ()))
-        if job:
-            job["status"] = "blocked_no_source"
-            _repair_job_touch(job, {"kind": "blocked_no_source", "message": message})
+            and MP3_FALLBACK_EXT in _aggregated_rejected_formats(stats or {}))
         return {"ok": False, "message": message}
     group.pop("no_source_reason", None)
     group.pop("mp3_would_help", None)
@@ -16152,25 +17185,9 @@ def _apply_group_sources(group: dict, plan: dict, folders: list,
     }
     group["last_action"] = "source_search"
     group["updated_at"] = now
-    for idx, track in enumerate(group.get("missing_tracks", [])):
+    for track in group.get("missing_tracks", []):
         if track.get("decision") == "approved":
             track["decision"] = "source_pending"
-    if job:
-        job["source_pools"] = [{
-            "id": hashlib.sha1(f"{fd.get('username','')}|{fd.get('folder','')}".encode("utf-8")).hexdigest()[:16],
-            "source_user": fd.get("username", ""),
-            "source_folder": fd.get("folder", ""),
-            "status": "candidate",
-            # Not the file list: this was a second full copy of the peer's
-            # listing (source_results.folders already holds it) persisted into
-            # every review-state write, and nothing ever read it back.
-            "file_count": len(fd.get("files") or []),
-            "created_at": now,
-        } for fd in folders[:20]]
-        for jt in job.get("tracks", []):
-            if jt.get("status") == "approved":
-                jt["status"] = "approved"
-        _repair_job_touch(job, {"kind": "sources_found", "message": f"Found {len(folders)} source(s)"})
     return {"ok": True, "message": f"Found {len(folders)} source(s)",
             "sources": len(folders)}
 
@@ -16193,16 +17210,6 @@ def _enqueue_group_source_inner(group: dict, source_index: int) -> dict:
     folders = (group.get("source_results") or {}).get("folders") or []
     if not (0 <= int(source_index) < len(folders)):
         return {"ok": False, "message": "Source index out of range"}
-    job = _create_or_update_repair_job_from_group(group, approved)
-    if job:
-        job["status"] = "source_selected"
-        _repair_job_touch(job, {"kind": "source_selected", "message": f"Selected source #{int(source_index) + 1}"})
-        by_index = {t.get("group_track_index"): t for t in job.get("tracks", [])}
-        for track in approved:
-            jt = by_index.get(track.get("_review_track_index"))
-            if jt:
-                track["repair_job_id"] = job.get("id", "")
-                track["repair_track_id"] = jt.get("id", "")
     user = _default_web_user()
     fd = folders[int(source_index)]
     ref_file = fd["files"][0] if fd.get("files") else {}
@@ -16248,9 +17255,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int) -> dict:
                         review_group_id=group.get("id", ""),
                         review_track_index=track.get("_review_track_index"),
                         match_mode=group.get("match_mode", "auto"),
-                        target_release_mbid=group.get("canonical_mbid", ""),
-                        repair_job_id=(job or {}).get("id", ""),
-                        repair_track_id=track.get("repair_track_id", "")):
+                        target_release_mbid=group.get("canonical_mbid", "")):
                     enqueued = True
                     _set_review_track_state(group.get("id", ""),
                                             track.get("_review_track_index"), "queued",
@@ -16280,7 +17285,6 @@ def _enqueue_group_source_inner(group: dict, source_index: int) -> dict:
         artist=group.get("artist", ""), album=group.get("album", ""),
         missing_tracks=approved, review_group_id=group.get("id", ""),
         match_mode=group.get("match_mode", "auto"),
-        repair_job_id=(job or {}).get("id", ""),
         allow_mp3=bool(group.get("allow_mp3")),
         siblings=siblings)
     if ok:
@@ -16305,7 +17309,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int) -> dict:
         leftovers = [t for t in approved
                      if t.get("_review_track_index") not in matched_idx]
         rescued, rescue_notes = _rescue_leftover_tracks(
-            group, leftovers, folders, int(source_index), siblings, job, user)
+            group, leftovers, folders, int(source_index), siblings, user)
         matched_idx |= set(rescued)
         for idx, track in enumerate(group.get("missing_tracks", [])):
             if track.get("decision") not in ("approved", "source_pending"):
@@ -16334,7 +17338,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int) -> dict:
 
 def _rescue_leftover_tracks(group: dict, leftovers: list, folders: list,
                             source_index: int, siblings: list,
-                            job: dict, user: dict) -> tuple:
+                            user: dict) -> tuple:
     """Try the alternate sources for tracks the chosen folder had no file for.
 
     Mirrors the per-track branch: walk the other ranked folders, expand each
@@ -16373,9 +17377,7 @@ def _rescue_leftover_tracks(group: dict, leftovers: list, folders: list,
                     review_group_id=group.get("id", ""),
                     review_track_index=idx,
                     match_mode=group.get("match_mode", "auto"),
-                    target_release_mbid=group.get("canonical_mbid", ""),
-                    repair_job_id=(job or {}).get("id", ""),
-                    repair_track_id=track.get("repair_track_id", "")):
+                    target_release_mbid=group.get("canonical_mbid", "")):
                 rescued[idx] = alt
                 break
             # Not queued after all — release the claim so another leftover can
@@ -16431,14 +17433,6 @@ def _pick_file_for_track(group: dict, track_index: int, source_index: int,
     t["_review_track_index"] = idx
     t["_match_mode"] = "manual"
     t["_target_release_mbid"] = group.get("canonical_mbid", "")
-    job = _repair_job_for_group(group.get("id", "")) or \
-        _create_or_update_repair_job_from_group(group, [t])
-    if job:
-        jt = next((r for r in job.get("tracks", [])
-                   if r.get("group_track_index") == idx), None)
-        if jt:
-            t["repair_job_id"] = job.get("id", "")
-            t["repair_track_id"] = jt.get("id", "")
     user = _default_web_user() or {}
     if not slskd_enqueue(
             fd.get("username", ""), chosen, track=t,
@@ -16447,9 +17441,7 @@ def _pick_file_for_track(group: dict, track_index: int, source_index: int,
             review_group_id=group.get("id", ""),
             review_track_index=idx,
             match_mode="manual",
-            target_release_mbid=group.get("canonical_mbid", ""),
-            repair_job_id=(job or {}).get("id", ""),
-            repair_track_id=t.get("repair_track_id", "")):
+            target_release_mbid=group.get("canonical_mbid", "")):
         return {"ok": False, "message": "slskd refused the download"}
 
     track["manual_pick"] = {
@@ -16526,23 +17518,33 @@ def _union_review_groups(new_groups: list, origin: str = "library") -> None:
         seen.add(gid)
         g.setdefault("origin", origin)
         deduped.append(g)
-    # include_jobs=False: a union keeps every group it did not cover exactly as
-    # it is, so there is nothing for a repair-job projection to stand in for —
-    # and appending one made the swap below REPLACE the live group with it,
-    # dropping its source_results, albums and counts. A source search opens a
-    # repair job, so once the auto-index worker unioned every few seconds, a
-    # search's results vanished within seconds of landing (Loveworm, 2026-09-24).
-    # The projection is for _replace_review_groups, where the group would
-    # otherwise disappear.
-    merged = _merge_review_groups(deduped, include_jobs=False)
+    # A union keeps every group it did not cover exactly as it is. (Until B-022
+    # the merge could append a repair-job projection for such a group, and the
+    # swap below then REPLACED the live group with it — a source search's
+    # results vanished within seconds of landing, Loveworm 2026-09-24.)
+    merged = _merge_review_groups(deduped)
     touched, displaced = [], set()
     with _review_lock:
         by_id = {g.get("id"): g for g in merged}
-        out = [by_id.pop(g.get("id"), g) for g in _review_state.get("groups", []) or []]
+        out = []
+        for live in _review_state.get("groups", []) or []:
+            rebuilt = by_id.pop(live.get("id"), live)
+            if rebuilt is not live:
+                # Same lock hold as the swap: the transfers follow their rows.
+                _repoint_transfer_indexes(live.get("id", ""),
+                                          live.get("missing_tracks") or [],
+                                          rebuilt.get("missing_tracks") or [])
+                _queue_disputed_verified(live.get("id", ""),
+                                         rebuilt.get("missing_tracks") or [])
+            out.append(rebuilt)
         # A genuinely new row for an album another origin already lists folds
         # into it, as _replace_review_groups does — otherwise a playlist's
         # album and the auto-index worker's row for it were two tiles.
-        by_identity = {k: g for g in out if (k := _identity_key(g))}
+        # A retired `repair` row neither absorbs nor stands in for an album
+        # (see _replace_review_groups): it is hidden, and its tracks folded
+        # into a real row would list a placed track as missing.
+        by_identity = {k: g for g in out
+                       if (k := _identity_key(g)) and _review_group_origin(g) != "repair"}
         for group in by_id.values():
             key = _identity_key(group)
             existing = by_identity.get(key) if key else None
@@ -16627,23 +17629,29 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
         was = {g.get("id") for g in current}
         kept = [g for g in current if _review_group_origin(g) != origin]
         kept_ids = {g.get("id") for g in kept}
-        by_identity = {k: g for g in kept if (k := _identity_key(g))}
+        # Retired `repair` rows (B-022, hidden by the migration) take no part in
+        # identity folding: folding into one hid the album, and folding one's
+        # tracks into a real row would list a placed track as missing. One whose
+        # id a fresh row of this scan carries (the zombie had the id of the group
+        # its job was for) is displaced by that row below.
+        by_identity = {k: g for g in kept
+                       if (k := _identity_key(g)) and _review_group_origin(g) != "repair"}
+        retired_ids = {g.get("id") for g in kept if _review_group_origin(g) == "repair"}
         fresh, folded, fresh_ids, displaced = [], [], set(), set()
         for group in merged:
             gid = group.get("id")
-            if gid in kept_ids or gid in fresh_ids:
-                # A repair-job projection for a group another origin still holds
-                # live. Keeping it made two rows with one id, and whichever came
-                # first won both _find_review_group and the flush — sometimes the
-                # projection, which has no albums and no sources.
+            reclaims = (gid in retired_ids and gid not in fresh_ids
+                        and _review_group_origin(group) != "repair")
+            if (gid in kept_ids or gid in fresh_ids) and not reclaims:
+                # Never two rows with one id: whichever came first would win both
+                # _find_review_group and the flush. Ids are built per origin, so
+                # a scan's own rows collide with another origin's only through a
+                # retired `repair` row, which carries the id of the group its job
+                # was for — and that one the fresh row reclaims (`reclaims`,
+                # above; B-022), rather than being dropped here behind it.
                 continue
             key = _identity_key(group)
             existing = by_identity.get(key) if key else None
-            if existing is not None and _review_group_origin(group) == "repair":
-                # Same album, reached through a job whose release drifted from
-                # the group's: the live group already stands for it, and folding
-                # the job's tracks in would list a verified track as missing.
-                continue
             fresh_ids.add(gid)
             if existing is not None:
                 # Another origin already has this album. Contribute the tracks,
@@ -16656,6 +17664,10 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
                     continue
                 displaced.add(existing.get("id"))
                 by_identity[key] = group
+            if reclaims:
+                # The real album under the id its retired job had: it replaces
+                # the hidden zombie rather than being dropped behind it.
+                displaced.add(gid)
             fresh.append(group)
         if displaced:
             kept = [g for g in kept if g.get("id") not in displaced]
@@ -16666,6 +17678,19 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
         })
         if fuzzy is not None:
             _review_state["fuzzy"] = fuzzy
+        # A rebuilt row of this origin replaced the live one with its id; its
+        # transfers follow their rows inside this same lock hold.
+        previous_by_id = {}
+        for g in current:
+            previous_by_id.setdefault(g.get("id"), g)
+        for group in fresh:
+            live = previous_by_id.get(group.get("id"))
+            if live is not None and live is not group:
+                _repoint_transfer_indexes(group.get("id", ""),
+                                          live.get("missing_tracks") or [],
+                                          group.get("missing_tracks") or [])
+                _queue_disputed_verified(group.get("id", ""),
+                                         group.get("missing_tracks") or [])
         after = len(_review_state["groups"])
         gone = was - {g.get("id") for g in _review_state["groups"]}
     # Only what actually changed: this origin's rows, the other-origin rows a
@@ -16680,6 +17705,23 @@ def _replace_review_groups(origin: str, new_groups: list, message: str,
     _web_log(f"{origin} scan: {len(new_groups)} group(s) in, "
              f"{len(fresh)} new row(s); review {before} -> {after} group(s)")
     _save_review_state()
+
+def _playlist_loose_group_id(user: dict) -> str:
+    """The playlist scan's "Loose tracks" group id — stable across rescans.
+
+    It used to be salted with the clock, so every scan built a new group with
+    every row `pending` and deleted the old one: `_merge_review_groups` carries
+    decisions, verified/filed_extra rows and live transfers only by id (B-033).
+    An existing playlist loose group keeps the id it has, which carries a group
+    minted under the old clock-salted scheme across the first scan after this.
+    """
+    with _review_lock:
+        for g in _review_state.get("groups", []) or []:
+            if (_review_group_origin(g) == "playlist"
+                    and g.get("group_type") == "tracks" and g.get("id")):
+                return g["id"]
+    key = f"playlist|solo|{user.get('listenbrainz_user', '')}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 def _playlist_scan_task(task_id: str) -> None:
     user = _default_web_user()
@@ -16698,7 +17740,7 @@ def _playlist_scan_task(task_id: str) -> None:
                      for g in album_groups]
     if solo_tracks:
         review_groups.append({
-            "id": hashlib.sha1(f"playlist|solo|{time.time()}".encode("utf-8")).hexdigest()[:16],
+            "id": _playlist_loose_group_id(user),
             "group_type": "tracks",
             "origin": "playlist",
             "artist": "Loose tracks",
@@ -16831,11 +17873,15 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
         folders = kept
     if not folders:
         reason = _no_source_reason(stats)
-        mp3_would_help = MP3_FALLBACK_EXT in (stats.get("rejected_formats") or ())
+        # Same aggregate _no_source_reason itself reads (Q-013): a pass that
+        # rejected mp3 and got overwritten by a later, emptier one must not
+        # leave the reason saying "they were mp3" while this verdict and the
+        # failure classification below still call it a bare no_source.
+        rejected = _aggregated_rejected_formats(stats)
+        mp3_would_help = MP3_FALLBACK_EXT in rejected
         # Peers offered files and the format policy turned them all away, versus
         # nobody had it at all. The first is what Allow-MP3-and-retry is for; the
         # second has no better action than the user asking again later.
-        rejected = stats.get("rejected_formats") or ()
         _album_fill_fail(release_mbid,
                          "format_rejected" if rejected else "no_source",
                          reason, mp3WouldHelp=bool(mp3_would_help))
@@ -16935,6 +17981,81 @@ def _artist_scan_get(mbid: str = "", nd_id: str = "") -> dict | None:
             "startedAt": scan.get("started_at", 0),
             "finishedAt": scan.get("finished_at", 0)}
 
+def _reconcile_artist_review_groups(result: dict) -> dict:
+    """B-040: bring the artist's older library review groups up to date after a
+    re-index — refresh the ones whose album still exists, retire the ones whose
+    album is gone. Returns {"dropped": [...], "refreshed": [...]}.
+
+    A scan unions only the groups it produces (its `incomplete` releases), and
+    `_union_review_groups` keeps everything it didn't cover, so the artist's other
+    groups were never looked at again: Sgt. Pepper, completed by hand-filing, went
+    on reading `ready` with its title track missing, and a group for a deleted
+    folder stayed in Fill gaps forever, reachable from no client.
+
+    Not decided from the scan's own `complete` verdict: that is per release-group,
+    and a group measures its album's own edition — on the NAS (2026-09-30) the
+    index called Revolver (Super Deluxe)'s album complete while Navidrome held 1
+    of its 63 tracks. So an existing album is re-read through the group's own
+    matcher (`refresh_group_albums_from_navidrome`), and only a group none of
+    whose Navidrome album ids exist any more is dropped — judged against a fresh
+    album list, never the 5-minute cache, and never on an empty one. A group with
+    work in flight (a live transfer, a queued/downloading row, a running placement
+    verifier) is left alone. A dropped group's downloaded files stay in /downloads,
+    where Placement lists them. Only the manual re-index calls this; the
+    auto-index worker would spread a mistake across the whole library.
+    """
+    outcome = {"dropped": [], "refreshed": []}
+    artist_norm = _norm_album_text(result.get("artist_name") or "")
+    if not artist_norm:
+        return outcome
+    produced = {g.get("id") for g in result.get("review_groups") or []}
+    live = _live_transfer_indexes_by_group()
+    with _placement_verify_lock:
+        verifying = set(_placement_verifiers)
+
+    def album_ids(group: dict) -> set:
+        return {a.get("id") for a in group.get("albums") or [] if a.get("id")}
+
+    with _review_lock:
+        candidates = [(g.get("id"), album_ids(g))
+                      for g in _review_state.get("groups", []) or []
+                      if _review_group_origin(g) == "library"
+                      and g.get("id") not in produced
+                      and album_ids(g)
+                      and _norm_album_text(g.get("artist") or "") == artist_norm
+                      and not live.get(g.get("id"))
+                      and g.get("id") not in verifying
+                      and not any(t.get("decision") in _IN_FLIGHT_DECISIONS
+                                  for t in g.get("missing_tracks") or [])]
+    if not candidates:
+        return outcome
+    try:
+        fresh = {a.get("id"): a for a in _nd_album_index(force=True) if a.get("id")}
+    except Exception as e:  # noqa: BLE001 — Navidrome down: change nothing
+        print(f"  review reconcile: album list unavailable ({e}); nothing changed")
+        return outcome
+    if not fresh:
+        return outcome
+    gone = {gid for gid, ids in candidates if not (ids & fresh.keys())}
+    for gid, ids in candidates:
+        if gid not in gone and refresh_group_albums_from_navidrome(gid, live_albums=fresh):
+            outcome["refreshed"].append(gid)
+    if gone:
+        with _review_lock:
+            groups = _review_state.get("groups", []) or []
+            outcome["dropped"] = [g.get("id") for g in groups if g.get("id") in gone]
+            _review_state["groups"] = [g for g in groups if g.get("id") not in gone]
+        # A dropped group must be marked too: the flusher deletes a marked id
+        # that is no longer live. (A refresh marks its own group.)
+        _mark_review_groups_dirty(outcome["dropped"])
+    if outcome["dropped"] or outcome["refreshed"]:
+        _save_review_state()
+        _web_log(f"{result.get('artist_name')}: re-index refreshed "
+                 f"{len(outcome['refreshed'])} older review group(s), retired "
+                 f"{len(outcome['dropped'])} whose album is gone"
+                 + (f" ({', '.join(outcome['dropped'])})" if outcome["dropped"] else ""))
+    return outcome
+
 def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
                              user: dict, nd_artist_id: str = "",
                              skip_library: bool = False) -> None:
@@ -16986,6 +18107,10 @@ def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
         # Union, never replace: a single-artist scan must not wipe the gaps
         # accumulated from other artists / full-library scans.
         _union_review_groups(result["review_groups"])
+    if not skip_library:
+        # …but a union never revisits this artist's other groups, so the
+        # re-index refreshes or retires them here (B-040).
+        _reconcile_artist_review_groups(result)
     _index_store_artist(result, nd_artist_id)
     counts = {}
     for r in result["releases"]:
@@ -17716,18 +18841,7 @@ def _live_transfer_track_indexes(group_id: str) -> set:
     """
     if not group_id:
         return set()
-    out = set()
-    for info in list(pending_downloads.values()):
-        if info.get("review_group_id") != group_id:
-            continue
-        idx = info.get("review_track_index")
-        if idx is None:
-            continue
-        try:
-            out.add(int(idx))
-        except (TypeError, ValueError):
-            pass
-    return out
+    return _live_transfer_indexes_by_group().get(group_id, set())
 
 def _review_group_next_action(group: dict) -> dict:
     tracks = group.get("missing_tracks", []) or []
@@ -17755,7 +18869,8 @@ def _review_group_next_action(group: dict) -> dict:
     if any(d in ("approved", "source_pending") for d in decisions):
         return {"bucket": "source_pending", "label": "Choose reliable sources",
                 "action": "Choose sources"}
-    if tracks and all(d in ("placed", "verified", "skipped") for d in decisions):
+    if tracks and all(d in ("placed", "verified", "skipped", "filed_extra")
+                      for d in decisions):
         return {"bucket": "completed", "label": "Placed in library",
                 "action": "Rescan"}
     if tracks:
@@ -18726,7 +19841,6 @@ def _candidate_download_folders_for_group(group: dict, extra_paths: list = None)
     return paths
 
 def _reconcile_group_downloaded_files(group: dict, folder_paths: list = None) -> dict:
-    job = _create_or_update_repair_job_from_group(group)
     folders = _candidate_download_folders_for_group(group, folder_paths)
     files = []
     seen = set()
@@ -18760,23 +19874,6 @@ def _reconcile_group_downloaded_files(group: dict, folder_paths: list = None) ->
         track["download_state"] = "reconciled"
         _stamp_downloaded(track, previous_decision)
         track.pop("download_error", None)
-        if job:
-            tid = track.get("repair_track_id") or _repair_track_id(group.get("id", ""), idx, track)
-            jt = _repair_track_by_id(job, tid)
-            if jt:
-                jt["status"] = "downloaded"
-                jt["local_path"] = best.get("path", "")
-                jt["matched_relpath"] = best.get("relpath") or best.get("name", "")
-                jt["updated_at"] = time.time()
-                jt.pop("error", None)
-            pool_path = best.get("folder", "") or os.path.dirname(best.get("path", ""))
-            if pool_path and pool_path not in [p.get("path") for p in job.setdefault("source_pools", [])]:
-                job["source_pools"].append({
-                    "id": hashlib.sha1(pool_path.encode("utf-8")).hexdigest()[:16],
-                    "path": pool_path,
-                    "status": "downloaded",
-                    "created_at": time.time(),
-                })
         matched.append({
             "index": idx,
             "title": track.get("title", ""),
@@ -18786,9 +19883,6 @@ def _reconcile_group_downloaded_files(group: dict, folder_paths: list = None) ->
     if matched:
         group["status"] = "review"
         group["updated_at"] = time.time()
-        if job:
-            job["status"] = _repair_job_status_from_tracks(job)
-            _repair_job_touch(job, {"kind": "reconciled", "message": f"Reconciled {len(matched)} downloaded file(s)"})
     return {
         "ok": True,
         "folders": folders,
@@ -18863,19 +19957,6 @@ def _downloads_snapshot() -> dict:
         "bot_pending": bot_pending,
         "album_groups": album_groups,
         "review": review,
-        "repair_jobs": [
-            {
-                "id": job.get("id", ""),
-                "group_id": job.get("group_id", ""),
-                "artist": job.get("artist", ""),
-                "album": job.get("album", ""),
-                "status": job.get("status", ""),
-                "downloads": len(job.get("downloads", []) or []),
-                "matches": len(job.get("file_matches", []) or []),
-            }
-            for job in repair_jobs.values()
-            if job.get("status") != "archived"
-        ],
     }
 
 # ---------------------------------------------------------------------------
@@ -19448,10 +20529,18 @@ _TRACK_STATE_BY_DECISION = {
     "downloaded": "downloaded",
     "needs_match": "downloaded",
     "failed": "failed",
-    "cancelled": "failed",
+    # Its own word on the wire (PROTOCOL §15.2: a cancel is the user's verdict,
+    # not a failure). Mapping it to "failed" made every row of a cancelled gap
+    # read failed (B-004).
+    "cancelled": "cancelled",
     "skipped": "skipped",
     "placed": "done",
     "verified": "done",
+    # A loose file that matched no slot of its release and was filed into it
+    # as an extra track (B-025): in the library, so settled, but never placed
+    # into a slot — the verifier does not look for it and the row names where
+    # it went.
+    "filed_extra": "done",
 }
 
 # How long a group may sit on "downloaded" — files fetched, placement still to
@@ -19471,10 +20560,17 @@ def _downloaded_is_stale(group: dict, now: float | None = None) -> bool:
     card's own Reconcile all bump without placing anything — so a stuck album
     read "working" for another 30 minutes after every one of them. A downloaded
     track with no stamp predates the stamp and has been there at least that long.
+
+    A Loose-tracks row whose auto-placement already missed (`_placement_missed`)
+    is waiting on nothing, so it does not count as recent however new it is: a
+    group whose only downloaded rows missed is stalled at once (B-025). For those
+    30 minutes it read "downloading", fetch and auto answered `alreadyActive`,
+    and a finished source search was thrown away — so the group's other rows
+    could not be fetched either.
     """
     stamps = [float(t.get("downloaded_at") or 0)
               for t in (group.get("missing_tracks") or [])
-              if t.get("decision") == "downloaded"]
+              if t.get("decision") == "downloaded" and not _placement_missed(t)]
     newest = max(stamps, default=0.0)
     return ((now or time.time()) - newest) > DOWNLOADED_STALE_SECS
 
@@ -19764,12 +20860,14 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
     index_of = {id(t): i for i, t in enumerate(missing)}
     by_mbid = {t.get("mbid"): t for t in missing if t.get("mbid")}
     by_title = {(t.get("title") or "").lower().strip(): t for t in missing}
+    loose = _is_loose_tracks_group(group)
     tracks = []
     for row in _canonical_tracklist_from_group(group):
         m = (by_mbid.get(row.get("recording_mbid"))
              or by_title.get((row.get("title") or "").lower().strip()))
         decision = (m or {}).get("decision", "")
         pick = (m or {}).get("manual_pick") or {}
+        local = (m or {}).get("local_path", "") or ""
         tracks.append({
             "index": index_of.get(id(m)) if m is not None else None,
             "recordingMbid": (row.get("recording_mbid", "")
@@ -19780,7 +20878,16 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
             "artist": row.get("artist", ""),
             "state": (_TRACK_STATE_BY_DECISION.get(decision, "missing")
                       if m else "present"),
-            "downloadError": (m or {}).get("download_error", ""),
+            # Placement writes `download_error`;
+            # every per-track state write (the poller, the cancel routes) puts
+            # its text in `error`. Read both, the latter only while the row is
+            # still failed/cancelled — `error` outlives a retry.
+            # Without the mount prefixes: a stored text can name a host path
+            # (Q-021), and this reaches both clients.
+            "downloadError": _strip_host_paths(
+                (m or {}).get("download_error", "")
+                or ((m or {}).get("error", "")
+                    if decision in ("failed", "cancelled") else "")),
             "manualPick": ({"peer": pick.get("username", ""),
                             "filename": pick.get("filename", "")}
                            if pick else None),
@@ -19789,7 +20896,16 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
             # override on its own.
             "canForcePlace": bool((m or {}).get("can_force_place")),
             "forcePlaceConflict": (m or {}).get("force_place_conflict", ""),
+            # A downloaded Loose-tracks row has no release to be filed under, so
+            # its fix is "Pick the release" on this download folder (B-017).
+            "placeFolder": (_download_folder_of(local)
+                            if loose and decision in ("downloaded", "needs_match")
+                            and os.path.isfile(local) else ""),
         })
+        # And the file itself, relative to that folder: the folder can hold
+        # other peers' unrelated tracks, and only this one is being filed.
+        tracks[-1]["placeFile"] = (os.path.relpath(local, tracks[-1]["placeFolder"])
+                                   if tracks[-1]["placeFolder"] else "")
     page = _group_source_page(group, source_page, 10)
     sources = []
     for i, summary in enumerate(page.get("sources", [])):
@@ -19825,8 +20941,30 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
                                 "into the album. Reconcile the downloaded files to "
                                 "match them again, or rescan the album if they are "
                                 "already there.")}
+        if loose:
+            # Reconcile matches against a release this group does not have.
+            # `placeFolder` (on `tracks`, above) is only set when the row's own
+            # file is still on disk -- if none of the stalled rows have one
+            # left, "Pick the release" has nothing to point at either, and
+            # saying so was the SPA's job to guess at (Q-017(e)).
+            if any(t["placeFolder"] for t in tracks):
+                fail_msg["message"] = (
+                    f"{stalled} track(s) downloaded, but lb-bot has no MusicBrainz "
+                    "release to file them under. Use Pick the release on each track "
+                    "to file its download folder into the library.")
+            else:
+                # Said where: this text reaches Feishin and Navic too, and they
+                # offer no fetch on a stalled gap (R10/R15/R17).
+                fail_msg["message"] = (
+                    f"{stalled} track(s) were downloaded, but the file(s) are no "
+                    "longer where they were downloaded — they may have been moved "
+                    "or deleted outside lb-bot. Fetch them again in lb-bot.")
     view.update({
         "stalledPlacement": stalled_placement,
+        # A playlist's "Loose tracks" group: no release to reconcile against,
+        # so no Reconcile. Said outright — the SPA used an empty `releaseMbid`
+        # as the stand-in, which an album gap with no MBID also has.
+        "loose": loose,
         "tracks": tracks,
         "sources": sources,
         "sourcesTotal": page.get("total", 0),
@@ -20264,7 +21402,7 @@ def _api_error_payload(code: str, reason: str, detail: str = "",
 # source, not about the track. Leaving them out stranded every track of a
 # failed download -- the next source pick found nothing approved and died on
 # "No approved/source-pending tracks". In-flight (queued/downloading) and
-# settled (placed/verified/skipped) decisions are deliberately absent.
+# settled (placed/verified/skipped/filed_extra) decisions are deliberately absent.
 #
 # "source_pending" belongs here too, and its absence was a trap: a finished
 # source search flips every approved track to source_pending, so an album whose
@@ -20290,16 +21428,24 @@ def _approve_pending_missing_tracks(group: dict) -> int:
     too: "download again from another source" and "search again" are the Stuck
     card's remedies, and with "downloaded" left out every source answered "No
     approved/source-pending tracks" — reported to the user as the peers
-    rejecting the request."""
-    changed = 0
+    rejecting the request.
+
+    Except a Loose-tracks row whose auto-placement missed (`_placement_missed`),
+    while anything else is there to fetch and its file is still in /downloads:
+    "Pick the release" is its fix, so re-approving it — clearing `local_path` —
+    threw that away and downloaded the file a second time. A miss stalls the
+    group at once (B-025), so every fetch, auto and source search would do that
+    to it. When the miss is all there is, "download again" still means it; and
+    once its file is gone there is nothing to keep, so it is fetched with the
+    rest rather than on a second click."""
     live = None
     stalled = _group_placement_stalled(group)
-    for idx, track in enumerate(group.get("missing_tracks", []) or []):
+    tracks = group.get("missing_tracks", []) or []
+    picked = []
+    for idx, track in enumerate(tracks):
         decision = track.get("decision", "pending")
         if decision == "downloaded" and stalled:
-            for field in ("local_path", "matched_relpath", "download_state",
-                          "downloaded_at", "download_percent"):
-                track.pop(field, None)
+            pass
         elif decision not in _RETRYABLE_DECISIONS:
             # queued/downloading with no transfer behind it is a phantom — it
             # will never progress and must be re-approvable. Anything genuinely
@@ -20310,10 +21456,20 @@ def _approve_pending_missing_tracks(group: dict) -> int:
                 live = _live_transfer_track_indexes(group.get("id", ""))
             if idx in live:
                 continue
+        picked.append(track)
+    others = [t for t in picked
+              if not (t.get("decision") == "downloaded" and _placement_missed(t)
+                      and os.path.isfile(t.get("local_path") or ""))]
+    if others or any(t.get("decision") == "approved" for t in tracks):
+        picked = others
+    for track in picked:
+        if track.get("decision") == "downloaded":
+            for field in ("local_path", "matched_relpath", "download_state",
+                          "downloaded_at", "download_percent"):
+                track.pop(field, None)
         track["decision"] = "approved"
         track.pop("download_error", None)
-        changed += 1
-    return changed
+    return len(picked)
 
 # How far the automatic walk down the ranked source list goes before it hands
 # back to the user. Search-time peer state (free slot, queue length, online)
@@ -20960,10 +22116,7 @@ def start_web_dashboard() -> None:
                 return jsonify(_api_error_payload(
                     "nothing_to_fetch", "Nothing left to fetch for this album",
                     "Every missing track is already downloading, downloaded or placed.")), 400
-            job = (_repair_job_for_group(group_id)
-                   or _create_or_update_repair_job_from_group(group))
-            op = _operation_create("select_source", "Queueing selected source",
-                                   (job or {}).get("id", ""))
+            op = _operation_create("select_source", "Queueing selected source")
             # start_is_choice: the tapped source is walked even unverified —
             # the user looked at it — but the failover continuation is
             # unattended and skips other unverified ones.
@@ -21038,10 +22191,8 @@ def start_web_dashboard() -> None:
                 return jsonify({"ok": True, "alreadyActive": True,
                                 "gap": _gap_detail_view(group)})
             label = f"Auto-select source: {group.get('artist')} - {group.get('album')}"
-            job = (_repair_job_for_group(group_id)
-                   or _create_or_update_repair_job_from_group(group))
         op = _operation_create("auto_select_source", label,
-                               (job or {}).get("id", ""), status="queued")
+                               status="queued")
         task_id = _task_run("source-search", label,
                             lambda tid: _gap_auto_task(tid, group_id),
                             group_id=group_id)
@@ -21598,7 +22749,7 @@ def start_web_dashboard() -> None:
         release_mbid = str(data.get("release_mbid") or "").strip()
         if not release_mbid:
             return jsonify({"error": "release_mbid is required"}), 400
-        cancelled = _cancel_album_fill(release_mbid, "Cancelled")
+        cancelled = _cancel_album_fill(release_mbid, USER_CANCEL_REASON)
         return jsonify({"ok": True, "cancelled": cancelled,
                         "status": _album_fill_view(release_mbid)})
 
@@ -22117,6 +23268,9 @@ def start_web_dashboard() -> None:
         # `mb:` ids are the not-in-the-library form the discography scan already
         # understands; there is nothing to match against, so everything is missing.
         external = bool(data.get("external")) or nd_id.startswith("mb:")
+        # The artist the caller says this is, as opposed to one inferred below
+        # from the release-group's credit.
+        requested_mbid = mbid or (nd_id[3:] if nd_id.startswith("mb:") else "")
         artist_mbid = mbid or rg.get("artist_mbid", "")
         if nd_id.startswith("mb:"):
             # Not a Navidrome id at all — it is the artist's own MBID wearing the
@@ -22130,6 +23284,14 @@ def start_web_dashboard() -> None:
                       or _index_artist_key(artist_mbid, nd_id))
         if not artist_key:
             return jsonify({"error": "Could not identify the artist to index against"}), 400
+        # A same-name artist is someone else (the SPA's resolver refuses it too):
+        # filing under its key would put this release in the wrong discography.
+        other_mbid = _index_artist_mbid_conflict(artist_key, requested_mbid)
+        if other_mbid:
+            return jsonify({"error": "That library artist is a different artist "
+                                     "with the same name",
+                            "code": "artist_conflict",
+                            "artistKey": artist_key}), 409
 
         release, group = None, None
         if external:
@@ -22296,9 +23458,23 @@ def start_web_dashboard() -> None:
                 "Pick a MusicBrainz release before placing this folder.")), 400
         artist = data.get("artist", "")
         album = data.get("album", "")
+        # A subset of the folder, relative to it. "Pick the release" from a
+        # loose track sends that one file: slskd drops unrelated tracks from
+        # different peers into one shared folder, and filing the whole folder
+        # retagged every one of them as the picked release (B-017).
+        only_relpaths = None
+        if data.get("only_relpaths"):
+            try:
+                selected = _selected_paths_under_album(
+                    path, list(data.get("only_relpaths") or []))
+            except (TypeError, ValueError) as e:
+                return jsonify(_api_error_payload(
+                    "bad_selection", "Those files can't be placed", str(e))), 400
+            only_relpaths = [os.path.relpath(p, os.path.abspath(path)) for p in selected]
         task_id = _task_run("placement", f"Place: {path}",
                             lambda tid: _deterministic_import_task(
-                                tid, path, release_mbid, artist, album, group_id))
+                                tid, path, release_mbid, artist, album, group_id,
+                                only_relpaths=only_relpaths))
         return jsonify({"ok": True, "task_id": task_id})
 
     @app.post("/api/beets/import-preview")
@@ -22399,8 +23575,7 @@ def start_web_dashboard() -> None:
             # The redesigned UI has no separate approve step — searching for
             # sources implies wanting all missing tracks (mirrors the fetch route).
             _approve_pending_missing_tracks(group)
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-        op = _operation_create("find_sources", label, (job or {}).get("id", ""), status="queued")
+        op = _operation_create("find_sources", label, status="queued")
         task_id = _task_run(
             "source-search",
             label,
@@ -22490,9 +23665,7 @@ def start_web_dashboard() -> None:
             group = _find_review_group(group_id)
             if not group:
                 return jsonify({"error": "Group not found"}), 404
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-            op = _operation_create("reconcile_downloads", "Reconciling downloaded files",
-                                   (job or {}).get("id", ""))
+            op = _operation_create("reconcile_downloads", "Reconciling downloaded files")
             result = _reconcile_group_downloaded_files(
                 group, data.get("paths", []) or data.get("folders", []))
             group["last_action"] = "reconcile_downloads"
@@ -22521,9 +23694,7 @@ def start_web_dashboard() -> None:
             group = _find_review_group(group_id)
             if not group:
                 return jsonify({"error": "Group not found"}), 404
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-            op = _operation_create("select_source", "Queueing selected source",
-                                   (job or {}).get("id", ""))
+            op = _operation_create("select_source", "Queueing selected source")
             result = _enqueue_group_source(group, source_index)
             _operation_finish(op["id"], bool(result.get("ok")),
                               result.get("message", "Source queued"),
@@ -22541,12 +23712,14 @@ def start_web_dashboard() -> None:
             return jsonify({"error": "username and filename are required"}), 400
         _slskd_cancel(username, filename)
         info = pending_downloads.pop((username, filename), None)
-        op = _operation_create("cancel_download", "Cancelling download",
-                               (info or {}).get("repair_job_id", ""))
-        if info and info.get("repair_job_id"):
-            _repair_update_download(info.get("repair_job_id", ""), username, filename,
-                                    "cancelled", "cancelled by user",
-                                    raw_state="Cancelled")
+        op = _operation_create("cancel_download", "Cancelling download")
+        if info and info.get("review_group_id"):
+            _mark_detached_entries_cancelled(
+                [{"username": username, "filename": filename,
+                  "review_group_id": info.get("review_group_id", ""),
+                  "review_track_index": info.get("review_track_index"),
+                  "review_track_key": _review_row_identity(info.get("track"))}],
+                USER_CANCEL_REASON)
         _operation_finish(op["id"], True, "Download cancelled")
         _save_state()
         _save_review_state()
@@ -22700,9 +23873,7 @@ def start_web_dashboard() -> None:
         rec = _albums.get(download_id)
         if not rec or rec.get("review_group_id") != group_id:
             return jsonify({"error": "Download match item not found"}), 404
-        job = _repair_job_for_group(group_id)
-        op = _operation_create("manual_match_selected", "Matching selected downloaded files",
-                               (job or {}).get("id", ""))
+        op = _operation_create("manual_match_selected", "Matching selected downloaded files")
         release_mbid = data.get("release_mbid") or rec.get("release_mbid", "")
         autotag = bool(data.get("autotag", True))
         relpaths = data.get("files", [])
@@ -22758,9 +23929,7 @@ def start_web_dashboard() -> None:
         rec = _albums.get(download_id)
         if not rec or rec.get("review_group_id") != group_id:
             return jsonify({"error": "Download match item not found"}), 404
-        job = _repair_job_for_group(group_id)
-        op = _operation_create("manual_match_folder", "Importing downloaded folder",
-                               (job or {}).get("id", ""))
+        op = _operation_create("manual_match_folder", "Importing downloaded folder")
         release_mbid = data.get("release_mbid") or rec.get("release_mbid", "")
         result = _deterministic_album_import(
             rec.get("album_dir", ""), release_mbid,
@@ -22820,17 +23989,23 @@ def start_web_dashboard() -> None:
             group = _find_review_group(group_id)
             if not group:
                 return jsonify({"error": "Group not found"}), 404
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-            op = _operation_create("set_canonical", "Updating canonical album",
-                                   (job or {}).get("id", ""))
+            op = _operation_create("set_canonical", "Updating canonical album")
             album_id = data.get("album_id", "")
             if not any(a.get("id") == album_id for a in group.get("albums", [])):
                 _operation_finish(op["id"], False, "Unknown album id", "Unknown album id")
                 return jsonify({"error": "Unknown album id"}), 400
+            previous_id = group.get("canonical_album_id", "")
             group["canonical_album_id"] = album_id
-            refresh_group_missing(group)
+            unchanged = _refresh_group_missing(group)
+            if unchanged:
+                # Refused whole (final review M-1): the refresh left the release,
+                # its name and its rows as they were, and the new id beside them
+                # would describe a pick that never happened.
+                group["canonical_album_id"] = previous_id
+                message = f"Canonical album not changed: {unchanged}"
+                _operation_finish(op["id"], False, message, message)
+                return jsonify(_with_operation({"error": message, "group": group}, op)), 409
             group["last_action"] = "canonical"
-            _create_or_update_repair_job_from_group(group)
             _operation_finish(op["id"], True, "Canonical album updated")
         _save_review_state()
         _save_state()
@@ -22858,12 +24033,13 @@ def start_web_dashboard() -> None:
             group = _find_review_group(group_id)
             if not group:
                 return jsonify({"error": "Group not found"}), 404
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-            op = _operation_create("rescan_missing", "Rescanning missing tracks",
-                                   (job or {}).get("id", ""))
-            refresh_group_missing(group)
+            op = _operation_create("rescan_missing", "Rescanning missing tracks")
+            unchanged = _refresh_group_missing(group)
+            if unchanged:
+                message = f"Missing tracks not rescanned: {unchanged}"
+                _operation_finish(op["id"], False, message, message)
+                return jsonify(_with_operation({"error": message, "group": group}, op)), 409
             group["last_action"] = "missing_scan"
-            _create_or_update_repair_job_from_group(group)
             _operation_finish(op["id"], True, "Missing tracks rescanned")
         _save_review_state()
         _save_state()
@@ -22873,9 +24049,8 @@ def start_web_dashboard() -> None:
     def api_retag(group_id):
         if not _find_review_group(group_id):
             return jsonify({"error": "Group not found"}), 404
-        job = _repair_job_for_group(group_id)
         op = _operation_create("retag_group", f"Retag group {group_id}",
-                               (job or {}).get("id", ""), status="queued")
+                               status="queued")
         task_id = _task_run("retag", f"Retag group {group_id}",
                             lambda tid: _retag_task(tid, group_id))
         _operation_update(op["id"], status="running", task_id=task_id)
@@ -22889,9 +24064,7 @@ def start_web_dashboard() -> None:
             group = _find_review_group(group_id)
             if not group:
                 return jsonify({"error": "Group not found"}), 404
-            job = _repair_job_for_group(group_id) or _create_or_update_repair_job_from_group(group)
-            op = _operation_create("track_decisions", "Updating track decisions",
-                                   (job or {}).get("id", ""))
+            op = _operation_create("track_decisions", "Updating track decisions")
             tracks = group.get("missing_tracks", [])
             for item in data.get("tracks", []):
                 indexes = item.get("indexes")
@@ -22908,10 +24081,12 @@ def start_web_dashboard() -> None:
                     idx = int(raw_idx)
                     if 0 <= idx < len(tracks):
                         tracks[idx]["decision"] = decision
+                        # A re-approved track sheds its old failure, or the
+                        # retry reads as already failed. (The repair-job
+                        # rebuild used to do this as a side effect.)
+                        if decision in ("pending", "approved", "source_pending"):
+                            tracks[idx].pop("download_error", None)
             group["updated_at"] = time.time()
-            job = _create_or_update_repair_job_from_group(group)
-            if job:
-                _repair_job_touch(job, {"kind": "track_decision", "message": "Track decisions updated"})
             _operation_finish(op["id"], True, "Track decisions updated")
         _save_review_state()
         _save_state()
@@ -22921,9 +24096,8 @@ def start_web_dashboard() -> None:
     def api_download(group_id):
         if not _find_review_group(group_id):
             return jsonify({"error": "Group not found"}), 404
-        job = _repair_job_for_group(group_id)
         op = _operation_create("download_approved", f"Download approved tracks {group_id}",
-                               (job or {}).get("id", ""), status="queued")
+                               status="queued")
         task_id = _task_run("download-approved", f"Download approved tracks {group_id}",
                             lambda tid: _download_group_task(tid, group_id))
         _operation_update(op["id"], status="running", task_id=task_id)
@@ -23215,8 +24389,13 @@ async def main():
     if WEB_UI_ENABLED:
         _install_log_tee()
     print("Bot starting...")
+    _sweep_orphaned_state_tmp_files()
     _load_state()
     _load_review_state()
+    _hide_retired_repair_groups()
+    # A restart ended every verifier, and a rescan keeps a placed row only
+    # while one watches its group — so they come back before anything rescans.
+    _resume_placement_verification()
     _load_prefs()
     print(f"  config: STATE_FILE={STATE_FILE}")
     print(f"  config: REVIEW_FILE={REVIEW_FILE}")

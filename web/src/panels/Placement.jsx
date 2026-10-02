@@ -7,7 +7,9 @@ import { EmptyState, Notice, PageTitle, ProgressBar } from '../components/ui.jsx
 // Filing one downloaded folder into the library, by hand. This used to be the
 // Advanced → Import tab: a second list of the download folders with its own
 // one-tap suggestions. The list lives in Downloads now; this is only the
-// drill-down it opens — route #/downloads/place/<folder path>[/<group id>|-[/pick]].
+// drill-down it opens — route #/downloads/place/<folder path>[/<group id>|-[/pick[/<file>]]].
+// <file> (relative to the folder) files that one file only: a loose track's
+// download folder can hold other peers' unrelated tracks.
 
 // Per-file result, shown once a placement task finishes.
 function PerFileResult({ perFile }) {
@@ -228,7 +230,7 @@ function MatchToGap({ path, initialGroupId }) {
 
 // Pick a MusicBrainz release for a folder that is not a gap in an album the
 // library has — a brand-new album.
-function PickRelease({ path }) {
+function PickRelease({ path, file }) {
   const { pushToast } = useApp()
   const folder = useFolder(path)
   const [query, setQuery] = useState('')
@@ -257,7 +259,8 @@ function PickRelease({ path }) {
   useEffect(() => {
     if (searched.current || !folder) return
     searched.current = true
-    const seed = folder.suggested_release_label || folder.name || ''
+    const seed = (file ? file.split('/').pop().replace(/\.[^.]+$/, '').replace(/^\d+\s*[-.]\s*/, '') : '')
+      || folder.suggested_release_label || folder.name || ''
     setQuery(seed)
     if (seed.trim()) search(seed)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -269,6 +272,7 @@ function PickRelease({ path }) {
     try {
       const r = await post('/api/place-folder', {
         path, release_mbid: c.release_mbid || '', artist: c.artist || '', album: c.title || '',
+        ...(file ? { only_relpaths: [file] } : {}),
       })
       setTaskId(r.task_id)
     } catch (e) {
@@ -281,6 +285,7 @@ function PickRelease({ path }) {
   return (
     <>
       <FolderHeader folder={folder} path={path} title="Pick the release" />
+      {file && <div className="mb-3"><Notice>Only <span className="font-mono">{file}</span> will be filed — the rest of this folder stays where it is.</Notice></div>}
       <FolderMissing folder={folder} />
       {taskId ? <PlacementResult taskId={taskId} onDone={() => navigate('Downloads')} /> : (
         <>
@@ -325,10 +330,10 @@ function PickRelease({ path }) {
 }
 
 export default function Placement({ params }) {
-  // params: [<folder path>, <group id> | '-', <mode>]
-  const [path, groupId, mode] = params
+  // params: [<folder path>, <group id> | '-', <mode>, <file>]
+  const [path, groupId, mode, file] = params
   if (!path) return <EmptyState title="No folder chosen" />
   return mode === 'pick'
-    ? <PickRelease key={path} path={path} />
+    ? <PickRelease key={`${path}|${file || ''}`} path={path} file={file || ''} />
     : <MatchToGap key={path} path={path} initialGroupId={groupId && groupId !== '-' ? groupId : ''} />
 }

@@ -199,6 +199,11 @@ function MissingTrackRow({ track: t, detail, sources, expandSource }) {
             <div className="text-micro text-faint" title={t.manualPick.filename}>hand-picked from @{t.manualPick.peer}</div>
           ) : null}
         </div>
+        {/* A loose track's download has no release on record to be filed
+            under; the server names its folder so the user can pick one. */}
+        {t.placeFolder && (
+          <button className="sm" onClick={() => navigate('Downloads', 'place', t.placeFolder, '-', 'pick', t.placeFile)}>Pick the release…</button>
+        )}
         {canPick && (
           <button className="sm" aria-expanded={picking} onClick={openPicker}>{picking ? 'Close' : 'Pick a file…'}</button>
         )}
@@ -407,6 +412,9 @@ function ActionCard({ detail, transfers, rescanAlbum, rescanning }) {
   ].filter(Boolean).join(' · ')
 
   const stalled = !!detail.stalledPlacement
+  // Downloaded loose tracks with no release to file under. Reconcile cannot
+  // help those; picking the release for each file can.
+  const pickTracks = (detail.tracks || []).filter(t => t.placeFolder)
   // Tracks the server has queued or is downloading. The transfers snapshot can
   // be a poll behind the album (it is only fetched while something is known to
   // be moving), and without this the card said "filing into the album" with no
@@ -488,10 +496,24 @@ function ActionCard({ detail, transfers, rescanAlbum, rescanning }) {
                 {stalled ? (
                   <>
                     {/* The files are already here; another source would fetch
-                        them again. Matching them is the fix. */}
-                    <button className="go !rounded-card !px-5 font-semibold" disabled={busy} onClick={reconcile}>
-                      Reconcile downloaded files
-                    </button>
+                        them again. Matching them is the fix — or, for loose
+                        tracks with no release, picking one. Reconcile matches
+                        against a release the group's own tracks would be
+                        filed under, which a loose group has none of — so it
+                        is never offered there, file gone or not. The server
+                        says which kind of group this is (`loose`); an empty
+                        releaseMbid is not it, since an album gap with no MBID
+                        on record has one too and still needs Reconcile. */}
+                    {pickTracks.length ? (
+                      <button className="go !rounded-card !px-5 font-semibold"
+                        onClick={() => navigate('Downloads', 'place', pickTracks[0].placeFolder, '-', 'pick', pickTracks[0].placeFile)}>
+                        {pickTracks.length > 1 ? `Pick the release (1 of ${pickTracks.length})` : 'Pick the release'}
+                      </button>
+                    ) : !detail.loose ? (
+                      <button className="go !rounded-card !px-5 font-semibold" disabled={busy} onClick={reconcile}>
+                        Reconcile downloaded files
+                      </button>
+                    ) : null}
                     {/* Only an album with a library copy has anything to rescan;
                         a playlist or repair group carries no album record. */}
                     {detail.albumId && (
@@ -627,11 +649,13 @@ function ActionCard({ detail, transfers, rescanAlbum, rescanning }) {
       )}
 
       <div className="mt-6">
-        <SectionHeader label="Missing tracks" action={
+        {/* Same gate as the Stuck card's Reconcile: a loose group has no
+            release to reconcile against (Q-020). */}
+        <SectionHeader label="Missing tracks" action={!detail.loose ? (
           <button type="button" className="link-inline !text-caption !text-muted" onClick={reconcile}
             title="Match files already in the downloads folder against these tracks">
             Reconcile downloaded files
-          </button>} />
+          </button>) : null} />
         {(detail.tracks || []).filter(t => t.state !== 'present').map((t, i) => (
           <MissingTrackRow key={t.index ?? i} track={t} detail={detail} sources={firstPage} expandSource={expandSource} />
         ))}

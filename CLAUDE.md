@@ -1,7 +1,7 @@
 # CLAUDE.md — lb-bot
 
 Context for working on this repo with Claude Code. Read this before touching the
-gap-fill / repair pipeline.
+gap-fill pipeline.
 
 ## Local dev environment (this workstation, since 2026-09-20)
 
@@ -22,9 +22,10 @@ cd web && npm ci && npm run build               # SPA → web/dist (system Node 
 
 Deploying no longer means SSHing into the NAS by hand — see **Deployment** below.
 
-**Test baseline:** **32 errors, 0 failures** (441 tests on `index-mirror`, 2026-09-24 — the total drifts as
-tests are added, so check the 32/0, not the count; all 32 are in `AlbumReviewTests`). The errors are all stale beets tests kept
-from before the beets removal (see Decision below). Anything *else* failing is yours.
+**Test baseline:** **0 errors, 0 failures** (524 tests measured 2026-09-27 — the total drifts as tests are
+added, so check the 0/0, not the count). Q-002 deleted the 32 stale beets tests that used to error (every one an
+`AttributeError` for a function removed with beets, see Decision below); a branch cut before Q-002 still shows
+those 32 errors. Anything failing on a branch that has Q-002 is yours.
 
 **Placement goes through `_place_file`.** Move, `chmod 0o664`, `_touch`, in that order, and each
 step is load-bearing — read its docstring before changing the placement path. It was extracted
@@ -469,7 +470,7 @@ never wired up:
 
 - it re-enqueued the **whole folder**, ignoring `missing_tracks` — so a switched
   source fetched a whole album to fill two holes;
-- it dropped the **review and repair linkage**, so a switched album downloaded
+- it dropped the **review linkage**, so a switched album downloaded
   correctly while every track sat on the `failed` the poller had just written.
 
 On exhaustion it pops the group and prompts but records nothing in the fill
@@ -544,6 +545,22 @@ A user cancelling ONE file in slskd's UI no longer cancels the album: that file 
 counted lost with no failover, and the album is cancelled only when nothing has
 landed and every remaining file is Cancelled in the same listing.
 
+**Every cancel path marks the gap's review tracks, not just `_gap_cancel`** (B-021).
+`_mark_detached_entries_cancelled(entries, reason)` is the shared helper — every entry
+a cancel detaches carries its own `review_group_id`/`review_track_index` from enqueue
+(and `review_track_key`, so a rescan between the detach and the mark cannot move the
+mark onto a neighbour), so the helper marks each behind track `cancelled` (grouped by
+group id, one `_push_gap`
+per affected group) and skips a track that already reads a settled decision
+(`placed`/`verified`/`skipped`/`filed_extra`) instead of dragging it back. `_gap_cancel`
+uses it unchanged; `_cancel_album_fill` (`/api/album/cancel`, the vanished-transfer
+sweep, the "every file Cancelled in slskd" branch) and `/api/downloads/cancel` now call
+it too, with the caller's own reason text. `_cancel_album_fill` marks **from the
+detached `entries`, not from the ledger CAS's `applied` result** — the detach already
+happened by the time the CAS can lose (row already `placing`/`placed`/`verified`/
+`needs_match`), so those transfers are gone either way and their still-open tracks must
+not keep reading `downloading`.
+
 **5. Honest status, one clock, and a push.** Every counter a client reads off
 `/api/album/status` moves on a poller tick, so `DOWNLOAD_POLL_INT = 60` made the
 status up to a minute stale by construction while the bot's own SPA read slskd
@@ -572,6 +589,19 @@ the request path never touches slskd. What the view reports changed with it:
   `verifyGaveUp`. The restore docstring used to promise this and nothing did it.
 - Gap-fill rows reach `verified` (`_album_fill_mark_group_verified` from the
   review-group verifier); they used to sit on `placed` forever.
+- The review-group verifier's deadline is **per row**
+  (`_placement_verify_deadline`: `PLACEMENT_VERIFY_TIMEOUT` after the row's
+  `imported_at`, never sooner than that after the worker started) — one worker
+  runs per group and a later placement joins it, so a row placed late used to be
+  reset to `pending` seconds after landing (B-025). For "Loose tracks" rows
+  (B-017 auto-placement) the linker records the slot the file went into
+  (`placed_title`, `placed_recording_mbid` — the import rewrote the file's tags
+  to those) and the verifier searches for that, not the playlist's spelling;
+  each matched loose song's own album is announced (`albumIndexed` with the
+  Navidrome song's artist/album), never one "Loose tracks" notice. A loose file
+  that matched no slot was filed as an extra track: the row settles as
+  `filed_extra` (wire `done`, never re-approved, not verified) with a note naming
+  the release as "artist – album", never a path.
 
 `GET /api/fills?release_mbids=a,b&group_ids=g` answers every watched fill in one
 read (`_fills_view`; 32 each, album views minus the per-file list, gap summaries
@@ -681,6 +711,42 @@ review with its own 97, silently and with no way back — `gaps.needs` went from
 ~3000 to 78 and stayed there. Nothing in the UI or the logs said a thing. If you
 add a scan, give it an origin and use `_replace_review_groups`; if it only covers
 part of a set, union instead.
+
+**`repair` is retired (B-022), and so is the whole repair-job pipeline.** Its own
+steps went in `c5bcb77` (2026-07-03: the matcher/stager/importer, the
+`/api/repair-jobs/*` routes, `RepairQueue.jsx`); what survived was a shadow copy
+of the review — a `repair_jobs` dict created on every fetch/search/decision route
+and updated from the enqueue, the poller and `_set_review_track_state`, which
+nothing read except two things that did harm. `_merge_review_groups` turned
+every active job whose group a scan no longer listed into an origin-`repair`
+group — no albums, no sources, tracks stuck on `downloaded`, nothing that could
+ever clear it (58 on the NAS) — and `_apply_repair_job_projection_to_group`
+copied each job's track statuses back over the review on every rescan. All of it
+is deleted, `LB_BOT_REPAIR_JOBS` with it. The state file's `repair_jobs` key is
+still read, ignored, and written back unchanged (`_retired_repair_jobs`) so the
+previous release keeps its jobs on a rollback. `_review_track_id` (the old
+`_repair_track_id`, same hash) survives as `track_id` on
+`_canonical_tracklist_from_group`'s rows. Operations no longer carry a `job_id`.
+
+The origin-`repair` rows that exist are hidden once at startup by
+`_hide_retired_repair_groups`, not deleted: unhide is one tap, and their files are
+still in /downloads for Placement. It is
+recorded in `library_index.db`'s **`migrations`** table (`name`, `applied_at`,
+`detail`), written only after the rows landed — a failed flush leaves no row and
+the next start retries — and never runs again, so an unhide sticks. That table is
+the place for any future one-time data migration that the data alone cannot say
+has run; an older release ignores it. `repair` stays in `REVIEW_ORIGINS` because
+those rows still carry it.
+
+A retired row carries **the id of the group its job was for**, so the real album
+can come back under that id. Three rules keep a hidden zombie from shadowing it:
+`_merge_review_groups` does not carry `hidden` from a `repair` row into a
+non-`repair` one (the zombie's `hidden` is the migration's, not the user's);
+`_replace_review_groups` lets a fresh non-`repair` row with the zombie's id
+displace it rather than skipping the fresh row as a duplicate id; and both union
+and replace leave `repair` rows out of identity folding, since folding into one
+hid the album and folding its tracks into a real row would list a placed track
+as missing.
 
 Group **ids are per-origin** (`sha1("playlist|<release>|<artist>|<album>")` vs
 `sha1("<group_type>|<artist_key>|<album_key>|<ids>")`), so the same
@@ -1034,18 +1100,31 @@ handed the UI a claim that wasn't true, and the fixes are rules now:
   message, which is not why the album is stuck — so the UI offers
   Reconcile/Rescan, not "try the next source". **The clock is the tracks'
   `downloaded_at` and nothing else**, stamped by `_stamp_downloaded` only on the
-  transition into `downloaded` (from `_set_review_track_state`, the repair
-  projection and the reconcile pass). It first read the group's `updated_at`
+  transition into `downloaded` (from `_set_review_track_state` and the reconcile
+  pass). It first read the group's `updated_at`
   too, which Skip, Unhide, allow-MP3, a rescan, a source search and the Stuck
   card's own Reconcile all bump without placing anything, so a stuck album read
-  "working" for another half hour after each. On a stalled group
+  "working" for another half hour after each. One exception (B-025): a
+  Loose-tracks row whose auto-placement already ran and missed
+  (`placement_missed_at` ≥ its `downloaded_at`, stamped by
+  `_auto_place_loose_track`) is waiting on nothing, so it does not count as
+  recent — a loose group whose only downloaded rows missed is stalled at once
+  instead of reading "downloading" (and answering `alreadyActive`) for 30 min.
+  The list snapshot carries that stamp too. On a stalled group
   `_approve_pending_missing_tracks` re-approves the downloaded tracks, so the
-  Stuck card's "download again" and "search again" can actually fetch; the
+  Stuck card's "download again" and "search again" can actually fetch — except
+  a missed loose row whose file is still in /downloads while any other row is
+  approvable: it keeps its file and its "Pick the release" hint, and it is
+  re-approved only when it is all there is to fetch (a miss whose file is gone is
+  fetched with the rest — nothing is left to keep). A loose group's Stuck card
+  offers Pick the release, never Reconcile (it has no release to reconcile
+  against); the SPA reads that from the gap view's `loose`, not from an empty
+  `releaseMbid`, which an album gap with no MBID has too. The
   fetch route answers 400 `nothing_to_fetch` when nothing is approvable rather
   than reporting every source as a peer rejection. `refresh_group_missing` is a
-  no-op on a group with no `albums` (repair projections, playlist and Spotify
-  groups) — it used to blank `canonical_mbid` and `missing_tracks` and mark them
-  complete.
+  no-op on a group with no `albums` (playlist and Spotify groups, and the retired
+  `repair` ones) — it used to blank `canonical_mbid` and `missing_tracks` and mark
+  them complete.
 - **One definition of "has gaps"**: `_group_needs_attention(status)` — anything
   not `complete`. The Fill-gaps counts, the Library title (`libraryTotals`) and
   `/api/summary`'s `library.withGaps` used to answer three different ways
@@ -1092,9 +1171,79 @@ handed the UI a claim that wasn't true, and the fixes are rules now:
   carries `_REVIEW_GROUP_CARRIED_FIELDS` (allow-MP3, the last no-source verdict)
   and `_REVIEW_TRACK_CARRIED_FIELDS` (manual picks, force-place state) across a
   rescan — the auto-index worker unions every artist it walks, so they used to
-  last until that artist's next scan. `_replace_review_groups` drops a repair-job
-  projection whose id (or identity) another origin still holds live; keeping it
-  made two rows with one id. Both union and replace fold a second origin's row
+  last until that artist's next scan. **A rescan keeps a `queued`/`downloading`
+  row only when a live transfer backs it** (B-022): `_STALE_ON_RESCAN_DECISIONS`
+  resets both (ba8b83e — a phantom with nothing behind it must be retryable), and
+  `_inherit_track_state` exempts a row whose previous index is in
+  `_live_transfer_track_indexes`, the same test `_review_group_next_action` and
+  `_approve_pending_missing_tracks` apply, carrying its transfer fields
+  (`_IN_FLIGHT_TRACK_FIELDS`) with it. Without that, a rescan read a running fill as
+  `ready`, the fetch route's `alreadyActive` dedupe stopped firing and both
+  transfers were approved for a second download. Every rebuild — the merge's swap
+  in `_union_review_groups` / `_replace_review_groups`, and `refresh_group_missing`
+  — then calls `_repoint_transfer_indexes` **under the same `_review_lock` hold as
+  the swap**: the poller, the source switch and the cancel paths address a row by
+  `review_track_index` (on the transfer, its track dict, and the album fill's
+  `review_track_indexes`/`missing_tracks`), so a rescan that lists a new track
+  first would otherwise have the poller's "downloaded" land on the neighbour. A
+  row the rebuild drops gets index `None`, which `_set_review_track_state` ignores.
+  **The re-point reaches only what is registered**, so a writer that reads an index
+  and then waits names its row as well: `_set_review_track_state(...,
+  expect_key=_rescan_track_key(row))` writes the index only while the row there is
+  still that row, else follows the row by key within the group, else drops the write
+  (the group lists it nowhere, or twice) with one log line (`_review_row_index`).
+  The verifier (Navidrome round trip), the poller (its `_resolve_local_path` await,
+  after which it also re-reads the transfer's index), `_loose_place_miss` (the
+  transfer is deleted before auto-placement), `_mark_detached_entries_cancelled`
+  (entries carry `review_track_key` from `_detach_transfer`) and the loose-track
+  linker pass it; the key comes from the row copy the writer holds
+  (`_review_row_identity` — a transfer's `track` is the enqueue's `dict(row)`). And
+  `slskd_enqueue`, which registers only after its slskd call, re-resolves the index
+  by that key and registers in one `_review_lock` hold (`_current_review_index`),
+  so no rescan falls between. Without it the verifier turned a never-downloaded
+  row `verified` — and `verified` survives every rescan.
+  **`placed` goes stale; `verified` only once the song is gone; `filed_extra` never.** A `placed` row a
+  scan still reports missing resets to `pending` (ba8b83e: an unchecked claim) —
+  except while a verifier runs for its group (`_placement_verifiers`): until
+  Navidrome indexes the file every scan reports it missing, and a reset took it
+  off the verifier and offered it for a second download; the verifier verifies it
+  or resets it itself at the deadline. A verifier is a thread and a restart ends it,
+  so `main()` starts one for every group holding `placed` rows right after loading
+  the review, before anything can rescan (`_resume_placement_verification`; each row
+  gets its window again from boot) — otherwise the first rescan after a deploy reset
+  every freshly placed row for re-download. A `verified` row (and the legacy
+  `navidrome_verified`) was matched in Navidrome and a `filed_extra` row is a file
+  filed into the library, so they are kept whatever a rescan says: when the two
+  disagree it is the rescan's matching that missed. The verifier searches
+  library-wide while a rescan reads only the group's own album records — so an
+  album Navidrome splits under another record reads missing, including in the
+  verifier's own closing `_refresh_group_counts_after_fill` — and a playlist scan
+  uses the playlist's spelling. Resetting them re-downloaded a file the library
+  has. That is also what production did until B-022: the repair-job projection
+  kept both settled in every group that could hold them, so ba8b83e's rule for
+  them only ever existed on paper. **A disputed `verified` row is re-checked, not
+  kept blindly** (Q-023): the verifier records the Navidrome song it matched
+  (`nd_song_id`, carried by both rebuild paths through `_REVIEW_TRACK_CARRIED_FIELDS`
+  — one list now; `refresh_group_missing` kept its own inline copy, which had
+  drifted), and every rebuild that makes a `verified` row with a song id live —
+  the swaps in `_union_review_groups` / `_replace_review_groups`, and
+  `refresh_group_missing` — queues it under the swap's own `_review_lock` hold
+  (`_queue_disputed_verified`). One `verified-recheck` thread asks Navidrome for
+  that song off every lock (`nd_get_song`, `getSong`) and resets the row to
+  `pending` with `_set_review_track_state(..., expect_key=…)` — only while it still
+  reads `verified` with that song — **only on a positive "no such song" (Subsonic
+  error 70)**, and even then only once the verifier's own library-wide match
+  (`nd_track_match`, the check that verified the row) also finds nothing while
+  Navidrome answers and is not scanning (`_recheck_gone_song`): error 70 means "no
+  song with that id", and a re-id (a rescan of moved files) answers it too, so a
+  song the match finds is followed to its new id instead. An outage, a refused
+  login or any other answer keeps the row; so does a song Navidrome still has on
+  another album record (the split case above). A pass stops at the first
+  transport error and leaves the rest queued for the next one. Still kept unchecked, as before: `filed_extra` rows (nothing records a
+  song for them) and verified rows with no song id (verified before this,
+  including the legacy `navidrome_verified`).
+  `_replace_review_groups` still refuses two rows with
+  one id. Both union and replace fold a second origin's row
   for the same album into the **richer** one (`_fold_by_identity`); rows naming
   no album at all (`_identity_key` == "") never fold together.
 - **`GET /api/album/lookup?artist=&album=`** runs `_mbz_release_group_for` —
@@ -1105,10 +1254,11 @@ handed the UI a claim that wasn't true, and the fixes are rules now:
   still on disk (`filed` says which). The old Import tab listed these beside the
   real queue without telling them apart.
 - **`WEB_BUILD` is `LB_BOT_REVISION`**, baked in by `ARG LB_BOT_REVISION` in the
-  Dockerfile. `deploy.sh dev` passes `<commit>[+dirty]-dev`; **CI does not yet**
-  (the workflow lives in the publish clone — add `build-args: LB_BOT_REVISION=${{ github.sha }}`
-  to `docker/build-push-action` there at the next release). Unset reads `unknown`.
-  It was a hand-edited constant three months stale.
+  Dockerfile. `deploy.sh dev` passes `<commit>[+dirty]-dev`; **CI bakes it too**
+  since S-012 (the workflow lives in the publish clone —
+  `build-args: LB_BOT_REVISION=${{ github.sha }}` on `docker/build-push-action`,
+  `.github/workflows/docker.yml`). Unset reads `unknown`. It was a hand-edited
+  constant three months stale before this.
 - **stdout and stderr reach the Logs view.** `_LogTee` (installed at the top of
   `main()`, never at import, so tests that capture stdout are unaffected) wraps
   both streams — stderr is where `traceback.print_exc()` and every `logging`
@@ -1148,6 +1298,24 @@ handed the UI a claim that wasn't true, and the fixes are rules now:
 - **`_deezer_get` raises `DeezerError` for transport failures too.** A read
   timeout escaped as a bare `requests` exception, which no caller catches, so
   `/api/artist/related` answered 500 whenever Deezer was slow.
+- **`POST /api/artist/release` answers 409** `{"error", "code": "artist_conflict",
+  "artistKey"}` when the request's artist mbid conflicts with the same-name
+  library artist's — Navidrome keys artists by name, so an mbid plus a same-name
+  artist's nd id used to file the release under the wrong artist's discography
+  (B-018, `_index_artist_mbid_conflict`). A key with no mbid on record is not a
+  conflict.
+- **Gap `tracks[].state` can be `"cancelled"`**, alongside the existing states,
+  and `downloadError` carries the `error` text for `failed`/`cancelled` rows
+  (B-004) — a cancel is the user's verdict, not a failure, and both clients used
+  to render it with a Retry button.
+
+> **The sections from here down are the 2026-06 plan, kept as history.** The
+> per-track "repair path" they build on is gone — `c5bcb77` removed its steps and
+> B-022 (2026-09-28) the rest of the `repair_jobs` pipeline — so
+> `repair_import_matched_tracks`, `_repair_track_metadata`, `repair_job_id` and
+> `_repair_update_download` below name code that no longer exists. Placement is
+> `_deterministic_album_import` / `_place_file` now, and source failover is
+> § Acquisition reliability.
 
 ## The goal (confirmed spec)
 

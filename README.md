@@ -98,8 +98,8 @@ python listenbrainz_bot.py            # bot + web UI on :8899
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | What the process is doing: the three concurrent halves, the state files and index schema, the systems it talks to, the `/api/*` surface, the overrides and the listens mirror, and how acquisition and placement actually work. |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, mounts and ownership, what Navidrome must be set to, every environment variable, local development, Telegram commands. |
-| [`CLAUDE.md`](CLAUDE.md) | The deep, opinionated design notes — placement internals, beets removal, runtime chown quirks. **Read this before touching the gap-fill or repair pipeline.** |
-| [`docs/STATUS.md`](docs/STATUS.md) | What has landed but not yet been run against the live stack. |
+| [`CLAUDE.md`](CLAUDE.md) | The long-form design notes: every rule with its reason, written as the work was done, oldest sections kept as history. Where it and the architecture page disagree about the present, the architecture page is the current one. **Read the relevant section before touching acquisition or placement.** |
+| [`docs/STATUS.md`](docs/STATUS.md) | How far to trust each part: what has been confirmed on a live stack, what is built and not confirmed, and the known limits. |
 
 Line numbers in `CLAUDE.md` and in code comments are snapshot hints and drift —
 navigate by function name.

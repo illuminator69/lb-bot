@@ -1,45 +1,62 @@
 # lb-bot — architecture
 
-What the process is actually doing. The [README](../README.md) is the description and the quick
-start; [`DEPLOYMENT.md`](DEPLOYMENT.md) covers running it; [`CLAUDE.md`](../CLAUDE.md) holds the
-opinionated design notes and is the thing to read before editing the pipeline.
+What the process is doing. The [README](../README.md) is the description and the quick
+start; [`DEPLOYMENT.md`](DEPLOYMENT.md) covers running it; [`STATUS.md`](STATUS.md) says how
+far each part has been confirmed on a live stack; [`CLAUDE.md`](../CLAUDE.md) holds the long
+form of every rule here and is the thing to read before editing the pipeline. Code is named
+by function and constant, never by line.
 
 ---
 
 ## Architecture at a glance
 
-Single file, `listenbrainz_bot.py` (~11k lines). One process runs three things
-concurrently:
+One module, `listenbrainz_bot.py` (about 35,000 lines), and one process running three
+things concurrently:
 
-- **Telegram bot** — `python-telegram-bot`, command + inline-button driven.
-- **Flask web UI + JSON API** — port `8899`, serving a prebuilt React SPA plus a
-  large `/api/*` surface.
-- **Background workers** — startup scan, periodic housekeeping sweeps, download
-  polling, the verifier that waits for Navidrome to list what was placed, a
-  worker that indexes artists nobody has opened yet (it gives way to MusicBrainz
-  requests a page is waiting for), and the ListenBrainz listens mirror.
+- **Telegram bot** — `python-telegram-bot`, command and inline-button driven.
+- **Flask web UI + JSON API** — port `8899`, serving a prebuilt React SPA and a large
+  `/api/*` surface.
+- **Background workers** — a scan at start and one a week, the download poller, the
+  verifier that waits for Navidrome to list what was placed, a worker that indexes
+  artists nobody has opened yet (`_auto_index_worker`; it gives way to MusicBrainz
+  requests a page is waiting for), the ListenBrainz listens mirror
+  (`_listens_sync_worker`), the wishlist's slow re-search, and the sender that tells a
+  navi-connect hub what changed.
 
-State is held in module-level dicts and periodically flushed to JSON on disk
-(`lb_bot_state.json`), plus a review file (`missing_album_review.json`) and a SQLite
-index (`library_index.db`: indexed `artists` and `release_groups`, plus
-`file_signatures` — cached audio identity per file, see "Duplicates").
-`pending_album_groups` is persisted as JSON, so anything stashed on a group must be
-JSON-serializable (lists, not sets).
+**What is on disk**, all under `/config`:
 
-The index also holds what the user has corrected — `artist_overrides`,
-`album_overrides`, `artist_merges` — and `tag_changes`: each file's tags as they
-were before lb-bot first rewrote them, which is what an undo restores. Beside it,
-`listens.db` is the listens mirror, a file of its own with its own lock; deleting
-it with lb-bot stopped is the supported way to rebuild it.
+- `lb_bot_state.json` — module-level dicts flushed periodically: transfers in flight,
+  album groups, the fill ledger. `pending_album_groups` is persisted as JSON, so anything
+  stashed on a group must be JSON-serializable (lists, not sets).
+- `library_index.db` (SQLite) — the catalogue: `artists` and `release_groups`; the
+  **review** (`review_groups`: one row per album that needs something, with the user's
+  decisions and the download state); `file_signatures` (cached audio identity per file,
+  see "Duplicates"); the editorial `meta` cache; the `wishlist`; `rejected_sources`
+  (peers whose file was identified as another recording); what the user has corrected
+  (`artist_overrides`, `album_overrides`, `artist_merges`) and `tag_changes` — each
+  file's tags as they were before lb-bot first rewrote them, which is what an undo
+  restores; and `migrations`, the record of one-time data fixes.
+- `library_index.db.hwm.json` — the highest change-feed sequence ever sent out (see "The
+  library index and its change feed").
+- `listens.db` — the listens mirror, a file of its own with its own lock; deleting it
+  with lb-bot stopped is the supported way to rebuild it.
+- `missing_album_review.json` — the small per-session remainder (tasks, searches,
+  operations); `mbz_cache.json` — MusicBrainz answers, kept across restarts.
+- `cover-backups/` — the covers a cover change moved aside.
 
-**Changing the index schema needs two things.** `CREATE TABLE IF NOT EXISTS`
-never adds a column to a database that already exists, so a new column needs an
-explicit `ALTER` in `_index_db()`, guarded on `PRAGMA table_info` rather than by
-swallowing the duplicate-column error — a real failure should still surface.
-And if the change means existing rows are *wrong* or *missing* rather than
-merely old, bump **`INDEX_SCAN_VERSION`**: `_index_get_artist` compares it and
-marks mismatched artists stale, which is what puts "may be out of date" and a
-Rescan button in front of the user.
+**Every review group has an origin** (`library`, `playlist`, `spotify`, `duplicate`;
+`repair` is a retired one that old rows still carry, hidden), and a scan replaces only
+its own (`_replace_review_groups`; a scan of one artist or one
+release unions instead, `_union_review_groups`). A scan that replaced the whole list
+would wipe every other scan's work.
+
+**Changing the index schema needs two things.** `CREATE TABLE IF NOT EXISTS` never adds a
+column to a database that already exists, so a new column needs an explicit `ALTER` in
+`_index_db()`, guarded on `PRAGMA table_info` rather than by swallowing the
+duplicate-column error. And if the change means existing rows are *wrong* or *missing*
+rather than merely old, bump **`INDEX_SCAN_VERSION`**: `_index_get_artist` compares it
+and marks mismatched artists stale, which puts "may be out of date" and a Rescan button
+in front of the user — and the background indexer scans them again by itself.
 
 ### The React web frontend
 
@@ -85,8 +102,8 @@ shut rather than popping, and nothing above a page's body changes height after
 its first frame. Two parts carry behavior worth knowing about:
 
 - **`useSourceFiles`** is the fetch-once-and-keep "show files" expansion, shared
-  by `SourceRow` and the hero card so a peer's folder is never read twice or
-  read differently in two places.
+  by every source row, so a peer's folder is never read twice or read
+  differently in two places.
 - **`Cover`** takes a `fallbackUrl` and walks a chain before giving up: the
   requested art, then the fallback, then a deterministic gradient from the
   album name. That chain is what lets a per-release cover degrade to its
@@ -104,20 +121,27 @@ cover-gradient fallbacks.
 |---|---|---|---|
 | **Navidrome** | Music server; source of truth for what's in the library and the **success oracle** for placement | Subsonic API | `http://navidrome:4533` |
 | **slskd** | Soulseek client; the acquisition backend | REST, `X-API-Key` auth | `http://slskd:5030` |
-| **MusicBrainz** | Canonical release/track/recording metadata (rate-limited; contact email required) | `ws/2` | `musicbrainz.org` |
+| **MusicBrainz** | Canonical release/track/recording metadata (rate-limited to one request a second; contact email required) | `ws/2` | `musicbrainz.org` |
 | **ListenBrainz** | Weekly playlist sources (Weekly Jams, Weekly Exploration); fresh releases; the user's own listens (mirrored); **similar artists** (the `labs.api` dataset, a separate host from the main API) | `api.listenbrainz.org/1`, `labs.api.listenbrainz.org` | — |
 | **Last.fm** | Optional cross-check for similar artists (`artist.getsimilar`). Absent `LASTFM_API_KEY`, the ListenBrainz half runs alone | REST | — |
 | **Cover Art Archive** | Album art for releases the library doesn't hold, keyed by **release** or release-group; the covers an album override offers | REST | `coverartarchive.org` |
 | **AcoustID** | Optional identity check at placement: is this audio the recording it is being filed as? Fingerprinted locally with `fpcalc` (Chromaprint) | REST | `api.acoustid.org` |
+| **Wikidata / Wikipedia** | The "About" text of an artist or an album, found through MusicBrainz's own links | REST | — |
+| **Deezer** | Charts and editorial picks for Discover, and related artists. Open API, no key | REST | `api.deezer.com` |
 | **Spotify** | Optional public-playlist import (Client Credentials flow) | Web API | — |
-| **beets** | Legacy placement path — **being removed** from the hot path (see below) | CLI subprocess | — |
+| **navi-connect hub** | Optional. lb-bot tells it when a fill moves or the index changes; the hub proxies a slice of this API to the players | REST | `LB_BOT_HUB_URL` |
+
+MusicBrainz is the scarce one: every request goes through `mbz_get`, which paces them
+and lets a background caller (the indexer) wait while a page is waiting. Nothing that
+renders a browse row may spend that budget — Deezer rows and similar-artist rows are
+resolved against the library index, never against MusicBrainz, and Wikimedia requests
+have a client of their own (`_wiki_get`).
 
 Navidrome derives `album.created_at` from the *oldest* file, so gap-filled albums
 never move in the default `newest` sort. Placement stamps placed files with a
 current mtime; set **`ND_RECENTLYADDEDBYMODTIME=true` on the Navidrome container**
-so AudioMuse's newest-albums scan surfaces filled albums. The bot does **not**
-call AudioMuse directly — it only makes filled tracks visible to it.
-
+so a filled album counts as recently added (which is also how AudioMuse's
+newest-albums scan finds it — lb-bot does not call AudioMuse itself).
 
 ## Library tagging — recommended
 
@@ -141,12 +165,12 @@ Two deliberate design decisions produce those rows:
   confidently wrong, so it is flagged rather than guessed.
 - An artist's library bucket is **every library entry that carries the scanned
   MusicBrainz artist id** — the one the file tags give, or the one you chose —
-  plus the entry the scan was started from. An album belongs by its artist's id;
-  a name is consulted only for an album no id speaks for. Two spellings of one
-  artist are therefore one bucket, and a namesake with an id of its own is
-  somebody else. (It used to be a match on the normalized *name*: two spellings
-  were two buckets, each scan marking the other's albums missing, and every
-  non-Latin name normalized to nothing.)
+  plus the entry the scan was started from (`_artist_library_albums`). An album
+  belongs by its artist's id; a name is consulted only for an album no id speaks
+  for. Two spellings of one artist are therefore one bucket, and a namesake with
+  an id of its own is somebody else. Do not go back to matching on a normalized
+  name: two spellings become two buckets, each scan marks the other's albums
+  missing, and every non-Latin name normalizes to nothing.
 
 **Recommendation:** tag with Picard before the first scan. Untagged still finds whole
 missing albums; it just won't fill partial ones.
@@ -155,96 +179,110 @@ missing albums; it just won't fill partial ones.
 
 ## Web API surface (`/api/*`)
 
-Served by Flask (`app` built around line 9415). Highlights — this is a large,
-evolving surface; navigate the source by route string:
+Served by Flask; every route is declared in `start_web_dashboard()`, many as a thin
+wrapper round a module-level view that the unit suite calls without Flask. There is no
+inbound authentication — put it behind your own network or proxy. Navigate the source by
+route string. By family:
 
-- **Overview:** `/api/summary`, `/api/status`, `/api/system/health`,
-  `/api/action-center`, `/api/diagnostics`, `/api/logs`, `/api/settings`,
-  `/api/prefs` (GET/PUT)
-- **Gaps & review:** `/api/gaps`, `/api/gaps/<group_id>` (+ `/fetch`, `/auto`,
-  `/cancel`, `/allow-mp3`, `/duplicate-files`, `/rescan` — a *scoped* re-check of
-  one album: re-reads it from Navidrome and walks its folder for files Navidrome
-  hasn't indexed, returning the updated `{present, total, status, foundOnDisk}`
-  so the UI reconciles without a full library scan), `/api/review`,
-  `/api/duplicates`, `/api/duplicate-files`, `/api/library/delete-file`,
-  `/api/library/trash` (+ `/restore`, `/empty`)
-- **Scanning:** `/api/scan`, `/api/scan-all`, `/api/playlists/scan`,
-  `/api/spotify/scan`, `/api/rescan`
-- **Search & download:** `/api/search`, `/api/searches`,
-  `/api/searches/<sid>/download`, `/api/downloads`, `/api/downloads/cancel`,
-  `/api/transfers`
-- **Albums & artists:** `/api/album/lookup|releases|sources|tracklist|download|status|similar`
-  (`sources` pairs each peer folder against the canonical MusicBrainz tracklist —
-  see "Source coverage" below),
-  `/api/artists`, `/api/artist/lookup|discography`, `/api/fresh-releases`,
-  `/api/cover/<album_id>`
+- **Overview and system:** `/api/summary`, `/api/status`, `/api/health` (a liveness
+  probe that never writes and asks no other service), `/api/system/health|status`,
+  `POST /api/system/recheck`, `/api/action-center`, `/api/diagnostics`, `/api/logs`,
+  `/api/settings`, `/api/prefs` (GET/PUT), `/api/tasks`, `/api/tasks/<task_id>`
+  (+ `/cancel`), `/api/operations`, `/api/operations/<operation_id>`,
+  `POST /api/acoustid/rejected/clear`
+- **Gaps and the review:** `/api/gaps`, `/api/gaps/<group_id>` (+ `/fetch`, `/auto`,
+  `/cancel`, `/allow-mp3`, `/duplicate-files`, `/rescan` — a *scoped* re-check of one
+  album: re-reads it from Navidrome and walks its folder for files Navidrome hasn't
+  indexed), `/api/review`, `/api/library` (the review as a sortable, paged table)
+- **One review group** (`/api/groups/<group_id>/…`): `sources` (GET the list, POST a
+  search), `sources/<n>/files` (expand the peer's real folder), `sources/<n>/download`,
+  `tracks/<n>/pick-file`, `tracks/<n>/place-anyway`, `reconcile-downloads`, `hide`,
+  `download`, `decisions`, `missing`, `canonical`, `retag`, `match-mode`, `preview`,
+  `release-details`, and `downloads/<id>/match`, `downloads/<id>/match-preview`,
+  `downloads/<id>/match-selected` for pairing a finished download by hand. "Merge duplicates" in the UI posts to **`retag`**: it writes the canonical
+  album and MusicBrainz ids onto the other copies and lets Navidrome collapse them on its
+  next scan; a failed tag write fails the merge. `place-anyway` overrules the one refusal
+  the row shows — "already in the album", or "another recording" — and no other; it takes
+  what the page showed for the row (`recordingMbid`, `title`) and answers 409 `row_moved`
+  when a rescan has since put another row at that index.
+- **Scanning:** `/api/scan`, `/api/scan-all`, `/api/playlists/scan`, `/api/spotify/scan`,
+  `/api/rescan` (a Navidrome scan), `/api/library-index/build|status`
+- **Albums and artists:** `/api/album/lookup|releases|sources|tracklist|download|status|cancel|similar`,
+  `/api/artists`, `/api/artist/lookup|discography|release|similar|related`,
+  `/api/fresh-releases`, `/api/cover/<album_id>`, `POST /api/resolve-link` (one streaming
+  or MusicBrainz URL in, MusicBrainz ids out, with a `confidence` that says how it was
+  resolved)
 
-  `releases` returns two axes, not one flat list: a **variant** (Original /
-  Remaster / Deluxe) changes the tracklist, an **edition** (Digital / CD /
-  Vinyl) is the same tracklist pressed differently and carries its *own* cover
-  art. The release-group's Cover Art Archive image is whichever release the
-  Archive picked, which is how a vinyl-tagged copy shows a photo of the disc
-  where the sleeve belongs; each variant defaults to its digital edition, the
-  likeliest to have a correct front. `tracklist` takes an optional `album_ids`
-  or `group_id` and then marks **each track** `present` — the album page used
-  to receive only `{present, total}` and had to guess which tracks were
-  missing, which is wrong whenever the gaps aren't the trailing tracks.
-  `similar` rolls the ListenBrainz (+ optional Last.fm) similar-artists lookup
-  up to one owned album per similar artist, each attributed to the artist being
-  viewed.
+  `lookup` marks each candidate with whether the library holds it (`releaseOwned`,
+  `releaseAlbumId`) — it marks, it does not filter. Its order is MusicBrainz's text
+  score, which a caller must not trust: pass `artist=` and `album=` for a fielded
+  search when you know which half is which.
 
-  **`download` is idempotent per release** and **`status` is how you watch it** —
-  see "Watching a fill from outside" below.
+  `releases` returns two axes, not one flat list: a **variant** (Original / Remaster /
+  Deluxe) changes the tracklist, an **edition** (Digital / CD / Vinyl) is the same
+  tracklist pressed differently and carries its *own* cover art. Each variant defaults
+  to its digital edition, the likeliest to have a correct front. It also names the
+  release's first credited artist (`artistMbid`). `tracklist` takes an optional
+  `album_ids` or `group_id` and then marks **each track** `present`; rows carry their
+  disc. `similar` rolls the similar-artists lookup up to one owned album per similar
+  artist.
 
-  **A click is that source.** `download` with `sourceUsername` (and
-  `sourceFolder`) takes that folder from the list `sources` last answered — it is
-  kept for a quarter of an hour — and searches nothing; `allFiles: true` beside
-  it asks the folder for every audio file, and every answer echoes `allFiles`. A
-  source row says how many files a plain download would leave out (`extraFiles`),
-  a fill says how many it left (`leftOut`) and which peer was picked
-  (`pickedSource`) beside the one it is on now.
+  `sources` pairs each peer folder against the canonical tracklist (see "Matching a file
+  to a track") and **keeps what it answered** for a quarter of an hour, so the list a
+  user is looking at holds still. `download` with `sourceUsername` (and `sourceFolder`)
+  takes that folder from the kept list and searches nothing: **a click downloads the
+  source that was clicked**. `allFiles: true` beside it asks the folder for every audio
+  file, and every answer echoes `allFiles`. A source row says how many files a plain
+  download would leave out (`extraFiles`); a fill says how many it left (`leftOut`) and
+  which peer was picked (`pickedSource`) beside the one it is on now. `download` is
+  idempotent per release and `status` is how you watch it — see "Watching a fill from
+  outside".
+- **Fills and transfers:** `/api/fills` (every watched fill in one read),
+  `/api/downloads` (+ `/cancel`, `/clear`), `/api/transfers` (+ `/<transfer_id>/dismiss`),
+  `/api/search`, `/api/searches`, `/api/searches/<sid>/download`
 - **Saying what something is** (each can be undone): `/api/overrides` — every
   correction, the artists worth a look, and the sets of one artist under two
-  names; `/api/artist/override` (+ `/remove`); `/api/album/override` (GET the
-  album's state, POST to apply; `/preview`, `/remove`), `/api/album/covers`,
-  `/api/album/cover`; `/api/artist/merge` (GET to follow, POST to merge;
-  `/preview`, `/undo`). See "Overrides" below
+  names; `/api/artist/override` (+ `/remove`); `/api/album/override` (+ `/preview`,
+  `/remove`) — GET the album's state, POST to apply — `/api/album/covers`,
+  `/api/album/cover`; `/api/artist/merge` (+ `/preview`, `/undo`) — GET to follow a
+  merge, POST to start one. See "Overrides"
 - **Listening:** `/api/listening/status|summary|unowned|recent`,
-  `POST /api/listening/sync` — aggregates over the mirrored ListenBrainz listens.
-  `/api/fresh-releases` rows carry `artistPlays`
-- **Placement:** `/api/placements`, `/api/placements/identify`,
-  `/api/placements/<id>/confirm|dismiss|delete`
-- **Groups (source & match management):** `/api/groups/<group_id>/...` —
-  `sources`, `sources/<idx>/files` (expand the peer's real folder),
-  `tracks/<idx>/pick-file`, `tracks/<idx>/place-anyway`, `reconcile-downloads`,
-  `match`, `canonical`, `retag`, `decisions`, `download`, etc. "Merge duplicates" in the UI posts to **`retag`**: it writes the
-  canonical album/albumartist/MB ids onto the other copies and lets Navidrome
-  collapse them on its next scan. A failed tag write now fails the merge instead of
-  reporting "tagged 0/12 file(s)" as a success, and `preview_group_retag`'s blocked
-  reasons reach the UI. `place-anyway` overrules the one refusal the row shows —
-  "already in the album", or "another recording" — and no other; it takes what
-  the page showed for the row (`recordingMbid`, `title`) and answers 409
-  `row_moved` when a rescan has since put another row at that index.
-- **Repair jobs:** `/api/imports/<recid>/retry|merge-retry|remove-stale-and-retry`
-- **Library index:** `/api/library`, `/api/library-index/build|status`
-- **Legacy beets:** `/api/beets/folders|release-candidates|import`
-- **Diagnostics:** `/api/debug/slskd-search?q=<query>&wait=<s>&stopAt=<s>` — traces
-  one slskd search end to end (every status poll, plus periodic probes of
-  `/responses` and `?includeResponses=true` with codes and lengths) and returns
-  slskd's effective search options. Read-only apart from creating and deleting
-  one search, and it uses the bot's own API key. Reach for this before theorising
-  about why a search returned nothing — see "Keeping the polled path cheap"
+  `POST /api/listening/sync`. `/api/fresh-releases` rows carry `artistPlays`
+- **Editorial and browse:** `/api/meta/artist|album` (the "About": attributed text,
+  members, credits, links; cached, and a `refresh=1` that never replaces a good entry
+  with a failed read), `/api/deezer/chart|editorial|genres`
+- **Wishlist:** `/api/wishlist` (GET, POST), `/api/wishlist/remove` — albums nobody was
+  sharing, searched again on a slow schedule
+- **Placement by hand:** `/api/placements` (+ `/identify`,
+  `/<placement_id>/confirm|dismiss|delete`), `/api/download-folders`,
+  `/api/place-folder` (+ `/candidates`), and
+  `/api/imports/<recid>/retry|merge-retry|remove-stale-and-retry` to place a recorded
+  import again. The `/api/beets/folders|release-candidates|import|import-preview`
+  routes are the older names of the same thing — nothing in them runs beets
+- **Duplicates and trash:** `/api/duplicates`, `/api/duplicate-files`,
+  `/api/library/delete-file`, `/api/library/trash` (+ `/restore`, `/empty`)
+- **The index feed** (for clients that mirror the index): `/api/index/changes`,
+  `/api/index/keys`
+- **Diagnostics:** `/api/debug/slskd-search?q=…` traces one slskd search end to end
+  (every status poll, the probes of its responses, slskd's effective options);
+  `/api/debug/album-search?artist=&album=` runs the real album search and shows every
+  folder's rank inputs and evidence. Reach for these before theorising about why a
+  search returned nothing or picked what it picked
 
 `/api/summary`, `/api/settings`, `/api/diagnostics` and `/api/action-center` are
-polled every few seconds, so their expensive parts are cached: slskd transfers
-(~3s), the four reachability probes (60s, and run concurrently), and the download
-folder listing (30s). Pass `?fresh=1` to bypass a cache for an explicit re-check.
+polled, so their expensive parts are cached: slskd transfers (~3s), the reachability
+probes (60s, and run concurrently), and the download folder listing (30s). Pass
+`?fresh=1` to bypass a cache for an explicit re-check.
+
+A dependency that did not answer is an error status, never an empty answer: a list
+that could not be read is left out or refused (502 / 503 with `retryable`), because a
+client reads an empty list as "there is none".
 
 ### Keeping the polled path cheap
 
-The SPA polls `/api/summary` and `/api/gaps` every 2s, so anything on that path
-is on a hot loop. Two rules follow, and breaking either was worth tens of
-seconds of frozen UI:
+The SPA polls `/api/summary` and `/api/gaps` every few seconds, so anything on that
+path is on a hot loop. Two rules follow, and breaking either costs tens of seconds of
+frozen UI:
 
 - **Never hold `_review_lock` across network I/O.** It is process-wide and every
   poll wants it. Read what you need under it, do the slow part outside, then
@@ -253,8 +291,8 @@ seconds of frozen UI:
   rescan landing mid-flight; discard rather than merge when it changes.
 - **Don't deep-copy the whole review state to render a list.** `_review_snapshot`
   copies everything (including every peer's file listing); `_review_list_snapshot`
-  copies only the fields `_album_view` and `_review_group_next_action` read. Add
-  to `_GAP_LIST_GROUP_FIELDS` when those functions start reading something new.
+  copies only the fields the list views read. Add to `_GAP_LIST_GROUP_FIELDS` when
+  those views start reading something new.
 
 The raw slskd payload (`source_results.folders[].files`, `_expanded`, `_claimed`)
 is deliberately **not persisted** — `_review_state_for_disk` strips it, and
@@ -264,9 +302,8 @@ search rather than showing sources that can't be enqueued. Results younger than
 posts `{force: true}` to bypass that.
 
 **slskd publishes search results only on completion — there is no partial
-read.** This is the single most important thing to know about this path, and
-assuming otherwise cost several rounds of wrong fixes. Traced against the live
-instance with `GET /api/debug/slskd-search?q=…` (`slskd_search_probe`):
+read.** This is the single most important thing to know about this path. Traced
+against a live instance with `GET /api/debug/slskd-search?q=…`:
 
 | t | state | responseCount | `/responses` | `?includeResponses=true` |
 |---|---|---|---|---|
@@ -276,147 +313,124 @@ instance with `GET /api/debug/slskd-search?q=…` (`slskd_search_probe`):
 | 39.4s | Completed, TimedOut | 143 | **142** | **142** |
 
 `responseCount` on the search status ticks up live — that is what the progress
-line counts, and why a failing search could honestly report "143 peers" and then
-surface nothing. So:
+line counts, and why a search can honestly report "143 peers" before it has
+anything to show. So:
 
 - The poll **must** run until `isComplete` / state `Completed`. `SLSKD_SEARCH_TIMEOUT`
   (75s) is a safety cap, not the intended exit, and must outlast slskd's own
-  straggler timeout (~40s observed). At 30s it cut the poll off just before the
-  results appeared.
+  straggler timeout (~40s observed).
 - What the early exit can still buy is ending the search *sooner*: once
   `SLSKD_SEARCH_MIN_RESPONSES` peers have arrived (or the file count has
   plateaued) past `SLSKD_SEARCH_MIN_WAIT`, `PUT /searches/{id}` asks slskd to
   wrap up, and it publishes on completion as usual. Best effort — if the stop
   fails the poll just runs to the cap.
-- `SLSKD_SEARCH_SETTLE` (25s) remains a backstop: if the array is still empty
-  after all that, wait for completion and ask once more, including via
-  `?includeResponses=true`. It fires only on an *empty* array — a short one is a
-  normal ranking outcome and must not cost anyone the wait.
-
-Use the probe endpoint before theorising about this path again.
+- `SLSKD_SEARCH_SETTLE` (25s) is a backstop: if the array is still empty
+  after all that, wait for completion and ask once more. It fires only on an
+  *empty* array — a short one is a normal ranking outcome and must not cost anyone
+  the wait.
+- **A search slskd cut off is a sample.** slskd ends a search at its response limit;
+  for a title made of common words that happens within seconds, and each search is
+  then a different random sample of the peers. `slskd_run_search` reads the pass's
+  state, and a cut-off pass is followed by a second question that names a track (see
+  "How a source is chosen").
 
 All outbound HTTP goes through `_http`, which keeps one pooled `requests.Session`
 per host. Use it rather than `requests.get`/`post` directly.
 
 ### Watching a fill from outside
 
-The navi-connect hub proxies a whitelisted slice of this API to the Feishin and
-Navic clients (`<hub>/lb/*`), which is what put two requirements on the album
-download path that the bot's own SPA never needed.
+The navi-connect hub proxies a whitelisted slice of this API to its clients
+(`<hub>/lb/*`), which puts requirements on the album download path that the bot's own
+SPA alone would not need.
 
 **`POST /api/album/download` returns a task id that is not the answer to "is it
-downloaded".** `_album_download_task` calls `_task_finish` as soon as slskd
-accepts the enqueue — "Queued 9/12 file(s)" — with the transfer, the placement and
-the Navidrome scan all still ahead. Polling `/api/tasks/<id>` therefore reports
-success roughly a minute before anything reaches the library. That endpoint is
-also expensive: like `/api/tasks`, it goes through `_review_snapshot()`, a deep
-copy of the whole review state under `_review_lock`.
-
+downloaded".** The task finishes as soon as slskd accepts the enqueue, with the
+transfer, the placement and the Navidrome scan all still ahead.
 `GET /api/album/status?release_mbid=…` (or `?rgid=`, which costs a MusicBrainz
 resolve, so prefer the release) answers properly:
 
 ```
 unknown → searching → queued → downloading → placing → placed → verified
-                                       ↘ needs_match   ↘ failed
+                          ↘ cancelled      ↘ needs_match   ↘ failed
 ```
 
-`{state, done, total, failed, percent, reason, mp3WouldHelp, groupId, artist, album}`.
-It reads the in-memory ledger `_album_fill_status` (written by the download task,
-`_finalize_group` and the verifier) plus live counts off `pending_album_groups`
-— **no `_review_snapshot`, no network I/O under `_review_lock`**. Progress is read
-at call time rather than written by the download poller, which runs every couple
-of seconds per file and must stay free of bookkeeping nobody may be watching.
+It reads the in-memory ledger `_album_fill_status` plus live counts off
+`pending_album_groups` — no review snapshot, no network I/O under `_review_lock`.
+What the view reports:
 
-`placed` means the files are in the album folder; **`verified` means Navidrome has
-indexed them**. A review-group fill gets that from `_verify_placement_worker`; an
-album fetched from an artist page has no review group, so
-`_start_album_fill_verification` polls the placement's own `per_file` rows with one
-`nd_track_present` search each (a full `_nd_album_index(force=True)` on a 30 s loop
-was the alternative, and a library page-through is not one).
+- `done` is files **completed**, `failed` sits beside it; `percent` is byte-based when
+  the transfers report sizes, and 100 from `placing` on.
+- `cancellable` is the one Cancel rule, stated by the server.
+- `placed` means the files are in the album folder; **`verified` means Navidrome has
+  indexed them** (`_verify_placement_worker` for a review group's fill,
+  `_start_album_fill_verification` for an album fetched whole).
+- `source` is the peer it is on now, `pickedSource` the one the user clicked, `leftOut`
+  and `allFiles` what that source was asked for.
+- `updatedAt` and `serverTime` let a client say "last checked N s ago".
 
-The ledger is in memory on purpose — an in-flight download does not survive a
-restart either, and a caller that finds nothing reads `unknown`.
+`GET /api/fills?release_mbids=…&group_ids=…` answers every watched fill in one read
+(`_fills_view`), and with a hub configured `_push_fill` posts each ledger transition
+and throttled progress to it, so a client need not poll at all.
+
+The download poller is the one clock: it lists slskd's transfers every
+`DOWNLOAD_POLL_ACTIVE_INT` (5 s) while any group or transfer is live and once a minute
+when idle — and an idle wait ends as soon as something is queued. The request path
+never touches slskd.
+
+**A cancel is terminal.** `cancelled` is a ledger state of its own, not a failure:
+`_album_fill_set` refuses to write over it for the fill it stopped, and
+`_cancel_album_fill` marks the group, detaches its transfers and only then cancels them
+in slskd, off the request thread — so the route answers in milliseconds and nothing can
+finalize the group meanwhile. Placement claims the row atomically, so a cancel that
+arrives once it says `placing` is told it was too late. A *new* fill for the same album
+lifts the cancelled row; nothing else does. The long form — what a cancel does to rows
+whose file had already landed, and to a fetch that is still queueing — is in
+`CLAUDE.md`.
 
 **`POST /api/album/download` returns the fill already in flight** rather than
-starting a second, checking `pending_album_groups` and the running
-`album-download` tasks for the same release first (`{ok: true, existing: true}`).
-Two clients and the SPA can all be looking at one album; a second tap used to mean
-a second search, a second set of transfers and a second placement pass over one
-folder.
+starting a second (`{ok: true, existing: true}`). Two clients and the SPA can all be
+looking at one album.
 
-**Failure reasons reach that path too.** `no_source_reason` / `mp3_would_help` are
-set on *review groups* by `_apply_group_sources`, and an artist-page download
-creates no group — so `_album_download_task` fills the same `stats` dict and runs
-it through `_no_source_reason`. The Allow-MP3 opt-in still needs a group id, so
-clients only offer it when `status` carries one.
+**Failure reasons reach that path too.** A fill that found nothing says why
+(`_no_source_reason`: every file in a rejected format, no folder that is clearly the
+album, the picked source no longer listed), and whether allowing MP3 would help. A
+fill that began with a click on a source gets no automatic retry — the retry would
+search again and take its own choice.
 
-**A placed album leaves the index saying `missing`,** so `_finalize_group` flips
-the row itself: `_index_mark_release_present(rgid=…, group_id=…)` sets
-`release_groups.status = 'present'` for the release-group (matched by rgid for an
-artist-page download, by review group id for a Fill-gaps completion). The rgid
-rides down from `api_album_download` through `_album_download_task` into the fill
-ledger purely so this call has it. Without the flip a filled album shows up twice
-in every client — once in the library, once in "not in your library" — until the
-artist is rescanned against MusicBrainz, which is a request per second and far too
-expensive to trigger per download. `present`/`total` and the Navidrome album ids
-are left alone; the next full scan fills them in.
+**A placed album is marked in the index at once.** `_finalize_group` calls
+`_index_mark_release_present`, so a filled album does not show up twice in a client —
+once in the library, once in "not in your library" — until the artist is scanned
+again. A later scan never forgets that mark.
 
 **Per-album quality.** `POST /api/album/download` takes an optional `quality`
-(one of `QUALITY_PREFERENCES`) that overrides the global Source preference for
-that fill alone. The global setting is the wrong granularity in practice — a
-record is worth 24/96 and a b-side single is not — and it lives three screens
-away from where the decision is made. It is scoped with a ContextVar
-(`_quality_preference`) for the same reason as the MP3 opt-in: the preference is
-read six levels down, in `_file_score` and the folder ranking, both now going
-through `_effective_quality()`. The album group also carries `quality` verbatim,
-because the failover path runs on another thread long after that scope has
-exited. An unknown value is a `400`: silently fetching hi-res after being asked
-not to is worse than refusing.
+(one of `QUALITY_PREFERENCES`) that overrides the global source preference for
+that fill alone. It is scoped with a ContextVar (`_quality_preference`, read through
+`_effective_quality()`), and the album group carries it too, because failover runs
+on another thread long after that scope has exited. An unknown value is a `400`.
 
-**A group whose transfers all vanished is finalized, not left hanging.** The
-download poller's sweep used to fire on `ALBUM_GROUP_TTL` alone — six hours — and
-only when a Telegram app was registered for the group's token. Neither held for a
-web- or client-started fill: the commoner failure is slskd forgetting every file
-of a group whose counters never reached `total` (a peer that disappeared
-mid-album, a row cleared by hand), which can make no further progress by
-definition, and there may be no bot to narrate it to. So the sweep also finalizes
-a group with nothing left in `pending_downloads` after
-`ALBUM_GROUP_ORPHAN_GRACE`, skipping groups mid-failover, and `_tg_send` no-ops on
-a falsy bot so placement never hinges on there being a Telegram chat. Left alone,
-such a group strands its files in `/downloads`, keeps the album on the Downloads
-tab and never resolves the fill a client is watching.
-
-**Optional hub ping.** With `LB_BOT_HUB_URL` + `LB_BOT_HUB_TOKEN` set,
-`_notify_hub_library_change` POSTs `<hub>/lb/notify` on placement so the
-navi-connect clients refresh a page they already have open. Fire-and-forget on its
-own thread: the placement path is what the user is waiting on, and the hub is
-optional infrastructure that may be down. Nothing reads the response, and an unset
-URL simply means no ping.
+**A group whose transfers all vanished is finalized, not left hanging.** The poller's
+sweep finalizes a group with nothing left in `pending_downloads` after
+`ALBUM_GROUP_ORPHAN_GRACE`, skipping groups mid-failover, and ledger rows that can make
+no further progress are failed with a reason (`_sweep_album_fill_zombies`). Nothing in
+placement hinges on there being a Telegram chat to narrate to.
 
 ### Background work must be visible and must not strand an album
 
 A source search is a background task: the POST returns a `task_id` immediately
-and the work continues while the user looks at a different album. Two things
-follow, and both were once broken in the same failure:
+and the work continues while the user looks at a different album. The rules:
 
 - **Stamp `group_id` on the task** (`_task_run(..., group_id=...)`). It is what
-  lets `_gap_detail_view` attach `sourceTask` and `_gaps_view` mark the rail row
+  lets `_gap_detail_view` attach `sourceTask` and `_gaps_view` mark the list row
   `searching` — without it, an in-flight search and a search that failed look
-  identical to a screen showing nothing. Long-running network steps report
-  through a `progress(text)` callback (`slskd_run_search`) into
-  `task["current"]`; there is no total to count towards, so elapsed time and the
-  peer count are the only honest progress.
+  identical. Long-running network steps report through a `progress(text)` callback
+  into `task["current"]`; there is no total to count towards, so elapsed time and
+  the peer count are the only honest progress.
 - **An empty result must say why.** `slskd_run_search` fills a caller-supplied
   `stats` dict (peers, files, folders before scoring, rejected formats) and
-  `_no_source_reason` turns it into a sentence. "No source found on slskd" right
-  after a progress line reading "103 peers, 2,047 files" reads as a bug in the
-  bot; usually it means every file was in a rejected format, which is also what
-  decides whether the per-album MP3 opt-in is worth offering (`mp3_would_help`).
+  `_no_source_reason` turns it into a sentence.
 - **Treat every slskd collection as nullable.** A response carries
-  `"files": null` when the peer's only hits were locked, and `for f in
-  peer.get("files", [])` iterates `None` for those — one such peer raised out of
-  the loop and discarded all 139 others' results, swallowed into a bare "no
-  sources". Read `peer.get("files") or []`, and the same for `lockedFiles`.
+  `"files": null` when the peer's only hits were locked. Read
+  `peer.get("files") or []`, and the same for `lockedFiles`.
 - **Never compare slskd's peer-wide `lockedFileCount` to a folder's file count.**
   A search response's `files` are the *unlocked* hits; locked ones arrive in
   `lockedFiles`. `_score_folder` uses `locked_in_folder`, counted per folder from
@@ -425,9 +439,13 @@ follow, and both were once broken in the same failure:
   approved track to `source_pending`. Any decision that means "still missing,
   nobody working on it" must be in that tuple, or `_approve_pending_missing_tracks`
   won't re-approve it and `_group_source_plan` dies on "No approved tracks" —
-  which strands the album on "choosing a source" with no sources to choose,
-  permanently, because results are dropped on restart (above) but the decisions
-  are not.
+  which strands the album on "choosing a source" with no sources to choose.
+- **A group stuck on `downloaded` stops claiming to be in progress.** Files fetched
+  and not placed for `DOWNLOADED_STALE_SECS` read as failed with the reason
+  `stalled_placement`, so the UI offers a way out instead of "working" for ever.
+- **Don't put a big nested payload on a task row.** Task rows are flat scalars;
+  `/api/tasks` serves all of them and the hub caps a proxied answer. Only
+  `/api/tasks/<task_id>` serves a task's `result`.
 
 ---
 
@@ -447,12 +465,13 @@ as to lb-bot's own web UI.
   release you pick: release and release-group ids, disc and track numbers,
   titles, the album title, the date — never the artists, and nothing is renamed
   or moved. *The tag is the pin*: the files say it, so Navidrome and every scan
-  agree without knowing an override exists. Each file's tags are kept, on disk,
-  before the first write, so an undo goes back to before the first change
-  however many followed. A Cover Art Archive image can be saved as the album's
-  cover with it, or on its own; the cover that was there is moved aside, never
-  deleted. A retag is expected to change the album's Navidrome id, so a job is
-  followed by the override's own id, not the album's.
+  agree without knowing an override exists; do not add a read-time lookup of the
+  override table to a matcher. Each file's tags are kept, on disk, before the
+  first write, so an undo goes back to before the first change however many
+  followed. A Cover Art Archive image can be saved as the album's cover with it,
+  or on its own; the cover that was there is moved aside, never deleted. A retag
+  is expected to change the album's Navidrome id, so a job is followed by the
+  override's own id, not the album's.
 - **That two artist names are one artist.** Navidrome keys an artist by name, so
   "A & B" and "A and B" are two artists there whatever id both carry. A merge
   rewrites one spelling to the other wherever a file's album-artist or
@@ -474,9 +493,13 @@ What they share:
   a download for the album is in flight answers `busy`.
 - **Done means Navidrome has it.** A change reads `applied` or `merged` only
   after a Navidrome scan that began after the last write, and once the album
-  that holds the rewritten files is listed again.
+  that holds the rewritten files is listed again. A change that wrote nothing
+  reads `failed`, never done.
 - **A dependency that did not answer is a 502 to retry**, never "no such album"
   or "nothing matches".
+- **The cover's address is checked before it is fetched**: https on the Archive's
+  own hosts only, redirects followed by hand through the same check, a size cap, JPEG
+  or PNG only.
 
 ## The listens mirror
 
@@ -490,205 +513,124 @@ were submitted late. Whether an album is owned is joined at read time and never
 stored inside an aggregate, so a fill shows at once. Local days come from the
 client's time zone (`tz`), since the container runs in UTC.
 
-## How placement works (the important part)
+## The library index and its change feed
 
-For each missing track, the gap-detection step already resolves the
-`recording_mbid`, `position`, canonical `mb_albumid`, and full
-`canonical_tracklist`. Placement is therefore **deterministic** and needs no beets:
+`artists` and `release_groups` are the durable catalogue of what exists and what is
+missing; only lb-bot writes them. Clients keep a local copy and pull what changed:
 
-1. **Find the target album folder** — primary path pulls the on-disk `path` of an
-   existing track in that album from Navidrome (`getAlbum` → child `path`) and
-   takes its parent dir; fallback is the cached filesystem index
-   (`mb_albumid → folder`). Split/duplicate albums pick the folder holding the
-   most tracks of that release.
-2. **Match each slot to a file** with the *same* ranked matcher acquisition uses
-   (`_best_file_for_missing_track` + the sibling tighter-claim discard), over only
-   the slots this fill is about (`group_id` → `_group_missing_slot_keys`).
-3. **Guard** (`_reject_reason`) — refuse a file whose audio is already in the album,
-   or whose own tags say it is a different track of this release. See below.
-4. **Tag** the downloaded file with mutagen from the canonical dict built by
-   `_repair_track_metadata`. FLAC/Opus are Vorbis comments; mp3 goes through ID3.
-5. **Move** with `shutil.move` into the target folder (filename is cosmetic;
-   Navidrome organizes by tags).
-6. **Verify** — trigger a Navidrome rescan and confirm via the
-   `navidrome_pending → navidrome_verified` loop. Navidrome is the success oracle.
-   The same pass then re-reads the group's albums
-   (`refresh_group_albums_from_navidrome`) so present/total/missing update without
-   a full library scan.
+- **A sequence number is maintained by SQLite triggers**, bumped on every row written
+  and stamped on the artist the row belongs to. Every index write must therefore be
+  ordinary SQL on the shared connection (`_index_db()`); a write that goes round the
+  triggers is a change no client will ever see.
+- **An epoch says when a client must start over**: a new database, a change in the
+  shape of a wire row (`WIRE_VERSION`), or a database that went backwards — caught by
+  the high-water mark kept beside it, which is written before any sequence number
+  leaves the process.
+- `GET /api/index/changes?since=&epoch=` pages by bytes; `GET /api/index/keys` lists
+  every artist's key for a drift repair; `GET /api/health` is the hub's liveness probe
+  and never writes.
+- The background indexer (`_auto_index_worker`) scans one artist at a time — never
+  scanned first, then stale — and backs off an artist that failed without stalling the
+  rest. `/api/summary` carries how far it is (`index`), which the web UI shows.
+- A scan never forgets a fill: rows marked `present` at placement are carried across a
+  rescan.
 
-A fill can span **several download directories** — a file that fails over to another
-peer lands in that peer's own folder — so `_deterministic_album_import` accepts a
-list of dirs and `_finalize_group` passes every directory that received a file.
+## How a source is chosen
 
-### What changed since the 2026-10-02 release
-
-Each of these fixed something that had looked like the feature working.
-
-- **A click downloads the source that was clicked.** A pick used to be a
-  preference: the download searched again and took its own choice when the pick
-  was not in the new answer. The source list is now kept, a click takes that
-  folder from it, and what a click may fail over to is only the other folders
-  that pass the unattended rule.
-- **Album evidence, not only artist evidence.** For an artist called "After",
-  every "After Hours" folder is "by the artist". A folder is taken unattended
-  only when its name or the titles of its files show *the album*; for a title
-  with no word of its own — a self-titled album, "EP 2" — only the tracks count.
-- **The import files nothing that has not shown the album.** Every slot is
-  paired before a file is touched; an unattended import that finds fewer than
-  half of the tracks files none; a file with no slot is an extra only when the
-  album was shown and the file's own tags name it; a length is evidence only for
-  the slot the file's own number names.
-- **A release is its media.** Rows carry their disc; a medium that only repeats
-  another (the LP sides of a box that also holds the CD) is dropped; a file is
-  numbered and named by its slot, not by what the downloaded file said.
-- **Placement writes one spelling.** Writing a tag deletes its other names first
-  (`album artist`, `albumartists`, …), so a placed file can no longer credit its
-  album to two spellings of one artist.
-- **Another recording of the same track is placed; a different song is refused,
-  and says what it is.** With `ACOUSTID_API_KEY` set the fingerprint gives one of
-  four verdicts. A refusal names what the audio was identified as and offers
-  "Place anyway" for that one row. Silence — no key, no `fpcalc`, a fingerprint
-  nobody knows — is never evidence against a file.
-- **Titles in another language.** A library tagged as one edition and a peer
-  sharing another pair on track number and length inside a folder that is
-  already trusted, and placement honours that pairing instead of filing the file
-  as a bonus track.
-
-### The placement guard
-
-Placement used to run its own weaker substring matcher and then rewrite the file's
-`title` and `mb_trackid` to whatever slot it had guessed. That is how a fill could
-leave an 11-track album with two copies of one song and one track still missing:
-slot "Sing" claimed `05 - Singularity.flac`, the tags were forged to match, the real
-gap stayed open — and because both duplicate-file keys are read from tags, no
-duplicate scan could see the pair it had just created.
-
-`_place` now refuses — leaving the file in `/downloads` and marking the track
-`failed` with a named reason, recoverable via the existing "Pick a source manually"
-— when either holds:
-
-- **the audio is already in the album**: `_audio_signature` compared with
-  `_same_audio_exact` — FLAC's `md5_signature` (an MD5 of the *unencoded* audio,
-  free from the stream header) or an identical sample count at the same rate.
-  Deliberately strict, because this gates a refusal to place; the looser
-  duration+size comparison belongs only in the duplicate *report*.
-- **the file's own tags contradict the slot**: a disagreeing recording MBID, or an
-  own-title that is exactly another track of this release.
-
-A file with no usable tags and no md5 — the common Soulseek case — has nothing to
-contradict and places exactly as before. The guard must never turn a working fill
-into a no-op.
-
-### Finding the right album in the first place
-
-Two naive queries used to be the whole strategy — `"{artist} {album}"`, then
-bare `"{album}"` — and they fail predictably. MusicBrainz canonical titles carry
-edition packaging no peer folder has, and a **self-titled album collapses into
-an artist-wide query**: "Led Zeppelin Led Zeppelin" asks for the discography.
-
-`_album_search_queries` emits up to `MAX_SEARCH_PASSES` (3) ordered variants:
-the cleaned title with repeated runs collapsed (`_clean_album_title`,
-`_dedupe_terms`) plus the **year** when self-titled; a punctuation-free or
-distinctive-words form; and a last resort that, for a self-titled album, asks
-for its most distinctive *track* instead. `slskd_search_album_folders` walks
-them, **merges** folders across passes keyed `(username, folder)` keeping the
-better-scored copy, and stops early once two folders actually resembling the
-album have turned up.
+**The questions asked.** MusicBrainz titles carry edition packaging no peer folder has,
+and a self-titled album collapses into an artist-wide query. `_album_search_queries`
+emits up to `MAX_SEARCH_PASSES` (3) ordered variants: the cleaned title with repeated
+runs collapsed, plus the year when self-titled; a punctuation-free or distinctive-words
+form; and one that asks for the album's most distinctive *track*
+(`_album_track_query`). `slskd_search_album_folders` walks them and merges folders
+across passes by peer and folder — a folder two passes found keeps both passes' files.
+It stops early once folders that are clearly the album have turned up, **except** that a
+pass slskd cut off, or a title with no word of its own (a self-titled album, "EP 2", a
+bare year), always gets the track question: the first answer was a sample.
 
 **Ranking knows which album it asked for.** `_annotate_folder_match` scores each
-folder's own path against the album and artist (`_folder_name_score`, over the
-last one or two components), and `_score_folder` pays up to **+3000** for it —
-deliberately the largest single term, because everything above it is a property
-of the *peer*. Without this, an ambiguous query returned the whole discography
-and sorted it by upload speed, so "3 pages of other albums" outranked the one
-being looked for.
+folder's own path against the album and artist (`_folder_name_score`, over the last
+one or two components), and `_score_folder` pays more for that than for anything that
+is a property of the *peer* (speed, queue, free slots, collection size). Token-sort is
+the base of the name score because it pays for extra words — a partial ratio scores any
+superstring at 100, so the artist's name alone would match every album of theirs.
+Sibling markers (a roman numeral, "part 2", "vol. 3") cap the score. The preferred
+quality (`flac-any`, `flac-16-44`, `highest-bitrate`, `prefer-opus`) picks between two
+copies of the same album and never rejects a source.
 
-`_folder_name_score` is not `_fuzzy_score`: `partial_ratio` scores any
-superstring at 100, so "Led Zeppelin" matched the folder
-`Led Zeppelin/Physical Graffiti` perfectly and every album tied. Token-sort is
-the base because it pays for extra words; the partial arm returns only when the
-candidate adds at most one token — room for a year, not for another album's
-title. The candidate gets the same `_clean_album_title` + `_dedupe_terms`
-treatment the query does, so `Artist - Album [1969 FLAC]` still matches.
+**Evidence is a tier, not a bonus.** `_rank_album_folders` sorts in three tiers,
+whatever the score inside each:
 
-**Preferred quality** (`System → Source preferences`, `_effective_prefs()["quality"]`)
-picks between two copies of the same album: `flac-any` (default), `flac-16-44`,
-`highest-bitrate`, `prefer-opus`. Scored up to +600 at folder level and mirrored
-in `_score_file`. It never rejects a source — a gap is still filled when only
-one copy exists. This replaces an implicit, unchangeable "higher bitrate always
-wins" that was wrong for anyone wanting a standard CD rip.
+1. *artist evidence and album evidence*;
+2. artist evidence only;
+3. the rest.
 
-**Source selection** ranks Soulseek folders (album-name match, track-count
-match, availability ratio, upload speed, queue length, free slots, collection
-size, preferred quality) with automatic
-per-file failover: a file that fails while the rest of the album is progressing is
-re-enqueued from the next candidate source (`_retry_file_from_alt_source`, capped
-at `MAX_FILE_RETRIES`) instead of finalizing the album short. Claims on a peer's
-files are tracked per (peer, folder) and persist across retries, so two tracks
-failing over to the same peer can't both be paired to the same file.
+Artist evidence: a complete credited artist name whole in a path component or in the
+artist part of a file name, or the folder's files lining up with the tracklist. Album
+evidence (`_stamp_album_evidence`): the folder's name matches the album, or at least
+half of the release's titles — and at least two — have a file in it. For an artist
+whose name is a common word every folder with that word is "by the artist", which is
+why artist evidence alone is not enough; and for a title with no word of its own the
+*name* is no evidence, only the tracks count. A release known to have one track is
+evidenced by that title only together with an exactly named artist and, where both
+sides state one, a matching length.
 
-**No track is left behind on an album fetch.** A track the chosen folder has no
-file for used to fail on the spot, even though the search had found other
-sources that might have it — the per-track path had always failed over, the
-album path never did, and that is a large share of the fills that finish two or
-three tracks short. `_rescue_leftover_tracks` runs the same walk over the
-alternate sources (capped at 6, each expanded once and cached, one claim ledger
-per source) before anything is marked failed, and the track records the peer it
-was actually rescued from rather than the one originally chosen.
+**Nothing unattended guesses.** `_unattended_folder_ok` — artist evidence, and album
+evidence for a folder of an album search — is the one rule behind the automatic choice
+(`_auto_download_choice`), every list of alternates, the failover order
+(`_source_failover_order`), the album switch and the leftover rescue. When no folder
+passes, the fill says so ("none is clearly this album — pick one yourself") rather than
+taking the best-scored stranger. A track search's folder is nobody's album and passes
+on artist evidence.
 
-> **Known cost:** `_enqueue_group_source` runs under `_review_lock`, and the
-> rescue pass does its `slskd_expand_directory` calls there — as the per-track
-> branch already did. It is bounded (≤6 expansions per fetch, cached across
-> leftovers), but it is network I/O under the process-wide lock, which the
-> polled path pays for. Worth moving out with the fetch endpoint next time that
-> code is opened.
+**A click is consent for that source only.** The list a user picks from is kept
+(`_album_sources_kept`); a click takes that folder from it (`_album_source_named`) and
+runs no new search, so the source downloaded is the one clicked. If it is no longer
+listed the fill fails and says so. What a click may fail over to is the other folders
+of the same list that pass the unattended rule.
 
-### Source coverage — "is this the right album?"
+**What is asked of a folder that has the whole release** (`_whole_album_files`): when
+every track of the release is paired with a file by its exact title, the files named
+for a track are asked for and the rest are left out — a peer's folder often holds
+another release's files too. One track paired on anything looser, or no tracklist to
+be had, and the folder is taken whole, so that the import has every candidate in hand.
+"Download all" (`allFiles`) asks for every audio file of the picked folder, and only
+of that one.
 
-`_source_coverage_summary` pairs what we want against the peer's file list with the
-same ranked matcher acquisition uses. It takes either a review group (Fill gaps →
-the missing tracks) or an explicit `tracks` list (the artist/album page → the
-canonical MusicBrainz tracklist). Before, the album path passed no tracks at all and
-coverage was `min(fileCount, total)/total`, so any folder with enough files in it
-read as a complete match however unrelated its contents.
+**Failover.** A refusal is the normal answer from a peer whose free-slot flag went
+stale since the search, so the ranked list is walked (`SOURCE_FAILOVER_MAX`, and in a
+synchronous request `LB_BOT_SOURCE_FAILOVER_DEADLINE`), re-taking `_review_lock` per
+attempt rather than holding it across slskd calls. While a download runs:
 
-`_source_files_view` then puts the pairing on the wire: one row per file with the
-slot it would fill (or none), the full peer filename, plus the tracklist slots
-nothing covers. `SourceRow` renders it behind a "Show files" disclosure in every
-picker, so a source whose files match no slot is visibly wrong before anything is
-downloaded. The Fill-gaps hero's **chosen-source card carries the same
-disclosure** — that is the source you are about to commit to, so it is the one
-place the check matters most. Both go through the `useSourceFiles` hook, so
-there is one fetch-once-and-keep expansion, not two that can drift.
+- a file that fails while the rest of the album is progressing is asked of the next
+  source (`_retry_file_from_alt_source`, capped at `MAX_FILE_RETRIES`); claims on a
+  peer's files are tracked per peer and folder so two tracks cannot be paired to one
+  file;
+- a source that has given the group **nothing** is replaced whole
+  (`_switch_album_source`). "Nothing" is read from the transfer listing in hand
+  (`_source_has_given`), not from a counter that lags it: a peer that refuses some
+  files while serving the others is serving the album;
+- a group is not judged while its files are still being asked for, one request at a
+  time;
+- a track the chosen folder has no file for is looked for in the alternates before
+  anything is marked failed (`_rescue_leftover_tracks`);
+- the stall watchdog tells *stalled* from *waiting*: a transfer that has been running
+  gets `STALL_TIMEOUT` (120s) of no byte progress; one still in the peer's remote queue
+  gets `QUEUE_TIMEOUT` (900s), because peers serve one or two files at a time.
 
-**Opening that disclosure expands the peer's real folder.** `fd["files"]` holds only
-the peer's *search hits*; the actual directory listing was fetched at download time
-and thrown away, so a file that exists in the source but didn't match the search
-query was invisible to the UI *and* to the matcher — which is why a source that
-really does have a track reported it missing. `GET
-/api/groups/<gid>/sources/<idx>/files` calls `slskd_expand_directory` once, caches it
-on `fd["_expanded"]` (the field the failover path already used), and recomputes
-coverage, `matchedTo` and the risk flags over the full listing. The UI labels which
-of the two it is showing.
+**Format policy** is per album at the edges: `FORMAT_PRIORITY` stays flac/opus, but a
+review group can set `allow_mp3` (`POST /api/gaps/<id>/allow-mp3`), which widens the
+accepted formats for that album's searches only, with mp3 ranked last. Placement
+always accepts mp3 — refusing to file a track that was deliberately downloaded would
+strand it.
 
-**A track can be matched by hand.** `POST /api/groups/<gid>/tracks/<idx>/pick-file
-{sourceIndex, filename}` enqueues one specific peer file for one specific missing
-track through the existing per-track path (`slskd_enqueue(track=,
-review_group_id=, review_track_index=)`) — only the *file choice* was ever
-automatic. The binding is recorded as `manual_pick`, and `_group_manual_pairs` turns
-it into `manual_pairs` (slot key → local path), which `_match_slot` consults **first**
-— otherwise placement would re-match and quietly undo the choice — and which also
-reserves that file against any other slot claiming it. A manual pairing skips the
-"the file's tags say it is a different track" refusal, since that is precisely the
-judgement being overridden, but **keeps** the "this audio is already in the album"
-one: that is what stops a duplicate being created. When it fires, the track reports
-`canForcePlace` and the name of the file it duplicates, and `POST
-/api/groups/<gid>/tracks/<idx>/place-anyway` re-runs placement for that one file with
-the audio check disabled, behind a confirm that names the existing file.
+## Matching a file to a track
 
-**Matching a missing track to a file in a source folder** is ranked, not
-substring. `_file_title_key` strips the track number and extension from the
-filename and `_title_match_rank` grades the hit, tightest first:
+`_album_file_pairs_for_missing_tracks` is **the** folder matcher: the picker's
+coverage, the enqueue, the rescue, the album switch and the per-file retry all call it,
+so what a row promises and what is fetched are one pairing. Title first:
+`_file_title_key` strips the track number and extension from the file name and
+`_title_match_rank` grades the hit, tightest first:
 
 | tier | basis | evidence |
 |---|---|---|
@@ -699,82 +641,142 @@ filename and `_title_match_rank` grades the hit, tightest first:
 | 4 | `duration` | no title matched; the file's length fits this track and nothing else, in both directions |
 | — | `position` | no title matched anywhere, but the folder *is* the whole album, so the track number is used |
 
-`_best_file_match` returns the basis alongside the file, so the UI can chip the
-weak tiers and `_match_slot` can report "medium" confidence honestly instead of
-presenting a duration guess and a recording-MBID hit as the same thing.
-`_best_file_for_missing_track` is the thin wrapper for callers that only want
-the file.
-
-Two rules keep the looser tiers from doing damage, and **neither is optional**:
+`_best_file_match` returns the basis alongside the file, so the UI can chip the weak
+tiers. Rules that keep the looser tiers from doing damage — none is optional:
 
 - **A loose hit is discarded when another title on the release claims the same
-  file at least as tightly** (`_sibling_claims_tighter`, fed by
-  `_release_track_titles`). Without it, missing "Sing" matched
-  `05 - Singularity.flac` and downloaded a song already in the library while the
-  real gap stayed open. This now applies to the fuzzy tier too — it is precisely
-  what lets that tier be loose without being dangerous.
-- **`partial_ratio` scores any substring at 100**, so "sing" inside
-  "singularity" would sail through the fuzzy tier on score alone. `_tokens_aligned`
-  requires the shorter string's tokens to appear as *whole* tokens in the longer,
-  which keeps "Song" ↔ "Song (feat. X)" and rejects the other.
+  file at least as tightly** (`_sibling_claims_tighter`). Without it, a missing "Sing"
+  matches `05 - Singularity.flac` and downloads a song already in the library while
+  the real gap stays open.
+- **`partial_ratio` scores any substring at 100**, so `_tokens_aligned` requires the
+  shorter string's tokens to appear as *whole* tokens in the longer.
+- **Track number and length count only in a trusted folder** — one whose name matches
+  the album or that has already matched a majority of the release's titles — and the
+  whole release is in view, so a song the library already has can veto a length guess.
+  This is what pairs a library tagged as one edition with a peer sharing another in a
+  different language.
+- **A track number is evidence only with its disc.** A release is its media: rows carry
+  their disc (`_row_slot`), a medium that only repeats another — the LP sides of a box
+  that also holds the CD — is dropped (`_release_tracks_from`), and on a release of
+  several media a bare "03" names no row.
+- **A folder with exactly as many files as there are gaps is not zipped to them
+  blindly** (`_exact_count_zip`): every file must carry the number of the row it lands
+  on, and no file may match another track of the release. Only a source the user chose
+  is zipped at all.
+- **A pairing with no title in it says so** (`weak_pairing`): such a source is offered
+  and can be fetched, but is never "recommended" (`_source_recommendable`).
 
-The `position` fallback is guarded hardest, because a blind positional zip is
-exactly how files get filed as the wrong song: the folder must hold as many
-audio files as the release has tracks **and** either match the album name
-(`album_match_ok`) or have already matched a majority of the release's titles,
-and each number must resolve to exactly one unclaimed file. It exists for
-localized or transliterated filenames, where the folder is plainly the album but
-no filename resembles a MusicBrainz title.
+`_source_coverage_summary` puts the pairing on a source row and `_source_files_view`
+on the wire file by file, so a source whose files match no track is visibly wrong
+before anything is downloaded. A search answer holds only the files that matched the
+question; `GET /api/groups/<id>/sources/<n>/files` reads the peer's real folder once
+(`slskd_expand_directory`) and recomputes the pairing over it.
 
-When nothing matches, the **nearest rejected candidate and its score** are
-recorded on the track (`closest: '05 - Singularity.flac' (100%)`). A bare "no
-matching file" reads as "the source was empty" when the truth is that the one
-candidate belongs to another track.
+**A track can be matched by hand.** `POST /api/groups/<id>/tracks/<n>/pick-file`
+enqueues one specific peer file for one specific missing track. The binding is
+recorded, and `_group_manual_pairs` hands it to placement, which consults it **first**
+— otherwise placement would re-match and quietly undo the choice.
 
-The placement guard (`_reject_reason`) is deliberately untouched by all of this:
-it is the safety net *behind* the looser matcher, not part of it.
+When nothing matches, the nearest rejected candidate and its score are recorded on the
+track: a bare "no matching file" reads as "the source was empty" when the truth is
+that the one candidate belongs to another track.
 
-The stall watchdog distinguishes *stalled* from *waiting*. A transfer that has
-actually been running gets `STALL_TIMEOUT` (120s) of no byte progress before it
-is cancelled; one still sitting in the peer's remote queue ("Queued, Remotely")
-gets `QUEUE_TIMEOUT` (900s), because Soulseek peers serve one or two files at a
-time and the tail of an album legitimately sits at 0 bytes for minutes. Killing
-those was the main reason a fill finished two or three tracks short.
+## How a file is placed
 
-**Format policy** is per album at the edges: `FORMAT_PRIORITY` stays flac/opus,
-but a review group can set `allow_mp3` (Fill gaps → "Allow MP3 as a last resort",
-`POST /api/gaps/<id>/allow-mp3`), which widens the accepted formats for that
-album's searches and enqueues only, with mp3 ranked last. Placement always
-accepts mp3 — refusing to file a track we deliberately downloaded would strand it
-in `/downloads`.
+For each missing track the scan has already resolved the recording, its place on the
+release and the canonical tracklist, so placement is deterministic:
+`_deterministic_album_import` for the folder, `_place` for a file, `_place_file` for
+the move.
 
-**Verification is real.** After placement, a background pass polls Navidrome for
-each placed track; confirmed tracks become `verified`, and anything that never
-appears within `PLACEMENT_VERIFY_TIMEOUT` is reset to `pending` so the next fill
-retries it. A rescan that still reports a track missing also clears any inherited
-`placed`/`queued` decision — the library, not the bookkeeping, is the oracle.
+1. **Which files.** A finished download imports the files *its own transfers landed*,
+   by name (`_finalize_import_selection`) — not the folder, which slskd names after the
+   peer folder's last component and which may hold what an earlier fill left. A
+   transfer's file is the one that arrived for it (`_transfer_local_path`): never older
+   than the transfer. A fill can span several download directories; a file picked by
+   hand or rescued from another peer is placed too (`_place_group_downloads`).
+2. **Find the album's folder** (`_nd_find_album_folder_by`): the folder of the Navidrome
+   album that carries the wanted release id, else whose artist and title are the
+   wanted ones — never just the best hit of a text search. None: `<music>/<artist>/<album>`
+   is made. A placement that is not for an album gap is filed under the library's own
+   spelling of its artist (`_library_artist_spelling`), so a new album cannot add a
+   second spelling.
+3. **Pair every slot before any file is touched** (`_match_slot`): a hand pick, then a
+   recording id in the file's tags, then the row the file was downloaded for, then the
+   title tiers. A length pairs a file only with the slot its own number names
+   (`_pair_by_length`, `_file_own_number`), and by number and length it is all or
+   nothing: one numbered file that does not fit its slot, and none is taken that way.
+4. **Nothing is filed that has not shown the album.** An unattended import with no
+   review group files nothing unless at least half of the tracks were found. A file
+   with no slot is filed as an extra only when the album was shown *and* the file's own
+   tags name this album (`_tags_name_album`); otherwise it stays where it is, with the
+   reason. A hand route — the user naming the folder and the release — places each file
+   it pairs.
+5. **Guard** (`_reject_reason`) — see below.
+6. **Tag** from the slot (`_mutagen_write_tags`; FLAC and Opus are Vorbis comments, MP3
+   goes through ID3): number, disc and their totals from the slot and never from the
+   downloaded file, the release's ids, the title. Writing a tag deletes its other names
+   first (`TAG_ALIASES`), so a placed file cannot credit its album to two spellings of
+   one artist. The file is named by its slot, with the disc once the release is more
+   than one medium.
+7. **Move** (`_place_file`): move, `chmod`, then a fresh mtime on the file and its
+   folders — each step is load-bearing. A rename keeps the downloader's mode, and
+   Navidrome sorts "recently added" by mtime.
+8. **Verify.** A Navidrome scan is asked for and a background pass looks each placed
+   track up; found tracks become `verified`, and one that never appears within
+   `PLACEMENT_VERIFY_TIMEOUT` goes back to `pending`. The library, not the bookkeeping,
+   is the oracle: a rescan that still reports a track missing clears an inherited
+   `placed`.
+
+A placement of a review group holds that group's claim (`_group_placement`) from before
+the first file can move until its rows are written, so a cancel always knows whether it
+came first. Every caller of the import that names a group is listed in a test that
+reads the module's syntax tree; a new one fails there until it is listed.
+
+### The placement guard
+
+`_place` refuses — leaving the file in `/downloads` with a named reason on the track —
+when one of these holds, in this order:
+
+- **the audio is another recording.** With `ACOUSTID_API_KEY` set the file is
+  fingerprinted and `_acoustid_verdict` gives one of four answers: *confirmed* (the
+  slot's recording is among those named); *the same track in another recording*
+  (`_same_track_recording`: the title, the album's artist, and a length within
+  `LB_BOT_SAME_TRACK_LENGTH_SEC` of the track's) — placed, and said; *different* —
+  refused, and remembered against the peer; or *no opinion*. **Silence is never
+  evidence**: no key, no `fpcalc`, a fingerprint nobody knows, AcoustID down — all are
+  "no opinion", and placement goes on as it would without the check.
+- **the audio is already in the album**: `_audio_signature` compared with
+  `_same_audio_exact` — FLAC's own MD5 of the *unencoded* audio, or an identical
+  sample count at the same rate. Deliberately strict, because it gates a refusal; that
+  hash proves two files are the same encode and says nothing about a different
+  recording, which is what the fingerprint is for.
+- **the file's own tags contradict the slot**: a recording id that is a real
+  MusicBrainz id and is not the slot's — unless the title and the length are the
+  slot's, which is what a file tagged with an id MusicBrainz has since merged looks
+  like — or an own-title that is exactly another track of this release.
+
+A refusal carries its kind, and `_note_force_place_offer` turns that into the offer:
+**"Place anyway"** on the row, which overrules the refusal the row shows and no other
+(`_place_track_anyway`). A hand pick skips the tag and fingerprint checks — that
+judgement is the one being overridden — and keeps "already in the album", which is
+what stops a duplicate being created. A file with no usable tags and no MD5 has
+nothing to contradict and is placed: the guard must never turn a working fill into a
+no-op.
 
 ### Duplicates
 
-Library → Duplicates covers two different things.
+Library → Cleanup covers two different things.
 
 **Duplicate albums** are bucketed by normalized artist + title, then optionally
-by fuzzy title similarity ("fuzzy matching"), then structurally. The structural
-pass exists because a Japanese release and its English-titled copy share no text
-at all, so no amount of fuzzy title matching can ever pair them: candidates are
+by fuzzy title similarity, then structurally. The structural pass exists because a
+release and its copy titled in another language share no text at all: candidates are
 albums with the same track count whose total runtimes agree within a tolerance
 that scales with the track count (`DUPLICATE_DURATION_TOLERANCE` floor,
-`DUPLICATE_TRACK_TOLERANCE` per track — Navidrome's album duration is a sum of
-whole seconds, so rounding alone drifts with length). A candidate is confirmed by,
-in order: the artist tag agreeing; both albums resolving to the same MusicBrainz
-release-group; or — with "match across languages" (`{"deep": true}` on
-`POST /api/scan`) — their **per-track runtimes agreeing track for track**
-(`_album_duration_fingerprint`). That last one needs no MBID on either side, which
-is the point: the localized rip this feature exists for is usually untagged, and
-requiring a release-group from *both* copies meant the deep pass could only ever
-confirm pairs the title passes had already found. The whole scan therefore
-considers untagged albums too, and an MBID is required only at the release-group
-lookup itself.
+`DUPLICATE_TRACK_TOLERANCE` per track). A candidate is confirmed by, in order: the
+artist tag agreeing; both albums resolving to the same MusicBrainz release-group; or —
+with "match across languages" (`{"deep": true}` on `POST /api/scan`) — their
+**per-track runtimes agreeing track for track** (`_album_duration_fingerprint`), which
+needs no MusicBrainz id on either side.
 
 **Duplicate files** are two files *inside one album* that are the same song —
 typically the residue of a fill that matched the wrong file. Files come from
@@ -788,53 +790,39 @@ are flagged `onlyOnDisk`). They are unioned on two kinds of evidence, reported a
 | `audio` | identical FLAC stream md5, or sample count at the same rate — proof |
 | `tags` | normalized title or recording MBID agrees |
 
-There used to be a third, `stream` (lossy files with no md5: same rounded duration,
-rate and channels, sizes within 2%). Rate and channels are constant across a rip, so
-it degenerated to *duration alone* and the size gate is a no-op for CBR — two
-different songs of equal length grouped, and union-find chained them into sets of
-three and more. A guess has no business feeding a delete button; it is gone.
+Nothing looser feeds a delete button: equal length, rate and channels is duration
+alone, and two different songs of one length would be grouped.
 
-`audio` is what catches a bad fill at all: placement rewrites the mis-slotted file's
-title *and* MBID, so the two copies share neither tag key. Signatures are cached in
-`library_index.db` (`file_signatures`, keyed on path + size + mtime), so a rescan
-costs one `stat` per file rather than a header read.
+Signatures are cached in `library_index.db` (`file_signatures`, keyed on path + size +
+mtime), so a rescan costs one `stat` per file rather than a header read.
 
 **A file is one file.** Identity is `(st_dev, st_ino)` (`_file_identity`), never the
 path string: `os.path.normpath` does not case-fold, resolve symlinks or
 unicode-normalize, while `_song_abs_path` forces NFC on Navidrome's path and
-`os.walk` returns the filesystem's spelling. Comparing strings therefore listed one
-file as two rows carrying the same stream md5 — grouped as `audio`, the strongest
-evidence there is, with the disk-side alias always ranked second and so always the
-deletable row. On a real library that flagged nearly every song and deleting the
-"duplicates" destroyed good files. Identity is used for the Navidrome/disk merge, the
-per-set dedupe, the cross-set `claimed` ledger (one file appears in at most one set,
-library-wide), the delete endpoint's prune, and the SPA's row keys. The disk walk is
-also non-recursive and skipped for the library root or a directory holding
-implausibly more audio than the album has tracks — counted in the scan stats.
+`os.walk` returns the filesystem's spelling. Compared as strings, one file is two rows
+carrying the same stream md5 — the strongest evidence there is, with one of them
+always the deletable row. Identity is used for the Navidrome/disk merge, the per-set
+dedupe, the cross-set `claimed` ledger (one file appears in at most one set), the
+delete endpoint's prune, and the SPA's row keys. The disk walk is non-recursive and
+skipped for the library root or a directory holding implausibly more audio than the
+album has tracks.
 
 Sets are ranked best-copy-first by format → bitrate → size and deleted one at a time
 through `POST /api/library/delete-file`, which requires `{"confirm": true}` and
 refuses any path that does not resolve strictly inside `LB_BOT_MUSIC_DIR`. Two
 further guards: it **refuses the last copy** (`409 last_copy`) unless some other
-file that still exists is genuinely the same song — checked against the stored set,
-or failing that against the file's own folder with the same audio/tag rules — and it
-**moves to trash rather than unlinking**. Trash is `LB_BOT_TRASH_DIR`, default
-`/music/.lb-bot-trash`, laid out as `<YYYY-MM-DD>/<path relative to the library>`
-with a `manifest.json` beside the files; same filesystem, so it is a rename, and
-dot-prefixed so Navidrome skips it. `GET /api/library/trash`,
-`POST /api/library/trash/restore {path}` (refuses an occupied original path) and
-`POST /api/library/trash/empty {confirm, older_than_days}` complete it. In the UI the
-row the set is keeping has **no Delete button** — other rows offer "keep this one
-instead", which re-points the recommendation — so emptying a set takes a deliberate
-change of mind.
+file that still exists is genuinely the same song, and it **moves to trash rather than
+unlinking**. Trash is `LB_BOT_TRASH_DIR`, default `/music/.lb-bot-trash`, laid out as
+`<YYYY-MM-DD>/<path relative to the library>` with a `manifest.json` beside the files;
+same filesystem, so it is a rename, and dot-prefixed so Navidrome skips it.
+`GET /api/library/trash`, `POST /api/library/trash/restore` (refuses an occupied
+original path) and `POST /api/library/trash/empty` complete it. In the UI the row the
+set is keeping has no Delete button, so emptying a set takes a deliberate change of
+mind.
 
-The library-wide list comes from the duplicate scan's second phase; `GET
-/api/gaps/<id>/duplicate-files` answers for a single album live (deduping the group's
-albums by resolved folder first), which is what the Fill gaps workspace uses.
-
+`GET /api/gaps/<id>/duplicate-files` answers for a single album live.
 `_missing_for_album_records` also reports `extra` — files the canonical tracklist
-can't account for — so an album reading 11/11 can still say something is off
-instead of absorbing the duplicate into `present`.
+can't account for — so an album reading 11/11 can still say something is off.
 
 ### Navidrome paths vs `/music`
 
@@ -843,10 +831,13 @@ not be lb-bot's `LB_BOT_MUSIC_DIR`. `_song_abs_path` therefore normalizes
 (backslashes, percent-encoding, NFC/NFD), tries the path as given, then rebases by
 walking the trailing components against `MUSIC_LIBRARY_PATH` until one resolves —
 never onto a bare filename, which would pair unrelated albums sharing a track name.
-The prefix that worked is remembered for the process (`_nd_path_prefix`).
+The prefix that worked is remembered for the process (`_nd_path_prefix`). Nothing needs
+to know Navidrome's root.
 
-Nothing needs to know Navidrome's root, and the failure is not cosmetic: it is what
-emptied the duplicate-file list, blocked merges with "outside `/music`", and turned
-the System → Diagnostics "Library path ↔ Navidrome" probe red while the mount was
-correct. That probe now samples across several albums and reports a ratio, so one
-stale Navidrome row no longer condemns the mount.
+That covers a *different root*. It does not cover a path Navidrome **made up from the
+tags**, which is what a Subsonic client is handed unless "Report Real Path" is on for
+its player: gap filling finds an album's folder all the same, but an album override, a
+cover change and a name merge need every file's real path and refuse without it (see
+"Overrides"). The System page's "Library path ↔ Navidrome" check samples across
+several albums and reports a ratio, so one stale Navidrome row does not condemn the
+mount.

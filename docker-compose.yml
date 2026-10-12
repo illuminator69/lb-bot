@@ -55,6 +55,7 @@ services:
 
       # Optional enrichment.
       LASTFM_API_KEY: "${LASTFM_API_KEY:-}"
+      ACOUSTID_API_KEY: "${ACOUSTID_API_KEY:-}"
       SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
       SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
 

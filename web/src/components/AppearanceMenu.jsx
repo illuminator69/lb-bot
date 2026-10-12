@@ -1,89 +1,53 @@
 import { useState } from 'react'
 import {
-  ACCENT_NAMES, ACCENT_SWATCHES, BG_TONES,
-  loadAppearance, saveAppearance, applyAppearance,
+  ACCENT_NAMES, BG_TONES, MODES, accentName, accentSwatch, bgName, bgSwatch,
+  loadAppearance, saveAppearance, applyAppearance, resolvedMode,
 } from '../lib/tokens.js'
-import { Menu } from './ui.jsx'
+import { Seg } from './Page.jsx'
 
-const TONE_LABELS = { warm: 'Warm', slate: 'Slate', plum: 'Plum' }
-// Representative surface colour per tone for the swatch.
-const TONE_DOTS = { warm: '#1c1611', slate: '#1a1d22', plum: '#1e171e' }
-
-function useAppearance() {
-  const [appearance, setAppearance] = useState(loadAppearance)
-  function set(patch) {
-    setAppearance(prev => {
-      const next = { ...prev, ...patch }
-      applyAppearance(next)
-      try { saveAppearance(next) } catch { /* per-viewer convenience only */ }
-      return next
-    })
-  }
-  return [appearance, set]
-}
-
-const Label = ({ children }) => (
-  <div className="mb-1.5 text-micro font-semibold uppercase tracking-[.1em] text-muted">{children}</div>
-)
-
-// The controls themselves — in the header popover and on Settings → Appearance.
+// System → Appearance. Per browser: nothing here is sent to lb-bot.
 export function AppearanceControls() {
-  const [appearance, set] = useAppearance()
+  const [look, setLook] = useState(loadAppearance)
+  function set(patch) {
+    const next = { ...look, ...patch }
+    setLook(next)
+    applyAppearance(next, { animate: true })
+    saveAppearance(next)
+  }
+  const mode = resolvedMode(look)
   return (
-    <div>
-      <Label>Theme</Label>
-      <div className="mb-3 flex gap-1 rounded-card border border-line p-[3px]" style={{ background: 'var(--inset-track)' }}>
-        {['dark', 'light'].map(t => (
-          <button key={t} aria-pressed={appearance.theme === t}
-            className={`flex-1 !rounded-ctl !border-0 !py-1.5 text-caption ${appearance.theme === t ? '!bg-accent !text-accent-fg font-semibold' : '!bg-transparent !text-muted'}`}
-            onClick={() => set({ theme: t })}>
-            {t === 'dark' ? '☾ Dark' : '☀ Light'}
-          </button>
-        ))}
+    <>
+      <div className="rows" style={{ maxWidth: 640 }}>
+        <div className="opt">
+          <span>Theme</span>
+          <Seg label="Theme" value={look.mode} onChange={m => set({ mode: m })} options={MODES} />
+        </div>
+        <div className="opt">
+          <span>Background</span>
+          {BG_TONES.map(k => {
+            const [a, b] = bgSwatch(k, mode)
+            return (
+              <button key={k} className="sw" title={bgName(k)} aria-label={`${bgName(k)} background`}
+                aria-pressed={look.bg === k} onClick={() => set({ bg: k })}
+                style={{ background: `linear-gradient(135deg, ${a} 50%, ${b} 50%)` }} />
+            )
+          })}
+          <span className="muted">{bgName(look.bg)}</span>
+        </div>
+        <div className="opt">
+          <span>Accent</span>
+          {ACCENT_NAMES.map(k => (
+            <button key={k} className="sw" title={accentName(k)} aria-label={`${accentName(k)} accent`}
+              aria-pressed={look.accent === k} onClick={() => set({ accent: k })}
+              style={{ background: accentSwatch(k, mode) }} />
+          ))}
+          <span className="muted">{accentName(look.accent)}</span>
+        </div>
       </div>
-      <Label>Accent</Label>
-      <div className="mb-3 flex gap-2.5">
-        {ACCENT_NAMES.map(a => (
-          <button key={a} aria-label={`${a} accent`} title={a} aria-pressed={appearance.accent === a}
-            className="h-7 w-7 !rounded-pill !p-0"
-            style={{
-              background: ACCENT_SWATCHES[a],
-              borderColor: appearance.accent === a ? 'var(--text)' : 'transparent',
-              boxShadow: appearance.accent === a ? '0 0 0 2px var(--surface) inset' : 'none',
-            }}
-            onClick={() => set({ accent: a })} />
-        ))}
-      </div>
-      <Label>Background</Label>
-      <div className="flex gap-1.5">
-        {BG_TONES.map(t => {
-          const active = appearance.bgTone === t
-          return (
-            <button key={t} aria-pressed={active}
-              className="flex flex-1 items-center justify-center gap-[7px] !py-[7px] text-caption"
-              style={{
-                borderColor: active ? 'var(--accent)' : 'var(--border)',
-                background: active ? 'var(--accent-tint)' : 'var(--inset-warm)',
-                color: active ? 'var(--accent)' : 'var(--text2)',
-                fontWeight: active ? 600 : 400,
-              }}
-              onClick={() => set({ bgTone: t })}>
-              <span className="h-3.5 w-3.5 shrink-0 rounded-[4px] border border-line" style={{ background: TONE_DOTS[t] }} />
-              {TONE_LABELS[t]}
-            </button>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-export default function AppearanceMenu() {
-  return (
-    <Menu align="right" width={268} title="Appearance" ariaLabel="Appearance" label="◑"
-      buttonClass="h-[34px] w-[34px] !p-0 text-lead leading-none"
-      buttonStyle={{ background: 'var(--inset-warm)', color: 'var(--text2)' }}>
-      <div className="p-2"><AppearanceControls /></div>
-    </Menu>
+      <p className="muted mt-3" style={{ maxWidth: '65ch' }}>
+        The accent colours the main action and the current selection. Amber, green and red stay reserved for
+        waiting, done and failed, so they are not offered as accents. These choices are kept in this browser.
+      </p>
+    </>
   )
 }

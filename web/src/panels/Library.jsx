@@ -1,44 +1,46 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useApp, navigate } from '../App.jsx'
+import { useApp, navigate, goGap } from '../App.jsx'
 import { api, post } from '../lib/api.js'
 import Cover from '../components/Cover.jsx'
 import { DuplicateFileSet, TrashPanel } from '../components/Duplicates.jsx'
-import Artist from './Artist.jsx'
-import {
-  Chip, EmptyState, Pager, PageTitle, SectionHeader, SelectField, StatusChip, SubTabs,
-} from '../components/ui.jsx'
+import Page, { Grp, Pick, Seg } from '../components/Page.jsx'
+import { ArtistIndex } from './Artist.jsx'
+import { Pager, StatusChip } from '../components/ui.jsx'
 
-// Library is what you have: your artists (with every album of theirs, owned or
-// not), your albums as a table, and cleanup. Before 2026-09-26 the Library tab
-// also carried an acquire-new search (now the header box) and two scan buttons
-// (now Fill gaps → Scan), and Artist was its own tab.
-const SUBS = [['artists', 'Artists'], ['albums', 'Albums'], ['cleanup', 'Cleanup']]
+// Library is what you have: your artists (each opens their whole discography,
+// owned or not), your albums as a list, and cleanup.
+const TABS = ['artists', 'albums', 'cleanup']
 
-// ── Albums ───────────────────────────────────────────────────────────────────
-// What each row's button does, by status — one verb per state.
-const ROW_ACTION = {
-  ready: 'Fill gaps',
-  picking: 'Decide',
-  downloading: 'View',
-  failed: 'Recover',
-  complete: 'Re-check',
+function LibraryFrame({ tab, bar, action, children }) {
+  const { state } = useApp()
+  // The summary: it refreshes on every poll of every screen, while the album
+  // list's own totals move only on the Albums tab.
+  const totals = state.summary?.library || state.library?.libraryTotals
+  const artists = state.summary?.index?.total
+  const sub = [
+    artists ? `${artists.toLocaleString()} artists` : null,
+    totals?.albums ? `${totals.albums.toLocaleString()} albums` : null,
+    totals?.albums ? `${(totals.withGaps || 0).toLocaleString()} with gaps` : null,
+  ].filter(Boolean).join(' · ')
+  return (
+    <Page title="Library" sub={sub} action={action}
+      tabs={[['artists', 'Artists', artists ?? null], ['albums', 'Albums', totals?.albums ?? null], ['cleanup', 'Cleanup']]}
+      tab={tab} onTab={k => navigate('library', k)} bar={bar}>
+      {children}
+    </Page>
+  )
 }
 
-const FILTERS = [
-  ['all', 'All'],
-  ['gaps', 'Has gaps'],
-  ['working', 'Working'],
-  ['decision', 'Needs a decision'],
-  ['failed', 'Failed'],
-  ['complete', 'Complete'],
-]
+// ── Albums ───────────────────────────────────────────────────────────────────
+const SPLIT = [['all', 'All'], ['gaps', 'With gaps'], ['complete', 'Complete']]
+const MORE = [['', 'Any status'], ['working', 'Working'], ['decision', 'Needs a decision'], ['failed', 'Failed']]
 
 const LIB_SORTS = [
   ['', 'Navidrome order'],
-  ['artist', 'Artist A–Z'],
-  ['album', 'Album A–Z'],
+  ['artist', 'Artist A to Z'],
+  ['album', 'Album A to Z'],
   ['year', 'Newest first'],
-  ['missing', 'Most missing first'],
+  ['missing', 'Most missing'],
 ]
 
 function AlbumsView() {
@@ -53,69 +55,73 @@ function AlbumsView() {
     return () => clearTimeout(t)
   }, [draftSearch, libSearch, dispatch])
 
+  const setFilter = f => dispatch({ type: 'SET_LIB_FILTER', filter: f || 'all' })
+  const inSplit = SPLIT.some(([k]) => k === libFilter)
+
+  // One verb per state.
   function rowAction(row) {
     if (!row.groupId) return null
-    const label = ROW_ACTION[row.status] || 'View'
     if (row.status === 'complete') {
       return (
-        <button className="sm" title="Recompute which tracks are missing"
+        <button className="sm quiet" title="Recompute which tracks are missing"
           onClick={() => action(`/api/groups/${row.groupId}/missing`)
-            .then(() => pushToast(`Re-checking ${row.album}…`))
+            .then(() => pushToast(`Re-checking ${row.album}`))
             .catch(e => pushToast(`Re-check failed: ${e.message}`, 'error'))}>
-          {label}
+          Re-check
         </button>
       )
     }
+    if (row.status === 'failed') {
+      return <button className="sm" onClick={() => navigate('needs', 'fix', `gap:${row.groupId}`)}>Fix</button>
+    }
     return (
-      <button className={`sm ${row.status === 'ready' ? 'primary' : ''}`} onClick={() => navigate('Fill gaps', row.groupId)}>
-        {label}
+      <button className="sm" onClick={() => goGap(row.groupId)}>
+        {row.status === 'downloading' ? 'View' : 'Find sources'}
       </button>
     )
   }
 
-  return (
+  const bar = (
     <>
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <input type="search" placeholder="Filter by artist or album…" aria-label="Filter albums" className="w-60"
-          value={draftSearch} onChange={e => setDraftSearch(e.target.value)} />
-        {FILTERS.map(([k, label]) => (
-          <Chip key={k} active={libFilter === k} onClick={() => dispatch({ type: 'SET_LIB_FILTER', filter: k })}>{label}</Chip>
-        ))}
-        <span className="spacer" />
-        <SelectField label="Sort" value={libSort} options={LIB_SORTS} onChange={v => dispatch({ type: 'SET_LIB_SORT', sort: v })} />
-      </div>
+      <Seg label="Which albums" value={inSplit ? libFilter : ''} onChange={setFilter} options={SPLIT} />
+      <input className="find" type="search" placeholder="Filter by artist or album" aria-label="Filter albums"
+        value={draftSearch} onChange={e => setDraftSearch(e.target.value)} />
+      <Pick label="Status" value={inSplit ? '' : libFilter} onChange={setFilter} options={MORE} />
+      <Pick label="Sort" value={libSort} onChange={v => dispatch({ type: 'SET_LIB_SORT', sort: v })} options={LIB_SORTS} />
+    </>
+  )
 
-      {!library ? <p className="text-caption text-muted">Loading albums…</p> : (
+  return (
+    <LibraryFrame tab="albums" bar={bar}>
+      {!library ? <p className="muted">{state.pollError ? 'Waiting for lb-bot…' : 'Loading albums…'}</p> : (
         <>
-          <div className="library-table">
-            <div className="library-head library-row">
-              <span>Album</span><span>Status</span><span>Tracks</span><span className="text-right">Action</span>
-            </div>
-            {!library.items.length && (
-              <div className="library-row"><span className="text-caption text-muted">No albums match this filter.</span></div>
-            )}
-            {library.items.map(row => (
-              <div className="library-row" key={row.id}>
-                <div className="flex min-w-0 items-center gap-[11px]">
-                  <Cover albumId={row.albumId || row.id} url={row.coverUrl} name={row.album} size={34} />
-                  <div className="min-w-0">
-                    <div className="truncate text-small font-semibold">{row.album}</div>
-                    <div className="truncate text-micro text-muted">{row.artist}{row.year ? ` · ${row.year}` : ''}</div>
+          {!library.items.length ? <p className="empty">No album matches this filter.</p> : (
+            <div className="rows">
+              {library.items.map(row => (
+                <div className="row stack" key={row.id}>
+                  <Cover albumId={row.albumId || row.id} url={row.coverUrl} name={row.album} size={40} />
+                  <div className="grow">
+                    {row.groupId && row.status !== 'complete'
+                      ? <button className="link plain t clip block max-w-full" onClick={() => goGap(row.groupId)}>{row.album}</button>
+                      : <div className="t clip">{row.album}</div>}
+                    <div className="s clip">{row.artist}{row.year ? ` · ${row.year}` : ''}</div>
                   </div>
+                  <span className="num muted hide-sm">{row.present}/{row.total}</span>
+                  <StatusChip status={row.status}
+                    word={row.status === 'ready' ? `${Math.max(0, row.total - row.present)} missing`
+                      : row.status === 'complete' ? 'In library' : undefined} />
+                  {rowAction(row)}
                 </div>
-                <span><StatusChip status={row.status} /></span>
-                <span className="font-mono text-caption" style={{ color: 'var(--text2)' }}>{row.present}/{row.total}</span>
-                <span className="text-right">{rowAction(row)}</span>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
           <div className="mt-3">
             <Pager page={library.page} pages={library.pages} total={library.total} pageSize={library.per || 50}
               onPage={p => dispatch({ type: 'SET_LIB_PAGE', page: p })} />
           </div>
         </>
       )}
-    </>
+    </LibraryFrame>
   )
 }
 
@@ -163,39 +169,40 @@ function DuplicateGroupCard({ g, onChanged }) {
     }
   }
 
+  const copies = g.albums || []
   return (
-    <div className="workspace-card mb-3">
-      <div className="text-caption font-semibold uppercase tracking-[.12em]" style={{ color: 'var(--accent)' }}>{g.artist}</div>
-      <div className="mb-2.5 mt-[3px] text-title font-bold">{g.album}</div>
-      <div className="mb-2.5 text-caption text-muted">
-        {(g.albums || []).length} copies in the library — pick the one to keep, the rest merge into it.
+    <div className="rows mb-2.5">
+      <div className="row wrap">
+        <div className="grow" style={{ minWidth: 160 }}>
+          <div className="t">{g.album}</div>
+          <div className="s">{g.artist} · {copies.length} copies. Pick the one to keep; the rest merge into it.</div>
+        </div>
+        <button className="sm" disabled={merging} aria-busy={merging} onClick={merge}>
+          {merging ? 'Merging…' : 'Merge duplicates'}
+        </button>
+        <button className="sm quiet" title="Not duplicates. Take this set off the list"
+          onClick={() => action(`/api/groups/${g.id}/hide`, { hidden: true }).then(onChanged)
+            .catch(e => pushToast(`Could not ignore the set: ${e.message}`, 'error'))}>
+          Ignore this set
+        </button>
       </div>
-      {(g.albums || []).map(a => {
+      {copies.map(a => {
         const keep = a.id === canonical
         return (
-          <button key={a.id} onClick={() => pick(a.id)} aria-pressed={keep}
-            className="mb-2 !flex w-full items-center gap-3 !rounded-card !p-3 text-left"
-            style={{ background: keep ? 'var(--sel-row)' : 'var(--inset-warm)', borderColor: keep ? 'var(--accent-bd-sel)' : 'var(--border)' }}>
-            <Cover albumId={a.id} name={a.name} size={44} />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <b className="text-small">{a.name}</b>
-                {keep && <span className="chip good !my-0">keep</span>}
-              </div>
-              <div className="mt-0.5 text-caption text-muted">{(a.tracks || []).length} track(s){a.year ? ` · ${a.year}` : ''}</div>
-              {a.musicBrainzId && <div className="mt-0.5 font-mono text-micro text-faint">{a.musicBrainzId}</div>}
-            </div>
+          <button key={a.id} className="row tap" onClick={() => pick(a.id)} aria-pressed={keep} aria-selected={keep}>
+            <Cover albumId={a.id} name={a.name} size={40} />
+            <span className="grow">
+              <span className="t clip block">{a.name}</span>
+              <span className="s clip block">
+                {(a.tracks || []).length} track(s){a.year ? ` · ${a.year}` : ''}
+                {a.musicBrainzId ? <span className="num"> · {a.musicBrainzId}</span> : null}
+              </span>
+            </span>
+            {keep ? <span className="st ok">Keep</span> : <span className="st">Merge into the kept copy</span>}
           </button>
         )
       })}
-      <div className="mt-3 flex items-center gap-2.5">
-        <button className="primary" disabled={merging} onClick={merge}>{merging ? 'Merging…' : 'Merge duplicates'}</button>
-        <button className="quiet" onClick={() => action(`/api/groups/${g.id}/hide`, { hidden: true }).then(onChanged)}>Ignore this set</button>
-      </div>
-      {mergeNote && (
-        <pre className="mt-2.5 whitespace-pre-wrap rounded-ctl border border-line p-2.5 font-mono text-micro"
-          style={{ background: 'var(--inset-deep)', color: 'var(--text2)' }}>{mergeNote}</pre>
-      )}
+      {mergeNote && <div className="row"><pre className="num m-0 whitespace-pre-wrap" style={{ color: 'var(--fg2)' }}>{mergeNote}</pre></div>}
     </div>
   )
 }
@@ -204,14 +211,14 @@ function DuplicateGroupCard({ g, onChanged }) {
 // timed out, and a music path that doesn't line up look like. Say which.
 function duplicateFilesEmptyHint(data) {
   const s = data?.stats || {}
-  const base = 'Files inside one album that are the same song show up here — usually the leftovers of a gap fill that matched the wrong track.'
-  if (!data?.scanned_at && !s.albums_scanned) return `${base} No duplicate scan has run yet — start one above.`
+  const base = 'Files inside one album that are the same song show up here. They are usually the leftovers of a gap fill that matched the wrong track.'
+  if (!data?.scanned_at && !s.albums_scanned) return `${base} No duplicate scan has run yet. Start one above.`
   if (s.files_missing_on_disk) {
-    return `Found ${s.sets_stored} set(s) in the last scan, but ${s.files_missing_on_disk} of their files are not visible on disk — so nothing can be shown or deleted. Navidrome's paths and ${s.music_dir || 'the music directory'} are not lining up; e.g. ${s.sample_missing_path}. Check "Library path ↔ Navidrome" in Settings → Status.`
+    return `Found ${s.sets_stored} set(s) in the last scan, but ${s.files_missing_on_disk} of their files are not visible on disk, so nothing can be shown or deleted. Navidrome's paths and ${s.music_dir || 'the music directory'} are not lining up, for example ${s.sample_missing_path}. Check "Library path ↔ Navidrome" under System, Status.`
   }
   if (s.listing_partial) return `${base} The last scan only listed part of the library before Navidrome errored (${s.listing_error || 'unknown error'}), so this answer is incomplete.`
   if (s.albums_short || s.albums_empty) {
-    return `${base} The last scan checked ${s.albums_scanned} of ${s.albums_total} album(s), but ${s.albums_short + s.albums_empty} returned no or partial track lists from Navidrome — those albums were not really examined.`
+    return `${base} The last scan checked ${s.albums_scanned} of ${s.albums_total} album(s), but ${s.albums_short + s.albums_empty} returned no or partial track lists from Navidrome, so those albums were not really examined.`
   }
   if (s.tracks_missing_path) return `${base} The last scan skipped ${s.tracks_missing_path} track(s) that Navidrome reported without a file path.`
   if (s.albums_scanned) return `${base} The last scan examined ${s.albums_scanned} album(s) and found none.`
@@ -260,68 +267,48 @@ function CleanupView() {
   const scanning = data?.status === 'running' && /duplicate/i.test(data?.message || '')
   const sets = files?.sets || []
 
-  return (
+  const bar = (
     <>
-      <div className="mb-4 flex flex-wrap items-center gap-2.5">
-        <button className="primary" disabled={scanning} aria-busy={scanning} onClick={scan}>
-          {scanning ? 'Scanning…' : 'Scan for duplicates'}
-        </button>
-        <label className="flex items-center gap-1.5 text-caption" title="Also group albums whose titles are nearly identical (deluxe/remaster editions)">
-          <input type="checkbox" checked={!!fuzzy} onChange={e => setFuzzy(e.target.checked)} /> fuzzy titles
-        </label>
-        <label className="flex items-center gap-1.5 text-caption"
-          title="Finds copies whose titles are in different languages, by confirming same-runtime albums against MusicBrainz. Slower — MusicBrainz is rate-limited.">
-          <input type="checkbox" checked={!!deep} onChange={e => setDeep(e.target.checked)} /> match across languages
-        </label>
-        {scanning && <span className="text-caption text-muted">{data?.message}</span>}
-      </div>
+      <button disabled={scanning} aria-busy={scanning} onClick={scan}>
+        {scanning ? 'Scanning…' : 'Scan for duplicates'}
+      </button>
+      <label className="flex items-center gap-1.5" title="Also group albums whose titles are nearly identical (deluxe and remaster editions)">
+        <input type="checkbox" checked={!!fuzzy} onChange={e => setFuzzy(e.target.checked)} /> Fuzzy titles
+      </label>
+      <label className="flex items-center gap-1.5"
+        title="Finds copies whose titles are in different languages, by confirming same-runtime albums against MusicBrainz. Slower: MusicBrainz is rate-limited.">
+        <input type="checkbox" checked={!!deep} onChange={e => setDeep(e.target.checked)} /> Match across languages
+      </label>
+      {scanning && <span className="st run clip">{data?.message}</span>}
+    </>
+  )
 
-      <SectionHeader label="Duplicate albums" sub={data ? `${groups.length} set(s)` : ''} />
-      {data === null ? <p className="text-caption text-muted">Loading…</p>
+  return (
+    <LibraryFrame tab="cleanup" bar={bar}>
+      <Grp n={data ? groups.length : ''}>Duplicate albums</Grp>
+      {data === null ? <p className="muted">Loading…</p>
         : !groups.length && !scanning ? (
-          <p className="mb-2 text-caption text-muted">No duplicate albums found. Fuzzy matching also catches near-identical titles.</p>
+          <p className="muted">No duplicate albums found. Fuzzy titles also catches near-identical names.</p>
         ) : groups.map(g => <DuplicateGroupCard key={g.id} g={g} onChanged={load} />)}
 
-      <SectionHeader className="mt-6" label="Duplicate files" sub={files ? `${sets.length} set(s)` : ''} />
-      {files === null ? <p className="text-caption text-muted">Loading…</p>
-        : !sets.length ? <EmptyState title="No duplicate files" hint={duplicateFilesEmptyHint(files)} />
+      <Grp n={files ? sets.length : ''}>Duplicate files</Grp>
+      {files === null ? <p className="muted">Loading…</p>
+        : !sets.length ? <p className="muted" style={{ maxWidth: '80ch' }}>{duplicateFilesEmptyHint(files)}</p>
         : sets.map((s, i) => (
           <DuplicateFileSet key={`${s.albumId}-${s.title}-${i}`} set={s} onDeleted={() => { load(); setTrashKey(k => k + 1) }} />
         ))}
 
-      <SectionHeader className="mt-6" label="Trash" />
+      <Grp>Trash</Grp>
       <TrashPanel refreshKey={trashKey} />
-      <p className="mt-2 text-caption text-muted">Deleted duplicates move here first, so a wrong call can be undone.</p>
-    </>
+      <p className="muted mt-2">Deleted duplicates move here first, so a wrong call can be undone.</p>
+    </LibraryFrame>
   )
 }
 
 export default function Library() {
   const { state } = useApp()
-  const params = state.routeParams
-  const sub = SUBS.some(([k]) => k === params[0]) ? params[0] : 'artists'
-  // The summary first: it refreshes on every poll of every screen, while the
-  // table's own totals move only on the Albums sub-tab — on Artists or Cleanup
-  // the title and the header stat disagreed after any change.
-  const totals = state.summary?.library || state.library?.libraryTotals
-
-  // The Artists sub-tab owns its own headline (artist name, album title).
-  const inArtist = sub === 'artists' && params[1]
-
-  return (
-    <>
-      {!inArtist && (
-        <div className="mb-4 flex flex-wrap items-end gap-4">
-          <PageTitle eyebrow="Library"
-            title={totals?.albums
-              ? `${totals.albums.toLocaleString()} albums · ${(totals.withGaps || 0).toLocaleString()} with gaps`
-              : 'Library'} />
-        </div>
-      )}
-      {!inArtist && <SubTabs items={SUBS} value={sub} onChange={k => navigate('Library', k)} label="Library sections" />}
-      {sub === 'artists' && <Artist params={params.slice(1)} />}
-      {sub === 'albums' && <AlbumsView />}
-      {sub === 'cleanup' && <CleanupView />}
-    </>
-  )
+  const tab = TABS.includes(state.routeParams[0]) ? state.routeParams[0] : 'artists'
+  if (tab === 'albums') return <AlbumsView />
+  if (tab === 'cleanup') return <CleanupView />
+  return <ArtistIndex frame={({ bar, children }) => <LibraryFrame tab="artists" bar={bar}>{children}</LibraryFrame>} />
 }

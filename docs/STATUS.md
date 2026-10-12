@@ -5,6 +5,50 @@ the real library). This is a rolling note; treat an item here as unverified unti
 
 ---
 
+## Since the 2026-10-02 release
+
+Landed since, with the Python suite at 0 errors and 0 failures and the web UI's
+wording matrices green (`node --test web/src/lib/*.test.mjs`):
+
+- **Artist MusicBrainz overrides** — say which artist a library artist is; the
+  ones worth a look are listed.
+- **The listens mirror** — a copy of your ListenBrainz listens and the aggregates
+  over it, including what you play most that the library lacks.
+- **AcoustID through `fpcalc`** — until this the fingerprint check answered "no
+  opinion" for every file in the image; it now gives a verdict, and a refusal
+  says what the audio was identified as.
+- **Album overrides** — retag an album's files to the release you pick, with or
+  without a cover; **artist name merge**; both undoable.
+- **One library bucket per MusicBrainz artist id** — `INDEX_SCAN_VERSION` is 3,
+  so every indexed artist reads "may be out of date" until it is scanned again,
+  which the background indexer does by itself over some hours.
+- **Acquisition and placement** — a click downloads the source that was clicked;
+  a folder must show the album before anything is taken unattended; the import
+  files nothing that has not shown the album; multi-disc releases; one spelling
+  per tag. ARCHITECTURE, "What changed since the 2026-10-02 release".
+- **The web UI on a new frame** — five sections, artist and album pages on top,
+  the override tools in lb-bot's own page, and a page that comes back as it was
+  left.
+
+This line ran on a live stack as development builds before it was released, and
+the web UI was walked there. What that did **not** settle:
+
+- **Whether a favourite, a rating or a play count survives an album override.**
+  A retag is expected to change the album's Navidrome id; what Navidrome carries
+  across that was not measured, and the UI says nothing about it.
+- **An artist override stored for a name that a merge then removed** stays in the
+  list applying to nobody; whether undoing the merge brings it back into force
+  depends on Navidrome giving the re-created artist the id it had, which was not
+  checked.
+- **An ID3v2.3 file does not come back byte for byte** from an override and its
+  undo: the values are the same, some frames are written in their v2.4 form.
+- **The web frame's "comes back as it was left"** was exercised in Chromium, at a
+  desktop and a phone width. Other engines are unconfirmed, and so is how far
+  apart a real touchpad's last inertia events come (the rule that keeps a swipe
+  back from losing the place assumes under a quarter of a second).
+
+The sections below predate that release and are kept as they were written.
+
 ## Active work / status
 
 Two work items are in progress (full detail in `CLAUDE.md`):

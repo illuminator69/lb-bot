@@ -90,6 +90,20 @@ def gap_detail(gid):
     })
     return d
 
+def _stub_index():
+    base = {"enabled": True, "running": True, "outcome": "indexed", "pausedUntil": 0, "current": ""}
+    return {
+        "indexing": {**base, "total": 2475, "remaining": 2443,
+                     "current": "King Gizzard & The Lizard Wizard"},
+        "outage": {**base, "outcome": "outage", "pausedUntil": time.time() + 240,
+                   "total": 2475, "remaining": 2443},
+        "waiting": {**base, "outcome": "idle", "total": 2475, "remaining": 3},
+        "done": {**base, "outcome": "idle", "total": 2475, "remaining": 0},
+        "build": {**base, "outcome": "paused", "total": 2475, "remaining": 2443,
+                  "build": {"done": 12, "total": 2475, "current": "Can"}},
+        "absent": base,
+    }[os.environ.get("STUB_INDEX", "indexing")]
+
 ROUTES = {
     "/api/summary": lambda q: {
         "gaps": {"needs": 2, "working": 1, "done": 1, "all": 4},
@@ -97,6 +111,9 @@ ROUTES = {
         "transfers": {"active": 1, "queued": 1, "failed": 1, "done": 2, "needsPlacement": 1},
         "activeTransfers": [{"id": "t1", "title": "Bonobo — Kerala", "state": "active", "pct": 46}],
         "library": {"albums": 3142, "withGaps": 187},
+        # Ruling U1. STUB_INDEX picks what the header and the Settings card are
+        # shown: indexing (default) | outage | waiting | done | build | absent.
+        "index": _stub_index(),
         "ts": time.time(),
     },
     "/api/gaps": lambda q: {"items": GAP_ITEMS,
@@ -180,8 +197,9 @@ ROUTES = {
     # just enough for each screen to render something.
     "/api/system/status": lambda q: {
         "revision": "stub", "startedAt": time.time() - 3600,
-        "autoIndex": {"enabled": True, "running": True, "outcome": "idle", "at": time.time() - 20,
-                      "failing": 0, "pausedUntil": 0, "scannedThisRun": 3, "ttlDays": 30},
+        "autoIndex": {"enabled": True, "running": True, "at": time.time() - 20,
+                      "failing": 0, "scannedThisRun": 3, "ttlDays": 30,
+                      **{k: v for k, v in _stub_index().items() if k != "build"}},
         "hubPush": {"configured": False, "url": "", "headSeq": 12},
         "acoustid": {"keySet": False, "fpcalc": True, "minScore": 0.6, "unavailable": "", "rejectedSources": 0},
         "lastfm": {"keySet": False}, "spotify": {"configured": False},

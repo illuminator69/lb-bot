@@ -44,12 +44,12 @@ export function DuplicateFileSet({ set: dup, onDeleted }) {
     setBusy(idOf(file))
     try {
       const r = await confirmAction(
-        `Move this file to the trash? It can be restored from Library → Cleanup.\n\n${file.path}\n\n${basis.hint}`,
+        `Move this file to the trash? It can be restored from Library, Cleanup.\n\n${file.path}\n\n${basis.hint}`,
         '/api/library/delete-file', { path: file.path, confirm: true },
         { confirmLabel: 'Move to trash', danger: true })
       if (!r) return
       setGone(g => ({ ...g, [idOf(file)]: true }))
-      pushToast('Moved to trash — Navidrome is rescanning')
+      pushToast('Moved to trash. Navidrome is rescanning')
       onDeleted?.()
     } catch (e) {
       pushToast(e.payload?.code === 'last_copy' ? `Refused: ${e.message}` : `Delete failed: ${e.message}`, 'error')
@@ -59,42 +59,36 @@ export function DuplicateFileSet({ set: dup, onDeleted }) {
   }
 
   return (
-    <div className="mb-2.5 rounded-card border border-line bg-panel p-3.5">
-      <div className="flex flex-wrap items-baseline gap-2">
-        <b className="text-small">{dup.track ? `${dup.track}. ` : ''}{dup.title}</b>
-        <span className="text-caption text-muted">{dup.artist} — {dup.album}</span>
-        <span className="spacer" />
+    <div className="rows mb-2.5">
+      <div className="row wrap">
+        <div className="grow" style={{ minWidth: 160 }}>
+          <div className="t">{dup.track ? `${dup.track}. ` : ''}{dup.title}</div>
+          <div className="s clip">{dup.artist} · {dup.album}</div>
+        </div>
         <span className={`chip ${basis.chip} !my-0`} title={basis.hint}>{basis.label}</span>
-        <span className="chip warn !my-0">{files.length} copies</span>
+        <span className="num muted">{files.length} copies</span>
       </div>
       {files.map(f => {
         const isKeep = f === keep
         return (
-          <div key={idOf(f)}
-            className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-ctl border p-2.5"
-            style={{
-              background: isKeep ? 'var(--sel-row)' : 'var(--inset-warm)',
-              borderColor: isKeep ? 'var(--accent-bd-sel)' : 'var(--border)',
-            }}>
+          <div key={idOf(f)} className="row wrap" style={isKeep ? { background: 'var(--accent-tint)' } : undefined}>
             <Badge format={f.format} />
-            <span className="font-mono text-caption" style={{ color: 'var(--text2)' }}>
+            <span className="num" style={{ color: 'var(--fg2)' }}>
               {[f.bitRate ? `${f.bitRate} kbps` : null, fmtSize(f.size)].filter(Boolean).join(' · ')}
             </span>
-            {isKeep && <span className="chip good !my-0">keeping this one</span>}
             {f.onlyOnDisk && (
-              <span className="chip warn !my-0" title="On disk but not indexed by Navidrome yet — usually a file placed in the last few minutes.">
+              <span className="chip warn !my-0" title="On disk but not indexed by Navidrome yet. Usually a file placed in the last few minutes.">
                 not in Navidrome
               </span>
             )}
-            <span className="spacer" />
-            <span className="min-w-0 flex-1 truncate font-mono text-micro text-muted" title={f.path}>{f.path}</span>
+            <span className="grow clip num muted" style={{ minWidth: 120 }} title={f.path}>{f.path}</span>
             {isKeep
-              ? <span className="text-micro text-faint">kept</span>
+              ? <span className="st ok">Keeping this one</span>
               : (
                 <>
                   <button className="sm"
                     title="Make this the copy that survives; the current one becomes deletable instead."
-                    onClick={() => setKeepId(idOf(f))}>keep this one instead</button>
+                    onClick={() => setKeepId(idOf(f))}>Keep this one instead</button>
                   <button className="sm danger" disabled={busy === idOf(f)} aria-busy={busy === idOf(f)}
                     onClick={() => remove(f)}>Move to trash</button>
                 </>
@@ -123,14 +117,14 @@ export function TrashPanel({ refreshKey }) {
   useEffect(() => { load() }, [load, refreshKey])
 
   const files = data?.files || []
-  if (!files.length) return null
+  if (!files.length) return <p className="muted">{data ? 'The trash is empty.' : 'Could not read the trash.'}</p>
   const totalSize = files.reduce((s, f) => s + (f.size || 0), 0)
 
   async function restore(f) {
     setBusy(f.trashPath)
     try {
       await post('/api/library/trash/restore', { path: f.trashPath })
-      pushToast('Restored — Navidrome is rescanning')
+      pushToast('Restored. Navidrome is rescanning')
       load()
     } catch (e) {
       pushToast(`Restore failed: ${e.message}`, 'error')
@@ -152,28 +146,25 @@ export function TrashPanel({ refreshKey }) {
   }
 
   return (
-    <div className="rounded-card border border-line bg-panel p-3.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-caption text-muted">
-          {files.length} file(s), {fmtSize(totalSize)}, in {data?.trashDir} — still recoverable
+    <div className="rows">
+      <div className="row wrap">
+        <span className="grow s" style={{ minWidth: 160 }}>
+          {files.length} file(s), {fmtSize(totalSize)}, in <span className="num">{data?.trashDir}</span>. Still recoverable.
         </span>
-        <span className="spacer" />
-        <button className="sm danger" onClick={empty}>Empty trash…</button>
+        <button className="sm danger" onClick={empty}>Empty trash</button>
       </div>
       {files.slice(0, 50).map(f => (
-        <div key={f.trashPath}
-          className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-ctl border p-2.5"
-          style={{ background: 'var(--inset-warm)', borderColor: 'var(--border)' }}>
-          <span className="min-w-0 flex-1 truncate font-mono text-micro text-muted" title={f.originalPath}>{f.originalPath}</span>
-          <span className="text-micro text-faint">{fmtWhen(f.deletedAt)}</span>
-          <span className="font-mono text-micro text-faint">{fmtSize(f.size)}</span>
+        <div key={f.trashPath} className="row wrap">
+          <span className="grow clip num muted" style={{ minWidth: 160 }} title={f.originalPath}>{f.originalPath}</span>
+          <span className="s hide-sm">{fmtWhen(f.deletedAt)}</span>
+          <span className="num muted">{fmtSize(f.size)}</span>
           {f.restorable
             ? <button className="sm" disabled={busy === f.trashPath} aria-busy={busy === f.trashPath}
                 onClick={() => restore(f)}>Restore</button>
-            : <span className="text-micro text-faint" title="Something already occupies the original path.">original path occupied</span>}
+            : <span className="s" title="Something already occupies the original path.">original path occupied</span>}
         </div>
       ))}
-      {files.length > 50 && <p className="mt-2 text-caption text-muted">…and {files.length - 50} more.</p>}
+      {files.length > 50 && <div className="row s">…and {files.length - 50} more.</div>}
     </div>
   )
 }

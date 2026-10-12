@@ -20,9 +20,17 @@ docker compose pull && docker compose up -d    # update to the latest build
 To build locally instead, comment the `image:` line in the compose file and
 uncomment `build: .`.
 
+The runtime image installs **`libchromaprint-tools`** — the `fpcalc` binary the
+optional AcoustID check fingerprints with. Nothing to do when you pull the image;
+on a base of your own without it the check simply has no opinion and placement
+goes on as before.
+
 **Mounts (host → container):**
 
-- `/mnt/user/appdata/lb-bot` → `/config` — state, index DB, review file
+- `/mnt/user/appdata/lb-bot` → `/config` — state, the index DB (`library_index.db`,
+  which also holds your overrides and what they changed), the listens mirror
+  (`listens.db`), the covers a cover change moved aside (`cover-backups/`), the
+  review file
 - `/mnt/user/appdata/slskd/downloads` → `/downloads` (`SLSKD_DOWNLOAD_DIR`)
 - `/mnt/user/Music` → `/music` (`LB_BOT_MUSIC_DIR`, the library root)
 
@@ -38,6 +46,21 @@ aren't root-owned. **All three mounts must be writable by that uid** — includi
 > into pre-existing folders fails). See `CLAUDE.md`.
 
 Network: `media` (external Docker network).
+
+### What Navidrome must be set to
+
+- **"Report Real Path" for lb-bot's player** — needed for an album override, a
+  cover change and an artist name merge. Navidrome hands a Subsonic client a path
+  it *makes up from the tags* unless this is switched on for that client's player,
+  and lb-bot rewrites tags only in files it has found for certain. In Navidrome:
+  **Settings → Players →** the player whose name starts with
+  **`listenbrainz-bot`** (it appears after lb-bot's first request) **→ Report
+  Real Path**. Without it those three
+  answer **409** with how many of the album's files lb-bot could reach, and write
+  nothing; scanning, gap filling and placement are not affected, and an undo does
+  not need it (it works from the paths it kept).
+- **`ND_RECENTLYADDEDBYMODTIME=true`** on the Navidrome container, so a filled
+  album counts as recently added (see ARCHITECTURE, "External systems").
 
 ### Local development
 
@@ -73,6 +96,13 @@ docker compose up -d
 - `LASTFM_API_KEY` — optional. Cross-checks the ListenBrainz similar-artists
   lookup that backs the album page's "Similar albums" shelf. Without it the
   ListenBrainz half runs alone; the shelf still works
+- `ACOUSTID_API_KEY` — optional. With it (and `fpcalc`, which the image has) a
+  downloaded file is fingerprinted before it is placed: a different song under
+  the right name is refused, another recording of the same track is placed and
+  said. Without it nothing is checked and nothing is refused on that ground
+- `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` — optional, for
+  [navi-connect](https://github.com/illuminator69/navi-connect): the hub's
+  *http* address and its token, so the players hear of a fill as it happens
 
 **Paths & files**
 
@@ -96,6 +126,26 @@ docker compose up -d
   instead of being unlinked; must be on the library's filesystem for the move to
   stay a rename, and hidden from Navidrome
 
+**Optional checks and background work** (all default to sensible values; none is
+needed to run)
+
+- `ACOUSTID_MIN_SCORE` (`0.6`) — below this an AcoustID answer is no opinion,
+  not evidence against a file
+- `LB_BOT_SAME_TRACK_LENGTH_SEC` (`7`) — how many seconds a file may differ from
+  its track's stated length and still be placed as *another recording of the
+  same track* (a remix listed as its own recording); further off, it is refused
+  as a different version
+- `LB_BOT_LISTENS_SYNC` (on) — the ListenBrainz listens mirror. `0` stops the
+  worker and leaves what is already stored
+- `LB_BOT_AUTO_INDEX` (on) — the background worker that indexes artists nobody
+  has opened yet, giving way to MusicBrainz requests a page is waiting for. `0`
+  turns it off
+- `LB_BOT_WISHLIST_INTERVAL` (`21600`, 6 h), `LB_BOT_WISHLIST_COOLDOWN` (`43200`,
+  12 h) — how often the wishlist of albums nobody was sharing is looked at, and
+  how long one album waits before it is searched again
+- `LB_BOT_SOURCE_FAILOVER_DEADLINE` (`45`) — how many seconds one request may
+  spend walking down the ranked source list after a peer refuses
+
 **Web UI**
 
 - `LB_BOT_WEB` (enable, default on), `LB_BOT_WEB_HOST` (`0.0.0.0`),
@@ -103,7 +153,6 @@ docker compose up -d
 
 **Behavior toggles**
 
-- `LB_BOT_REPAIR_JOBS` (durable per-track repair jobs, default on)
 - `FUZZY_DUPLICATES_DEFAULT`
 
 **Multi-user:** the `USERS` list (near the top of the file) holds one entry per

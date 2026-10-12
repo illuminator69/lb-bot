@@ -1,30 +1,63 @@
-// Generated design tokens, ported from the lb-bot.dc.html mock's tokens()
-// method. The full palette is derived from three appearance inputs --
-// theme (dark/light) x bgTone (warm/slate/plum) x accent (amber/sky/sage/rose)
-// -- by mixing a small anchor table, and written onto :root as CSS custom
-// properties. Components must never hardcode hex except cover gradients —
-// text on a filled accent is `var(--on-accent)`.
+// Design tokens for the 2026-10 redesign (design_handoff_lb_bot_frontend/
+// redesign-2026-10). The palette is three appearance inputs -- mode
+// (system/light/dark) x background (graphite/neutral/warm/plum) x accent
+// (cobalt/violet/teal/rose) -- written onto :root as CSS custom properties.
+//
+// Colour has one job each: the accent is the single main action and the
+// current selection, amber means waiting on you, green done, red failed. That
+// is why amber, green and red are not offered as accents.
+//
+// The second half of tokens() derives the names the older components were
+// written against (--text, --border, --green, --danger, ...) from the same
+// anchors, so a component that has not been restyled yet still follows the
+// theme. New code uses the short names: --fg --fg2 --muted --line --surface
+// --sunk --accent --wait --ok --bad.
 
-const BG_ANCHORS = {
-  warm: {
-    dark: { bg: '#17130f', surf: '#1c1611', text: '#f2e9dd', shade: '#0a0806' },
-    light: { bg: '#efe7d8', surf: '#fbf7f0', text: '#2a2118', shade: '#d3c6ae' },
+// bg, surface, sunk, line, fg, fg2, muted
+const BG = {
+  graphite: {
+    name: 'Graphite',
+    light: ['#f1f2f5', '#ffffff', '#e7e9ee', '#d6d9e1', '#171a21', '#474d5c', '#6c7383'],
+    dark: ['#14161b', '#1b1e25', '#0f1115', '#2c303a', '#e9ebf0', '#b6bbc8', '#878e9e'],
   },
-  slate: {
-    dark: { bg: '#14161a', surf: '#1a1d22', text: '#e8ecf2', shade: '#080a0c' },
-    light: { bg: '#e8ebf0', surf: '#fdfdfe', text: '#1c2128', shade: '#c9cfd8' },
+  neutral: {
+    name: 'Neutral',
+    light: ['#f4f4f4', '#ffffff', '#eaeaea', '#d9d9d9', '#161616', '#4a4a4a', '#707070'],
+    dark: ['#0e0e0e', '#171717', '#080808', '#2a2a2a', '#ededed', '#b8b8b8', '#8a8a8a'],
+  },
+  warm: {
+    name: 'Warm',
+    light: ['#f3efe8', '#fdfbf7', '#e9e3d8', '#d9d1c2', '#221c15', '#51483c', '#776c5e'],
+    dark: ['#17130f', '#1e1914', '#0f0c09', '#332b23', '#f2e9dd', '#c4b9aa', '#978b7b'],
   },
   plum: {
-    dark: { bg: '#181218', surf: '#1e171e', text: '#efe6ee', shade: '#0b070b' },
-    light: { bg: '#efe6ee', surf: '#fdf9fc', text: '#261e26', shade: '#d2c4d2' },
+    name: 'Plum',
+    light: ['#f3eef3', '#fdfafd', '#e9e1e9', '#d9cdd9', '#231b23', '#50454f', '#766a75'],
+    dark: ['#181218', '#1f181f', '#0f0b0f', '#332933', '#efe6ee', '#c2b6c1', '#948693'],
   },
 }
 
-const ACCENTS = { amber: '#e0913f', sky: '#5aa0e0', sage: '#7bab6f', rose: '#d97a8c' }
+// accent, text on accent
+const AC = {
+  cobalt: { name: 'Cobalt', light: ['#2447d6', '#ffffff'], dark: ['#8199ff', '#0c1130'] },
+  violet: { name: 'Violet', light: ['#6a3fd0', '#ffffff'], dark: ['#b196ff', '#1a0f3a'] },
+  teal: { name: 'Teal', light: ['#0b7a80', '#ffffff'], dark: ['#4fc4c9', '#04282a'] },
+  rose: { name: 'Rose', light: ['#c22f63', '#ffffff'], dark: ['#ff8fb0', '#3a0a1c'] },
+}
 
-export const BG_TONES = Object.keys(BG_ANCHORS)
-export const ACCENT_NAMES = Object.keys(ACCENTS)
-export const ACCENT_SWATCHES = ACCENTS
+const STATUS = {
+  light: { wait: '#955400', waitTint: '#fbeed6', ok: '#1c7448', okTint: '#dcf1e5', bad: '#b3362e', badTint: '#fae2df' },
+  dark: { wait: '#e3aa4c', waitTint: '#382c15', ok: '#62c290', okTint: '#16301f', bad: '#f18c82', badTint: '#3b1c19' },
+}
+
+export const MODES = [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']]
+export const BG_TONES = Object.keys(BG)
+export const ACCENT_NAMES = Object.keys(AC)
+export const bgName = k => BG[k]?.name || k
+export const accentName = k => AC[k]?.name || k
+/** The two colours a background swatch is split between, for the mode in use. */
+export const bgSwatch = (k, mode) => [BG[k][mode][0], BG[k][mode][1]]
+export const accentSwatch = (k, mode) => AC[k][mode][0]
 
 function hx(h) {
   h = h.replace('#', '')
@@ -40,58 +73,86 @@ function mix(a, b, t) {
   }).join('')
 }
 
-export function tokens({ theme, bgTone, accent: accentName }) {
-  const m = mix
-  const A = (BG_ANCHORS[bgTone] || BG_ANCHORS.warm)[theme === 'light' ? 'light' : 'dark']
-  const { bg, surf, text, shade } = A
-  const accent = ACCENTS[accentName] || ACCENTS.amber
-  const green = theme === 'dark' ? '#6fae8f' : '#3f8f66'
-  const danger = theme === 'dark' ? '#e88a80' : '#c0463a'
-  const decide = theme === 'dark' ? '#d9b45f' : '#9a7d2e'
+export function systemMode() {
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+/** 'light' or 'dark' for an appearance whose mode may be 'system'. */
+export const resolvedMode = look => (look.mode === 'light' || look.mode === 'dark' ? look.mode : systemMode())
+
+export function tokens(look) {
+  const mode = resolvedMode(look)
+  const dark = mode === 'dark'
+  const [bg, surface, sunk, line, fg, fg2, muted] = (BG[look.bg] || BG.graphite)[mode]
+  const [accent, onAccent] = (AC[look.accent] || AC.cobalt)[mode]
+  const s = STATUS[mode]
+  const accentTint = mix(surface, accent, dark ? 0.20 : 0.14)
   return {
-    '--bg': bg, '--surface': surf, '--surface-alt': m(bg, surf, 0.5),
-    '--rail': m(bg, shade, 0.35), '--inset-track': m(bg, shade, 0.55), '--inset-deep': m(bg, shade, 0.80), '--inset-warm': m(bg, shade, 0.42),
-    '--active-item': m(surf, accent, 0.05), '--sel-row': m(surf, accent, 0.10),
-    '--border': m(surf, text, 0.085), '--border-warm': m(surf, text, 0.12), '--hairline': m(surf, text, 0.045),
-    '--text': text, '--text2': m(text, bg, 0.22), '--muted': m(text, bg, 0.42), '--faint': m(text, bg, 0.60), '--dot': m(text, bg, 0.74),
-    '--accent': accent,
-    // Text on a filled accent (primary buttons, active chips). Was a hex
-    // literal repeated in four components.
-    '--on-accent': '#17130f',
-    '--accent-2': theme === 'dark' ? m(accent, '#ffffff', 0.18) : m(accent, '#000000', 0.28),
-    '--accent-3': theme === 'dark' ? m(accent, '#ffffff', 0.35) : m(accent, '#000000', 0.12),
-    '--accent-tint': m(accent, surf, 0.90), '--accent-btn': m(accent, surf, 0.86), '--accent-bd-soft': m(accent, surf, 0.80),
-    '--accent-bd': m(accent, surf, 0.66), '--accent-bd-sel': m(accent, surf, 0.55), '--accent-chip': m(accent, surf, 0.88),
-    '--green': green, '--green-on': theme === 'dark' ? '#0f2019' : '#ffffff', '--green-tint': m(green, surf, 0.86), '--green-tint-2': m(green, surf, 0.91), '--green-bd': m(green, surf, 0.62),
-    '--danger': danger, '--danger-text': m(danger, text, 0.30), '--danger-tint': m(danger, surf, 0.86), '--danger-tint-2': m(danger, surf, 0.80), '--danger-bd': m(danger, surf, 0.62),
-    '--decide-fg': decide, '--decide-tint': m(decide, surf, 0.88), '--warn-tint': m(accent, surf, 0.90),
+    '--bg': bg, '--surface': surface, '--sunk': sunk, '--line': line,
+    '--fg': fg, '--fg2': fg2, '--muted': muted,
+    '--accent': accent, '--on-accent': onAccent, '--accent-tint': accentTint,
+    '--wait': s.wait, '--wait-tint': s.waitTint,
+    '--ok': s.ok, '--ok-tint': s.okTint,
+    '--bad': s.bad, '--bad-tint': s.badTint,
+
+    // Names the pre-redesign components use, derived from the same anchors.
+    '--text': fg, '--text2': fg2,
+    '--faint': mix(muted, bg, 0.18), '--dot': mix(muted, bg, 0.5),
+    '--border': line, '--border-warm': line, '--hairline': mix(line, surface, 0.45),
+    '--surface-alt': mix(surface, bg, 0.5),
+    '--rail': sunk, '--inset-track': sunk, '--inset-deep': sunk, '--inset-warm': mix(surface, sunk, 0.55),
+    '--active-item': accentTint, '--sel-row': accentTint,
+    '--accent-2': accent, '--accent-3': accent,
+    '--accent-btn': accentTint, '--accent-chip': accentTint,
+    '--accent-bd-soft': line, '--accent-bd': mix(surface, accent, 0.5), '--accent-bd-sel': accent,
+    '--green': s.ok, '--green-on': dark ? '#0c1f15' : '#ffffff',
+    '--green-tint': s.okTint, '--green-tint-2': s.okTint, '--green-bd': mix(surface, s.ok, 0.5),
+    '--danger': s.bad, '--danger-text': mix(s.bad, fg, 0.35),
+    '--danger-tint': s.badTint, '--danger-tint-2': s.badTint, '--danger-bd': mix(surface, s.bad, 0.5),
+    '--decide-fg': s.wait, '--decide-tint': s.waitTint, '--warn-tint': s.waitTint,
   }
 }
 
-const STORAGE_KEY = 'lbAppearance'
-
-export function systemTheme() {
-  return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
-    ? 'light' : 'dark'
-}
+// A new key: the old `lbAppearance` held warm/amber choices that no longer
+// exist, and carrying them over would land everyone on a look nobody picked.
+const STORAGE_KEY = 'lbLook'
+export const DEFAULT_LOOK = { mode: 'system', bg: 'graphite', accent: 'cobalt' }
 
 export function loadAppearance() {
-  let stored = {}
-  try { stored = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {} } catch { /* corrupt -> defaults */ }
+  let v = {}
+  try { v = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {} } catch { /* corrupt or blocked -> defaults */ }
   return {
-    theme: stored.theme === 'light' || stored.theme === 'dark' ? stored.theme : systemTheme(),
-    bgTone: BG_TONES.includes(stored.bgTone) ? stored.bgTone : 'warm',
-    accent: ACCENT_NAMES.includes(stored.accent) ? stored.accent : 'amber',
+    mode: ['system', 'light', 'dark'].includes(v.mode) ? v.mode : DEFAULT_LOOK.mode,
+    bg: BG[v.bg] ? v.bg : DEFAULT_LOOK.bg,
+    accent: AC[v.accent] ? v.accent : DEFAULT_LOOK.accent,
   }
 }
 
-export function saveAppearance(appearance) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(appearance))
+export function saveAppearance(look) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(look)) } catch { /* per-browser convenience only */ }
 }
 
-export function applyAppearance(appearance) {
-  const t = tokens(appearance)
+let themingTimer
+export function applyAppearance(look, { animate = false } = {}) {
+  const t = tokens(look)
   const el = document.documentElement
+  if (animate) {
+    // Colours ease over when the user changes them; on first paint they don't.
+    el.classList.add('theming')
+    clearTimeout(themingTimer)
+    themingTimer = setTimeout(() => el.classList.remove('theming'), 380)
+  }
   for (const k in t) el.style.setProperty(k, t[k])
-  el.style.colorScheme = appearance.theme
+  const mode = resolvedMode(look)
+  el.dataset.theme = mode
+  el.style.colorScheme = mode
+}
+
+/** Re-apply when the OS switches light/dark, while the mode is "system". */
+export function followSystem(getLook) {
+  const mq = window.matchMedia?.('(prefers-color-scheme: dark)')
+  if (!mq) return () => {}
+  const on = () => { if (getLook().mode === 'system') applyAppearance(getLook(), { animate: true }) }
+  mq.addEventListener('change', on)
+  return () => mq.removeEventListener('change', on)
 }

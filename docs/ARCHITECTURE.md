@@ -15,7 +15,9 @@ concurrently:
 - **Flask web UI + JSON API** — port `8899`, serving a prebuilt React SPA plus a
   large `/api/*` surface.
 - **Background workers** — startup scan, periodic housekeeping sweeps, download
-  polling, and durable "repair jobs" that survive restarts.
+  polling, the verifier that waits for Navidrome to list what was placed, a
+  worker that indexes artists nobody has opened yet (it gives way to MusicBrainz
+  requests a page is waiting for), and the ListenBrainz listens mirror.
 
 State is held in module-level dicts and periodically flushed to JSON on disk
 (`lb_bot_state.json`), plus a review file (`missing_album_review.json`) and a SQLite
@@ -23,6 +25,12 @@ index (`library_index.db`: indexed `artists` and `release_groups`, plus
 `file_signatures` — cached audio identity per file, see "Duplicates").
 `pending_album_groups` is persisted as JSON, so anything stashed on a group must be
 JSON-serializable (lists, not sets).
+
+The index also holds what the user has corrected — `artist_overrides`,
+`album_overrides`, `artist_merges` — and `tag_changes`: each file's tags as they
+were before lb-bot first rewrote them, which is what an undo restores. Beside it,
+`listens.db` is the listens mirror, a file of its own with its own lock; deleting
+it with lb-bot stopped is the supported way to rebuild it.
 
 **Changing the index schema needs two things.** `CREATE TABLE IF NOT EXISTS`
 never adds a column to a database that already exists, so a new column needs an
@@ -40,18 +48,41 @@ which the Docker build copies into the image; Flask serves it from `/`. Without 
 build, `/` serves a short "run `npm run build`" page — the JSON API works either
 way.
 
-The hash is the single source of truth for navigation: every tab and drill-down
-has a route (`#/gaps/<id>`, `#/artist/<id>/<rgid>`, `#/system/<subtab>`,
-`#/library/duplicates`, `#/import/<path>[/<groupId>[/<mode>]]`), parsed once in
-`App.jsx` (`parseHash` → `SET_ROUTE`). Navigate with `navigate()` for a history
+The hash is the single source of truth for navigation. Five sections — **Needs
+you** (the queue of albums with gaps, and a "To fix" tab for what only the user
+can decide), **Activity**, **Discover**, **Library**, **System** — each
+`#/<section>[/<tab>[/<selection>]]`, and three pages that open on top of whatever
+you were looking at: `#/artist/<id>`, `#/album/<artist>/<release-group>[/sources|/edition]`
+and `#/search/<query>`. `lib/router.js` parses the hash, keeps one entry per
+history step (so a page's Back button can name the page under it) and answers
+older addresses through an alias table. Navigate with `navigate()` for a history
 entry, `replaceRoute()` for transient corrections. Panels never parse the hash
 themselves.
 
-Shared primitives live in `components/ui.jsx` and are **built once, used
-everywhere** — `SourceRow` appears in the Fill-gaps picker, the hero's chosen
-source and the Library search results; `TrackList`, `ReleaseTile`, `ArtistTile`,
-`Badge`, `Chip`, `StatusChip`, `Pager`, `Toggle`, `EmptyState`, `Skeleton` and
-`SortToggle` back the rest. Two of them carry behavior worth knowing about:
+**A page comes back as it was left.** One page is mounted at a time, so what a
+page showed is kept with its history entry: the router holds a small bag per
+entry — scroll offsets and small scalars, never a list or an answer — in
+`sessionStorage`. Back, Forward, a reload and returning to a section from the
+bar restore it; a link, a tab or a row is a fresh page at its top. The frame
+keeps its scrollers' places by itself, and a page keeps a view choice by using
+`useViewState` where it would use `useState` (`lib/useView.js`; the decisions
+are pure, in `lib/view.js`). Never for anything whose restoring would ask the
+server for something or write something.
+
+**Wording is code under test.** What a page may say about a job, a refusal or a
+count lives in pure modules under `web/src/lib/` (`overrides.js`, `merges.js`,
+`artistMatch.js`, `albumSources.js`, `indexStatus.js`, …), each with a matrix
+beside it: `node --test web/src/lib/*.test.mjs`, no dependency. A change that
+takes a while — an album retag, a name merge, an artist rescan — is followed in
+one place outside the components (`lib/jobWatch.js`), so leaving a page stops
+nothing and two surfaces never poll one job twice.
+
+The frame's parts are in `components/Page.jsx` (`Page`, `Roll`, `Fluid`, `Grp`,
+`Pick`, `Seg`, `Meter`) and the shared rows and tiles in `components/ui.jsx`
+(`SourceRow`, `ReleaseTile`, `ArtistTile`, `Cover`, `Chip`, `Skeleton`,
+`Notice`, `EmptyState`) — **built once, used everywhere**. Blocks fold open and
+shut rather than popping, and nothing above a page's body changes height after
+its first frame. Two parts carry behavior worth knowing about:
 
 - **`useSourceFiles`** is the fetch-once-and-keep "show files" expansion, shared
   by `SourceRow` and the hero card so a peer's folder is never read twice or
@@ -74,9 +105,10 @@ cover-gradient fallbacks.
 | **Navidrome** | Music server; source of truth for what's in the library and the **success oracle** for placement | Subsonic API | `http://navidrome:4533` |
 | **slskd** | Soulseek client; the acquisition backend | REST, `X-API-Key` auth | `http://slskd:5030` |
 | **MusicBrainz** | Canonical release/track/recording metadata (rate-limited; contact email required) | `ws/2` | `musicbrainz.org` |
-| **ListenBrainz** | Weekly playlist sources (Weekly Jams, Weekly Exploration); fresh releases; **similar artists** (the `labs.api` dataset, a separate host from the main API) | `api.listenbrainz.org/1`, `labs.api.listenbrainz.org` | — |
+| **ListenBrainz** | Weekly playlist sources (Weekly Jams, Weekly Exploration); fresh releases; the user's own listens (mirrored); **similar artists** (the `labs.api` dataset, a separate host from the main API) | `api.listenbrainz.org/1`, `labs.api.listenbrainz.org` | — |
 | **Last.fm** | Optional cross-check for similar artists (`artist.getsimilar`). Absent `LASTFM_API_KEY`, the ListenBrainz half runs alone | REST | — |
-| **Cover Art Archive** | Album art for releases the library doesn't hold, keyed by **release** or release-group | REST | `coverartarchive.org` |
+| **Cover Art Archive** | Album art for releases the library doesn't hold, keyed by **release** or release-group; the covers an album override offers | REST | `coverartarchive.org` |
+| **AcoustID** | Optional identity check at placement: is this audio the recording it is being filed as? Fingerprinted locally with `fpcalc` (Chromaprint) | REST | `api.acoustid.org` |
 | **Spotify** | Optional public-playlist import (Client Credentials flow) | Web API | — |
 | **beets** | Legacy placement path — **being removed** from the hot path (see below) | CLI subprocess | — |
 
@@ -99,7 +131,7 @@ on an untagged library** — but not equally well.
 |---|---|
 | **MusicBrainz-tagged** (Picard or equivalent) | Full function: missing releases **and** per-track gap filling. |
 | **Untagged, consistently named** | Missing releases only. Owned albums classify as `untagged` and completeness is not computed. |
-| **Album-artist names that don't match MusicBrainz** | The artist's library bucket comes back empty, so the whole catalog reads as `missing`. |
+| **An artist matched to the wrong MusicBrainz artist, or to none** | Its albums line up with nothing, so the whole catalog reads as `missing`. Such artists are listed under Needs you › To fix, where you pick the right one (an *artist override*, below). |
 
 Two deliberate design decisions produce those rows:
 
@@ -107,11 +139,14 @@ Two deliberate design decisions produce those rows:
   `musicBrainzId` is emitted as `status: "untagged"` and **skipped before**
   `_make_review_group` — completeness computed from an unverified match would be
   confidently wrong, so it is flagged rather than guessed.
-- The per-artist library bucket uses **exact** normalized album-artist matching. A
-  cross-artist fuzzy fallback used to live there and was removed: when an artist's
-  tags didn't normalize cleanly it handed the scan a different artist's catalog, and
-  every later title match produced a wrong ownership verdict. An empty bucket is the
-  safer failure.
+- An artist's library bucket is **every library entry that carries the scanned
+  MusicBrainz artist id** — the one the file tags give, or the one you chose —
+  plus the entry the scan was started from. An album belongs by its artist's id;
+  a name is consulted only for an album no id speaks for. Two spellings of one
+  artist are therefore one bucket, and a namesake with an id of its own is
+  somebody else. (It used to be a match on the normalized *name*: two spellings
+  were two buckets, each scan marking the other's albums missing, and every
+  non-Latin name normalized to nothing.)
 
 **Recommendation:** tag with Picard before the first scan. Untagged still finds whole
 missing albums; it just won't fill partial ones.
@@ -160,6 +195,23 @@ evolving surface; navigate the source by route string:
 
   **`download` is idempotent per release** and **`status` is how you watch it** —
   see "Watching a fill from outside" below.
+
+  **A click is that source.** `download` with `sourceUsername` (and
+  `sourceFolder`) takes that folder from the list `sources` last answered — it is
+  kept for a quarter of an hour — and searches nothing; `allFiles: true` beside
+  it asks the folder for every audio file, and every answer echoes `allFiles`. A
+  source row says how many files a plain download would leave out (`extraFiles`),
+  a fill says how many it left (`leftOut`) and which peer was picked
+  (`pickedSource`) beside the one it is on now.
+- **Saying what something is** (each can be undone): `/api/overrides` — every
+  correction, the artists worth a look, and the sets of one artist under two
+  names; `/api/artist/override` (+ `/remove`); `/api/album/override` (GET the
+  album's state, POST to apply; `/preview`, `/remove`), `/api/album/covers`,
+  `/api/album/cover`; `/api/artist/merge` (GET to follow, POST to merge;
+  `/preview`, `/undo`). See "Overrides" below
+- **Listening:** `/api/listening/status|summary|unowned|recent`,
+  `POST /api/listening/sync` — aggregates over the mirrored ListenBrainz listens.
+  `/api/fresh-releases` rows carry `artistPlays`
 - **Placement:** `/api/placements`, `/api/placements/identify`,
   `/api/placements/<id>/confirm|dismiss|delete`
 - **Groups (source & match management):** `/api/groups/<group_id>/...` —
@@ -169,7 +221,10 @@ evolving surface; navigate the source by route string:
   canonical album/albumartist/MB ids onto the other copies and lets Navidrome
   collapse them on its next scan. A failed tag write now fails the merge instead of
   reporting "tagged 0/12 file(s)" as a success, and `preview_group_retag`'s blocked
-  reasons reach the UI.
+  reasons reach the UI. `place-anyway` overrules the one refusal the row shows —
+  "already in the album", or "another recording" — and no other; it takes what
+  the page showed for the row (`recordingMbid`, `title`) and answers 409
+  `row_moved` when a rescan has since put another row at that index.
 - **Repair jobs:** `/api/imports/<recid>/retry|merge-retry|remove-stale-and-retry`
 - **Library index:** `/api/library`, `/api/library-index/build|status`
 - **Legacy beets:** `/api/beets/folders|release-candidates|import`
@@ -376,6 +431,65 @@ follow, and both were once broken in the same failure:
 
 ---
 
+## Overrides — saying what an artist or an album is
+
+Three corrections a user can make. Each is stored in the index, each can be
+undone, and each is served to the navi-connect clients through the hub as well
+as to lb-bot's own web UI.
+
+- **Which MusicBrainz artist a library artist is.** One row of
+  `artist_overrides`. Everything that needs a Navidrome artist's MusicBrainz id
+  reads it through one function (`_nd_artist_index()`), so a set or a remove is
+  seen at once; the artist's index rows are re-homed and its discography is
+  scanned again. Artists whose match holds none of their albums are listed for a
+  look.
+- **Which release an album is.** lb-bot **retags the album's files** to the
+  release you pick: release and release-group ids, disc and track numbers,
+  titles, the album title, the date — never the artists, and nothing is renamed
+  or moved. *The tag is the pin*: the files say it, so Navidrome and every scan
+  agree without knowing an override exists. Each file's tags are kept, on disk,
+  before the first write, so an undo goes back to before the first change
+  however many followed. A Cover Art Archive image can be saved as the album's
+  cover with it, or on its own; the cover that was there is moved aside, never
+  deleted. A retag is expected to change the album's Navidrome id, so a job is
+  followed by the override's own id, not the album's.
+- **That two artist names are one artist.** Navidrome keys an artist by name, so
+  "A & B" and "A and B" are two artists there whatever id both carry. A merge
+  rewrites one spelling to the other wherever a file's album-artist or
+  track-artist tag *is* that spelling — a substitution of values, so a co-credit
+  or a featured credit beside it stays. It is offered only between entries that
+  carry the same MusicBrainz id and are spellings of each other: a collaboration
+  credit is not a spelling of its lead artist, and two different collaborations
+  are not spellings of each other.
+
+What they share:
+
+- **lb-bot must reach every file Navidrome lists for the album**, or it writes
+  nothing and answers 409 `files_unreachable` — it does not guess which file is
+  which. That needs Navidrome's "Report Real Path" for lb-bot's player; see
+  [`DEPLOYMENT.md`](DEPLOYMENT.md). An undo works from the paths it kept and does
+  not ask Navidrome.
+- **A running change holds the album.** Fill gaps starts nothing for it
+  meanwhile, a second change answers `in_progress`, and a change asked for while
+  a download for the album is in flight answers `busy`.
+- **Done means Navidrome has it.** A change reads `applied` or `merged` only
+  after a Navidrome scan that began after the last write, and once the album
+  that holds the rewritten files is listed again.
+- **A dependency that did not answer is a 502 to retry**, never "no such album"
+  or "nothing matches".
+
+## The listens mirror
+
+lb-bot keeps a copy of the user's ListenBrainz listens in `listens.db` — one
+writer thread, the routes only read — and answers aggregates over it: the most
+played artists, albums and tracks of a period, a calendar, the most recent
+listens, and what is played most that the library **does not hold**. The first
+import pages back through the whole history and survives a restart; after it
+there is a pull every ten minutes, and once a day a wider one for listens that
+were submitted late. Whether an album is owned is joined at read time and never
+stored inside an aggregate, so a fill shows at once. Local days come from the
+client's time zone (`tz`), since the container runs in UTC.
+
 ## How placement works (the important part)
 
 For each missing track, the gap-detection step already resolves the
@@ -405,6 +519,40 @@ For each missing track, the gap-detection step already resolves the
 A fill can span **several download directories** — a file that fails over to another
 peer lands in that peer's own folder — so `_deterministic_album_import` accepts a
 list of dirs and `_finalize_group` passes every directory that received a file.
+
+### What changed since the 2026-10-02 release
+
+Each of these fixed something that had looked like the feature working.
+
+- **A click downloads the source that was clicked.** A pick used to be a
+  preference: the download searched again and took its own choice when the pick
+  was not in the new answer. The source list is now kept, a click takes that
+  folder from it, and what a click may fail over to is only the other folders
+  that pass the unattended rule.
+- **Album evidence, not only artist evidence.** For an artist called "After",
+  every "After Hours" folder is "by the artist". A folder is taken unattended
+  only when its name or the titles of its files show *the album*; for a title
+  with no word of its own — a self-titled album, "EP 2" — only the tracks count.
+- **The import files nothing that has not shown the album.** Every slot is
+  paired before a file is touched; an unattended import that finds fewer than
+  half of the tracks files none; a file with no slot is an extra only when the
+  album was shown and the file's own tags name it; a length is evidence only for
+  the slot the file's own number names.
+- **A release is its media.** Rows carry their disc; a medium that only repeats
+  another (the LP sides of a box that also holds the CD) is dropped; a file is
+  numbered and named by its slot, not by what the downloaded file said.
+- **Placement writes one spelling.** Writing a tag deletes its other names first
+  (`album artist`, `albumartists`, …), so a placed file can no longer credit its
+  album to two spellings of one artist.
+- **Another recording of the same track is placed; a different song is refused,
+  and says what it is.** With `ACOUSTID_API_KEY` set the fingerprint gives one of
+  four verdicts. A refusal names what the audio was identified as and offers
+  "Place anyway" for that one row. Silence — no key, no `fpcalc`, a fingerprint
+  nobody knows — is never evidence against a file.
+- **Titles in another language.** A library tagged as one edition and a peer
+  sharing another pair on track number and length inside a folder that is
+  already trusted, and placement honours that pairing instead of filing the file
+  as a bonus track.
 
 ### The placement guard
 

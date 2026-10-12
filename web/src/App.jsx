@@ -1,120 +1,67 @@
 import { createContext, useContext, useReducer, useEffect, useCallback, useRef, useState } from 'react'
 import { api, post } from './lib/api.js'
-import Layout from './components/Layout.jsx'
+import { jobs } from './lib/jobs.js'
+import {
+  isSection, navigate, onRoute, parseHash, replaceRoute, routeHash, currentKind,
+} from './lib/router.js'
+import Shell from './components/Shell.jsx'
 import ConfirmBar from './components/ConfirmBar.jsx'
-import FillGaps from './panels/FillGaps.jsx'
-import Downloads from './panels/Downloads.jsx'
+import Toasts from './components/Toasts.jsx'
+import NeedsYou from './panels/NeedsYou.jsx'
+import Activity from './panels/Activity.jsx'
 import Library from './panels/Library.jsx'
 import Discover from './panels/Discover.jsx'
-import Settings from './panels/Settings.jsx'
+import System from './panels/System.jsx'
 import Search from './panels/Search.jsx'
-import Toasts from './components/Toasts.jsx'
+import { ArtistPage, AlbumPage, forgetDiscography } from './panels/Artist.jsx'
+import Placement from './panels/Placement.jsx'
 
 // ── Context ──────────────────────────────────────────────────────────────────
 export const AppContext = createContext(null)
 export const useApp = () => useContext(AppContext)
 
-// ── Nav ──────────────────────────────────────────────────────────────────────
-// Five sections. Search is a screen but not a tab — the header box opens it.
+// ── Navigation ───────────────────────────────────────────────────────────────
+// Five sections in the sidebar. Artist, album, search and "file a folder"
+// pages belong to none of them: they open on top of the page you were on, and
+// Back names that page (lib/router.js).
 //
-// Before 2026-09-26 there were seven tabs plus an "Advanced" dropdown: Library
-// held four unrelated features, Artist and Fresh were top-level, and Advanced
-// hid Import (a second, older copy of Downloads' placement list) and Playlist
-// (a scan button over a generic task log). See the SESSION note of that date.
-export const SECTIONS = ['Fill gaps', 'Downloads', 'Library', 'Discover', 'Settings']
-export const TAB_ROUTES = {
-  'Fill gaps': 'gaps',
-  'Downloads': 'downloads',
-  'Library': 'library',
-  'Discover': 'discover',
-  'Settings': 'settings',
-  'Search': 'search',
-}
-export const TABS = Object.keys(TAB_ROUTES)
-const ROUTE_TABS = Object.fromEntries(
-  Object.entries(TAB_ROUTES).map(([tab, route]) => [route, tab]))
+// Before 2026-10 the sections were Fill gaps / Downloads / Library / Discover /
+// Settings in a header, and artist and album pages lived under Library with a
+// Back button hardcoded to "All artists". Old hashes are aliased in the router.
+export { navigate, replaceRoute, routeHash }
 
-// Old hashes → new ones, so bookmarks and history entries from before the
-// restructure still land somewhere sensible.
-function aliasOf(segs) {
-  const [head, ...rest] = segs
-  switch (head) {
-    case 'artist': return ['library', 'artists', ...rest]
-    case 'fresh': return ['discover', 'new']
-    case 'playlist': return ['gaps']
-    case 'import': return rest.length ? ['downloads', 'place', ...rest] : ['downloads']
-    case 'system': {
-      const sub = { health: 'status', prefs: 'sources', logs: 'logs' }[rest[0]] || 'status'
-      return ['settings', sub]
-    }
-    case 'library':
-      if (rest[0] === 'duplicates') return ['library', 'cleanup']
-      return null
-    default: return null
-  }
-}
-
-const enc = s => encodeURIComponent(s)
-
-/** Build a hash for a tab plus positional params. Empty params stop the list. */
-export function routeHash(tab, ...params) {
-  const base = TAB_ROUTES[tab]
-  if (!base) return '#/'
-  const parts = []
-  for (const p of params) {
-    if (p == null || p === '') break
-    parts.push(enc(String(p)))
-  }
-  return `#/${base}${parts.length ? '/' + parts.join('/') : ''}`
-}
-
-function splitHash(hash) {
-  const raw = (hash || '').replace(/^#\/?/, '')
-  return raw.split('/').filter(s => s !== '').map(s => { try { return decodeURIComponent(s) } catch { return s } })
-}
-
-/** Parse location.hash into { tab, params } — params are already decoded.
- *  An old-style hash is rewritten in place (no history entry). */
-export function parseHash(hash = location.hash) {
-  let segs = splitHash(hash)
-  if (!segs.length) return { tab: null, params: [] }
-  const aliased = aliasOf(segs)
-  if (aliased) {
-    segs = aliased
-    const next = routeHash(ROUTE_TABS[segs[0]], ...segs.slice(1))
-    if (next !== location.hash) history.replaceState(null, '', location.pathname + location.search + next)
-  }
-  const tab = ROUTE_TABS[segs[0]]
-  if (!tab) return { tab: null, params: [] }
-  return { tab, params: segs.slice(1) }
-}
-
-/** Push a route as a new history entry (the normal navigation verb). */
-export function navigate(tab, ...params) {
-  const next = routeHash(tab, ...params)
-  if (location.hash !== next) location.hash = next
-}
-
-/** Rewrite the current route without adding an entry (transient sync only). */
-export function replaceRoute(tab, ...params) {
-  const next = routeHash(tab, ...params)
-  if (location.hash === next) return
-  history.replaceState(null, '', location.pathname + location.search + next)
-  window.dispatchEvent(new HashChangeEvent('hashchange'))
+/** What the app does with a job that ended while no page was showing it (the
+ *  watch's notifier, lib/jobs.js): one toast says how it ended — and what the
+ *  session kept of the artists' discographies is let go of first (F1):
+ *  whatever the job changed, no page was there to read it again, and the
+ *  artist's page would open on what it read before. */
+export const onJobEnded = pushToast => toast => {
+  forgetDiscography()
+  pushToast(toast.text, toast.level)
 }
 
 // Where an artist, or one of their albums, lives. `artistId` is a Navidrome id
 // for an owned artist or `mb:<mbid>` for anyone else; `pick` opens the album
-// page with its source picker showing.
+// page with its source list showing.
 export function goArtist(artistId, rgid, pick) {
-  navigate('Library', 'artists', artistId, rgid, pick ? 'sources' : undefined)
+  if (rgid) navigate('album', artistId, rgid, pick ? 'sources' : undefined)
+  else navigate('artist', artistId)
 }
 
 // An album known only by its release-group id (search results, charts, the
 // wishlist). The album page needs an artist, so this lands on a small resolver
 // that asks MusicBrainz who made it and then replaces itself with the real page.
 export function goAlbum(rgid, pick) {
-  navigate('Library', 'artists', '-', rgid, pick ? 'sources' : undefined)
+  navigate('album', '-', rgid, pick ? 'sources' : undefined)
+}
+
+/** One album in the gaps queue. */
+export const goGap = id => navigate('needs', 'gaps', id)
+
+/** The "file this downloaded folder" page. `groupId` preselects the album it
+ *  fills; mode 'pick' opens the release search; `file` files one file only. */
+export function goPlace(path, groupId, mode, file) {
+  navigate('place', path, groupId || (mode ? '-' : undefined), mode, file)
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -122,7 +69,7 @@ function initialTab() {
   const fromHash = parseHash().tab
   if (fromHash) return fromHash
   const stored = lsGet('lbTab', null)
-  return stored && SECTIONS.includes(stored) ? stored : 'Fill gaps'
+  return stored && isSection(stored) ? stored : 'needs'
 }
 
 // Sticky UI bits persist across tab switches and reloads. Storage can throw
@@ -140,11 +87,27 @@ export function lsSet(key, value) {
   } catch { /* per-viewer convenience only */ }
 }
 
+// The gaps queue's selected album is the route's third segment.
+const gapFromRoute = (tab, params) =>
+  (tab === 'needs' && (params[0] || 'gaps') === 'gaps' ? (params[1] || null) : undefined)
+
+/** Which album's detail the Needs you page is showing: the queue's selection,
+ *  or the failed gap selected under To fix. */
+export function gapDetailId(ui) {
+  if (ui.tab !== 'needs') return null
+  const sub = ui.routeParams[0] || 'gaps'
+  if (sub === 'gaps') return ui.selGap
+  const sel = ui.routeParams[1] || ''
+  return sub === 'fix' && sel.startsWith('gap:') ? sel.slice(4) : null
+}
+
+const boot = parseHash()
 const initialState = {
   summary: null,
-  gaps: null,          // { items, counts, origins, scanTask }
+  gaps: null,          // { items, counts, origins, scanTask } — the visible queue
+  hiddenGaps: null,    // the same shape, for albums the user hid
   // The list in hand can't confirm the selected album (deep link, or a group a
-  // later scan created) — FillGaps holds the cursor instead of re-homing.
+  // later scan created) — the queue holds the cursor instead of re-homing.
   gapsStale: false,
   gapDetail: null,
   transfers: null,     // { transfers, needsPlacement, counts, identify }
@@ -158,10 +121,9 @@ const initialState = {
   tasks: null,
   // ui
   tab: initialTab(),
-  routeParams: parseHash().params,
-  selGap: parseHash().tab === 'Fill gaps'
-    ? (parseHash().params[0] || null)
-    : lsGet('lb.selGap', null),
+  routeParams: boot.params,
+  navKind: '',
+  selGap: gapFromRoute(boot.tab, boot.params) ?? lsGet('lb.selGap', null),
   gapFilter: lsGet('lb.gapFilter', 'needs'),
   gapHidden: false,
   gapSearch: '',
@@ -184,40 +146,61 @@ function reducer(state, action) {
     }
     // The one place the hash turns into UI state.
     case 'SET_ROUTE': {
-      const { tab, params } = action
-      if (SECTIONS.includes(tab)) lsSet('lbTab', tab)
-      const next = { ...state, tab, routeParams: params }
-      if (tab === 'Fill gaps') {
-        const id = params[0] || null
-        if (id !== state.selGap) {
-          lsSet('lb.selGap', id)
-          next.selGap = id
+      const { tab, params, kind } = action
+      if (isSection(tab)) lsSet('lbTab', tab)
+      const next = { ...state, tab, routeParams: params, navKind: kind ?? state.navKind }
+      const id = gapFromRoute(tab, params)
+      // A route that names no album (#/needs/gaps) keeps the cursor where it was.
+      if (id != null && id !== state.selGap) {
+        lsSet('lb.selGap', id)
+        next.selGap = id
+        const has = (list, x) => (list?.items || []).some(g => g.id === x)
+        const inVisible = has(state.gaps, id)
+        if (state.gapHidden) {
+          // The Hidden view has its own list. An album in it is an ordinary
+          // selection. (Checked against the visible list alone, every hidden
+          // album looked like a link to somewhere else and switched the view
+          // off: Hidden showed 35 and listed none.) Only a link to an album
+          // that is NOT hidden leaves the view, once that list is in hand.
+          if (state.hiddenGaps && !has(state.hiddenGaps, id)) {
+            next.gapHidden = false
+            if (!inVisible) { lsSet('lb.gapFilter', ''); next.gapFilter = ''; next.gapsStale = true }
+          }
+        } else if (id && !inVisible) {
           // Only a *deep link* needs special handling: when the album isn't in
           // the list in hand, widen the filter and hold the cursor until a
           // fresh list arrives, rather than blanking the screen.
-          if (id && !(state.gaps?.items || []).some(g => g.id === id)) {
-            lsSet('lb.gapFilter', '')
-            next.gapFilter = ''
-            next.gapsStale = true
-            // The Hidden view persists across tabs; a link to a visible album
-            // fetched the hidden list, missed the album and re-homed onto a
-            // hidden one.
-            if (state.gapHidden) { next.gapHidden = false; next.gaps = null }
-          }
+          lsSet('lb.gapFilter', '')
+          next.gapFilter = ''
+          next.gapsStale = true
         }
       }
       return next
     }
+    // A write route answered with the album as it now stands. Showing that at
+    // once, in the detail and on its list row, is what keeps the page from
+    // sitting on the old state until the next poll.
+    case 'GAP_UPDATED': {
+      const d = action.gap
+      if (!d?.id) return state
+      const patch = list => (list?.items?.some(g => g.id === d.id)
+        ? { ...list, items: list.items.map(g => (g.id === d.id
+            ? { ...g, status: d.status, present: d.present, total: d.total, missingCount: d.missingCount,
+                sourceCount: d.sourcesTotal ?? g.sourceCount, updatedAt: d.updatedAt ?? g.updatedAt }
+            : g)) }
+        : list)
+      return {
+        ...state,
+        gaps: patch(state.gaps),
+        hiddenGaps: patch(state.hiddenGaps),
+        gapDetail: gapDetailId(state) === d.id ? d : state.gapDetail,
+      }
+    }
     case 'SET_GAP_FILTER':
       lsSet('lb.gapFilter', action.filter)
-      // Leaving the Hidden view drops its list, or the rail showed hidden
-      // albums under "Needs you" until the next fetch.
-      return {
-        ...state, gapFilter: action.filter, gapHidden: false,
-        ...(state.gapHidden ? { gaps: null, gapsStale: false } : {}),
-      }
+      return { ...state, gapFilter: action.filter, gapHidden: false }
     case 'SET_GAP_HIDDEN':
-      return { ...state, gapHidden: action.hidden, gaps: null, gapsStale: false }
+      return { ...state, gapHidden: action.hidden, hiddenGaps: null }
     case 'SET_GAP_SEARCH':
       return { ...state, gapSearch: action.q }
     case 'SET_LIB_FILTER':
@@ -247,6 +230,8 @@ function reducer(state, action) {
   }
 }
 
+const soft = p => p.catch(e => { if (e.name === 'AbortError') throw e; return null })
+
 // Which screen-level data each route needs. A key here is refetched on every
 // poll of that screen; anything a panel loads for itself is not listed.
 function jobsFor(ui, want, signal) {
@@ -254,40 +239,55 @@ function jobsFor(ui, want, signal) {
   if (want('summary')) jobs.summary = api('/api/summary', { signal })
   const sub = ui.routeParams[0] || ''
   switch (ui.tab) {
-    case 'Fill gaps':
-      if (want('gaps')) jobs.gaps = api(ui.gapHidden ? '/api/gaps?hidden=1' : '/api/gaps', { signal })
+    case 'needs': {
+      const fix = sub === 'fix'
+      if (want('gaps')) jobs.gaps = api('/api/gaps', { signal })
+      if (!fix && ui.gapHidden && want('hiddenGaps')) jobs.hiddenGaps = soft(api('/api/gaps?hidden=1', { signal }))
       // A selected id can stop existing — its 404 must not reject the batch
       // and take the gaps list down with it.
-      if (ui.selGap && want('gapDetail')) {
-        jobs.gapDetail = api(`/api/gaps/${ui.selGap}`, { signal })
-          .catch(e => { if (e.name === 'AbortError') throw e; return null })
-      }
-      // The selected album's own status counts too: right after "Get N
-      // tracks" the list is a poll behind, and without its transfers the card
-      // read "filing into the album" with no Cancel.
-      if (want('transfers') && (!ui.summary
+      const id = gapDetailId(ui)
+      if (id && want('gapDetail')) jobs.gapDetail = soft(api(`/api/gaps/${id}`, { signal }))
+      // To fix lists the folders waiting to be filed, which ride on the
+      // transfers answer. In the queue the selected album's own status counts
+      // too: right after a source is picked the list is a poll behind, and
+      // without its transfers the detail read "filing into the album" with no
+      // Cancel.
+      if (want('transfers') && (fix || !ui.summary
           || (ui.summary?.transfers?.active || 0) + (ui.summary?.transfers?.queued || 0) > 0
           || ui.gapDetail?.status === 'downloading'
           || ui.gaps?.items?.some(g => g.status === 'downloading'))) {
         jobs.transfers = api('/api/transfers', { signal })
       }
+      if (fix && want('fills')) jobs.fills = soft(api('/api/fills?recent=1', { signal }))
       break
-    case 'Downloads':
-      // The placement drill-down loads its own folder and never reads these.
-      if (sub === 'place') break
+    }
+    case 'album':
+      // An incomplete album shows its gap's download as it runs.
+      if (want('transfers') && (ui.summary?.transfers?.active || 0) + (ui.summary?.transfers?.queued || 0) > 0) {
+        jobs.transfers = soft(api('/api/transfers', { signal }))
+      }
+      break
+    case 'activity':
       if (want('transfers')) jobs.transfers = api('/api/transfers', { signal })
-      if (want('wishlist')) jobs.wishlist = api('/api/wishlist', { signal }).catch(() => null)
-      if (want('fills')) jobs.fills = api('/api/fills?recent=1', { signal }).catch(() => null)
+      if (want('fills')) jobs.fills = soft(api('/api/fills?recent=1', { signal }))
+      // Once, not on every poll: Landed names a gap fill by its album in the
+      // queue, and the list is 1.4 MB.
+      if (!ui.gaps && want('gaps')) jobs.gaps = soft(api('/api/gaps', { signal }))
       break
-    case 'Library':
+    case 'discover':
+      // A few rows at most, and every tab reads it: the Wishlist tab's count,
+      // and which new releases are already wished for.
+      if (want('wishlist')) jobs.wishlist = soft(api('/api/wishlist', { signal }))
+      break
+    case 'library':
       if (sub === 'albums' && want('library')) {
         const q = new URLSearchParams({ filter: ui.libFilter, q: ui.libSearch, page: ui.libPage, sort: ui.libSort })
         jobs.library = api(`/api/library?${q}`, { signal })
       }
       break
-    case 'Settings':
+    case 'system':
       // Status loads its own health checks: the first run takes ~6 s and would
-      // hold every other poll (and the Live dot) hostage.
+      // hold every other poll (and the connection light) hostage.
       if (sub === 'sources' && !ui.prefs && want('prefs')) jobs.prefs = api('/api/prefs', { signal })
       if (sub === 'logs' && want('logEntries')) {
         const f = ui.logFilter
@@ -300,6 +300,21 @@ function jobsFor(ui, want, signal) {
   }
   return jobs
 }
+
+const PAGES = {
+  needs: NeedsYou,
+  activity: Activity,
+  discover: Discover,
+  library: Library,
+  system: System,
+  search: Search,
+  artist: ArtistPage,
+  album: AlbumPage,
+  place: Placement,
+}
+
+const TOAST_MS = 4000
+const TOAST_ERROR_MS = 9000
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -322,10 +337,20 @@ export default function App() {
   const pushToast = useCallback((msg, level = 'info') => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     dispatch({ type: 'PUSH_TOAST', toast: { id, msg, level } })
-    if (level !== 'error') setTimeout(() => dispatch({ type: 'DISMISS_TOAST', id }), 4000)
+    // Every notification leaves on its own. An error stays longer, since it is
+    // the one that has to be read, and can still be dismissed by hand. Errors
+    // used to stay until dismissed, and a few of them piled up over the page.
+    setTimeout(() => dispatch({ type: 'DISMISS_TOAST', id }), level === 'error' ? TOAST_ERROR_MS : TOAST_MS)
   }, [])
 
   const dismissToast = useCallback((id) => dispatch({ type: 'DISMISS_TOAST', id }), [])
+
+  // A retag or an undo that ends with no page showing it (lib/jobs.js): one
+  // toast names the album and says how it ended.
+  useEffect(() => {
+    jobs.setNotifier(onJobEnded(pushToast))
+    return () => jobs.setNotifier(null)
+  }, [pushToast])
 
   // `only` restricts the batch to named jobs (selecting an album needs its
   // detail and nothing else).
@@ -381,47 +406,47 @@ export default function App() {
   // instant instead of poll-paced. Skips the first run (the mount did it).
   const paramsMountedRef = useRef(false)
   const { tab, selGap, gapHidden, libFilter, libSearch, libPage, libSort, logFilter } = state
-  // On Fill gaps the first route param IS the selected album, already tracked
-  // as selGap; counting it again made every album switch a full forced refresh
-  // instead of the one-request detail fetch below.
-  const sub = tab === 'Fill gaps' ? '' : (state.routeParams[0] || '')
+  // In the gaps queue the selected album is tracked as selGap; counting the
+  // route segment again made every album switch a full forced refresh instead
+  // of the one-request detail fetch below.
+  const sub = state.routeParams[0] || ''
+  const fixSel = tab === 'needs' && sub === 'fix' ? (state.routeParams[1] || '') : ''
   const prevDepsRef = useRef(null)
   useEffect(() => {
-    const deps = { tab, sub, selGap, gapHidden, libFilter, libSearch, libPage, libSort, logFilter }
+    const deps = { tab, sub, selGap, fixSel, gapHidden, libFilter, libSearch, libPage, libSort, logFilter }
     const prev = prevDepsRef.current
     prevDepsRef.current = deps
     if (!paramsMountedRef.current) { paramsMountedRef.current = true; return }
     const ui = uiRef.current
-    const onlyTabChanged = prev && prev.tab !== deps.tab &&
-      Object.keys(deps).every(k => k === 'tab' || prev[k] === deps[k])
-    const haveTabData = { 'Fill gaps': ui.gaps, 'Downloads': ui.transfers }[deps.tab]
+    const changed = Object.keys(deps).filter(k => !prev || prev[k] !== deps[k])
+    const onlyTabChanged = changed.length === 1 && changed[0] === 'tab'
+    const haveTabData = { needs: ui.gaps, activity: ui.transfers }[deps.tab]
     if (onlyTabChanged && haveTabData && Date.now() - ui.lastSyncAt < 3000) {
       scheduleRefresh(500)
       return
     }
-    const onlySelGapChanged = prev && prev.tab === deps.tab && prev.selGap !== deps.selGap &&
-      Object.keys(deps).every(k => k === 'selGap' || prev[k] === deps[k])
-    if (onlySelGapChanged && deps.tab === 'Fill gaps' && ui.gaps) {
+    // Moving the cursor needs that album's detail and nothing else.
+    const onlySelection = changed.length === 1 && (changed[0] === 'selGap' || changed[0] === 'fixSel')
+    if (onlySelection && deps.tab === 'needs' && ui.gaps) {
       refresh({ silent: true, force: true, only: ['gapDetail'] })
       return
     }
     refresh({ silent: true, force: true })
-  }, [tab, sub, selGap, gapHidden, libFilter, libSearch, libPage, libSort, logFilter, refresh, scheduleRefresh])
+  }, [tab, sub, selGap, fixSel, gapHidden, libFilter, libSearch, libPage, libSort, logFilter, refresh, scheduleRefresh])
 
-  // The router: one hashchange listener, one SET_ROUTE dispatch.
+  // The router: one subscription, one SET_ROUTE dispatch.
   useEffect(() => {
-    function syncHash() {
+    function sync(kind) {
       const { tab, params } = parseHash()
       if (tab) {
-        dispatch({ type: 'SET_ROUTE', tab, params })
+        dispatch({ type: 'SET_ROUTE', tab, params, kind: kind === 'soft' ? '' : kind })
       } else {
-        replaceRoute(uiRef.current.tab)
-        dispatch({ type: 'SET_ROUTE', tab: uiRef.current.tab, params: [] })
+        const here = isSection(uiRef.current.tab) ? uiRef.current.tab : 'needs'
+        replaceRoute(here)
       }
     }
-    syncHash()
-    window.addEventListener('hashchange', syncHash)
-    return () => window.removeEventListener('hashchange', syncHash)
+    sync(currentKind())
+    return onRoute(sync)
   }, [])
 
   const action = useCallback(async (path, body = {}) => {
@@ -450,37 +475,13 @@ export default function App() {
 
   const ctx = { state, dispatch, refresh, scheduleRefresh, action, confirmAction, requestConfirm, pushToast }
 
-  const panels = {
-    'Fill gaps': FillGaps,
-    'Downloads': Downloads,
-    'Library': Library,
-    'Discover': Discover,
-    'Settings': Settings,
-    'Search': Search,
-  }
-  const Panel = panels[tab] || null
-  // Screens gate on the summary; the ones that load their own data don't wait.
-  const ready = state.summary !== null || ['Library', 'Discover', 'Search', 'Settings'].includes(tab)
+  const Panel = PAGES[tab] || null
 
   return (
     <AppContext.Provider value={ctx}>
-      <Layout>
-        <main className="app-main">
-          {state.pollError && (
-            <div role="status" aria-live="polite"
-              className="mb-4 flex flex-wrap items-center gap-3 rounded-card border p-3.5 text-small"
-              style={{ background: 'var(--warn-tint)', borderColor: 'var(--danger-bd)', color: 'var(--danger-text)' }}>
-              <span className="font-semibold" style={{ color: 'var(--danger)' }}>Can’t reach lb-bot</span>
-              <span className="text-muted">{state.pollError}</span>
-              <span className="spacer" />
-              <button onClick={() => refresh({ force: true })}>Retry now</button>
-            </div>
-          )}
-          {!ready
-            ? <p className="text-caption text-muted">{state.pollError ? 'Waiting for the backend…' : 'Loading…'}</p>
-            : Panel ? <Panel /> : null}
-        </main>
-      </Layout>
+      <Shell>
+        {Panel ? <Panel /> : null}
+      </Shell>
       <ConfirmBar pending={pendingConfirm} onResolve={resolveConfirm} />
       <Toasts toasts={state.toasts} onDismiss={dismissToast} />
     </AppContext.Provider>

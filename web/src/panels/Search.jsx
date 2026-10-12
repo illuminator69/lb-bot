@@ -2,17 +2,17 @@ import { useEffect, useState } from 'react'
 import { useApp, navigate, replaceRoute, goArtist, goAlbum } from '../App.jsx'
 import { api, post } from '../lib/api.js'
 import Cover from '../components/Cover.jsx'
+import Page, { Grp } from '../components/Page.jsx'
 import { loadArtists } from './Artist.jsx'
-import { EmptyState, Notice, PageTitle, SectionHeader, Skeleton } from '../components/ui.jsx'
+import { EmptyState, Skeleton } from '../components/ui.jsx'
 
-// The header search. Three kinds of answer from one box:
+// Search. Three kinds of answer from one box:
 //   - a pasted link  → /api/resolve-link (Spotify, Deezer, Apple Music, TIDAL,
 //                      Qobuz, YouTube Music, MusicBrainz) → the album/artist page
 //   - a Spotify *playlist* link → offer to scan it for missing tracks
 //   - text           → your artists by name, plus MusicBrainz artists and albums
 // Every result opens an existing page; acquisition happens there, through the
-// one album pipeline. The old Library "Add music" box ran a second, legacy slskd
-// search next to it and sent pasted links to MusicBrainz as text.
+// one album pipeline.
 
 const isLink = q => /^https?:\/\//i.test(q) || /^spotify:/i.test(q)
   || /^(open\.spotify|music\.apple|deezer|tidal|www\.qobuz|music\.youtube|musicbrainz)\./i.test(q)
@@ -22,6 +22,7 @@ function LinkResult({ q }) {
   const { action, pushToast } = useApp()
   const [r, setR] = useState(null)
   const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const playlist = isSpotifyPlaylist(q)
   useEffect(() => {
     if (playlist) return
@@ -33,66 +34,85 @@ function LinkResult({ q }) {
 
   if (playlist) {
     return (
-      <Notice tone="quiet" title="A Spotify playlist"
-        actions={<button className="primary" onClick={async () => {
-          try {
-            await action('/api/spotify/scan', { playlist: q })
-            pushToast('Scanning the playlist — its missing tracks will appear in Fill gaps under “Spotify”')
-            navigate('Fill gaps')
-          } catch (e) { pushToast(`Scan failed: ${e.message}`, 'error') }
-        }}>Scan it for missing tracks</button>}>
-        lb-bot can check which of its tracks your library is missing and queue them in Fill gaps.
-      </Notice>
+      <div style={{ maxWidth: 640 }}>
+        <p className="why quiet">
+          A Spotify playlist. lb-bot can check which of its tracks your library is missing and put them in the gaps
+          queue, under Found by: Spotify.
+        </p>
+        <div className="acts">
+          <button className="primary" disabled={busy} aria-busy={busy} onClick={async () => {
+            setBusy(true)
+            try {
+              await action('/api/spotify/scan', { playlist: q })
+              pushToast('Scanning the playlist. Its missing tracks will appear in the gaps queue')
+              navigate('needs', 'gaps')
+            } catch (e) { pushToast(`Scan failed: ${e.message}`, 'error') }
+            finally { setBusy(false) }
+          }}>Scan it for missing tracks</button>
+        </div>
+      </div>
     )
   }
-  if (err) return <EmptyState title="Couldn't read that link" hint={err} />
-  if (!r) return <p className="text-caption text-muted">Working out what that link is…</p>
+  if (err) return <EmptyState title="Couldn’t read that link" hint={err} />
+  if (!r) return <p className="muted">Working out what that link is…</p>
   if (r.kind === 'unknown' || !r.confidence) {
-    return <EmptyState title="Couldn't work out what that link is" hint={r.reason || 'Try searching for the artist and album by name instead.'} />
+    return <EmptyState title="Couldn’t work out what that link is" hint={r.reason || 'Try searching for the artist and album by name instead.'} />
   }
-  const sure = r.confidence >= 0.85
-  return <LinkAnswer r={r} sure={sure} />
+  return <LinkAnswer r={r} sure={r.confidence >= 0.85} />
 }
 
 // A link resolved by id (MusicBrainz, or the store's own API) just opens —
 // pasting it meant "open this". A page-title match (confidence ~0.7) shows a
-// card first, because the name it went on may be the wrong record.
+// row first, because the name it went on may be the wrong record.
 function LinkAnswer({ r, sure }) {
   useEffect(() => {
     if (!sure) return
-    if (r.rgid) replaceRoute('Library', 'artists', '-', r.rgid)
-    else if (r.kind === 'artist' && r.mbid) replaceRoute('Library', 'artists', `mb:${r.mbid}`)
+    if (r.rgid) replaceRoute('album', '-', r.rgid)
+    else if (r.kind === 'artist' && r.mbid) replaceRoute('artist', `mb:${r.mbid}`)
   }, [r, sure])
   return (
-    <div className="workspace-card flex flex-wrap items-center gap-4">
-      {r.rgid && <Cover url={`https://coverartarchive.org/release-group/${r.rgid}/front-250`} name={r.title} size={96} />}
-      <div className="min-w-[200px] flex-1">
-        <div className="text-caption font-semibold uppercase tracking-[.1em] text-muted">{r.kind} · from {r.provider}</div>
-        <div className="text-title font-semibold">{r.title || r.artist || (r.kind === 'artist' ? 'An artist' : 'An album')}</div>
-        {r.title && r.artist && <div className="text-small text-muted">{r.artist}</div>}
-        {!sure && (
-          <div className="mt-1 text-caption" style={{ color: 'var(--decide-fg)' }}>
-            Matched by name from the store's page, not by an id — check it's the right one.
+    <div style={{ maxWidth: 720 }}>
+      {!sure && (
+        <p className="why">Matched by name from the store’s page, not by an id. Check it is the right one before opening it.</p>
+      )}
+      <div className="rows">
+        <div className="row">
+          {r.rgid && <Cover url={`https://coverartarchive.org/release-group/${r.rgid}/front-250`} name={r.title || '?'} size={48} />}
+          <div className="grow">
+            <div className="t clip">{r.title || r.artist || (r.kind === 'artist' ? 'An artist' : 'An album')}</div>
+            <div className="s clip">{[r.title && r.artist, r.kind, `from ${r.provider}`].filter(Boolean).join(' · ')}</div>
           </div>
-        )}
+          {r.rgid
+            ? <button className="primary sm" onClick={() => goAlbum(r.rgid)}>Open album</button>
+            : r.kind === 'artist' && r.mbid
+              ? <button className="primary sm" onClick={() => goArtist(`mb:${r.mbid}`)}>Open artist</button>
+              : <button className="sm" onClick={() => navigate('search', [r.artist, r.title].filter(Boolean).join(' '))}>Search by name</button>}
+        </div>
       </div>
-      {r.rgid
-        ? <button className="primary" onClick={() => goAlbum(r.rgid)}>Open album →</button>
-        : r.kind === 'artist' && r.mbid
-          ? <button className="primary" onClick={() => goArtist(`mb:${r.mbid}`)}>Open artist →</button>
-          : <button onClick={() => navigate('Search', [r.artist, r.title].filter(Boolean).join(' '))}>Search by name</button>}
     </div>
   )
 }
 
+const skeletonRows = n => (
+  <div className="rows">
+    {Array.from({ length: n }, (_, i) => (
+      <div key={i} className="row"><Skeleton style={{ width: 40, height: 40 }} /><Skeleton className="h-3" style={{ width: `${40 - i * 6}%` }} /></div>
+    ))}
+  </div>
+)
+
 function TextResults({ q }) {
   const [owned, setOwned] = useState(null)
   const [artists, setArtists] = useState(null)
+  // Why the MusicBrainz artist search has no rows, when it failed: an empty
+  // list alone read "No other artists found" for a search that never ran.
+  const [artistsError, setArtistsError] = useState(null)
   const [albums, setAlbums] = useState(null)
+  const [albumsError, setAlbumsError] = useState(null)
 
   useEffect(() => {
     let dead = false
-    setOwned(null); setArtists(null); setAlbums(null)
+    setOwned(null); setArtists(null); setArtistsError(null); setAlbums(null); setAlbumsError(null)
     const m = q.split(/\s+[–—-]\s+/)
     // "Artist – Album" matches your artists on the artist half.
     const needle = (m.length === 2 ? m[0] : q).toLowerCase()
@@ -100,7 +120,8 @@ function TextResults({ q }) {
       .then(list => !dead && setOwned(list.filter(a => (a.name || '').toLowerCase().includes(needle)).slice(0, 12)))
       .catch(() => !dead && setOwned([]))
     api('/api/artist/lookup?q=' + encodeURIComponent(m.length === 2 ? m[0] : q))
-      .then(r => !dead && setArtists(r.candidates || [])).catch(() => !dead && setArtists([]))
+      .then(r => !dead && setArtists(r.candidates || []))
+      .catch(e => { if (!dead) { setArtists([]); setArtistsError(e.message || 'the search failed') } })
     // "Artist – Album" is asked fielded, which MusicBrainz ranks far better
     // than free text (free text puts parodies first). The server quotes it and
     // falls back to free text.
@@ -108,7 +129,8 @@ function TextResults({ q }) {
       ? `/api/album/lookup?artist=${encodeURIComponent(m[0])}&album=${encodeURIComponent(m[1])}`
       : '/api/album/lookup?q=' + encodeURIComponent(q)
     api(url)
-      .then(r => !dead && setAlbums(r.candidates || [])).catch(() => !dead && setAlbums([]))
+      .then(r => !dead && setAlbums(r.candidates || []))
+      .catch(e => { if (!dead) { setAlbums([]); setAlbumsError(e.message || 'the search failed') } })
     return () => { dead = true }
   }, [q])
 
@@ -119,55 +141,56 @@ function TextResults({ q }) {
   // owned artist's index row.
   const ownedMbids = new Set((owned || []).map(a => a.mbid).filter(Boolean))
   const others = (artists || []).filter(c => c.mbid && !ownedMbids.has(c.mbid))
-  const loading = n => Array.from({ length: n }, (_, i) => <Skeleton key={i} className="h-9 w-40" />)
+  const artistRows = [
+    ...(owned || []).map(a => ({ key: a.id, name: a.name, cover: a.coverUrl, owned: true, open: () => goArtist(a.id),
+      note: `${a.releaseCount} release${a.releaseCount === 1 ? '' : 's'}` })),
+    ...others.map(c => ({ key: `mb:${c.mbid}`, name: c.name, owned: false, open: () => goArtist(`mb:${c.mbid}`),
+      note: [c.disambiguation, c.type, c.area || c.country].filter(Boolean).join(' · ') })),
+  ]
+  const artistsLoading = owned === null || artists === null
 
   return (
     <>
-      <SectionHeader label="Your artists" sub={owned?.length || ''} />
-      <div className="mb-6 flex flex-wrap gap-1.5">
-        {owned === null ? loading(3)
-          : !owned.length ? <p className="text-caption text-muted">None of your artists match.</p>
-          : owned.map(a => (
-            <button key={a.id} className="!flex items-center gap-2 !py-1.5" onClick={() => goArtist(a.id)}>
-              <Cover url={a.coverUrl} name={a.name} size={24} round /> {a.name}
-            </button>
-          ))}
-      </div>
+      <Grp n={artistsLoading ? '' : artistRows.length}>Artists</Grp>
+      {artistsLoading && !artistRows.length ? skeletonRows(3)
+        : !artistRows.length ? <p className="muted">No artist matches, in your library or on MusicBrainz.</p>
+        : (
+          <div className="rows">
+            {artistRows.map(a => (
+              <button key={a.key} className="row tap" onClick={a.open}>
+                <Cover url={a.cover} name={a.name} size={40} round />
+                <span className="grow">
+                  <span className="t clip block">{a.name}</span>
+                  {a.note && <span className="s clip block">{a.note}</span>}
+                </span>
+                <span className={`st ${a.owned ? 'ok' : ''}`}>{a.owned ? 'In library' : 'Not in library'}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      {artistsError && <p className="bad mt-2 text-caption">Couldn’t search MusicBrainz for artists: {artistsError}</p>}
 
-      <SectionHeader label="Albums" sub="MusicBrainz" />
-      <div className="mb-6">
-        {albums === null ? <div className="tile-grid">{Array.from({ length: 6 }, (_, i) => <Skeleton key={i} style={{ aspectRatio: '1 / 1.25' }} />)}</div>
-          : !albums.length ? <p className="text-caption text-muted">No albums found. Try “Artist – Album”.</p>
-          : (
-            <div className="tile-grid">
-              {albums.map(c => (
-                <button key={c.rgid} onClick={() => goAlbum(c.rgid)}
-                  className="!flex flex-col !rounded-card border !border-line !bg-panel !p-2.5 text-left">
-                  <div className="mb-2 w-full"><Cover url={c.coverUrl} name={c.title} fluid /></div>
-                  <div className="w-full truncate text-small font-semibold">{c.title}</div>
-                  <div className="w-full truncate text-micro text-muted">{c.artist}</div>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-micro text-faint">
-                    {[c.year, c.primary_type].filter(Boolean).join(' · ')}
-                    {c.releaseOwned && <span className="chip good !my-0 !py-0">in library</span>}
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-      </div>
-
-      <SectionHeader label="Other artists" sub="MusicBrainz" />
-      <div className="flex flex-wrap gap-1.5">
-        {artists === null ? loading(4)
-          : !others.length ? <p className="text-caption text-muted">No other artists found.</p>
-          : others.map(c => (
-            <button key={c.mbid} className="!py-1.5 text-left" onClick={() => goArtist(`mb:${c.mbid}`)}
-              title={[c.disambiguation, c.type, c.area || c.country].filter(Boolean).join(' · ')}>
-              {c.name}
-              {(c.disambiguation || c.area) && <span className="text-caption text-muted"> · {c.disambiguation || c.area}</span>}
-            </button>
-          ))}
-      </div>
+      <Grp n={albums?.length || ''}>Albums</Grp>
+      {albums === null ? skeletonRows(4)
+        : albumsError ? <p className="bad text-caption">Couldn’t search MusicBrainz for albums: {albumsError}</p>
+        : !albums.length ? <p className="muted">No albums found. Try “Artist – Album”.</p>
+        : (
+          <div className="rows">
+            {albums.map(c => (
+              <div key={c.rgid} className="row stack">
+                <Cover url={c.coverUrl} name={c.title} size={40} />
+                <div className="grow">
+                  <button className="link plain t clip block max-w-full" onClick={() => goAlbum(c.rgid)}>{c.title}</button>
+                  <div className="s clip">{[c.artist, c.year, c.primary_type && c.primary_type.toLowerCase() !== 'album' ? c.primary_type : null].filter(Boolean).join(' · ')}</div>
+                </div>
+                <span className={`st ${c.releaseOwned ? 'ok' : ''}`}>{c.releaseOwned ? 'In library' : 'Not in library'}</span>
+                {c.releaseOwned
+                  ? <button className="sm" onClick={() => goAlbum(c.rgid)}>View</button>
+                  : <button className="sm" onClick={() => goAlbum(c.rgid, true)}>Find sources</button>}
+              </div>
+            ))}
+          </div>
+        )}
     </>
   )
 }
@@ -175,11 +198,26 @@ function TextResults({ q }) {
 export default function Search() {
   const { state } = useApp()
   const q = (state.routeParams[0] || '').trim()
+  const [draft, setDraft] = useState(q)
+  useEffect(() => { setDraft(q) }, [q])
+  const shownQ = q.length > 60 ? q.slice(0, 57) + '…' : q
   return (
-    <>
-      <div className="mb-5"><PageTitle eyebrow="Search" title={q ? `“${q.length > 60 ? q.slice(0, 57) + '…' : q}”` : 'Search'} /></div>
-      {!q ? <EmptyState title="Search for an artist or album" hint="Or paste a link from Spotify, Apple Music, Deezer, TIDAL, Qobuz, YouTube Music or MusicBrainz." />
-        : isLink(q) ? <LinkResult q={q} /> : <TextResults q={q} />}
-    </>
+    <Page title="Search" sub={q ? (isLink(q) ? 'A pasted link' : `Results for “${shownQ}”`) : undefined}
+      bar={(
+        <form className="flex min-w-0 flex-1 gap-2" role="search"
+          onSubmit={e => { e.preventDefault(); if (draft.trim()) navigate('search', draft.trim()) }}>
+          <input className="find" style={{ flex: 1, width: 'auto' }} type="search" autoFocus={!q}
+            placeholder="Artist, album, or a streaming link" aria-label="Search"
+            value={draft} onChange={e => setDraft(e.target.value)} />
+          <button type="submit">Search</button>
+        </form>
+      )}>
+      {!q ? (
+        <p className="empty">
+          Type an artist or album, or paste a link from Spotify, Apple Music, Deezer, TIDAL, Qobuz, YouTube Music or
+          MusicBrainz.
+        </p>
+      ) : isLink(q) ? <LinkResult q={q} /> : <TextResults q={q} />}
+    </Page>
   )
 }

@@ -10,7 +10,9 @@ It also has a **second front end you don't run yourself**: through
 [navi-connect](https://github.com/illuminator69/navi-connect), lb-bot's
 discography and gap-filling surface appears *inside* the music players — the
 albums you're missing show up on the artist page next to the ones you own, and a
-download is reviewed and started from there. If that's what you came for, the
+download is reviewed and started from there. The Android client,
+[Navic](https://github.com/illuminator69/navic-gaps/releases), also carries lb-bot's
+Needs attention, Source history and listening pages. If that's what you came for, the
 [navi-connect setup guide](https://github.com/illuminator69/navi-connect/blob/main/TESTING-SETUP.md)
 is the place to start; it covers both halves.
 

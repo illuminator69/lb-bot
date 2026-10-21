@@ -34432,5 +34432,239 @@ class OldRecordingRefusalsLookedAtAgainTests(unittest.TestCase):
                         src.index("threading.Thread(target=_startup_placement"))
 
 
+class AttentionActivityTests(unittest.TestCase):
+    """P6 (navi-connect PROTOCOL §15.6): `/api/attention` and `/api/activity`,
+    the phone's Needs attention and Source history. Both reach devices through
+    the hub, so every row is an allowlist; both are capped; the counts are the
+    summary's own."""
+
+    SECRET_KEY = "slskd-key-0000secret"
+    SECRET_TOKEN = "123456:TELEGRAM-token-secret"
+    SECRET_CHAT = "-100987654321"
+
+    ALBUM_KEYS = {"kind", "key", "groupId", "releaseMbid", "rgid", "albumId", "artist",
+                  "album", "coverUrl", "state", "missingCount", "total", "updatedAt"}
+    FOLDER_KEYS = {"id", "fileCount", "formats", "matchLabel", "confidence",
+                   "canConfirm", "groupId", "releaseMbid", "identified"}
+    REQUEST_KEYS = {"releaseMbid", "rgid", "groupId", "albumId", "artist", "album", "state",
+                    "percent", "done", "total", "failureKind", "reason", "retryable",
+                    "gapFill", "updatedAt"}
+    TRANSFER_KEYS = {"id", "kind", "album", "artist", "groupId", "state", "pct", "peer"}
+
+    def setUp(self):
+        self._saved_ledger = dict(bot._album_fill_status)
+        with bot._album_fill_lock:
+            bot._album_fill_status.clear()
+
+    def tearDown(self):
+        with bot._album_fill_lock:
+            bot._album_fill_status.clear()
+            bot._album_fill_status.update(self._saved_ledger)
+
+    @staticmethod
+    def _group(gid, **extra):
+        g = {"id": gid, "origin": "library", "artist": f"Artist {gid}", "album": f"Album {gid}",
+             "artist_key": "a", "album_key": "b", "canonical_album_id": f"nd-{gid}",
+             "canonical_mbid": f"rel-{gid}", "merge_mode": "", "match_mode": "auto",
+             "missing_tracks": [{"decision": "pending"}] * 3, "messages": [],
+             "total": 11, "updated_at": 100.0,
+             # credentials a careless copy of the record would carry along
+             "token": AttentionActivityTests.SECRET_TOKEN,
+             "chat_id": AttentionActivityTests.SECRET_CHAT}
+        g.update(extra)
+        return g
+
+    def _folder(self, i, identified):
+        return {"id": f"f{i:011d}", "filed": "", "name": f"Some.Folder.{i}",
+                "path": f"/downloads/{self.SECRET_KEY}/Some.Folder.{i}",
+                "fileCount": 11, "formats": "flac", "match": None,
+                "matchLabel": "Band — Record" if identified else "",
+                "confidence": "high" if identified else "unknown",
+                "identified": identified, "matchSource": "", "releaseMbid": "rel-f" if identified else "",
+                "coverUrl": "/api/cover/x", "identifyError": f"nothing at /downloads/{i}",
+                "canConfirm": identified, "groupId": "", "matchBasis": "", "diff": {}}
+
+    def _ledger(self, rows):
+        with bot._album_fill_lock:
+            bot._album_fill_status.update(rows)
+
+    def _attention(self, groups, status, folders):
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = groups
+            with patch.object(bot, "_gap_status_for_group", lambda g, now=None: status[g["id"]]), \
+                 patch.object(bot, "_nd_album_artist_map", lambda: {}), \
+                 patch.object(bot, "_needs_placement_view", lambda include_filed=False: folders), \
+                 patch.object(bot, "SLSKD_API_KEY", self.SECRET_KEY):
+                view = bot._attention_view()
+                gap_counts = bot._gaps_view()["counts"]
+        return view, gap_counts
+
+    def _standard(self):
+        groups = [self._group(f"F{i}", updated_at=100.0 + i) for i in range(3)]
+        # picks newer than the failures: failed rows still come first
+        groups += [self._group(f"P{i}", updated_at=200.0 + i) for i in range(14)]
+        groups += [self._group("R"), self._group("H", hidden=True)]
+        status = {g["id"]: ("failed" if g["id"].startswith("F") else
+                            "picking" if g["id"].startswith("P") else
+                            "failed" if g["id"] == "H" else "ready") for g in groups}
+        folders = [self._folder(i, identified=i >= 12) for i in range(16)]
+        self._ledger({"req-1": {"state": "failed", "artist": "Req", "album": "Uest",
+                                "rgid": "rg-1", "updated_at": 500.0,
+                                "token": self.SECRET_TOKEN, "chat_id": self.SECRET_CHAT},
+                      "req-2": {"state": "downloading", "album": "Live"}})
+        return groups, status, folders
+
+    def test_counts_are_the_summarys(self):
+        groups, status, folders = self._standard()
+        view, gap_counts = self._attention(groups, status, folders)
+        self.assertEqual(view["counts"], {"failedGaps": 3, "failedRequests": 1, "folders": 16,
+                                          "foldersUnidentified": 12, "picks": 14})
+        self.assertEqual(view["counts"]["failedGaps"], gap_counts["failed"])
+        self.assertEqual(view["counts"]["failedRequests"], bot._album_fill_counts()["failed"])
+        self.assertEqual(view["counts"]["foldersUnidentified"], bot._unidentified_count(folders))
+        self.assertEqual(view["version"], 1)
+
+    def test_albums_failed_first_then_picks_newest_first_and_allowlisted(self):
+        groups, status, folders = self._standard()
+        view, _ = self._attention(groups, status, folders)
+        states = [a["state"] for a in view["albums"]]
+        self.assertEqual(states, ["failed"] * 4 + ["picking"] * 14)
+        failed = view["albums"][:4]
+        self.assertEqual(failed[0]["key"], "req-1", "the newest failure first")
+        self.assertEqual([a["key"] for a in failed[1:]], ["F2", "F1", "F0"])
+        self.assertEqual(failed[0]["coverUrl"],
+                         "https://coverartarchive.org/release-group/rg-1/front-250")
+        self.assertNotIn("H", [a["key"] for a in view["albums"]], "a hidden group is not listed")
+        for row in view["albums"]:
+            self.assertEqual(set(row), self.ALBUM_KEYS)
+        self.assertEqual(view["albums"][1]["missingCount"], 3)
+
+    def test_albums_are_capped_and_say_by_how_many(self):
+        groups = [self._group(f"F{i}", updated_at=float(i)) for i in range(60)]
+        view, _ = self._attention(groups, {g["id"]: "failed" for g in groups}, [])
+        self.assertEqual(len(view["albums"]), bot.ATTENTION_ALBUMS_MAX)
+        self.assertEqual(view["truncated"], {"albums": 10, "folders": 0})
+        self.assertEqual(view["counts"]["failedGaps"], 60, "the count is not capped")
+
+    def test_folders_are_capped_too(self):
+        view, _ = self._attention([], {}, [self._folder(i, False) for i in range(55)])
+        self.assertEqual(len(view["folders"]), bot.ATTENTION_FOLDERS_MAX)
+        self.assertEqual(view["truncated"]["folders"], 5)
+        self.assertEqual(view["counts"]["folders"], 55)
+
+    def test_an_unnamed_failed_request_is_left_out_and_a_nameless_one_is_named_from_its_group(self):
+        groups = [self._group("G", canonical_mbid="rel-g")]
+        self._ledger({"lost": {"state": "failed", "updated_at": 9.0},
+                      "rel-g": {"state": "failed", "updated_at": 8.0}})
+        view, _ = self._attention(groups, {"G": "ready"}, [])
+        keys = [a["key"] for a in view["albums"]]
+        self.assertNotIn("lost", keys)
+        named = next(a for a in view["albums"] if a["key"] == "rel-g")
+        self.assertEqual((named["artist"], named["album"], named["groupId"], named["albumId"]),
+                         ("Artist G", "Album G", "G", "nd-G"))
+        # the summary does not count a row with no name of its own; neither does this
+        self.assertEqual(view["counts"]["failedRequests"], 0)
+
+    def test_a_failed_gap_fill_is_listed_once(self):
+        groups = [self._group("G", canonical_mbid="rel-g")]
+        self._ledger({"rel-g": {"state": "failed", "album": "Album G", "updated_at": 8.0}})
+        view, _ = self._attention(groups, {"G": "failed"}, [])
+        self.assertEqual([(a["kind"], a["key"]) for a in view["albums"]], [("gap", "G")])
+        self.assertEqual((view["counts"]["failedGaps"], view["counts"]["failedRequests"]), (1, 1))
+
+    def test_folders_carry_no_name_path_error_or_cover(self):
+        groups, status, folders = self._standard()
+        view, _ = self._attention(groups, status, folders)
+        for row in view["folders"]:
+            self.assertEqual(set(row), self.FOLDER_KEYS)
+            self.assertEqual(row["fileCount"], 11)
+        unmatched = view["folders"][0]
+        self.assertEqual((unmatched["matchLabel"], unmatched["identified"]), ("", False))
+        self.assertEqual(view["folders"][15]["matchLabel"], "Band — Record")
+        text = json.dumps(view)
+        for leak in ("/downloads/", "Some.Folder", "/api/cover/", self.SECRET_KEY,
+                     self.SECRET_TOKEN, self.SECRET_CHAT, '"token"', '"chat_id"', '"path"', '"name"'):
+            self.assertNotIn(leak, text)
+
+    def _activity(self, transfers):
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [self._group("G", canonical_mbid="rel-gap")]
+            with patch.object(bot, "_transfers_view", lambda: {"transfers": transfers}), \
+                 patch.object(bot, "_nd_album_artist_map", lambda: {}):
+                return bot._activity_view()
+
+    def test_activity_lists_the_ledger_newest_first(self):
+        self._ledger({
+            "live": {"state": "downloading", "album": "L", "done": 4, "total": 10, "updated_at": 40.0},
+            "ver": {"state": "verified", "album": "V", "updated_at": 30.0},
+            "bad": {"state": "failed", "album": "F", "failureKind": "no_source",
+                    "reason": "nobody at /downloads/x", "updated_at": 20.0,
+                    "token": self.SECRET_TOKEN},
+            "can": {"state": "cancelled", "album": "C", "updated_at": 10.0},
+            "rel-gap": {"state": "verified", "updated_at": 5.0},
+            "unk": {"state": "unknown", "updated_at": 50.0},
+        })
+        view = self._activity([])
+        self.assertEqual([r["releaseMbid"] for r in view["requests"]],
+                         ["live", "ver", "bad", "can", "rel-gap"])
+        self.assertEqual(view["requests"][0]["percent"], 40)
+        gap = view["requests"][4]
+        self.assertEqual((gap["album"], gap["groupId"], gap["gapFill"]), ("Album G", "G", True))
+        for row in view["requests"]:
+            self.assertEqual(set(row), self.REQUEST_KEYS)
+        self.assertNotIn(self.SECRET_TOKEN, json.dumps(view))
+        self.assertNotIn("/downloads/", json.dumps(view), "a reason's host path is stripped")
+
+    def test_a_row_past_its_ttl_is_the_ledgers_own_business(self):
+        """The endpoint adds no prune of its own: what the ledger holds is listed,
+        and the ledger's restore drops what has aged out."""
+        old = time.time() - 30 * 3600
+        bot._album_fill_restore({"old": {"state": "failed", "album": "O", "updated_at": old},
+                                 "new": {"state": "failed", "album": "N", "updated_at": time.time()}})
+        view = self._activity([])
+        self.assertEqual([r["releaseMbid"] for r in view["requests"]], ["new"])
+
+    def test_requests_and_transfers_are_capped(self):
+        self._ledger({f"r{i}": {"state": "verified", "album": "x", "updated_at": float(i)}
+                      for i in range(250)})
+        transfers = [{"id": f"t{i}", "kind": "track", "state": "active", "pct": 1,
+                      "username": "peer", "filename": "@@x\\a.flac", "title": "A — a"}
+                     for i in range(130)]
+        view = self._activity(transfers)
+        self.assertEqual(len(view["requests"]), bot.ACTIVITY_REQUESTS_MAX)
+        self.assertEqual(view["requests"][0]["releaseMbid"], "r249")
+        self.assertEqual(len(view["transfers"]), bot.ACTIVITY_TRANSFERS_MAX)
+
+    def test_transfers_carry_no_filename_path_or_title(self):
+        transfers = [{"id": "t1", "kind": "track", "title": "A — Song", "displayTitle": "A — Song",
+                      "artist": "A", "album": "Alb", "state": "active", "pct": 30,
+                      "groupId": "G", "username": "peer1", "filename": "@@peer\\Music\\01.flac",
+                      "sub": "from @peer1"},
+                     {"id": "t2", "kind": "album", "title": "Band - Whole", "sub": "from @peer2",
+                      "state": "done", "pct": 100, "groupId": ""}]
+        view = self._activity(transfers)
+        for row in view["transfers"]:
+            self.assertEqual(set(row), self.TRANSFER_KEYS)
+        self.assertEqual([t["peer"] for t in view["transfers"]], ["peer1", "peer2"])
+        text = json.dumps(view)
+        for leak in ("01.flac", "Music", "A — Song", "Band - Whole"):
+            self.assertNotIn(leak, text)
+
+    def test_both_routes_answer_empty_lists_when_nothing_is_going_on(self):
+        client = _web_app().test_client()
+        with isolated_review(), \
+             patch.object(bot, "_needs_placement_view", lambda include_filed=False: []), \
+             patch.object(bot, "_transfers_view", lambda: {"transfers": []}):
+            att = client.get("/api/attention")
+            act = client.get("/api/activity")
+        self.assertEqual(att.status_code, 200)
+        self.assertEqual((att.get_json()["albums"], att.get_json()["folders"]), ([], []))
+        self.assertEqual(att.get_json()["counts"]["folders"], 0)
+        self.assertEqual(act.status_code, 200)
+        self.assertEqual((act.get_json()["requests"], act.get_json()["transfers"]), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

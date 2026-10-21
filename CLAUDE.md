@@ -4178,6 +4178,34 @@ section comment above `LISTENS_PAGE_SIZE` is the long form; what binds a change:
   once. The tag's own artist, if it is a real other one, keeps those plays too:
   the two cannot be told apart.
 
+### The phone's Needs attention and Source history — `GET /api/attention`, `GET /api/activity` (P6, 2026-10-21)
+
+Two read-only views the navi-connect hub serves to devices (`/lb/attention`, `/lb/activity`, cached 20 s
+there; navi-connect PROTOCOL §15.6). **Every row is an allowlist** (`_ATTENTION_FOLDER_KEYS` and the literal
+dicts in `_attention_view` / `_activity_view`): never a whole record, never a path, a peer filename, a token or
+a chat id. `/api/downloads` (its review rows carry the Telegram token and chat id) never goes through the hub.
+
+- **`/api/attention`**: `counts` are `/api/summary`'s own numbers by the same rules — `failedGaps` (visible
+  groups whose `_gap_status_for_group` is `failed`, as `_gaps_view` counts them), `failedRequests`
+  (`_album_fill_counts`' rule: a failed ledger row with a name or a release-group), `folders` and
+  `foldersUnidentified` (`_needs_placement_view`, `_unidentified_count`) — plus `picks` (visible groups at
+  `picking`). The to-fix number is the web UI's `needs.js`: `failedGaps + failedRequests + folders`, added up by
+  the client, never sent. `albums`: failed gaps and failed requests, newest first, then the picks, at most 50; a
+  request named from its row, else from the group covering its release (`_fill_names_by_release`), else left
+  out; a failed gap fill (a failed group AND a failed row under its release) listed once, as the group.
+  `folders`: at most 50, without `name`, `path`, `identifyError` (it can quote a path) or `coverUrl` (this
+  process's own cover route). `truncated` says how many rows the caps cut. Built from `_review_list_snapshot()`,
+  never `_gaps_view()`'s per-album view (1.4 MB on a 3,098-group library).
+- **`/api/activity`**: every row the fill ledger holds, live or terminal, newest first, at most 200 (what is
+  there is the ledger's own TTL rule, `_ALBUM_FILL_TERMINAL_TTL`; the endpoint prunes nothing), a gap fill's
+  nameless row named from its group with `gapFill`; `reason` through `_strip_host_paths`. `transfers`: at most
+  100, `{id, kind, album, artist, groupId, state, pct, peer}`, never `filename`, `path` or the composed `title`.
+
+Tests: `AttentionActivityTests` (12; every guard mutation-checked). Live, read-only, 2026-10-21 (before this was
+deployed): `/api/summary` 0.88 s and 3 failed gaps + 1 failed request + 16 folders (12 unidentified) = 20;
+`/api/placements` 16 rows, 7 KB, `formats` a string and `confidence` a word (`likely`, `possible`, `unknown`);
+both new routes answered 404 `{"error"}` with no `code`, which the clients read as "older".
+
 ### Why a playlist scan was taking 40 minutes
 
 `group_missing_by_album` is O(tracks in the matched *releases*), not O(missing

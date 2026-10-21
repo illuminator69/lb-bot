@@ -32421,6 +32421,194 @@ def _summary_view() -> dict:
         "ts": time.time(),
     }
 
+# ---------------------------------------------------------------------------
+# P6: the phone's Needs attention and Source history (`GET /api/attention`,
+# `GET /api/activity`; navi-connect PROTOCOL §15.6)
+#
+# Both answer through the hub to a device, so each row is built from an
+# explicit allowlist: never a whole record, never a path, a peer filename, a
+# token or a chat id. Both are capped, and say how many rows the caps cut.
+# Neither builds `_gaps_view`'s per-album view (1.4 MB on a 3,000-group
+# library): the gap counts are worked out here from the list snapshot by the
+# same rule `_gaps_view` counts them by.
+# ---------------------------------------------------------------------------
+
+ATTENTION_ALBUMS_MAX = 50
+ATTENTION_FOLDERS_MAX = 50
+ACTIVITY_REQUESTS_MAX = 200
+ACTIVITY_TRANSFERS_MAX = 100
+
+# The keys a folder row may carry off `_needs_placement_view()`. Not `name`,
+# `path`, `identifyError` (it can quote a path) or `coverUrl` (lb-bot's own
+# cover route, which no phone can reach).
+_ATTENTION_FOLDER_KEYS = ("id", "fileCount", "formats", "matchLabel", "confidence",
+                          "canConfirm", "groupId", "releaseMbid", "identified")
+
+
+def _caa_rg_cover(rgid: str) -> str:
+    return f"https://coverartarchive.org/release-group/{rgid}/front-250" if rgid else ""
+
+
+def _attention_view() -> dict:
+    """lb-bot's own "to fix" for a client: the summary's three counts plus the
+    picks, and the rows behind them.
+
+    `counts` are `/api/summary`'s fields under the same rules: `failedGaps` is
+    `gaps.failed` (visible groups whose status is `failed`), `failedRequests`
+    is `requests.failed` (failed ledger rows that can be named), `folders` and
+    `foldersUnidentified` are `transfers.needsPlacement` and `.unidentified`.
+    `picks` (visible groups at `picking`) is listed, never part of the to-fix
+    number, which the client adds up as the web UI does (`needs.js`).
+
+    `albums`: failed gaps and failed whole-album requests, then the picks,
+    newest first inside each, at most ATTENTION_ALBUMS_MAX. A failed request
+    is named from its ledger row, else from the review group that covers its
+    release (`_fill_names_by_release`, the web UI's `namedFills`), else left
+    out: a row that cannot be named cannot be acted on.
+    """
+    snap = _review_list_snapshot()
+    failed_gaps, picks = [], []
+    for group in snap.get("groups", []) or []:
+        if group.get("hidden"):
+            continue
+        status = _gap_status_for_group(group)
+        if status not in ("failed", "picking"):
+            continue
+        rgid = group.get("rgid", "") or ""
+        row = {
+            "kind": "gap", "key": group.get("id", ""), "groupId": group.get("id", ""),
+            "releaseMbid": group.get("canonical_mbid", "") or group.get("release_mbid", "") or "",
+            "rgid": rgid, "albumId": group.get("canonical_album_id", "") or "",
+            "artist": group.get("artist", "") or "", "album": group.get("album", "") or "",
+            "coverUrl": _caa_rg_cover(rgid), "state": status,
+            "missingCount": len(group.get("missing_tracks") or []),
+            "total": int(group.get("total") or 0),
+            "updatedAt": float(group.get("updated_at") or 0),
+        }
+        (failed_gaps if status == "failed" else picks).append(row)
+
+    with _album_fill_lock:
+        ledger = [(mbid, dict(entry or {})) for mbid, entry in _album_fill_status.items()]
+    names = None
+    failed_requests = []
+    nameable = 0
+    for mbid, entry in ledger:
+        if entry.get("state") != "failed":
+            continue
+        artist, album = entry.get("artist", "") or "", entry.get("album", "") or ""
+        rgid = entry.get("rgid", "") or ""
+        # The summary's own rule (`_album_fill_counts`): a row is counted when
+        # it carries a name or a release-group.
+        if artist or album or rgid:
+            nameable += 1
+        group_id, album_id = entry.get("groupId", "") or "", ""
+        if not (artist or album):
+            if names is None:
+                names = _fill_names_by_release()
+            known = names.get(mbid) or {}
+            artist, album = known.get("artist", ""), known.get("album", "")
+            group_id = group_id or known.get("groupId", "")
+            album_id = known.get("albumId", "")
+        if not (artist or album or rgid):
+            continue
+        failed_requests.append({
+            "kind": "request", "key": mbid, "groupId": group_id, "releaseMbid": mbid,
+            "rgid": rgid, "albumId": album_id, "artist": artist, "album": album,
+            "coverUrl": _caa_rg_cover(rgid), "state": "failed",
+            "missingCount": 0, "total": int(entry.get("total") or 0),
+            "updatedAt": float(entry.get("updated_at") or 0),
+        })
+
+    # A gap fill that failed is both a failed group and a failed ledger row
+    # under the group's release: list it once, as the group (it stays counted
+    # in both numbers, as the summary counts it).
+    gap_releases = {g["releaseMbid"] for g in failed_gaps if g["releaseMbid"]}
+    failed_requests = [r for r in failed_requests if r["releaseMbid"] not in gap_releases]
+
+    def newest(rows):
+        return sorted(rows, key=lambda r: r["updatedAt"], reverse=True)
+    albums = newest(failed_gaps + failed_requests) + newest(picks)
+
+    placements = _needs_placement_view()
+    folders = []
+    for p in placements:
+        row = {k: p.get(k) for k in _ATTENTION_FOLDER_KEYS}
+        row["identified"] = bool(p.get("identified")) or bool(p.get("match"))
+        row["matchLabel"] = p.get("matchLabel", "") or ""
+        folders.append(row)
+
+    return {
+        "version": 1,
+        "serverTime": time.time(),
+        "counts": {
+            "failedGaps": len(failed_gaps),
+            "failedRequests": nameable,
+            "folders": len(placements),
+            "foldersUnidentified": _unidentified_count(placements),
+            "picks": len(picks),
+        },
+        "albums": albums[:ATTENTION_ALBUMS_MAX],
+        "folders": folders[:ATTENTION_FOLDERS_MAX],
+        "truncated": {"albums": max(0, len(albums) - ATTENTION_ALBUMS_MAX),
+                      "folders": max(0, len(folders) - ATTENTION_FOLDERS_MAX)},
+    }
+
+
+def _activity_view() -> dict:
+    """Every request the fill ledger still holds, live or terminal, newest
+    first (at most ACTIVITY_REQUESTS_MAX), and the file-level transfers (at
+    most ACTIVITY_TRANSFERS_MAX). How long a terminal row stays is the ledger's
+    own rule (`_ALBUM_FILL_TERMINAL_TTL`); nothing here prunes. A gap fill's
+    row, written under the release id alone, is named from its review group and
+    marked `gapFill`, as `/api/fills` does."""
+    with _album_fill_lock:
+        ledger = [(mbid, dict(entry or {})) for mbid, entry in _album_fill_status.items()]
+    ledger.sort(key=lambda kv: float(kv[1].get("updated_at") or 0), reverse=True)
+    names = None
+    requests_out = []
+    for mbid, entry in ledger:
+        state = entry.get("state") or ""
+        if not state or state == "unknown":
+            continue
+        artist, album = entry.get("artist", "") or "", entry.get("album", "") or ""
+        group_id, album_id, gap_fill = entry.get("groupId", "") or "", "", False
+        if not (artist or album):
+            if names is None:
+                names = _fill_names_by_release()
+            known = names.get(mbid)
+            if known:
+                artist, album = known["artist"], known["album"]
+                group_id = group_id or known["groupId"]
+                album_id, gap_fill = known["albumId"], True
+        total = int(entry.get("total") or 0)
+        done = int(entry.get("done") or 0)
+        requests_out.append({
+            "releaseMbid": mbid, "rgid": entry.get("rgid", "") or "",
+            "groupId": group_id, "albumId": album_id,
+            "artist": artist, "album": album, "state": state,
+            "percent": int(done * 100 / total) if total else 0,
+            "done": done, "total": total,
+            "failureKind": entry.get("failureKind", "") or "",
+            "reason": _strip_host_paths(entry.get("reason", "") or ""),
+            "retryable": bool(entry.get("retryable")),
+            "gapFill": gap_fill,
+            "updatedAt": float(entry.get("updated_at") or 0),
+        })
+        if len(requests_out) >= ACTIVITY_REQUESTS_MAX:
+            break
+    transfers = []
+    for t in (_transfers_view().get("transfers") or [])[:ACTIVITY_TRANSFERS_MAX]:
+        sub = t.get("sub", "") or ""
+        transfers.append({
+            "id": t.get("id", ""), "kind": t.get("kind", ""),
+            "album": t.get("album", "") or "", "artist": t.get("artist", "") or "",
+            "groupId": t.get("groupId", "") or "", "state": t.get("state", ""),
+            "pct": int(t.get("pct") or 0),
+            "peer": t.get("username", "") or (sub[len("from @"):] if sub.startswith("from @") else ""),
+        })
+    return {"version": 1, "serverTime": time.time(),
+            "requests": requests_out, "transfers": transfers}
+
 def start_web_dashboard() -> None:
     if not WEB_UI_ENABLED:
         return
@@ -32785,6 +32973,16 @@ def start_web_dashboard() -> None:
     @app.get("/api/transfers")
     def api_transfers():
         return jsonify(_transfers_view())
+
+    # P6 (PROTOCOL §15.6): the phone's Needs attention and Source history.
+    # Read-only and allowlisted; the hub serves both to devices.
+    @app.get("/api/attention")
+    def api_attention():
+        return jsonify(_attention_view())
+
+    @app.get("/api/activity")
+    def api_activity():
+        return jsonify(_activity_view())
 
     @app.get("/api/library")
     def api_library():

@@ -15,8 +15,15 @@ import OverridesTab from './Overrides.jsx'
 // edited.
 const TABS = [['status', 'Status'], ['sources', 'Source rules'], ['overrides', 'Overrides'], ['activity', 'Activity'], ['logs', 'Logs'], ['appearance', 'Appearance']]
 
+// Worbus P1: a non-admin has Appearance alone (a per-browser setting); a
+// server that does not download has no Source rules.
+function tabsFor({ isAdmin, downloadsOn }) {
+  if (!isAdmin) return TABS.filter(([k]) => k === 'appearance')
+  return downloadsOn ? TABS : TABS.filter(([k]) => k !== 'sources')
+}
+
 function SystemFrame({ tab, sub, bar, action, children }) {
-  const { state } = useApp()
+  const { state, isAdmin, downloadsOn } = useApp()
   const checks = state.health?.checks
   const failing = checks ? checks.filter(c => !c.ok).length : 0
   const line = sub ?? (checks
@@ -24,7 +31,7 @@ function SystemFrame({ tab, sub, bar, action, children }) {
     : '')
   return (
     <Page title="System" sub={line} action={action} bar={bar}
-      tabs={TABS} tab={tab} onTab={k => navigate('system', k)}>
+      tabs={tabsFor({ isAdmin, downloadsOn })} tab={tab} onTab={k => navigate('system', k)}>
       {children}
     </Page>
   )
@@ -467,8 +474,11 @@ function Status() {
             <Grp>Configuration<span className="note">from environment variables on the container</span></Grp>
             {settings.cards.map((c, i) => (
               <div className="rows mb-2.5" key={i}>
-                <KV label={<span className="t" style={{ color: 'var(--fg)' }}>{c.title}</span>} st={c.ok ? 'OK' : 'Check'}
-                  note={!c.ok && c.fix ? c.fix : null} />
+                {/* A feature that is off (downloading, with no slskd key) is no
+                    failure: it says so, and how to turn it on. */}
+                <KV label={<span className="t" style={{ color: 'var(--fg)' }}>{c.title}</span>}
+                  st={c.state === 'off' ? 'Off' : c.ok ? 'OK' : 'Check'}
+                  note={(c.state === 'off' || !c.ok) && c.fix ? c.fix : null} />
                 {Object.entries(c.values || {}).map(([k, v]) => <KV key={k} label={k} mono>{String(v)}</KV>)}
               </div>
             ))}
@@ -496,7 +506,7 @@ const TASK_KIND = {
 }
 
 function Activity() {
-  const { state, action, pushToast } = useApp()
+  const { state, action, pushToast, downloadsOn } = useApp()
   const [filter, setFilter] = useState('')
   const tasks = useMemo(() => Object.values(state.tasks || {})
     .sort((a, b) => (b.started_at || 0) - (a.started_at || 0)), [state.tasks])
@@ -552,10 +562,12 @@ function Activity() {
             ))}
           </div>
         )}
-        <p className="muted mt-3">
-          Downloads and album requests have their own page:{' '}
-          <button className="link" onClick={() => navigate('activity')}>Activity</button>.
-        </p>
+        {downloadsOn && (
+          <p className="muted mt-3">
+            Downloads and album requests have their own page:{' '}
+            <button className="link" onClick={() => navigate('activity')}>Activity</button>.
+          </p>
+        )}
       </div>
     </SystemFrame>
   )

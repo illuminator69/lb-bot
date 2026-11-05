@@ -32,6 +32,8 @@ function aliasOf(segs) {
       return ['activity']
     case 'import': return rest.length ? ['place', ...rest] : ['needs', 'fix']
     case 'fresh': return ['discover', 'new']
+    // The wishlist moved to Library (Worbus P1).
+    case 'discover': return rest[0] === 'wishlist' ? ['library', 'wishlist'] : null
     case 'settings': return ['system', ...rest]
     case 'system': {
       const sub = { health: 'status', prefs: 'sources' }[rest[0]]

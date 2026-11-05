@@ -6,17 +6,15 @@ import Cover from '../components/Cover.jsx'
 import Page, { Grp, Pick, Seg } from '../components/Page.jsx'
 import { ago, Chip, EmptyState, fmtDuration, Skeleton } from '../components/ui.jsx'
 
-// Discover is what you don't have yet: New releases (the ListenBrainz feed),
-// Charts (Deezer's chart and editors' picks), and the Wishlist — albums nobody
-// was sharing, which lb-bot keeps looking for.
-const TABS = ['new', 'charts', 'wishlist']
+// Discover is what you don't have yet: New releases (the ListenBrainz feed)
+// and Charts (Deezer's chart and editors' picks). The Wishlist lives in
+// Library since Worbus P1 (`#/discover/wishlist` is aliased there).
+const TABS = ['new', 'charts']
 
 function DiscoverPage({ tab, sub, bar, children }) {
-  const { state } = useApp()
-  const wished = state.wishlist?.total ?? state.wishlist?.wishlist?.length
   return (
     <Page title="Discover" sub={sub}
-      tabs={[['new', 'New releases'], ['charts', 'Charts'], ['wishlist', 'Wishlist', wished || null]]}
+      tabs={[['new', 'New releases'], ['charts', 'Charts']]}
       tab={tab} onTab={k => navigate('discover', k)} bar={bar}>
       {children}
     </Page>
@@ -37,9 +35,11 @@ const tileSkeleton = (
 
 /** Add / on-the-wishlist toggle. Adding is idempotent on the server. */
 function WishButton({ wished, disabled, onAdd, className = 'sm' }) {
+  const { downloadsOn } = useApp()
   return (
     <button className={`${className}${wished ? ' done-state' : ''}`} disabled={disabled || wished} aria-pressed={wished}
-      title="lb-bot searches for it again every few hours until a peer shares it" onClick={onAdd}>
+      title={downloadsOn ? 'lb-bot searches for it again every few hours until a peer shares it'
+        : 'Saved for later. Worbus looks for it once downloading is set up'} onClick={onAdd}>
       {wished ? 'On the wishlist' : 'Add to wishlist'}
     </button>
   )
@@ -94,6 +94,7 @@ const BUCKET_LABEL = {
 // release-group (which resolves editions, tracklist and sources); Find sources
 // opens the same page with the search already running.
 function FreshCard({ r, onOpenArtist, onOpenAlbum, onFindSources, wished, onWishlist }) {
+  const { canDownload } = useApp()
   const upcoming = r.releaseDate && r.releaseDate > new Date().toISOString().slice(0, 10)
   const open = () => (r.releaseGroupMbid ? onOpenAlbum(r) : onOpenArtist(r))
   return (
@@ -114,8 +115,8 @@ function FreshCard({ r, onOpenArtist, onOpenAlbum, onFindSources, wished, onWish
         {r.releaseOwned ? (
           // Already in the library — don't offer a duplicate download.
           <button className="sm" onClick={() => onOpenArtist(r)}>View</button>
-        ) : upcoming ? (
-          // Not out yet: the wishlist searches until someone shares it.
+        ) : upcoming || !canDownload ? (
+          // Not out yet, or no downloading here: the wishlist is the way to keep it.
           <WishButton wished={wished} disabled={!r.releaseGroupMbid} onAdd={() => onWishlist(r)} />
         ) : (
           <button className="sm" disabled={!r.releaseGroupMbid} onClick={() => onFindSources(r)}>Find sources</button>
@@ -309,7 +310,7 @@ async function resolveRgid(row) {
 }
 
 function ChartAlbum({ a }) {
-  const { pushToast } = useApp()
+  const { pushToast, canDownload } = useApp()
   const [busy, setBusy] = useState('')
   async function open(pick) {
     setBusy(pick ? 'find' : 'open')
@@ -338,7 +339,9 @@ function ChartAlbum({ a }) {
         {a.releaseOwned ? <span className="st ok">In library</span> : <span className="st">Not in library</span>}
         {a.releaseOwned
           ? <button className="sm" disabled={!!busy} onClick={() => open(false)}>View</button>
-          : <button className="sm" disabled={!!busy} aria-busy={busy === 'find'} onClick={() => open(true)}>Find sources</button>}
+          : canDownload
+            ? <button className="sm" disabled={!!busy} aria-busy={busy === 'find'} onClick={() => open(true)}>Find sources</button>
+            : <button className="sm" disabled={!!busy} aria-busy={busy === 'open'} onClick={() => open(false)}>Open</button>}
       </div>
     </div>
   )
@@ -423,65 +426,8 @@ function Charts() {
   )
 }
 
-// ── Wishlist ─────────────────────────────────────────────────────────────────
-const caaCover = rgid => rgid ? `https://coverartarchive.org/release-group/${rgid}/front-250` : null
-
-function Wishlist() {
-  const { state, pushToast, scheduleRefresh } = useApp()
-  const data = state.wishlist
-  const [busy, setBusy] = useState('')
-  const rows = data?.wishlist || []
-  async function remove(r) {
-    setBusy(r.rgid)
-    try {
-      await post('/api/wishlist/remove', { rgid: r.rgid })
-      pushToast(`Removed ${r.title} from the wishlist`)
-      scheduleRefresh(300)
-    } catch (e) {
-      pushToast(`Could not remove: ${e.message}`, 'error')
-    } finally { setBusy('') }
-  }
-  const every = data?.intervalSeconds ? fmtDuration(data.intervalSeconds) : '6 h'
-  const cooldown = data?.cooldownSeconds ? fmtDuration(data.cooldownSeconds) : '12 h'
-  return (
-    <DiscoverPage tab="wishlist" sub="Albums nobody was sharing, searched again on a slow schedule">
-      {data === null ? <p className="muted">Loading the wishlist…</p> : !rows.length ? (
-        <p className="empty">
-          The wishlist is empty. Albums with no source go here, and lb-bot searches for one of them every {every}.
-        </p>
-      ) : (
-        <>
-          <div className="rows arrive">
-            {rows.map(r => (
-              <div key={r.rgid} className="row stack">
-                <Cover url={caaCover(r.rgid)} name={r.title || '?'} size={40} />
-                <div className="grow">
-                  <button className="link plain t clip block max-w-full" onClick={() => goAlbum(r.rgid)}>{r.title || r.rgid}</button>
-                  <div className="s clip">
-                    {r.artist}{' · added '}{ago(r.addedAt)} ago
-                    {r.lastTriedAt ? ` · searched ${ago(r.lastTriedAt)} ago` : ' · not searched yet'}
-                    {r.attempts ? ` · ${r.attempts} search${r.attempts === 1 ? '' : 'es'}` : ''}
-                  </div>
-                  {r.lastReason && <div className="s clip">{r.lastReason}</div>}
-                </div>
-                <button className="sm" onClick={() => goAlbum(r.rgid, true)}>Find sources</button>
-                <button className="sm quiet" disabled={busy === r.rgid} onClick={() => remove(r)}>Remove</button>
-              </div>
-            ))}
-          </div>
-          <p className="muted mt-3" style={{ maxWidth: '70ch' }}>
-            lb-bot searches for one of these every {every}, and for each at most every {cooldown}. When one lands it
-            leaves the list on its own. Add albums from an album page, from New releases, or from a failed request
-            under Needs you.
-          </p>
-        </>
-      )}
-    </DiscoverPage>
-  )
-}
-
 export default function Discover() {
   const { state } = useApp()
   const tab = TABS.includes(state.routeParams[0]) ? state.routeParams[0] : 'new'
-  return tab === 'charts' ? <Charts /> : tab === 'wishlist' ? <Wishlist /> : <NewReleases />
+  return tab === 'charts' ? <Charts /> : <NewReleases />
 }

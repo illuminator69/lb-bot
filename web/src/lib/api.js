@@ -1,3 +1,9 @@
+// Worbus P1: lb-bot's web UI is behind the Navidrome login. A 401
+// `signin_required` from any route means the session is gone (expired, or
+// lb-bot restarted): the app shows its sign-in page (App.jsx sets this).
+let signedOut = null
+export function onSignedOut(fn) { signedOut = fn }
+
 export async function api(path, opts = {}) {
   // `timeoutMs` is opt-in, not a default: some routes here deliberately run for
   // minutes (scans, source searches). It exists for the read-only lookups a
@@ -42,6 +48,7 @@ export async function api(path, opts = {}) {
     err.status = res.status
     throw err
   }
+  if (res.status === 401 && data?.code === 'signin_required' && signedOut) signedOut()
   if (!res.ok) {
     const err = new Error(data.reason || data.error || data.message || res.statusText)
     // Structured error envelope ({code, reason, detail, nextSource, logTail})
@@ -57,6 +64,8 @@ export const get = (path) => api(path)
 
 export const post = (path, body = {}) =>
   api(path, { method: 'POST', body: JSON.stringify(body) })
+
+export const del = (path) => api(path, { method: 'DELETE' })
 
 export const put = (path, body = {}) =>
   api(path, { method: 'PUT', body: JSON.stringify(body) })

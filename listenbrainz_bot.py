@@ -23,6 +23,7 @@ import glob
 import json
 import time
 import hashlib
+import hmac
 import math
 import zlib
 import datetime
@@ -58,6 +59,19 @@ from telegram.ext import (
 NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "http://navidrome:4533")
 SLSKD_URL     = os.environ.get("SLSKD_URL", "http://slskd:5030")
 SLSKD_API_KEY = os.environ.get("SLSKD_API_KEY", "")        # Options > API Keys in the slskd UI
+# Worbus P1 S2: downloading is a mode, on iff an slskd API key is set. Read
+# once at start, so changing it needs a restart. SLSKD_URL always has a
+# default, so it cannot be the test. With it off lb-bot makes no slskd call
+# at all, and every route that would start or need a download answers 409
+# `downloads_off` (`needs_downloads`).
+DOWNLOADS_ON = bool(SLSKD_API_KEY.strip())
+
+def _downloads_on() -> bool:
+    """Whether downloading is on. Reads `DOWNLOADS_ON` at call time."""
+    return bool(DOWNLOADS_ON)
+
+DOWNLOADS_OFF_BODY = {"code": "downloads_off",
+                      "error": "Downloading is not set up on this server."}
 
 # MusicBrainz — contact email required by their API ToS
 MBZ_CONTACT   = os.environ.get("MBZ_CONTACT", "")  # required by MusicBrainz API ToS
@@ -168,7 +182,9 @@ FUZZY_DUPLICATES_DEFAULT = os.environ.get(
 # the index on its own soon enough — so an unset URL, a wrong token or a hub that
 # is down all mean "no ping", never a failed placement.
 HUB_NOTIFY_URL   = os.environ.get("LB_BOT_HUB_URL", "").rstrip("/")
-HUB_NOTIFY_TOKEN = os.environ.get("LB_BOT_HUB_TOKEN", "")
+# Stripped: a token read from a secrets file keeps its trailing newline,
+# and the hub's `Bearer` header never carries one (review S#10).
+HUB_NOTIFY_TOKEN = os.environ.get("LB_BOT_HUB_TOKEN", "").strip()
 
 # Placement file mode. Nothing in this image reads a UMASK env var on our behalf
 # (python:3.11-slim, bare `python` CMD — no s6/linuxserver init), so apply it
@@ -186,6 +202,40 @@ if LB_BOT_UMASK:
 # It used to be a hand-edited constant, which went three months stale and made
 # the System screen name a June build while an unreleased one was running.
 WEB_BUILD = (os.environ.get("LB_BOT_REVISION", "") or "").strip() or "unknown"
+
+# B-095: what an open tab of the web UI compares to notice an upgrade. The
+# revision the image was built with (`LB_BOT_REVISION`, baked in by the
+# Dockerfile: `deploy.sh dev` passes `<commit>[+dirty]-dev`, CI the pushed sha),
+# and a digest of the SPA's own `index.html`, which names the content-hashed
+# script it loads — so a rebuilt page reads as new even where the revision is
+# "unknown" (a source checkout). Read once: one process serves one build.
+_WEB_BUILD_ID: list = []
+
+def _web_build_id_of(revision: str, page: str) -> str:
+    """`<revision>+<12 hex of the page's sha256>`, `+no-page` with no page."""
+    try:
+        with open(page, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+    except OSError:
+        digest = "no-page"
+    return f"{revision}+{digest}"
+
+def _web_build_id() -> str:
+    if not _WEB_BUILD_ID:
+        _WEB_BUILD_ID.append(_web_build_id_of(WEB_BUILD, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "web", "dist", "index.html")))
+    return _WEB_BUILD_ID[0]
+
+def _web_page_with_build(page: str, build: str) -> str:
+    """The SPA's index.html with the build that serves it, as
+    `<meta name="lb-bot-build">` right after `<head>`: a tab's baseline is the
+    page it loaded, not its first `/api/health` answer — which, for a page
+    loaded just before a restart, is already the new build (B-095 review 12)."""
+    meta = f'<meta name="lb-bot-build" content="{html.escape(build, quote=True)}">'
+    head = re.search(r"<head[^>]*>", page, re.I)
+    if not head:
+        return meta + page
+    return page[:head.end()] + meta + page[head.end():]
 
 # ---------------------------------------------------------------------------
 # Pooled HTTP
@@ -1638,6 +1688,12 @@ def _review_list_snapshot() -> dict:
             for k in ("canonical_mbid", "release_mbid"):
                 if group.get(k):
                     row[k] = group[k]
+            # The release-group the artist-discography path set on it (S1): the
+            # phone's Needs attention builds a cover URL and opens the album by
+            # it. Absent when the group has none, like the two above; read from
+            # memory, so not a review_groups column.
+            if group.get("rgid"):
+                row["rgid"] = group["rgid"]
             # Whether a source search has left results to pick from — the rail
             # used to say "source ready" for every album, searched or not.
             row["source_count"] = len(
@@ -2379,7 +2435,7 @@ def _place_group_downloads(group_id: str, token: str = "", only_paths=None) -> d
             _start_placement_verification(group_id)
         if result.get("moved"):
             outcome["scanned"] = bool(_nd_scan_after_import(
-                token or (_default_web_user() or {}).get("telegram_token", "")))
+                token or _web_user_key()))
         if outcome["placed"] or outcome["refused"] or outcome["deferred"]:
             print(f"  placement: group {group_id}: {outcome['placed']} downloaded "
                   f"file(s) placed, {outcome['refused']} refused"
@@ -2643,7 +2699,13 @@ def _startup_placement(pause=time.sleep) -> int:
     With no Navidrome login configured there is nothing to wait for, and the
     pass runs as it always did. `pause` is the sleep between two looks.
     Returns how many rows were placed.
+
+    With downloading off (Worbus P1 S2) it does nothing: placing moves
+    files and asks Navidrome to scan, and a server that does not download
+    has nothing of lb-bot's to place (review S#5).
     """
+    if not _downloads_on():
+        return 0
     if (_default_web_user() or {}).get("navidrome_user"):
         waited = 0
         while not _navidrome_answers():
@@ -2786,7 +2848,12 @@ def _resume_placement_verification() -> int:
     its window again from the worker's start (`_placement_verify_deadline`): a
     row placed before the restart is verified if Navidrome has it, and reset by
     the verifier itself if it still does not when the window closes — what the
-    lost verifier would have done."""
+    lost verifier would have done.
+
+    Not with downloading off (review S#5): a verifier asks Navidrome to
+    scan, and that server places nothing; the rows stay as they are."""
+    if not _downloads_on():
+        return 0
     with _review_lock:
         group_ids = [g.get("id", "") for g in _review_state.get("groups", []) or []
                      if any(t.get("decision") == "placed"
@@ -2920,12 +2987,15 @@ def _verify_placement_worker(group_id: str) -> None:
                 with _review_lock:
                     group = _find_review_group(group_id) or {}
                     g_artist, g_album = group.get("artist", ""), group.get("album", "")
+                    g_rgid = group.get("rgid", "") or ""
                     g_mbids = {group.get("canonical_mbid", ""), group.get("release_mbid", "")}
                 # A gap fill shares the album ledger (its transfer group carries
                 # the release), but only this worker verifies it — and it never
                 # wrote the row, so gap rows sat on `placed` forever.
-                _album_fill_mark_group_verified(group_id, g_mbids - {""},
-                                                _album_ids_of(matched))
+                _album_fill_mark_group_verified(
+                    group_id, g_mbids - {""}, _album_ids_of(matched),
+                    labels={"labelArtist": g_artist, "labelAlbum": g_album,
+                            "labelRgid": g_rgid})
                 if loose:
                     _announce_loose_songs_indexed(matched)
                 else:
@@ -3013,6 +3083,45 @@ _ALBUM_FILL_PER_FILL_FIELDS = (
     "allFiles", "leftOut",
 )
 
+# B-254: what a gap fill's ledger row is called. A gap fill begins no row
+# (`_album_fill_begin` is a whole-album request's), so its row is written under
+# the release id alone and was named only from its review group, which is gone
+# once the group is retired: 10 of 22 live activity rows read as a raw id. The
+# names are stamped on the row at its first write, under keys of their own:
+# `artist` and `album` on a row mean "a whole-album request" — they arm the
+# automatic whole-album retry (`_album_fill_fail`) and count it as a named
+# request (`_album_fill_counts`) — and a gap fill must do neither.
+_FILL_LABEL_KEYS = ("labelArtist", "labelAlbum", "labelRgid")
+
+def _album_fill_stamp_labels(entry: dict, labels: dict) -> None:
+    """Put a gap fill's names on its ledger row, under `_album_fill_lock`:
+    each label once (the first write wins), and never on a row that carries a
+    whole-album request's own `artist` or `album`."""
+    if not labels or entry.get("artist") or entry.get("album"):
+        return
+    for key in _FILL_LABEL_KEYS:
+        value = str(labels.get(key) or "")
+        if value and not entry.get(key):
+            entry[key] = value
+
+def _gap_fill_labels(group_id: str, artist: str = "", album: str = "") -> dict:
+    """The labels for a gap fill of review group `group_id`: the group's own
+    artist, album and release-group, else the names the transfer group was
+    queued under. Reads the live group under `_review_lock` without marking
+    it (nothing slow, nothing written). {} for no group id."""
+    if not group_id:
+        return {}
+    group = None
+    with _review_lock:
+        for g in _review_state.get("groups", []) or []:
+            if g.get("id") == group_id:
+                group = {k: g.get(k, "") for k in ("artist", "album", "rgid")}
+                break
+    group = group or {}
+    return {"labelArtist": group.get("artist") or artist or "",
+            "labelAlbum": group.get("album") or album or "",
+            "labelRgid": group.get("rgid") or ""}
+
 def _album_fill_set(release_mbid: str, state: str, **fields) -> bool:
     """Record where one release-group's fill has got to. Last writer wins —
     with one exception: a `cancelled` row is refused-over.
@@ -3036,6 +3145,7 @@ def _album_fill_set(release_mbid: str, state: str, **fields) -> bool:
         return False
     durable = bool(fields.pop("durable", False))
     begin = bool(fields.pop("begin", False))
+    labels = fields.pop("labels", None) or {}
     with _album_fill_lock:
         entry = _album_fill_status.setdefault(release_mbid, {})
         if (entry.get("state") == "cancelled" and state != "cancelled"
@@ -3044,6 +3154,7 @@ def _album_fill_set(release_mbid: str, state: str, **fields) -> bool:
                   f"({release_mbid[:8]})")
             return False
         entry.update(fields)
+        _album_fill_stamp_labels(entry, labels)
         entry["state"] = state
         entry["updated_at"] = time.time()
         entry.setdefault("created_at", entry["updated_at"])
@@ -3590,14 +3701,17 @@ def _album_group_for_release(release_mbid: str) -> tuple:
     return "", None
 
 def _album_fill_mark_group_verified(group_id: str, release_mbids: set,
-                                    nd_album_ids: list) -> None:
-    """Flip every `placed` ledger row that belongs to a review group."""
+                                    nd_album_ids: list, labels: dict = None) -> None:
+    """Flip every `placed` ledger row that belongs to a review group, and
+    name it from the group where its first write did not (B-254: a row a
+    build before this one placed)."""
     with _album_fill_lock:
         targets = [m for m, e in _album_fill_status.items()
                    if e.get("state") == "placed"
                    and (m in release_mbids or (group_id and e.get("groupId") == group_id))]
     for mbid in targets:
-        _album_fill_set(mbid, "verified", ndAlbumIds=list(nd_album_ids or []))
+        _album_fill_set(mbid, "verified", ndAlbumIds=list(nd_album_ids or []),
+                        labels=labels)
 
 def _start_album_fill_verification(release_mbid: str, result: dict,
                                    artist: str = "", rgid: str = "",
@@ -3707,13 +3821,76 @@ def _strip_host_paths(text) -> str:
         text = re.sub(rf"(?<![\w./-]){p}/*(?![\w.-])", lambda _m: name, text)
     return text
 
+# Roots a path can start at that are neither of the two mounts `_strip_host_paths`
+# knows (S3, audit L3-04): a state file under /config, a home directory, a tmp
+# dir. Reduced to the last segment, so the sentence still names the file.
+_WIRE_PATH_ROOTS = ("config", "beets", "app", "data", "tmp", "home", "root", "mnt",
+                    "usr", "var", "etc")
+# The scheme is anchored with a lookbehind, not `\b`: `\b` lets a match start at
+# every word boundary inside a long run of letters, dots and dashes, and each
+# start scans to the end of the run before it fails (quadratic: 50 KB took 6.8 s).
+# The lookbehind admits a start only at the front of a run.
+_WIRE_URL_USERINFO = re.compile(
+    r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://)[^/\s@]+@([^/:\s?#]+)")
+# `_wire_text` cuts its input here before any regex runs: the output is cut at
+# `limit` anyway, and an exception's `str(e)` has no length bound of its own.
+_WIRE_INPUT_CEILING = 4000
+_WIRE_ROOT_PATH = re.compile(
+    r"(?<![\w.~:/\]-])/(?:" + "|".join(_WIRE_PATH_ROOTS) + r")(?:/[^\s'\"),;]*)?(?![\w-])")
+_WIRE_WIN_PATH = re.compile(r"(?<!\w)[A-Za-z]:\\[^\s'\"),;]*")
+_WIRE_UNC_PATH = re.compile(r"(?<![\w\\])\\\\[^\s\\]+\\[^\s'\"),;]*")
+
+def _wire_text(text, limit: int = 300) -> str:
+    """The one redaction for free text that reaches a device (S3, audit L3-04
+    and L3-05): `/api/activity` and `/api/album/status` reasons, the fall-back
+    text of an OS error, and the message of an /api/* 500.
+
+    `_redact_secrets` (keys, tokens, Subsonic query credentials, hosts) and
+    `_strip_host_paths` (the download and library mounts), then what neither
+    covers: URL userinfo (`https://user:pass@host` lost `user` and kept `:pass@`
+    to the first), an absolute path under another root (`_WIRE_PATH_ROOTS`) and
+    a Windows or UNC path, each reduced to its last segment; finally cut at
+    `limit` characters on a word boundary with an ellipsis. The cut comes last
+    so no half-redacted secret survives it. Never raises; None reads as ""."""
+    try:
+        text = str(text) if text else ""
+        text = text[:max(_WIRE_INPUT_CEILING, (limit or 0) * 8)]
+        text = _strip_host_paths(_redact_secrets(text))
+
+        def userinfo(m):
+            host = m.group(2)
+            if host.lower() not in ("localhost", "127.0.0.1"):
+                host = "[redacted-host]"
+            return f"{m.group(1)}[redacted]@{host}"
+
+        def last_segment(m):
+            raw = m.group(0)
+            body = raw.rstrip(".:")
+            tail = raw[len(body):]
+            return (re.split(r"[\\/]+", body.rstrip("\\/"))[-1] or "") + tail
+
+        text = _WIRE_URL_USERINFO.sub(userinfo, text)
+        text = _WIRE_ROOT_PATH.sub(last_segment, text)
+        text = _WIRE_WIN_PATH.sub(last_segment, text)
+        text = _WIRE_UNC_PATH.sub(last_segment, text)
+        text = text.strip()
+        if limit and len(text) > limit:
+            cut = text[:max(0, limit - 1)]
+            space = cut.rfind(" ")
+            if space > limit // 2 and not text[len(cut)].isspace():
+                cut = cut[:space]
+            text = cut.rstrip() + "\u2026"
+        return text
+    except Exception:
+        return ""
+
 def _os_error_text(e: Exception) -> str:
     """The OS's own reason ("Permission denied") when there is one — an
     OSError's `str(e)` names the paths involved. Otherwise the exception's own
     text with the mount prefixes taken off (`shutil.Error`, an OSError with no
     `strerror`, says "Destination path '…' already exists"; final review M-3),
     and only for an empty one its type."""
-    return (getattr(e, "strerror", None) or _strip_host_paths(str(e)).strip()
+    return (getattr(e, "strerror", None) or _wire_text(str(e))
             or type(e).__name__)
 
 def _album_fill_view(release_mbid: str, include_files: bool = True) -> dict:
@@ -3749,7 +3926,7 @@ def _album_fill_view(release_mbid: str, include_files: bool = True) -> dict:
         "percent": 0,
         "bytesDone": 0, "bytesTotal": 0, "speedBps": 0, "activeFiles": 0,
         # Stored rows keep the text they were written with (Q-021).
-        "reason": _strip_host_paths(entry.get("reason", "")),
+        "reason": _wire_text(entry.get("reason", "")),
         "mp3WouldHelp": bool(entry.get("mp3WouldHelp")),
         "allowMp3": bool(entry.get("allowMp3")),
         # What kind of failure, whether a plain Retry is worth offering, and how
@@ -4085,6 +4262,122 @@ def _fill_names_by_release() -> dict:
                          "groupId": g.get("id", "") or "",
                          "albumId": g.get("canonical_album_id", "") or ""}
     return out
+
+def _names_by_nd_album_ids(album_ids) -> dict:
+    """`navidrome album id -> {artist, album, rgid}` for a ledger row that
+    carries the Navidrome albums it was verified as (`ndAlbumIds`) and no name
+    (B-254: a gap fill placed before its rows were named). From the library
+    index — the release-group row that lists the album, in ONE query — and
+    then from the Navidrome album list lb-bot already holds in memory, which
+    is read and never fetched. No request of any kind; {} on any failure."""
+    ids = list(dict.fromkeys(str(a) for a in (album_ids or []) if a))[:900]
+    if not ids:
+        return {}
+    out: dict = {}
+    try:
+        with _index_lock:
+            rows = _index_db().execute(
+                "SELECT j.value AS album_id, rg.rgid, rg.title, a.name "
+                "FROM release_groups rg, json_each(rg.nd_album_ids) j "
+                "JOIN artists a ON a.artist_key = rg.artist_key "
+                f"WHERE j.value IN ({','.join('?' * len(ids))}) "
+                "AND rg.title != '' AND a.name != '' "
+                "ORDER BY rg.artist_key", ids).fetchall()
+        for album_id, rgid, title, artist in rows:
+            out.setdefault(str(album_id), {"artist": artist, "album": title, "rgid": rgid})
+    except Exception:
+        pass
+    left = [i for i in ids if i not in out]
+    if left:
+        with _ND_ALBUM_INDEX_LOCK:
+            held = list(_ND_ALBUM_INDEX.get("albums") or [])
+        wanted = set(left)
+        for album in held:
+            album_id = str((album or {}).get("id") or "")
+            if album_id in wanted and album.get("name") and album.get("artist"):
+                out.setdefault(album_id, {"artist": album["artist"],
+                                          "album": album["name"], "rgid": ""})
+    return out
+
+def _release_names_cached(release_mbid: str) -> dict:
+    """`{artist, album}` of a release from the MusicBrainz cache alone (any of
+    the release documents lb-bot asks for), never a request: {} when nothing
+    cached names both (B-254)."""
+    if not release_mbid:
+        return {}
+    path = f"release/{release_mbid}"
+    album = artist = ""
+    for inc in ("artist-credits", "release-groups artist-credits", "release-groups",
+                "recordings", "release-groups media", "release-groups recordings"):
+        doc = _mbz_cache.get(_mbz_cache_key(path, {"inc": inc}))
+        if not isinstance(doc, dict):
+            continue
+        album = album or str(doc.get("title") or
+                             (doc.get("release-group") or {}).get("title") or "")
+        artist = artist or _artist_credit_str(doc.get("artist-credit") or [])
+        if album and artist:
+            return {"artist": artist, "album": album}
+    return {}
+
+def _release_rgid_cached(release_mbid: str) -> str:
+    """The release-group id of a release from the MusicBrainz cache alone, never
+    a request: "" when no cached document of it names one (B-317). Every lookup
+    lb-bot makes with `release-groups` in its `inc` carries it, and those are
+    what is cached for most placed releases — documents with the release's
+    title and no artist credit, which `_release_names_cached` cannot use."""
+    if not release_mbid:
+        return ""
+    prefix = f"release/{release_mbid}?"
+    try:
+        keys = [k for k in list(_mbz_cache) if k.startswith(prefix)]
+    except Exception:
+        return ""
+    for key in sorted(keys):
+        doc = _mbz_cache.get(key)
+        rg = doc.get("release-group") if isinstance(doc, dict) else None
+        rgid = str((rg or {}).get("id") or "") if isinstance(rg, dict) else ""
+        if rgid:
+            return rgid
+    return ""
+
+def _names_by_rgid(rgids) -> dict:
+    """`rgid -> {artist, album}` read from the library index in ONE query, for a
+    ledger row that carries a release-group and no name (S1, audit L3-02): a
+    whole-album request from a source that never stamped one, or a row the gap
+    lookup could not match. Only rows with a title and an artist name count; an
+    rgid held under two artists answers with the first. No MusicBrainz request
+    and no lock but `_index_lock`. Returns {} on ANY failure: the activity view
+    must never fail for a name."""
+    ids = list(dict.fromkeys(r for r in (rgids or []) if r))[:900]
+    if not ids:
+        return {}
+    try:
+        with _index_lock:
+            rows = _index_db().execute(
+                "SELECT rg.rgid, rg.title, a.name FROM release_groups rg "
+                "JOIN artists a ON a.artist_key = rg.artist_key "
+                f"WHERE rg.rgid IN ({','.join('?' * len(ids))}) "
+                "AND rg.title != '' AND a.name != '' "
+                "ORDER BY rg.artist_key", ids).fetchall()
+    except Exception:
+        return {}
+    out: dict = {}
+    for rgid, title, artist in rows:
+        out.setdefault(rgid, {"artist": artist, "album": title})
+    return out
+
+_PEER_NAME_KEYS = frozenset({"source", "pickedSource", "peer", "username", "source_user"})
+
+def _without_peer_names(value):
+    """`value` (a fill view, or `_fills_view`'s answer) with every Soulseek
+    peer name taken out, at any depth: what a non-admin reads (Worbus P1
+    review S#3). Downloading is an admin's; who it came from is too."""
+    if isinstance(value, dict):
+        return {k: _without_peer_names(v) for k, v in value.items()
+                if k not in _PEER_NAME_KEYS}
+    if isinstance(value, list):
+        return [_without_peer_names(v) for v in value]
+    return value
 
 def _fills_view(release_mbids: list, group_ids: list) -> dict:
     """`GET /api/fills` — every fill a client watches, in one answer.
@@ -4681,6 +4974,553 @@ def _id3_frame_in(row: dict):
     return cls(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# The cover inside a file (B-297).
+#
+# Navidrome (0.64.2, measured on a stand-in of the NAS's version, 2026-10-31)
+# serves a **song's** picture from the picture inside its file, and falls back
+# to the album's folder cover only for a file that has none. So a cover change
+# that wrote only `cover.jpg` changed the album page and left every playing
+# song showing the old picture. What it does now, per file of the album:
+#
+# - **A file with no picture is not touched**: it already shows the folder
+#   cover. Only FLAC (picture blocks), MP3 (`APIC`) and Opus
+#   (`METADATA_BLOCK_PICTURE`) are written — the formats lb-bot writes tags in.
+# - **Which picture** (`_pictures_with_front`): Navidrome shows a front
+#   picture (type 3) wherever it sits, the first of several, and otherwise the
+#   first picture of any type, a back cover included. So every front is
+#   removed and the new image goes in as the front where the first front was,
+#   or appended when the file had none. Every other picture stays where it is.
+# - **Changed in place, behind a copy** (`_picture_rewrite`): a byte-for-byte
+#   copy of the file is made beside it first (a dot-name no player lists as
+#   audio), the change is rehearsed and checked on a second copy — its
+#   pictures must be the ones asked for, and its audio byte for byte what it
+#   was (`_audio_digest`) — then the file itself is written by mutagen, as a
+#   tag write is, and checked again; anything wrong and the copy's bytes go
+#   back into it. **Never a rename onto the file**: on Unraid's user share a
+#   new file may be created on another disk than the one it replaces, and
+#   the old one then stays visible. The file keeps its inode, mode, owner and
+#   links; a symbolic link is written through only to a file in the library.
+#   Its mtime moves: Navidrome does not notice a change whose mtime was put
+#   back (measured). A stop half way leaves a copy that the next run over
+#   the folder puts back or removes (`_picture_leftovers_recover`). Cost: a
+#   song streaming while it is written may glitch, as with a tag write.
+# - **What is kept** (`_picture_snapshot`): the pictures removed — their
+#   position in the file's list and every field (FLAC and Opus: type, mime,
+#   description, width, height, depth, colours; MP3: type, mime, description,
+#   text encoding) and the sha256 of their bytes; the bytes are the caller's
+#   to keep. `_picture_restore` puts them back where they were.
+# - **An MP3's tag is written as stored** (`_id3_untranslated`): a v2.3 tag
+#   keeps its v2.3 frames, it is saved as its own version, and an ID3v1 tag at
+#   the end keeps its bytes (`_id3v1_tail`). A v2.2 tag is not written.
+# - **Known and left:** mutagen writes an MP3's ID3 frames in an order of its
+#   own (by kind, then size), so the order of several `APIC` frames is
+#   mutagen's after any write — what Navidrome shows does not depend on it —
+#   and two `APIC` frames with one description are told apart by mutagen by a
+#   space it adds to the second. An Opus file's legacy `COVERART` comment is
+#   not read or written.
+# ---------------------------------------------------------------------------
+
+_PICTURE_WRITABLE_EXTS = ("flac", "opus", "mp3")
+_PICTURE_FRONT = 3
+_PICTURE_PART_SUFFIX = ".lbbot-cover.part"       # a whole, fsynced copy of the file
+_PICTURE_COPYING_SUFFIX = ".lbbot-cover.copying"  # that copy while it is being made
+_PICTURE_TRY_SUFFIX = ".lbbot-cover.try"         # the change rehearsed on a copy
+_PICTURE_FIELDS = ("type", "mime", "desc", "width", "height", "depth", "colors")
+_PICTURE_ID3_FIELDS = ("type", "mime", "desc", "encoding")
+
+def _picture_beside(path: str, suffix: str) -> str:
+    """A copy of `path` kept beside it: a name that begins with a dot and
+    ends in no audio extension, so that no scan lists it as a song."""
+    folder, name = os.path.split(path)
+    return os.path.join(folder, f".{name}{suffix}")
+
+def _picture_part_path(path: str) -> str:
+    """The byte-for-byte copy of `path` that `_picture_rewrite` keeps while
+    it writes the file itself, to put back if anything goes wrong."""
+    return _picture_beside(path, _PICTURE_PART_SUFFIX)
+
+def _picture_copying_path(path: str) -> str:
+    return _picture_beside(path, _PICTURE_COPYING_SUFFIX)
+
+def _picture_try_path(path: str) -> str:
+    return _picture_beside(path, _PICTURE_TRY_SUFFIX)
+
+def _picture_put_back(part: str, path: str) -> None:
+    """Make the file at `path` hold the bytes of `part` again — **in place**,
+    the same file (its inode, mode, owner and links), fsynced, and checked
+    byte for byte. Raises OSError."""
+    shutil.copyfile(part, path)
+    _fsync_path(path)
+    with open(part, "rb") as a, open(path, "rb") as b:
+        if hashlib.sha256(a.read()).digest() != hashlib.sha256(b.read()).digest():
+            raise OSError("the file does not read back as its copy")
+
+def _picture_leftovers_recover(folders) -> None:
+    """What a stop half way through `_picture_rewrite` left beside the files
+    of these folders, dealt with on the next run over them:
+
+    - a copy still being made, or a rehearsal: removed (the file itself was
+      not touched yet);
+    - **a whole copy** (`_picture_part_path`): the file itself may have been
+      left half written. If it cannot be read, or its audio is not the
+      copy's (`_audio_digest`), the copy's bytes are put back into it, in
+      place; then the copy goes. A file that reads and whose audio is the
+      copy's was written whole (or not at all): the copy just goes.
+    - a whole copy whose file is no longer there: left where it is, said —
+      somebody removed the song, and lb-bot does not bring it back.
+    """
+    for folder in dict.fromkeys(f for f in folders if f):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith("."):
+                continue
+            leftover = os.path.join(folder, name)
+            try:
+                if name.endswith((_PICTURE_COPYING_SUFFIX, _PICTURE_TRY_SUFFIX)):
+                    os.remove(leftover)
+                    continue
+                if not name.endswith(_PICTURE_PART_SUFFIX):
+                    continue
+                original = os.path.join(folder, name[1:-len(_PICTURE_PART_SUFFIX)])
+                fmt = _PICTURE_FORMAT_OF_EXT.get(_file_ext(original), "")
+                if not fmt:
+                    continue
+                if not os.path.exists(original):
+                    print("  cover inside the files: a copy of a song that is no longer there "
+                          "was left beside it")
+                    continue
+                kept = _audio_digest(leftover, fmt)
+                try:
+                    _embedded_pictures(original, fmt)
+                    whole = _audio_digest(original, fmt) == kept
+                except Exception:  # noqa: BLE001 — a file that does not read is not whole
+                    whole = False
+                if not whole:
+                    _picture_put_back(leftover, original)
+                    print("  cover inside the files: a song left half written by a stop was "
+                          "put back as it was")
+                os.remove(leftover)
+            except Exception as e:  # noqa: BLE001 — one leftover never stops the run
+                print(f"  cover inside the files: a leftover copy could not be dealt with "
+                      f"({_os_error_text(e)})")
+
+def _picture_sha(data) -> str:
+    return hashlib.sha256(bytes(data or b"")).hexdigest()
+
+def _flac_picture_dict(picture) -> dict:
+    return {"type": int(picture.type), "mime": str(picture.mime or ""),
+            "desc": str(picture.desc or ""), "width": int(picture.width or 0),
+            "height": int(picture.height or 0), "depth": int(picture.depth or 0),
+            "colors": int(picture.colors or 0), "data": bytes(picture.data or b"")}
+
+def _flac_picture_block(p: dict):
+    from mutagen.flac import Picture
+    picture = Picture()
+    picture.type, picture.mime, picture.desc = int(p["type"]), p["mime"], p["desc"]
+    picture.width, picture.height = int(p.get("width") or 0), int(p.get("height") or 0)
+    picture.depth, picture.colors = int(p.get("depth") or 0), int(p.get("colors") or 0)
+    picture.data = bytes(p["data"])
+    return picture
+
+# A file's extension -> the kind of picture block it holds.
+_PICTURE_FORMAT_OF_EXT = {"flac": "flac", "opus": "opus", "mp3": "id3"}
+
+def _embedded_pictures(path: str, fmt: str = "") -> tuple:
+    """`(format, id3 version, pictures)` — every picture inside the file, in
+    the file's order: `format` is "flac", "opus" or "id3" (an MP3), the ID3
+    version is what the tag is saved as (`_id3_own_version`, 0 for the other
+    two), and each picture is a dict of its fields and `data`. The format is
+    the file's extension's unless `fmt` names it (the copy a write is made
+    on has none). Raises when the file cannot be read, or is not a format
+    lb-bot writes pictures in."""
+    import base64
+    ext = _file_ext(path)
+    fmt = fmt or _PICTURE_FORMAT_OF_EXT.get(ext, "")
+    if fmt == "flac":
+        from mutagen.flac import FLAC
+        return "flac", 0, [_flac_picture_dict(p) for p in FLAC(path).pictures]
+    if fmt == "opus":
+        from mutagen.flac import Picture
+        from mutagen.oggopus import OggOpus
+        tags = OggOpus(path).tags
+        values = list(tags.get("metadata_block_picture") or []) if tags is not None else []
+        return "opus", 0, [_flac_picture_dict(Picture(base64.b64decode(v))) for v in values]
+    if fmt == "id3":
+        from mutagen.id3 import ID3NoHeaderError
+        try:
+            tag = _id3_untranslated(path)
+        except ID3NoHeaderError:
+            return "id3", 3, []
+        return "id3", _id3_own_version(tag), [
+            {"type": int(f.type), "mime": str(f.mime or ""), "desc": str(f.desc or ""),
+             "encoding": int(f.encoding), "data": bytes(f.data or b"")}
+            for f in tag.getall("APIC")]
+    raise ValueError(f"lb-bot cannot write the pictures of a .{ext} file")
+
+def _id3_untranslated(path: str):
+    """An MP3's ID3v2 tag **as stored** (`translate=False`): a v2.3 tag keeps
+    its v2.3 frames (`TYER`, `TDAT`, `TORY`, `IPLS`, `TSIZ`…), which the
+    ordinary load turns into v2.4 ones that a v2.3 save then writes back
+    changed — a picture write must not touch any frame but the pictures.
+    Raises for a v2.2 tag: mutagen cannot write one, and translated it would
+    come back another tag."""
+    from mutagen.id3 import ID3
+    tag = ID3(path, translate=False)
+    if tuple(tag.version[:2]) not in ((2, 3), (2, 4)):
+        raise ValueError("lb-bot writes no pictures into an ID3v2.2 tag")
+    return tag
+
+def _id3v1_tail(path: str) -> bytes:
+    """The ID3v1 tag at the end of an MP3, as its bytes — the 128 of `TAG`,
+    with the 227 of an extended `TAG+` before them — or b"" for none."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(size - 355, 0))
+        tail = fh.read()
+    if tail[-128:-125] != b"TAG":
+        return b""
+    return tail[-355:] if len(tail) >= 355 and tail[-355:-351] == b"TAG+" else tail[-128:]
+
+def _image_size(image: bytes) -> tuple:
+    """`(width, height)` of a JPEG or a PNG, `(0, 0)` when it cannot be read
+    off the header — what a FLAC picture block records beside the bytes."""
+    image = bytes(image or b"")
+    if image[:8] == b"\x89PNG\r\n\x1a\n" and len(image) >= 24:
+        return int.from_bytes(image[16:20], "big"), int.from_bytes(image[20:24], "big")
+    i = 2
+    while image[:2] == b"\xff\xd8" and i + 4 <= len(image) and image[i] == 0xFF:
+        marker = image[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB,
+                      0xCD, 0xCE, 0xCF):
+            if i + 9 <= len(image):
+                return (int.from_bytes(image[i + 7:i + 9], "big"),
+                        int.from_bytes(image[i + 5:i + 7], "big"))
+            break
+        if marker == 0xD8 or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        i += 2 + int.from_bytes(image[i + 2:i + 4], "big")
+    return 0, 0
+
+def _picture_new(fmt: str, image: bytes, mime: str, others) -> dict:
+    """The front picture lb-bot puts into a file. An `APIC` gets a
+    description no other picture of the file has ("" unless one does — then
+    with a space added, as mutagen would add it), so that what is read back
+    is what was written."""
+    if fmt == "id3":
+        taken, desc = {p["desc"] for p in others}, ""
+        while desc in taken:
+            desc += " "
+        return {"type": _PICTURE_FRONT, "mime": mime, "desc": desc, "encoding": 0,
+                "data": bytes(image)}
+    width, height = _image_size(image)
+    return {"type": _PICTURE_FRONT, "mime": mime, "desc": "", "width": width,
+            "height": height, "depth": 24, "colors": 0, "data": bytes(image)}
+
+def _pictures_with_front(pictures, new: dict) -> list:
+    """Rule 2: every front removed, `new` where the first one was — or
+    appended when there was none — and every other picture where it is."""
+    out, placed = [], False
+    for p in pictures:
+        if p["type"] == _PICTURE_FRONT:
+            if not placed:
+                out.append(new)
+                placed = True
+            continue
+        out.append(p)
+    return out if placed else out + [new]
+
+def _picture_write(path: str, fmt: str, version: int, pictures) -> None:
+    """Make `pictures`, in this order, every picture inside the file at
+    `path` (a copy while it is rehearsed, then the file itself).
+    Raises whatever mutagen raises."""
+    import base64
+    if fmt == "flac":
+        from mutagen.flac import FLAC, Picture
+        audio = FLAC(path)
+        blocks = list(audio.metadata_blocks)
+        first = next((i for i, b in enumerate(blocks) if b.code == Picture.code), None)
+        kept = [b for b in blocks if b.code != Picture.code]
+        at = len(kept) if first is None else sum(
+            1 for b in blocks[:first] if b.code != Picture.code)
+        audio.metadata_blocks = kept[:at] + [_flac_picture_block(p) for p in pictures] + kept[at:]
+        audio.save()
+    elif fmt == "opus":
+        from mutagen.oggopus import OggOpus
+        audio = OggOpus(path)
+        values = [base64.b64encode(_flac_picture_block(p).write()).decode("ascii")
+                  for p in pictures]
+        if values:
+            audio.tags["metadata_block_picture"] = values
+        elif "metadata_block_picture" in audio.tags:
+            del audio.tags["metadata_block_picture"]
+        audio.save()
+    elif fmt == "id3":
+        from mutagen.id3 import APIC
+        # As stored: untranslated, saved as the version it is, a v2.3 frame's
+        # several values left several — and the ID3v1 tag kept byte for byte:
+        # mutagen's own choices rewrite it from the v2 tag, or delete it, so it
+        # is deleted and the bytes it had are put back after.
+        tag = _id3_untranslated(path)
+        v1 = _id3v1_tail(path)
+        tag.delall("APIC")
+        for p in pictures:
+            tag.add(APIC(encoding=int(p["encoding"]), mime=p["mime"], type=int(p["type"]),
+                         desc=p["desc"], data=bytes(p["data"])))
+        tag.save(path, v1=0, v2_version=_id3_own_version(tag), v23_sep=None)
+        if v1:
+            with open(path, "rb") as fh:
+                fh.seek(max(os.path.getsize(path) - len(v1), 0))
+                now = fh.read()
+            if not now.endswith(v1):
+                left = v1[:-128] if len(v1) > 128 and now.endswith(v1[:-128]) else b""
+                with open(path, "ab") as fh:
+                    fh.write(v1[len(left):])
+    else:
+        raise ValueError(f"lb-bot cannot write pictures of the kind {fmt!r}")
+
+def _pictures_key(fmt: str, version: int, pictures) -> list:
+    """What "these are the pictures" is compared by: every field and the
+    sha256 of the bytes. FLAC and Opus in order; an MP3's sorted (mutagen
+    orders ID3 frames itself), with the text encoding a v2.3 save gives a
+    frame (UTF-8 and UTF-16BE are written as UTF-16 there)."""
+    if fmt == "id3":
+        def encoding(p):
+            e = int(p["encoding"])
+            return 1 if version == 3 and e in (2, 3) else e
+        return sorted((int(p["type"]), p["mime"], p["desc"], encoding(p), _picture_sha(p["data"]))
+                      for p in pictures)
+    return [(*(p.get(name) if name in ("mime", "desc") else int(p.get(name) or 0)
+               for name in _PICTURE_FIELDS), _picture_sha(p["data"])) for p in pictures]
+
+def _syncsafe(raw: bytes) -> int:
+    return (raw[0] << 21) | (raw[1] << 14) | (raw[2] << 7) | raw[3]
+
+def _audio_digest(path: str, fmt: str) -> tuple:
+    """What "the audio is untouched" is compared by: for a FLAC its
+    `STREAMINFO` block (the length and the audio's MD5 are in it) and the
+    sha256 of every byte after the last metadata block — the frames; for an
+    MP3 the sha256 of everything between the ID3v2 tag and an ID3v1 tag at
+    the end; for an Opus the sha256 of every audio packet (the pages around
+    them are renumbered when the comment header grows) and the last granule
+    position, its length. Raises when the file cannot be read."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        if fmt == "flac":
+            head = fh.read(10)
+            start = 0
+            if head[:3] == b"ID3" and len(head) == 10:
+                start = 10 + _syncsafe(head[6:10]) + (10 if head[5] & 0x10 else 0)
+            fh.seek(start)
+            if fh.read(4) != b"fLaC":
+                raise ValueError("not a FLAC stream")
+            streaminfo, last = b"", False
+            while not last:
+                header = fh.read(4)
+                if len(header) < 4:
+                    raise ValueError("the FLAC metadata ends early")
+                last = bool(header[0] & 0x80)
+                body = fh.read(int.from_bytes(header[1:4], "big"))
+                if header[0] & 0x7F == 0:
+                    streaminfo = body
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+            return streaminfo, digest.hexdigest()
+        if fmt == "id3":
+            data = fh.read()
+            start = 0
+            while data[start:start + 3] == b"ID3" and len(data) >= start + 10:
+                flags = data[start + 5]
+                start += 10 + _syncsafe(data[start + 6:start + 10]) + (10 if flags & 0x10 else 0)
+            end = len(data) - 128 if data[-128:-125] == b"TAG" else len(data)
+            digest.update(data[start:end])
+            return end - start, digest.hexdigest()
+        if fmt == "opus":
+            from mutagen.ogg import OggPage
+            pages = []
+            while True:
+                try:
+                    pages.append(OggPage(fh))
+                except EOFError:
+                    break
+            if not pages:
+                raise ValueError("no Ogg pages")
+            serial = pages[0].serial
+            pages = [p for p in pages if p.serial == serial]
+            for packet in OggPage.to_packets(pages, strict=False)[2:]:
+                digest.update(len(packet).to_bytes(4, "big"))
+                digest.update(packet)
+            return pages[-1].position, digest.hexdigest()
+    raise ValueError(f"lb-bot cannot check the audio of the kind {fmt!r}")
+
+def _picture_check(path: str, fmt: str, version: int, audio_before, expected) -> str:
+    """Why the file at `path` is not as a picture write must leave it, or ""
+    — it is read again, its pictures are `expected` (`_pictures_key`) and its
+    audio is `audio_before` (`_audio_digest`)."""
+    try:
+        _fmt, _version, pictures = _embedded_pictures(path, fmt)
+        audio = _audio_digest(path, fmt)
+    except Exception as e:  # noqa: BLE001 — whatever stops the reading
+        return f"the file could not be read again after the change ({type(e).__name__})"
+    if audio != audio_before:
+        return "the audio would have changed, so the change was not kept"
+    if _pictures_key(fmt, version, pictures) != expected:
+        return "the pictures read back were not the ones written, so the change was not kept"
+    return ""
+
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def _picture_rewrite(path: str, fmt: str, version: int, pictures) -> str:
+    """Make `pictures` every picture inside the file at `path`, safely: ""
+    when it is done, else why not — **and then the file is as it was**.
+
+    **The file is changed in place, never replaced by another file.** On
+    Unraid's user share a new file can be created on another array disk than
+    the one it is renamed onto, and the old file then stays visible from the
+    lower disk: the change would silently not happen. So:
+
+    1. a byte-for-byte copy of the file is made beside it
+       (`_picture_part_path`, made as `…copying` and renamed when whole),
+       fsynced with its folder;
+    2. the change is rehearsed on a second copy and checked
+       (`_picture_check`: the pictures read back are the ones written, the
+       audio is byte for byte what it was) — a change that fails here never
+       reaches the file;
+    3. the file itself is written by mutagen, as a tag write is, fsynced and
+       checked the same way; if anything fails, the copy's bytes are put back
+       into it, in place (`_picture_put_back`);
+    4. the copies go. A stop at any point leaves a copy the next run over
+       the folder deals with (`_picture_leftovers_recover`).
+
+    The same file throughout: its inode, mode, owner and hard links stay. A
+    symbolic link is written through — only when the file it points to is
+    in the music library. The mtime moves (`_touch`): Navidrome does not
+    notice a change whose mtime was put back (measured). **Cost:** a song
+    streaming while it is written may glitch, as with a tag write.
+    """
+    part, copying, trial = (_picture_part_path(path), _picture_copying_path(path),
+                            _picture_try_path(path))
+    keep_part = False
+    try:
+        if os.path.islink(path) and not _path_in_library(os.path.realpath(path)):
+            return "it is a link to a file outside the music folder, so it was left as it is"
+        audio_before = _audio_digest(path, fmt)
+        expected = _pictures_key(fmt, version, pictures)
+        shutil.copyfile(path, copying)
+        _fsync_path(copying)
+        os.rename(copying, part)
+        try:
+            _fsync_path(os.path.dirname(path) or ".")
+        except OSError:
+            pass                        # not every filesystem syncs a folder
+        shutil.copyfile(part, trial)
+        _picture_write(trial, fmt, version, pictures)
+        why = _picture_check(trial, fmt, version, audio_before, expected)
+        os.remove(trial)
+        if why:
+            return why
+        try:
+            _picture_write(path, fmt, version, pictures)
+            _fsync_path(path)
+            why = _picture_check(path, fmt, version, audio_before, expected)
+        except OSError as e:
+            why = _os_error_text(e)
+        except Exception as e:  # noqa: BLE001 — mutagen's own errors
+            why = f"it could not be written ({type(e).__name__})"
+        if why:
+            try:
+                _picture_put_back(part, path)
+            except OSError as e:
+                keep_part = True
+                return (f"{why}; and it could not be put back as it was "
+                        f"({_os_error_text(e)}) — lb-bot keeps a copy of it beside it")
+            return why
+    except OSError as e:
+        return _os_error_text(e)
+    except Exception as e:  # noqa: BLE001 — mutagen's own errors, a malformed block
+        return f"it could not be written ({type(e).__name__})"
+    finally:
+        for leftover in (copying, trial) + (() if keep_part else (part,)):
+            try:
+                os.remove(leftover)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"  cover inside the files: a copy could not be removed "
+                      f"({_os_error_text(e)})")
+    _touch(path)
+    return ""
+
+def _picture_replace(path: str, image: bytes, mime: str) -> str:
+    """Rule 2 in the file at `path`: "" when its front picture is now
+    `image`, else why not (the file then as it was — `_picture_rewrite`). A
+    file with no picture at all is not touched, and that is the reason."""
+    try:
+        fmt, version, pictures = _embedded_pictures(path)
+    except OSError as e:
+        return f"it could not be read ({_os_error_text(e)})"
+    except Exception as e:  # noqa: BLE001
+        return f"it could not be read ({type(e).__name__})"
+    if not pictures:
+        return "it has no picture inside it"
+    new = _picture_new(fmt, image, mime, [p for p in pictures if p["type"] != _PICTURE_FRONT])
+    return _picture_rewrite(path, fmt, version, _pictures_with_front(pictures, new))
+
+def _picture_snapshot(fmt: str, version: int, pictures) -> tuple:
+    """`(snapshot, images)`: what a cover change is about to remove from a
+    file whose pictures are `pictures` — every front, with its position in
+    the file's list, its fields and the sha256 of its bytes (JSON, no bytes
+    in it) — and `{sha256: bytes}` for the caller to keep beside it."""
+    removed, images = [], {}
+    names = _PICTURE_ID3_FIELDS if fmt == "id3" else _PICTURE_FIELDS
+    for position, p in enumerate(pictures):
+        if p["type"] != _PICTURE_FRONT:
+            continue
+        sha = _picture_sha(p["data"])
+        images[sha] = bytes(p["data"])
+        removed.append({"position": position, "sha256": sha,
+                        **{name: p.get(name) for name in names}})
+    return {"format": fmt, "version": int(version or 0), "count": len(pictures),
+            "removed": removed}, images
+
+def _picture_restore(path: str, snapshot: dict, images: dict) -> str:
+    """Put back what `_picture_snapshot` recorded: the fronts it removed, at
+    their places among the file's other pictures, with every field as it
+    was; the front lb-bot wrote goes. `images` are the kept bytes by sha256.
+    "" when done, else why not (the file then as it was). Whether the file's
+    front is still the one lb-bot wrote is the caller's to have asked."""
+    fmt = snapshot.get("format")
+    try:
+        current_fmt, version, current = _embedded_pictures(path)
+    except OSError as e:
+        return f"it could not be read ({_os_error_text(e)})"
+    except Exception as e:  # noqa: BLE001
+        return f"it could not be read ({type(e).__name__})"
+    if current_fmt != fmt:
+        return "it is not the kind of file the earlier picture was kept from"
+    names = _PICTURE_ID3_FIELDS if fmt == "id3" else _PICTURE_FIELDS
+    out = [p for p in current if p["type"] != _PICTURE_FRONT]
+    for row in sorted(snapshot.get("removed") or [], key=lambda r: int(r["position"])):
+        data = images.get(row["sha256"])
+        if data is None:
+            return "lb-bot no longer has the earlier picture"
+        out.insert(min(int(row["position"]), len(out)),
+                   {**{name: row.get(name) for name in names}, "data": data})
+    if fmt == "id3":
+        version = snapshot.get("version") if snapshot.get("version") in (3, 4) else version
+    return _picture_rewrite(path, fmt, version, out)
+
+
 def _task_create(kind: str, label: str, total: int = 0, **extra) -> str:
     """`extra` is stamped onto the task row — `group_id` is what lets the album
     screen find the search running for the album being looked at, instead of the
@@ -4854,6 +5694,12 @@ def _file_ext(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 _APPS: list = []   # populated in main(); lets command handlers reach every bot
+# (user, Application) pairs: the Telegram apps that started, set by main()
+# after the web UI and the workers are up. Empty with no Telegram configured.
+_TELEGRAM_APPS: list = []
+# Set by main() once `_TELEGRAM_APPS` is final, so the startup playlist scan
+# does not decide "no Telegram" while the apps are still starting.
+_TELEGRAM_STARTED = None
 
 def _progress_bar(done: int, total: int, width: int = 10) -> str:
     """Render a simple text progress bar like [█████·····]."""
@@ -4909,8 +5755,42 @@ def _folder(filename: str) -> str:
     f = filename.replace("\\", "/")
     return f.rsplit("/", 1)[0] if "/" in f else ""
 
+def _web_user_key() -> str:
+    """The owner key of state the web UI (and the hub) starts: `"web"`.
+
+    Per-user state is keyed by the user's Telegram token, which made `""` the
+    owner of every web-started download on a server with no Telegram, and put
+    the token itself into every row the state file holds. This key is stable,
+    is never a credential, and never goes on the wire; `_user_for_token` and
+    `_token_to_app` resolve it to the default web user and that user's
+    Telegram app, so the owner's setup keeps its completion messages."""
+    return "web"
+
 def _user_for_token(token: str):
+    if token == _web_user_key():
+        return _default_web_user() or None
     return next((u for u in USERS if u["telegram_token"] == token), None)
+
+def _token_owns(stored: str, token: str) -> bool:
+    """Whether state stored under `stored` belongs to the Telegram user
+    `token`: its own rows, and the web user's when that user is this one."""
+    if stored == token:
+        return True
+    return (stored == _web_user_key() and bool(token)
+            and token == (_default_web_user() or {}).get("telegram_token"))
+
+def _token_to_app(pairs: list | None = None) -> dict:
+    """`{owner key: Telegram Application}` for the poller and the scheduled
+    playlist scan: each user's token, plus `_web_user_key()` for the default
+    web user's app. `pairs` defaults to the live `_TELEGRAM_APPS`, which
+    `main()` fills only after the web UI and the workers have started."""
+    pairs = _TELEGRAM_APPS if pairs is None else pairs
+    table = {u.get("telegram_token", ""): app for u, app in pairs
+             if u.get("telegram_token", "")}
+    default_token = (_default_web_user() or {}).get("telegram_token", "")
+    if default_token and default_token in table:
+        table[_web_user_key()] = table[default_token]
+    return table
 
 def _resolve_token(context) -> str:
     token = next(
@@ -6273,7 +7153,36 @@ def _lucene_quote(value: str) -> str:
     """One Lucene phrase, safe to drop inside double quotes in an MB query."""
     return (value or "").replace("\\", " ").replace('"', " ").strip()
 
-def _mbz_release_group_for(artist: str, title: str, limit: int = 5) -> list:
+def _artist_agree_key(name: str) -> str:
+    """A credit's name for "is it the same artist?" in the link resolver's
+    gate: `&`/`+` read as "and", a leading "The" set aside, Latin accents
+    folded and every other script kept (`_letters_key`), spaces dropped; a
+    name of punctuation only by `_artist_fold`."""
+    text = _LEADING_THE_RE.sub("", re.sub(r"[&+]", " and ", name or ""))
+    return _letters_key(text).replace(" ", "") or _artist_fold(name or "")
+
+def _artist_agrees(wanted: str, credit: str) -> bool:
+    """Does a MusicBrainz candidate's credit name the artist a link named?
+    The artist-evidence tiers the source search uses (`_artist_variants`):
+    the whole names alike; or the wanted artist one credited act of the
+    candidate's ("Daft Punk" in "Daft Punk feat. Pharrell Williams"); or the
+    candidate the lead act of a credit the provider gave whole. Never by
+    containment: "Pink" is not "Pink Floyd". Nothing agrees with ''."""
+    w, c = _artist_agree_key(wanted), _artist_agree_key(credit)
+    if not w or not c:
+        return False
+    if w == c:
+        return True
+    if w in {_artist_agree_key(v) for v in _artist_variants(credit)[1:]}:
+        return True
+    lead = _artist_variants(wanted)[1:2]
+    return bool(lead) and _artist_agree_key(lead[0]) == c
+
+# How many free-text candidates the link resolver's gated fallback reads (B-170).
+RELEASE_GROUP_GATED_LIMIT = 10
+
+def _mbz_release_group_for(artist: str, title: str, limit: int = 5,
+                           artist_gate: bool = False) -> list:
     """Release-groups for a *known* artist and title, fielded rather than free-text.
 
     `mbz_search_release_groups` concatenates everything into one free-text
@@ -6289,6 +7198,15 @@ def _mbz_release_group_for(artist: str, title: str, limit: int = 5) -> list:
     when the store's spelling of the artist and MusicBrainz's disagree.
     Candidates whose title actually matches are floated to the front — the raw
     `score` cannot be trusted to do it, which is the whole point of the change.
+
+    **`artist_gate`** (the link resolver, B-170): the free-text fallback reads
+    RELEASE_GROUP_GATED_LIMIT candidates and keeps only those whose artist
+    agrees (`_artist_agrees`) — artist agreement is a gate, not a re-rank —
+    and with no artist there is no fallback. A fielded query is empty both
+    when MusicBrainz has nothing and when it did not answer (`mbz_get`
+    answers {} for both), and the fallback then decided alone: "Discovery"
+    resolved to Blue Tribe's, the first free-text hit whose title matched.
+    Nothing that agrees is `[]`, which the resolver says as "no match".
     """
     artist, title = (artist or "").strip(), (title or "").strip()
     if not title:
@@ -6302,7 +7220,17 @@ def _mbz_release_group_for(artist: str, title: str, limit: int = 5) -> list:
         except Exception as e:  # noqa: BLE001
             print(f"  release-group fielded search failed: {e}")
             hits = []
-    if not hits:
+    if not hits and artist_gate:
+        if not artist:
+            return []
+        try:
+            hits = mbz_search_release_groups(f"{artist} {title}",
+                                             max(limit, RELEASE_GROUP_GATED_LIMIT))
+        except Exception as e:  # noqa: BLE001
+            print(f"  release-group search failed: {e}")
+            return []
+        hits = [c for c in hits if _artist_agrees(artist, c.get("artist", ""))][:limit]
+    elif not hits:
         try:
             hits = mbz_search_release_groups(f"{artist} {title}".strip(), limit)
         except Exception as e:  # noqa: BLE001
@@ -6411,7 +7339,7 @@ def resolve_music_link(url: str) -> dict:
     if query_title:
         # Fielded, not free text: we know which half is the artist, and the
         # free-text form ranks a novelty remix above the record it remixes.
-        hits = _mbz_release_group_for(artist, query_title, 3)
+        hits = _mbz_release_group_for(artist, query_title, 3, artist_gate=True)
         if hits:
             best = hits[0]
             rgid = best.get("rgid", "")
@@ -6460,12 +7388,14 @@ LBZ_ENDPOINT = "https://api.listenbrainz.org/1"
 class LBZError(Exception):
     """ListenBrainz was unreachable / returned an error after retries."""
 
-def _lbz_get(path: str, timeout: int = 25, retries: int = 3) -> dict:
+def _lbz_get(path: str, timeout: int = 25, retries: int = 3,
+             empty_ok: bool = False) -> dict:
     """
     GET a ListenBrainz endpoint with retries + backoff. Raises LBZError if all
     attempts fail, so callers can tell 'API down' apart from 'no data'.
     Uses a (connect, read) timeout tuple and identifies the client, which some
-    hosts require before they will respond.
+    hosts require before they will respond. `empty_ok`: a 2xx with no body
+    (a stats route's 204 while it computes) is `{}`, not a failure.
     """
     last = None
     headers = {"User-Agent": f"listenbrainz-bot/1.0 ({MBZ_CONTACT})"}
@@ -6474,6 +7404,8 @@ def _lbz_get(path: str, timeout: int = 25, retries: int = 3) -> dict:
             r = _http.get(f"{LBZ_ENDPOINT}/{path}",
                              headers=headers, timeout=(10, timeout))
             r.raise_for_status()
+            if empty_ok and (r.status_code == 204 or not r.content):
+                return {}
             return r.json()
         except Exception as e:
             last = e
@@ -6566,6 +7498,8 @@ def _fresh_apply_limit(rows: list, limit: int) -> list:
     **Nor are rows by an artist the user plays** (`artistPlays > 0`, I-006),
     for the same reason: the clients' "Artists you play" scope is made of
     exactly those rows, and what one person plays is not what the site plays.
+    A caller who is not the primary user gets rows with no `artistPlays` at
+    all (Worbus P2), so for them this keeps the owned artists only.
 
     The remainder is filled by listen count, then the result is put back into the
     feed's own release-date order: the clients bucket by week, and handing them a
@@ -6896,9 +7830,10 @@ def deezer_search_artist_id(name: str) -> str:
     except DeezerError as e:
         print(f"  deezer artist search failed: {e}")
         return ""
-    wanted = _norm_album_text(name)
+    # B-060: `_norm_album_text` read every non-Latin name as '', so "Кино"
+    # took the first hit with another non-Latin name.
     for row in (data.get("data") or []):
-        if _norm_album_text(str((row or {}).get("name") or "")) == wanted:
+        if _same_name_spelling(str((row or {}).get("name") or ""), name):
             return str(row.get("id") or "")
     return ""
 
@@ -6916,9 +7851,8 @@ def deezer_artist_picture(name: str) -> str:
     except DeezerError as e:
         print(f"  deezer artist picture failed: {e}")
         return ""
-    wanted = _norm_album_text(name)
     for row in (data.get("data") or []):
-        if _norm_album_text(str((row or {}).get("name") or "")) == wanted:
+        if _same_name_spelling(str((row or {}).get("name") or ""), name):
             url = str(row.get("picture_medium") or row.get("picture") or "")
             # Deezer answers a grey silhouette under a fixed path for an artist
             # with no picture; that is not an image of them.
@@ -7385,11 +8319,99 @@ def _norm_album_text(value: str) -> str:
     value = (value or "").lower()
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
+# The edition words a fuzzy title key drops. One pattern for `_fuzzy_album_text`
+# and `_title_key`, so the two cannot drift apart on ASCII input.
+_EDITION_WORDS_RE = re.compile(r"\b(deluxe|expanded|remaster(?:ed)?|anniversary|edition|"
+                               r"version|mono|stereo|bonus|explicit)\b")
+
 def _fuzzy_album_text(value: str) -> str:
     value = _norm_album_text(value)
-    value = re.sub(r"\b(deluxe|expanded|remaster(?:ed)?|anniversary|edition|"
-                   r"version|mono|stereo|bonus|explicit)\b", " ", value)
+    value = _EDITION_WORDS_RE.sub(" ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+def _letters_key(value: str) -> str:
+    """`_norm_album_text` for text in any script (B-060).
+
+    **Text whose NFKC form is ASCII gets exactly `_norm_album_text(value)`**,
+    so nothing about an ASCII library changes. Any other text is NFKC-folded
+    and casefolded and keeps the letters, marks and digits of every script; a
+    Latin letter with an accent loses the accent ("Café" -> "cafe", the way
+    `_norm_album_text` used to read it closely enough to match "Cafe"), every
+    other character is a space. `_norm_album_text` keeps `[a-z0-9]` only, so
+    every non-Latin title was '' and equal to every other one.
+    """
+    text = value or ""
+    folded = unicodedata.normalize("NFKC", text)
+    if folded.isascii():
+        return _norm_album_text(text)
+    out = []
+    for ch in folded.casefold():
+        kind = unicodedata.category(ch)[0]
+        if kind == "L":
+            parts = unicodedata.normalize("NFKD", ch)
+            if (len(parts) > 1 and parts[0].isascii() and parts[0].isalpha()
+                    and all(unicodedata.category(p) == "Mn" for p in parts[1:])):
+                ch = parts[0]
+            out.append(ch)
+        elif kind in "MN":
+            out.append(ch)
+        else:
+            out.append(" ")
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+def _title_key(value: str) -> str:
+    """`_fuzzy_album_text` for titles in any script (B-060): `_letters_key`
+    with the same edition words dropped.
+
+    The parity rule: **for text whose NFKC form is ASCII this is exactly
+    `_fuzzy_album_text(value)`** — the owner's ASCII titles key as they always
+    did (`SharedDiscographyBucketTests.test_ascii_title_keys_are_unchanged`).
+    "Звезда по имени Солнце" keys to "звезда по имени солнце", not ''.
+
+    '' still happens (a title of punctuation or symbols only, "★"), and '' is
+    no title: callers must never pair two '' keys (`SequenceMatcher('', '')`
+    is 1.0, which is how every non-Latin album went to one release group).
+    """
+    text = value or ""
+    if unicodedata.normalize("NFKC", text).isascii():
+        return _fuzzy_album_text(text)
+    key = _EDITION_WORDS_RE.sub(" ", _letters_key(text))
+    return re.sub(r"\s+", " ", key).strip()
+
+def _title_symbols(value: str) -> str:
+    """A title with no letters or digits ("★", "?", "...") compared as itself:
+    NFKC, casefolded, whitespace dropped. Only for two titles whose
+    `_title_key` is '' — an exact equality, never a fuzzy score."""
+    return "".join(unicodedata.normalize("NFKC", value or "").casefold().split())
+
+def _latin_part(key: str) -> str:
+    """The Latin words of a `_title_key` that mixes Latin with another script
+    ("live at budokan 武道館" -> "live at budokan"), when they are at least two
+    words and six letters; "" otherwise — for a key in one script (every
+    ASCII key among them, so the parity rule is untouched), and for a short
+    part ("кино 2" -> "2", "花様年華 pt 1" -> "pt 1"), which is no title.
+    The base keyed such a title by its Latin part alone, and paired it so
+    (S1 review 3)."""
+    words = (key or "").split()
+    latin = [w for w in words if w.isascii()]
+    if len(latin) == len(words) or not any(
+            "LATIN" not in unicodedata.name(ch, "") for w in words if not w.isascii()
+            for ch in w if ch.isalpha()):
+        return ""
+    if len(latin) < 2 or sum(ch.isalpha() for w in latin for ch in w) < 6:
+        return ""
+    return " ".join(latin)
+
+def _same_name_spelling(name: str, other: str) -> bool:
+    """Two artist names written alike by `_letters_key` — `_norm_album_text`'s
+    old test for ASCII names, and for a non-Latin one its own letters, so
+    "Кино" is never "Ария" (both were ''). A name with no letters at all
+    ("!!!") is compared by `_artist_fold`, never as ''."""
+    key, other_key = _letters_key(name), _letters_key(other)
+    if key or other_key:
+        return key == other_key
+    fold = _artist_fold(name)
+    return bool(fold) and fold == _artist_fold(other)
 
 def _album_group_key(album: dict) -> tuple:
     return (_norm_album_text(album.get("artist") or album.get("albumArtist") or ""),
@@ -8489,7 +9511,7 @@ def _match_albums_to_release_groups(rgs: list, albums: list) -> tuple:
     title-match something else.
 
     Pass 2 — conservative title fallback for untagged/unresolvable albums:
-    greedy best-first assignment on _fuzzy_album_text similarity at
+    greedy best-first assignment on `_title_key` similarity at
     DISCOGRAPHY_TITLE_THRESHOLD, one fuzzy-title key per release-group and
     vice versa (duplicate copies sharing the same title stay grouped so the
     duplicate-merge machinery still sees them).
@@ -8515,16 +9537,39 @@ def _match_albums_to_release_groups(rgs: list, albums: list) -> tuple:
             fallback.append(album)
         # else: resolves to a release-group not in this discography — known
         # identity, deliberately not matched by title.
+    # B-060: keyed by `_title_key`, which reads every script; `_fuzzy_album_text`
+    # made every non-Latin title '', all of them one key, and the first non-Latin
+    # release-group claimed every such album at SequenceMatcher('', '') == 1.0.
+    # An empty key never pairs by score. A title with no letters or digits at
+    # all ("★") is keyed by its symbols instead and pairs only with the very
+    # same symbols, which is what '' == '' got right for an artist with one
+    # such title.
     by_title: dict = {}
     for album in fallback:
-        by_title.setdefault(_fuzzy_album_text(album.get("name", "")), []).append(album)
+        name = album.get("name", "")
+        key = _title_key(name)
+        by_title.setdefault((key, "" if key else _title_symbols(name)), []).append(album)
     pairs = []
     for rg in rgs:
         if rg["rgid"] in claims:
             continue
-        rg_key = _fuzzy_album_text(rg["title"])
+        rg_key = _title_key(rg["title"])
+        rg_symbols = "" if rg_key else _title_symbols(rg["title"])
         for title_key in by_title:
-            score = difflib.SequenceMatcher(None, rg_key, title_key).ratio()
+            key, symbols = title_key
+            if rg_key and key:
+                score = difflib.SequenceMatcher(None, rg_key, key).ratio()
+                # A mixed-script title's long Latin part against the other's
+                # whole key, never Latin part against Latin part: "Live at
+                # Budokan 武道館" is "Live at Budokan", and "Live in 東京" is
+                # not "Live in 大阪" (`_latin_part`).
+                for one, other in ((_latin_part(rg_key), key), (rg_key, _latin_part(key))):
+                    if one and other:
+                        score = max(score, difflib.SequenceMatcher(None, one, other).ratio())
+            elif not rg_key and not key and rg_symbols and rg_symbols == symbols:
+                score = 1.0
+            else:
+                continue
             if score >= DISCOGRAPHY_TITLE_THRESHOLD:
                 pairs.append((score, rg["rgid"], title_key))
     taken_rgs, taken_titles = set(), set()
@@ -8769,7 +9814,10 @@ def _classify_release_group(rg: dict, matches, match_info: dict,
     # a different release-group (or not resolve at all) — computing
     # completeness from that tag would judge this release-group by some
     # other album's tracklist. Pin the canonical tracklist to a release
-    # actually inside this release-group instead.
+    # actually inside this release-group instead. The title match it trusts
+    # is `_title_key`'s (B-060): with every non-Latin title keyed '', the
+    # guard pinned the first non-Latin release-group's tracklist on an album
+    # that was another one, and listed its "missing" tracks for a fill.
     canonical_override = ""
     if match_info.get("method") == "title":
         records_sorted = sorted(
@@ -8855,6 +9903,9 @@ _index_truncation_warned: dict = {}
 # seconds instead of one per artist touched.
 INDEX_PUSH_POLL_SECS = 1.0
 INDEX_PUSH_MIN_GAP_SECS = 2.0
+# A change of the index build's progress alone (the head unchanged) is sent
+# at most this often (Worbus P1 S3).
+INDEX_PUSH_PROGRESS_GAP_SECS = 5.0
 # A failing HWM write (a read-only /config) is retried on its own doubling
 # ladder rather than every poll (final review M3/T3).
 INDEX_PUSH_PERSIST_BACKOFF_MIN = 2.0
@@ -9416,6 +10467,24 @@ def _index_db():
               created_at REAL NOT NULL DEFAULT 0,
               PRIMARY KEY (batch_id, path)
             );
+            -- A file's front pictures from before an album override's cover
+            -- change first replaced them (B-297): `before` is
+            -- `_picture_snapshot`'s JSON (the removed pictures' places, fields
+            -- and sha256 — their bytes are kept beside the override's cover
+            -- backups) with the file's title and every sha256 lb-bot has
+            -- written into it under the batch. FIRST WRITE WINS, as in
+            -- `tag_changes`, and a table of its own so both undo rules stay
+            -- whole: a file whose tags an apply kept has a row there with no
+            -- picture in it. `wrote_sha` is what lb-bot last wrote, set before
+            -- the write. `path` is stored, never sent.
+            CREATE TABLE IF NOT EXISTS picture_changes (
+              batch_id   TEXT NOT NULL,
+              path       TEXT NOT NULL,
+              before     TEXT NOT NULL DEFAULT '{}',
+              wrote_sha  TEXT NOT NULL DEFAULT '',
+              created_at REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY (batch_id, path)
+            );
             PRAGMA user_version = 1;
         """)
         # CREATE TABLE IF NOT EXISTS never adds a column to a DB that already
@@ -9426,6 +10495,21 @@ def _index_db():
         if "secondary_types" not in have:
             conn.execute("ALTER TABLE release_groups "
                          "ADD COLUMN secondary_types TEXT NOT NULL DEFAULT '[]'")
+        # B-297: when (if at all) a cover change began writing the cover inside
+        # the album's songs and has not finished. Never on the wire: the row's
+        # state, done and total are what they were before this build. A value
+        # found at startup is a run a restart cut short
+        # (`_album_cover_embeds_interrupted`).
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(album_overrides)")}
+        if "embedding" not in have:
+            conn.execute("ALTER TABLE album_overrides "
+                         "ADD COLUMN embedding REAL NOT NULL DEFAULT 0")
+        # Worbus P2: who added a wishlist row, the identity's `user` (or "web"
+        # for an add with no identity). Rows from before say "": not known.
+        # Shown to admins only (`_wishlist_row_view`); never on the change feed.
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(wishlist)")}
+        if "added_by" not in have:
+            conn.execute("ALTER TABLE wishlist ADD COLUMN added_by TEXT NOT NULL DEFAULT ''")
         conn.commit()
         # The change sequence. INDEX_SCAN_VERSION is deliberately NOT bumped:
         # it gates the discography matcher, and nothing here changes a verdict.
@@ -9748,8 +10832,12 @@ WISHLIST_RESEARCH_INTERVAL = float(os.environ.get("LB_BOT_WISHLIST_INTERVAL", st
 # itself runs. Without this, adding a row would re-search every row.
 WISHLIST_ROW_COOLDOWN = float(os.environ.get("LB_BOT_WISHLIST_COOLDOWN", str(12 * 3600)))
 
-def _wishlist_row_view(row) -> dict:
-    return {
+def _wishlist_row_view(row, admin: bool = False) -> dict:
+    """One row as the wire carries it. `addedBy` (Worbus P2) is the user who
+    added it, "" for a row from before it was recorded, and is in an **admin's**
+    answer only: the list is shared, but who put what on it is not for every
+    signed-in user."""
+    view = {
         "rgid": row["rgid"],
         "artist": row["artist"],
         "title": row["title"],
@@ -9758,9 +10846,13 @@ def _wishlist_row_view(row) -> dict:
         "attempts": int(row["attempts"] or 0),
         "lastReason": row["last_reason"] or "",
     }
+    if admin:
+        view["addedBy"] = row["added_by"] or ""
+    return view
 
-def _wishlist_list() -> list:
-    """Every wishlist row, newest first. [] on a broken index, never a raise."""
+def _wishlist_list(admin: bool = False) -> list:
+    """Every wishlist row, newest first. [] on a broken index, never a raise.
+    `admin` adds each row's `addedBy` (`_wishlist_row_view`)."""
     try:
         with _index_lock:
             rows = _index_db().execute(
@@ -9768,10 +10860,14 @@ def _wishlist_list() -> list:
     except Exception as e:
         print(f"  wishlist read failed: {e}")
         return []
-    return [_wishlist_row_view(r) for r in rows]
+    return [_wishlist_row_view(r, admin) for r in rows]
 
-def _wishlist_add(rgid: str, artist: str = "", title: str = "") -> dict:
-    """Add one release-group. Idempotent — re-adding refreshes the names only.
+def _wishlist_add(rgid: str, artist: str = "", title: str = "",
+                  added_by: str = "web") -> dict:
+    """Add one release-group. Idempotent — re-adding refreshes the names only
+    (and keeps the first `added_by`: the list is shared, and a second person
+    wanting the same album does not take it over). `added_by` is the identity's
+    user; "web" is an add that has none.
 
     Deliberately does not reset `attempts` or `last_tried_at`: re-adding
     something already on the list is not new information about whether anybody
@@ -9795,8 +10891,9 @@ def _wishlist_add(rgid: str, artist: str = "", title: str = "") -> dict:
             else:
                 conn.execute(
                     "INSERT INTO wishlist (rgid, artist, title, added_at, "
-                    " last_tried_at, attempts, last_reason) VALUES (?,?,?,?,0,0,'')",
-                    (rgid, artist or "", title or "", now))
+                    " last_tried_at, attempts, last_reason, added_by) "
+                    "VALUES (?,?,?,?,0,0,'',?)",
+                    (rgid, artist or "", title or "", now, (added_by or "web")[:200]))
                 # Cap by age, like every other bounded collection here. The
                 # oldest row is the one whose "still want this" claim is
                 # stalest, and the user can always add it again.
@@ -9854,7 +10951,7 @@ def _wishlist_retry_one(row: dict) -> bool:
     """
     rgid = row.get("rgid", "")
     artist, title = row.get("artist", ""), row.get("title", "")
-    if not rgid:
+    if not rgid or not _downloads_on():
         return False
     try:
         resolved = mbz_resolve_album(rgid)
@@ -9925,6 +11022,11 @@ def _wishlist_sweep_loop() -> None:
     while True:
         try:
             time.sleep(WISHLIST_RESEARCH_INTERVAL)
+            if not _downloads_on():
+                # The wishlist is a plain list while downloading is off; a
+                # row added now is searched by the first sweep after slskd
+                # is configured and lb-bot restarted.
+                continue
             due = _wishlist_due()
             if not due:
                 continue
@@ -10735,7 +11837,18 @@ def _index_health_view() -> tuple:
     persisted = 0
     if recorded and recorded.get("epoch") == head_epoch:
         persisted = min(int(recorded.get("hwm") or 0), head_seq)
-    return {"ok": True, "epoch": head_epoch, "headSeq": persisted}, 200
+    # Worbus P1: the downloads mode and the names (never values) of the
+    # required settings that are empty. Nothing else: this route is open.
+    # `build` (B-095): lb-bot's own web UI reads it to notice an upgrade under
+    # an open tab. Additive; the hub's probe passes no part of this body on.
+    return {"ok": True, "epoch": head_epoch, "headSeq": persisted,
+            "downloads": "on" if _downloads_on() else "off",
+            "missingConfig": _missing_required_config(),
+            "build": _web_build_id(),
+            # Worbus P2: this lb-bot reads the hub's identity headers
+            # (`_request_identity`). Absent = an older lb-bot, which would
+            # serve listening and Fresh `artistPlays` to anyone.
+            "identity": 1}, 200
 
 def _artist_discography_read_view(mbid: str, nd_id: str) -> dict:
     """`GET /api/artist/discography`'s body. Module-level so it can be unit
@@ -10763,11 +11876,20 @@ def _artist_discography_read_view(mbid: str, nd_id: str) -> dict:
     override's scan is still running.
     """
     stored = _index_get_artist(mbid, nd_id)
-    scan = _artist_scan_get(_effective_artist_mbid(nd_id, mbid), nd_id)
+    effective = _effective_artist_mbid(nd_id, mbid)
+    # A scan just started beats an older entry: a Rescan of an artist
+    # scanned before would otherwise read that scan's `done` at once.
+    scan = (_artist_scan_just_started(effective, nd_id)
+            or _artist_scan_get(effective, nd_id))
     extra = {"scan": scan} if scan else {}
     if not stored:
         return {"indexed": False, **extra}
-    return {"indexed": True, **stored, **extra}
+    # Worbus P1 S3: a row with no MBID is the miss-stub a name search that
+    # found nobody leaves (`_index_store_unresolved_artist`): "MusicBrainz
+    # has no such artist", where `releases: []` alone read the same as an
+    # artist with no releases.
+    return {"indexed": True, **stored, "unresolved": not stored.get("artist_mbid"),
+            **extra}
 
 # ---------------------------------------------------------------------------
 # Artist MBID overrides (I-019).
@@ -11146,7 +12268,27 @@ def _artist_scan_covered(mbid: str, nd_artist_id: str, live_ids) -> bool:
     """
     return _auto_index_covering_row(mbid, nd_artist_id, time.time(), live_ids) is not None
 
-def _artist_rescan_view(data: dict) -> tuple:
+def _artist_rescan_caller_limits(data: dict) -> dict:
+    """A non-admin's `POST /api/artist/discography` body, cut to what a
+    Rescan or Scan now needs (Worbus P1 review S#2). Picking which
+    MusicBrainz artist a library artist is ("Match manually") is an admin's:
+    a body `mbid` other than one this artist already carries (its override,
+    Navidrome's tag, or the MBID its stored row was scanned under) is
+    dropped, so the scan resolves the artist itself; `name` is Navidrome's,
+    never the client's (it drives the name search); `external` is dropped.
+    An `mb:` page (an artist off the library) is passed through as it was."""
+    nd_id = str(data.get("nd_id") or "").strip()
+    if not nd_id or nd_id.startswith("mb:"):
+        return data
+    artist = next((a for a in _nd_artist_index() if a.get("id") == nd_id), None) or {}
+    stored = _index_get_artist("", nd_id) or {}
+    allowed = {m for m in (_effective_artist_mbid(nd_id), _nd_artist_tag_mbid(artist),
+                           stored.get("artist_mbid") or "") if m}
+    mbid = str(data.get("mbid") or "").strip()
+    return {"nd_id": nd_id, "mbid": mbid if mbid in allowed else "",
+            "name": artist.get("name") or ""}
+
+def _artist_rescan_view(data: dict, admin: bool = True) -> tuple:
     """`POST /api/artist/discography`: `(payload, status)`. Scan one artist's
     discography now — a page's Rescan, or the first open of an artist that
     has no index row yet.
@@ -11176,16 +12318,56 @@ def _artist_rescan_view(data: dict) -> tuple:
     without the library unless the library turns out to have them.
     """
     data = data if isinstance(data, dict) else {}
+    if not admin:
+        data = _artist_rescan_caller_limits(data)
     name = str(data.get("name") or "").strip()
     nd_id = str(data.get("nd_id") or "").strip()
     # I-019: a client whose copy of the overrides is stale still sends
     # Navidrome's tag; the artist is scanned under its override regardless.
     mbid = _effective_artist_mbid(nd_id, str(data.get("mbid") or "").strip())
-    if not mbid:
+    if not mbid and (not nd_id or nd_id.startswith("mb:")):
         return {"error": "mbid is required"}, 400
     user = _default_web_user()
     if not user:
         return {"error": "No configured user"}, 400
+    if not mbid:
+        # Worbus P1 S3, Scan now for a library artist lb-bot has no MBID
+        # for: the worker's own name -> MBID resolution, on the task's thread.
+        with _artist_scan_start_lock:
+            running = _artist_scan_in_flight("", nd_id)
+            if running:
+                return {"ok": True, "task_id": running, "running": True}, 200
+            task_id = _artist_resolve_scan_task(nd_id, name, user)
+            _artist_scan_pending[f"nd:{nd_id}"] = task_id
+        return {"ok": True, "task_id": task_id}, 200
+    with _artist_scan_start_lock:
+        return _artist_rescan_start(mbid, name, nd_id, user, data)
+
+def _artist_scan_in_flight(mbid: str, nd_id: str) -> str:
+    """The task id of a scan of this artist that is running, or "": one its
+    entry says is running (a page's, or the worker's — `AUTO_INDEX_SCAN_TASK`),
+    or one this route started whose task is still running and whose thread
+    has not written its entry yet. Called under `_artist_scan_start_lock`."""
+    running = _artist_scan_get(mbid, nd_id)
+    if running and running["state"] == "running":
+        return running["taskId"]
+    for key in _artist_scan_keys(mbid, nd_id):
+        task_id = _artist_scan_pending.get(key)
+        if not task_id:
+            continue
+        task = _task_snapshot(task_id)
+        if task and task.get("status") == "running":
+            with _artist_scans_lock:
+                written = any((_artist_scans.get(k) or {}).get("task_id") == task_id
+                              for k in _artist_scan_keys(mbid, nd_id))
+            if not written:
+                return task_id
+        _artist_scan_pending.pop(key, None)
+    return ""
+
+def _artist_rescan_start(mbid: str, name: str, nd_id: str, user: dict, data: dict) -> tuple:
+    """The rest of `_artist_rescan_view` for an artist with an MBID, under
+    `_artist_scan_start_lock`."""
     # `mb:` ids come from the MusicBrainz search (artists not in the
     # library), so there's nothing to match against — skip the library fetch.
     skip_library = bool(data.get("external")) or nd_id.startswith("mb:")
@@ -11199,16 +12381,18 @@ def _artist_rescan_view(data: dict) -> tuple:
             skip_library = False
             nd_id = owned["nd_id"]
             name = owned["name"] or name
-    running = _artist_scan_get(mbid, nd_id)
-    if running and running["state"] == "running":
+    running = _artist_scan_in_flight(mbid, nd_id)
+    if running:
         # Pressing Rescan again while one runs queues nothing new; it used to
         # start another walk sharing the same one-request-a-second budget.
-        return {"ok": True, "task_id": running["taskId"], "running": True}, 200
+        return {"ok": True, "task_id": running, "running": True}, 200
     if not skip_library and nd_id in _artist_overrides():
         live_ids = {a.get("id") for a in _nd_artist_index() if a.get("id")}
         if _artist_scan_covered(mbid, nd_id, live_ids):
             return {"ok": True, "task_id": "", "covered": True}, 200
     task_id = _artist_scan_task(mbid, name, nd_id, user, skip_library=skip_library)
+    for key in _artist_scan_keys(mbid, nd_id):
+        _artist_scan_pending[key] = task_id
     return {"ok": True, "task_id": task_id}, 200
 
 def _artist_matches_to_check(overrides: dict) -> list | None:
@@ -11680,8 +12864,37 @@ def _remove_artist_override(nd_id) -> tuple:
 #   first undo and dropped by the second — the library is a union of disks,
 #   and a disk that is away looks exactly like files that are gone), and **a
 #   cover that was the user's is never deleted** (`_album_cover_restore`).
-# - **Paths are stored, never sent**: `folder` and `tag_changes.path` do not
-#   leave the process; a failure names a file by its title.
+# - **A cover change reaches the songs too** (B-297). Navidrome serves a
+#   song's picture from inside its file first, so `cover.jpg` alone changed
+#   the album page and left Now playing on the old picture. After the folder
+#   cover, the front picture inside every file of the album that has a
+#   picture is replaced (`_album_embed_cover`; the per-format rules are above
+#   `_PICTURE_WRITABLE_EXTS`): every front out, the new one where the first
+#   was or appended, other pictures where they are, files with none left
+#   alone, m4a/WAV left with a failure row. What is put in is the fetched
+#   image up to `EMBEDDED_COVER_MAX_BYTES` (1.5 MB), else the Archive's
+#   1200 px, else its 500 px version (`_cover_for_embedding`). **First write
+#   wins in `picture_changes`** as in `tag_changes`, a table of its own; the
+#   removed pictures' bytes are kept as `picture-backups/<id>/<sha256>` —
+#   beside `cover-backups/`, never in it, which an undo (this build's, or a
+#   rolled-back one's) empties into the album folder — and everything is on
+#   disk before the first file is written (`_picture_changes_keep_all`). The
+#   route still answers as soon as the folder cover is written; the songs are
+#   an `album-cover` task that holds the album (`in_progress` for anyone
+#   else), asks for one scan after the last write, then announces. **The
+#   row's state, `done` and `total` are not the songs'**: clients read a
+#   cover row as the build before this left it, and an apply's count is its
+#   tags'; the songs add failures only, and that they are being written is
+#   the `embedding` column, which no client sees and the startup pass turns
+#   into a failure if a restart cut it short. An apply with `cover_url`
+#   embeds before its follow, so one scan covers both. The undo restores
+#   pictures after the tags and before the folder cover, only into a file
+#   whose front is still one lb-bot wrote (`_picture_changes_put_back`), and
+#   counts files, not records. No backfill: an album changed before this
+#   build has no picture rows; choosing its cover again embeds it.
+# - **Paths are stored, never sent**: `folder`, `tag_changes.path` and
+#   `picture_changes.path` do not leave the process; a failure names a file by
+#   its title.
 # - The tables are outside the change feed, like `artist_overrides`.
 # ---------------------------------------------------------------------------
 
@@ -11713,6 +12926,12 @@ ALBUM_OVERRIDE_INDEX_WAIT = 60.0
 ALBUM_OVERRIDE_FOLLOW_UP = 600.0
 ALBUM_OVERRIDE_POLL_SECS = 3.0
 ALBUM_COVER_MAX_BYTES = 20 * 1024 * 1024
+# The largest image lb-bot puts inside a song (B-297, rule 3; the owner's
+# figure). A larger one goes in as the Cover Art Archive's 1200 px version,
+# else its 500 px one, else not at all: no original of up to 20 MB is copied
+# into every file of an album. (Embedded pictures measured in the library:
+# median 72 kB, largest 4.7 MB.)
+EMBEDDED_COVER_MAX_BYTES = int(1.5 * 1024 * 1024)
 ALBUM_COVERS_MAX = 12
 # A wait for the album's placement claim this long was a real one: what was
 # planned before it is planned again (`_album_claim_groups`).
@@ -11720,6 +12939,14 @@ ALBUM_OVERRIDE_REPLAN_AFTER = 1.0
 _ALBUM_OVERRIDE_RUNNING = ("applying", "removing")
 _ALBUM_OVERRIDE_INTERRUPTED = ("interrupted by a restart — undo to restore the previous "
                                "tags, or apply again")
+# The same for a row whose change kept no tags (a cover change alone): there
+# are no tags to speak of.
+_ALBUM_OVERRIDE_INTERRUPTED_COVER = ("interrupted by a restart — undo to put the earlier cover "
+                                     "back")
+# What startup says on a row whose cover change a restart cut short while it
+# was writing the cover inside the songs (B-297). The row keeps its state.
+_COVER_INSIDE_INTERRUPTED = ("lb-bot stopped while it was changing the cover inside the "
+                             "songs; choose the cover again, or undo")
 # The image names Navidrome prefers for an album's cover, in any case.
 _COVER_IMAGE_RE = re.compile(r"^(?:cover|folder|front)\.[^.]+$", re.I)
 _ALBUM_COVER_ONE_FOLDER = ("this album's files are in more than one folder, and lb-bot only "
@@ -11743,10 +12970,12 @@ _album_override_claim_lock = threading.Lock()
 # The albums a job is working on right now, by their Navidrome ids: an apply
 # or a remove from the request's answer until the album is listed again (or
 # the minute's wait for that has passed, or the job has died), a cover change
-# for as long as its request takes. `{a token of the job: its album ids}`.
+# from its request until the cover inside the songs is written and Navidrome
+# asked to scan (B-297). `{a token of the job: its album ids}`.
 #
 # It answers two questions the rows cannot. "Is a job running?" for a cover
-# change, which gives the row no state of its own; and, for Fill gaps, "may
+# change, which gives the row no state of its own — not while the cover
+# inside the songs is written either; and, for Fill gaps, "may
 # work start for this album?" without a database read under `_review_lock`.
 # In memory on purpose: a job does not outlive the process, and a row found
 # `applying` at startup is settled there (`_album_overrides_interrupted`).
@@ -12288,6 +13517,18 @@ def _album_override_of(album: dict, folder: str = None) -> dict | None:
             return row
     return None
 
+def _album_override_kept_tags(override_id: str) -> bool:
+    """Whether the row's changes kept any file's tags — else it changed the
+    cover alone, and nothing it says may speak of tags."""
+    with _index_lock:
+        return _index_db().execute("SELECT 1 FROM tag_changes WHERE batch_id = ? LIMIT 1",
+                                   (override_id,)).fetchone() is not None
+
+def _album_override_way_out(override_id: str) -> str:
+    """How a row a job died on is undone, in a failure's words."""
+    return ("undo to restore the previous tags, or apply again"
+            if _album_override_kept_tags(override_id) else "undo to put the earlier cover back")
+
 def _album_overrides_interrupted() -> int:
     """Startup: a row found `applying` or `removing` was being worked on when
     lb-bot stopped — its task died with the process. It reads `failed`, with
@@ -12298,6 +13539,10 @@ def _album_overrides_interrupted() -> int:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, album, failures FROM album_overrides WHERE state IN (?, ?)",
             _ALBUM_OVERRIDE_RUNNING)]
+    reasons = {row["id"]: (_ALBUM_OVERRIDE_INTERRUPTED if _album_override_kept_tags(row["id"])
+                           else _ALBUM_OVERRIDE_INTERRUPTED_COVER) for row in rows}
+    with _index_lock:
+        conn = _index_db()
         with conn:
             for row in rows:
                 try:
@@ -12306,11 +13551,36 @@ def _album_overrides_interrupted() -> int:
                     failures = []
                 # A failure is named by a title; this one is the album's.
                 failures.append({"title": row["album"] or "This album",
-                                 "reason": _ALBUM_OVERRIDE_INTERRUPTED})
+                                 "reason": reasons[row["id"]]})
                 conn.execute("UPDATE album_overrides SET state = 'failed', failures = ? "
                              "WHERE id = ?", (json.dumps(failures), row["id"]))
     if rows:
         print(f"  album overrides: {len(rows)} interrupted by the restart")
+    return len(rows)
+
+def _album_cover_embeds_interrupted() -> int:
+    """Startup: a row whose `embedding` marker is set was having the cover
+    inside its songs written when lb-bot stopped (or between the route's
+    answer and the task's start). It keeps its state; it gets one failure that
+    says so, and the marker goes. Returns how many rows that was."""
+    with _index_lock:
+        conn = _index_db()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, failures FROM album_overrides WHERE embedding > 0")]
+        with conn:
+            for row in rows:
+                try:
+                    failures = json.loads(row["failures"] or "[]")
+                except ValueError:
+                    failures = []
+                if not isinstance(failures, list):
+                    failures = []
+                failures.append({"title": "Cover image", "reason": _COVER_INSIDE_INTERRUPTED})
+                conn.execute("UPDATE album_overrides SET embedding = 0, failures = ? WHERE id = ?",
+                             (json.dumps(failures), row["id"]))
+    if rows:
+        print(f"  album overrides: {len(rows)} cover change(s) cut short while the cover inside "
+              f"the songs was written")
     return len(rows)
 
 # ---- who else is working on the album -------------------------------------------
@@ -12815,8 +14085,8 @@ def _album_task(kind: str, label: str, override_id: str, work, job=None, died=No
                 override_id, state="failed",
                 failures=_album_override_wire(row)["failures"] + [{
                     "title": row["album"] or "This album",
-                    "reason": f"stopped by an error ({type(e).__name__}) — undo to "
-                              f"restore the previous tags, or apply again"}])
+                    "reason": f"stopped by an error ({type(e).__name__}) — "
+                              f"{_album_override_way_out(override_id)}"}])
 
     died = died or album_died
 
@@ -12969,6 +14239,17 @@ def _album_override_apply_task(override_id: str, album: dict, release: dict, pla
                 failures.append({"title": "Cover image",
                                  "reason": _os_error_text(e) if isinstance(e, OSError)
                                  else str(e)})
+            else:
+                # Before `_album_override_follow`, so that its one scan covers
+                # the tags and the pictures alike. The row's `done` and
+                # `total` stay the tag writes': this adds failures only.
+                album_files = [(f["path"], {"title": f["title"] or (f["slot"] or {}).get("title")
+                                            or "An untitled track"})
+                               for f in plan["files"] if f["path"]]
+                _done, inside, _paths = _album_embed_cover(
+                    override_id, album_files, cover_url, image, ext, base_failures=failures,
+                    label=f"{row['artist']} - {label}")
+                failures = failures + inside
     fields = dict(done=done, failures=failures)
     if done and release["title"]:
         fields["album"] = release["title"]
@@ -13140,14 +14421,31 @@ def _album_override_delete(override_id: str) -> None:
         conn = _index_db()
         with conn:
             conn.execute("DELETE FROM tag_changes WHERE batch_id = ?", (override_id,))
+            conn.execute("DELETE FROM picture_changes WHERE batch_id = ?", (override_id,))
             conn.execute("DELETE FROM album_overrides WHERE id = ?", (override_id,))
+    # A picture kept from inside a file is left where it is, as a folder
+    # cover is; only empty folders go.
+    _rmdir_if_empty(_picture_backup_dir(override_id))
     _rmdir_if_empty(_cover_backup_dir(override_id))
 
 def _album_override_reach(override_id: str, row: dict) -> tuple:
     """`_tag_changes_reach` for an album override's undo: the folders of the
-    files on record, and the album's own when there is a cover to undo."""
+    files on record — those whose tags were kept, and those whose pictures
+    were (B-297), **each file once** (the clients say `done/total files`) —
+    and the album's own when there is a cover to undo."""
     cover = row["cover_file"] or os.path.isdir(_cover_backup_dir(override_id))
-    return _tag_changes_reach(override_id, (row["folder"],) if cover else ())
+    _reachable, _total, there = _tag_changes_reach(override_id,
+                                                   (row["folder"],) if cover else ())
+    files = set(_tag_changes_paths(override_id)) | set(_picture_changes_paths(override_id))
+    there = there and all(_path_in_library(os.path.dirname(p))
+                          and os.path.isdir(os.path.dirname(p)) for p in files)
+    reachable = sum(1 for p in files if _path_in_library(p) and os.path.isfile(p))
+    return reachable, len(files), there
+
+def _tag_changes_paths(batch_id: str) -> list:
+    with _index_lock:
+        return [r[0] for r in _index_db().execute(
+            "SELECT path FROM tag_changes WHERE batch_id = ?", (batch_id,))]
 
 def _tag_changes_reach(batch_id: str, folders=()) -> tuple:
     """`(reachable, total, there)` for an undo: how many of the files whose
@@ -13215,7 +14513,34 @@ def _album_override_remove_view(data) -> tuple:
                 lambda: _album_override_remove_task(override_id, job), job=job)
     return {"ok": True, "id": override_id, "state": "removing"}, 200
 
-def _tag_changes_put_back(batch_id: str, keys, progress, what: str = "a batch") -> tuple:
+def _note_outcome(outcomes, path: str, before: tuple, after: tuple) -> None:
+    """What one pass of an undo's loop did to a file, from its counters
+    `(done, given up, failures)` before and after: "ok", "given up" or
+    "failed", appended to `outcomes[path]` (when there is an `outcomes`)."""
+    if outcomes is None:
+        return
+    outcome = ("ok" if after[0] > before[0] else "given up" if after[1] > before[1]
+               else "failed" if after[2] > before[2] else "")
+    if outcome:
+        outcomes.setdefault(path, []).append(outcome)
+
+def _undo_files(outcomes: dict, expected: dict) -> tuple:
+    """`(done, given up)` for an undo, counted in FILES (`expected`: each
+    path's number of records — tags, pictures): a file is done once every
+    record of it has been gone through, none failed and one at least was put
+    back or already right; it is given up once every record of it was."""
+    done = given_up = 0
+    for path, seen in outcomes.items():
+        if len(seen) < expected.get(path, 1):
+            continue
+        if all(o == "given up" for o in seen):
+            given_up += 1
+        elif "failed" not in seen and "ok" in seen:
+            done += 1
+    return done, given_up
+
+def _tag_changes_put_back(batch_id: str, keys, progress, what: str = "a batch",
+                          outcomes=None) -> tuple:
     """Put back every file's earlier tags under a batch — the one loop an
     undo runs, an album override's or an artist merge's. `keys` are the tags
     the batch writes (what "already as its snapshot says" is asked about).
@@ -13252,6 +14577,10 @@ def _tag_changes_put_back(batch_id: str, keys, progress, what: str = "a batch") 
     - **a snapshot that is not usable JSON** can never be restored by
       anything: dropped, and said. One whose `format` this build does not
       know is another build's (a newer one, after a rollback): kept, and said.
+
+    `outcomes`, when given, is a dict that gets each path's outcome appended
+    — "ok", "failed" or "given up" — before `progress` is called: what an
+    undo that also puts pictures back counts files by.
     """
     keys = tuple(keys)
     with _index_lock:
@@ -13261,6 +14590,7 @@ def _tag_changes_put_back(batch_id: str, keys, progress, what: str = "a batch") 
     failures, done, restored, given_up = [], 0, [], 0
     for entry in kept:
         path = entry["path"]
+        counts = (done, given_up, len(failures))
         try:
             before = json.loads(entry["before"] or "{}")
         except ValueError:
@@ -13312,6 +14642,7 @@ def _tag_changes_put_back(batch_id: str, keys, progress, what: str = "a batch") 
                     _tag_changes_drop(batch_id, path)
                 else:
                     fail("its tags could not be restored")
+        _note_outcome(outcomes, path, counts, (done, given_up, len(failures)))
         progress(done, failures)
     if given_up:
         print(f"  undo: gave up on the earlier tags of {given_up} file(s) of {what} that a "
@@ -13323,6 +14654,478 @@ def _undo_total(row: dict, given_up: int) -> int:
     files this press tried — what the request counted (`row`, read when the
     task began), less the ones it gave up on."""
     return max(int(row["total"] or 0) - int(given_up or 0), 0)
+
+# ---- the cover inside the files: keep, write, put back (B-297) -----------------
+
+# The reason every failure of a file's picture begins with.
+_PICTURE_NOT_CHANGED = "the cover inside this file was not changed"
+# Where a picture an undo gives up on goes, in words a client may see.
+_PICTURE_STAYS_KEPT = ("the picture that was in it stays in lb-bot's keeping (its "
+                       "picture-backups folder, beside its index)")
+
+def _picture_backup_dir(batch_id: str) -> str:
+    """Where the pictures a cover change took out of the files are kept: one
+    file per distinct image, named by its sha256, in
+    `<dir of library_index.db>/picture-backups/<override id>/` — beside
+    `cover-backups/`, **never inside it**. The folder cover's undo
+    (`_album_cover_restore`) moves every entry of `cover-backups/<id>/` into
+    the album's folder, and so does the build before this one's after a
+    rollback: anything of the songs' pictures kept there would land in the
+    album folder."""
+    return os.path.join(os.path.dirname(os.path.abspath(LIBRARY_INDEX_FILE)),
+                        "picture-backups", batch_id)
+
+def _file_has_picture(path: str):
+    """Whether a file lb-bot writes no pictures in has one all the same:
+    True, False, or None when it cannot be read. Any format mutagen reads —
+    an m4a's `covr`, the `APIC` of a WAV's ID3 chunk, a Vorbis picture."""
+    import mutagen
+    try:
+        audio = mutagen.File(path)
+    except Exception:  # noqa: BLE001 — whatever stops the reading
+        return None
+    if audio is None:
+        return None
+    if getattr(audio, "pictures", None):
+        return True
+    tags = audio.tags
+    if tags is None:
+        return False
+    if hasattr(tags, "getall"):
+        return bool(tags.getall("APIC"))
+    try:
+        keys = {str(k).lower() for k in tags.keys()}
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(keys & {"covr", "metadata_block_picture", "cover art (front)", "coverart"})
+
+def _picture_changes_plan(files) -> dict:
+    """What a cover change will do to each of `files` (`(path, labels)`,
+    labels being what a failure names the file by): `writes` — `(path,
+    labels, snapshot, fronts)` for every file lb-bot writes pictures in that
+    has one (`_picture_snapshot`'s JSON, and the sha256 of each front it has
+    now); `images` — the bytes of every front a write will remove, once per
+    distinct image (an album's files usually share one: what is held in
+    memory is that, never every file's pictures); `failures` — a file that
+    has a picture lb-bot cannot write (an m4a, a WAV: in the words the tag
+    writes use), or that cannot be read; `skipped` — how many have no
+    picture, and so already show the folder cover: they are neither written
+    nor a failure."""
+    writes, failures, skipped, images = [], [], 0, {}
+    for path, labels in files:
+        labels = labels if isinstance(labels, dict) else {"title": labels}
+        ext = _file_ext(path)
+        if ext in _PICTURE_WRITABLE_EXTS:
+            try:
+                fmt, version, pictures = _embedded_pictures(path)
+            except OSError as e:
+                failures.append({**labels, "reason": f"{_PICTURE_NOT_CHANGED}: it could not be "
+                                                     f"read ({_os_error_text(e)})"})
+                continue
+            except Exception as e:  # noqa: BLE001
+                failures.append({**labels, "reason": f"{_PICTURE_NOT_CHANGED}: it could not be "
+                                                     f"read ({type(e).__name__})"})
+                continue
+            if pictures:
+                snapshot, kept = _picture_snapshot(fmt, version, pictures)
+                images.update(kept)
+                writes.append((path, labels, snapshot, _fronts_of(pictures)))
+            else:
+                skipped += 1
+            continue
+        has = _file_has_picture(path)
+        if has is None:
+            failures.append({**labels, "reason": f"{_PICTURE_NOT_CHANGED}: it could not be read"})
+        elif has:
+            kind = f"a .{ext} file" if ext else "this kind of file"
+            failures.append({**labels, "reason": f"{_PICTURE_NOT_CHANGED}: lb-bot cannot write "
+                                                 f"the pictures of {kind}, so it was left as "
+                                                 f"it is"})
+        else:
+            skipped += 1
+    return {"writes": writes, "failures": failures, "skipped": skipped, "images": images}
+
+def _picture_backup_keep(batch_id: str, images: dict) -> None:
+    """Put each image (`{sha256: bytes}`) into the batch's backup folder,
+    once, **on disk** — written beside its name, fsynced, renamed, the
+    folder fsynced. Raises OSError."""
+    if not images:
+        return
+    folder = _picture_backup_dir(batch_id)
+    os.makedirs(folder, exist_ok=True)
+    for sha, data in images.items():
+        dest = os.path.join(folder, sha)
+        if os.path.isfile(dest):
+            continue
+        partial = dest + ".part"
+        with open(partial, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(partial, dest)
+    try:
+        _fsync_path(folder)
+    except OSError:
+        pass                            # not every filesystem syncs a folder
+
+def _picture_backup_read(batch_id: str, sha: str):
+    """The kept bytes of one image, or None when lb-bot no longer has them
+    whole (gone, or not what their name says)."""
+    try:
+        with open(os.path.join(_picture_backup_dir(batch_id), sha), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data if _picture_sha(data) == sha else None
+
+_SHA256_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def _shas_named_in(value) -> set:
+    """Every sha256 a row's JSON names, wherever it names it — so that the
+    images of a row in a shape this build does not know are still known to be
+    needed."""
+    if isinstance(value, dict):
+        return set().union(*(_shas_named_in(v) for v in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_shas_named_in(v) for v in value)) if value else set()
+    return {value} if isinstance(value, str) and _SHA256_NAME_RE.match(value) else set()
+
+def _picture_backup_give_up(batch_id: str, snapshot: dict) -> None:
+    """An undo is giving up on a file: keep what was taken out of it under a
+    name no prune touches — `given-up-<sha256>.<ext>` in the batch's backup
+    folder. It may be the only copy of a picture that was the user's (the file
+    has another picture now, or is gone), so lb-bot never deletes it."""
+    folder = _picture_backup_dir(batch_id)
+    for row in (snapshot or {}).get("removed") or []:
+        sha = row.get("sha256") if isinstance(row, dict) else None
+        if not (isinstance(sha, str) and _SHA256_NAME_RE.match(sha)):
+            continue
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg"}.get(
+            str(row.get("mime") or "").lower(), "img")
+        kept = os.path.join(folder, f"given-up-{sha}.{ext}")
+        if os.path.exists(kept) or not os.path.isfile(os.path.join(folder, sha)):
+            continue
+        try:
+            shutil.copyfile(os.path.join(folder, sha), kept)
+            _fsync_path(kept)
+        except OSError as e:
+            print(f"  cover inside the files: a picture given up on could not be kept apart "
+                  f"({_os_error_text(e)}); it stays under its own name")
+            raise
+
+def _picture_backups_prune(batch_id: str) -> None:
+    """Remove the kept images no row of the batch names any more — and only
+    those: a file named by a sha256 that no row names anywhere in its JSON,
+    whatever the row's shape (a newer build's included). An image given up on
+    (`given-up-…`) is never removed, nor is anything when a row of the batch
+    cannot be read. The folder goes once it is empty."""
+    folder = _picture_backup_dir(batch_id)
+    if not os.path.isdir(folder):
+        return
+    needed = set()
+    with _index_lock:
+        rows = _index_db().execute("SELECT before FROM picture_changes WHERE batch_id = ?",
+                                   (batch_id,)).fetchall()
+    for (before,) in rows:
+        try:
+            needed |= _shas_named_in(json.loads(before or "{}"))
+        except ValueError:
+            return                      # a row nobody can read may name any of them
+    for name in os.listdir(folder):
+        stem = name[:-len(".part")] if name.endswith(".part") else name
+        if not _SHA256_NAME_RE.match(stem) or (name == stem and name in needed):
+            continue
+        try:
+            os.remove(os.path.join(folder, name))
+        except OSError as e:
+            print(f"  cover inside the files: a kept picture could not be removed "
+                  f"({_os_error_text(e)})")
+    _rmdir_if_empty(folder)
+
+def _picture_changes_keep_all(batch_id: str, entries, images: dict, wrote_sha: str) -> set:
+    """Record files' front pictures from before a batch first replaces them:
+    `entries` are `(path, labels, snapshot)` (a `None` snapshot: the file is
+    already as wanted and only an existing row is told), `images` the bytes
+    by sha256. The images a new row needs first, then **one durable commit**
+    for every row (`_index_commit_durably`), all before any file is touched. **First write wins**: a row already on
+    record keeps its snapshot, and learns only that `wrote_sha` is now what
+    lb-bot writes (set before the write, and added to the row's list of what
+    it has written, so that an undo after a stop half way recognises either).
+    Returns the paths whose snapshot is this call's. Raises sqlite3.Error or
+    OSError, with nothing written."""
+    entries = list(entries)
+    fresh = set()
+    if not entries:
+        return fresh
+    on_record = set(_picture_changes_paths(batch_id))
+    needed = {r["sha256"] for path, _labels, snapshot in entries
+              if snapshot is not None and path not in on_record
+              for r in snapshot.get("removed") or []}
+
+    def write(conn) -> None:
+        have = {row[0]: row[1] for row in conn.execute(
+            "SELECT path, before FROM picture_changes WHERE batch_id = ?", (batch_id,))}
+        now = time.time()
+        for path, labels, snapshot in entries:
+            if path not in have:
+                if snapshot is None:
+                    continue
+                fresh.add(path)
+                labels = labels if isinstance(labels, dict) else {"title": labels}
+                conn.execute(
+                    "INSERT OR IGNORE INTO picture_changes "
+                    "(batch_id, path, before, wrote_sha, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (batch_id, path, json.dumps({**labels, "snapshot": snapshot,
+                                                 "wrote": [wrote_sha]}), wrote_sha, now))
+                continue
+            try:
+                noted = json.loads(have[path] or "{}")
+            except ValueError:
+                noted = None
+            if isinstance(noted, dict):
+                # Seen just now, and about to be written: an undo's notes are over.
+                noted.pop("missing", None)
+                noted.pop("changed", None)
+                wrote = [w for w in noted.get("wrote") or [] if isinstance(w, str)]
+                noted["wrote"] = wrote + ([wrote_sha] if wrote_sha not in wrote else [])
+                conn.execute("UPDATE picture_changes SET before = ?, wrote_sha = ? "
+                             "WHERE batch_id = ? AND path = ?",
+                             (json.dumps(noted), wrote_sha, batch_id, path))
+            else:
+                conn.execute("UPDATE picture_changes SET wrote_sha = ? "
+                             "WHERE batch_id = ? AND path = ?", (wrote_sha, batch_id, path))
+
+    _picture_backup_keep(batch_id, {sha: images[sha] for sha in needed})
+    _index_commit_durably(write)
+    return fresh
+
+def _picture_changes_drop(batch_id: str, path: str) -> None:
+    with _index_lock:
+        conn = _index_db()
+        with conn:
+            conn.execute("DELETE FROM picture_changes WHERE batch_id = ? AND path = ?",
+                         (batch_id, path))
+
+def _picture_changes_note(batch_id: str, path: str, before: dict, **notes) -> None:
+    """Note on a file's row what an undo found (`missing`, `changed`: when),
+    or take a note off (`False`). What a second undo reads before it gives
+    up on the file."""
+    noted = dict(before)
+    for name, on in notes.items():
+        if on:
+            noted[name] = time.time()
+        else:
+            noted.pop(name, None)
+    with _index_lock:
+        conn = _index_db()
+        with conn:
+            conn.execute("UPDATE picture_changes SET before = ? WHERE batch_id = ? AND path = ?",
+                         (json.dumps(noted), batch_id, path))
+
+def _picture_changes_paths(batch_id: str) -> list:
+    with _index_lock:
+        return [r[0] for r in _index_db().execute(
+            "SELECT path FROM picture_changes WHERE batch_id = ?", (batch_id,))]
+
+def _fronts_of(pictures) -> list:
+    """The sha256 of each front picture, in the file's order."""
+    return [_picture_sha(p["data"]) for p in pictures if p["type"] == _PICTURE_FRONT]
+
+def _picture_changes_apply(batch_id: str, plan: dict, image: bytes, mime: str,
+                           progress) -> tuple:
+    """Keep, then write: put `image` in as the front picture of every file in
+    `plan["writes"]` (`_picture_changes_plan`), under a batch that can be
+    undone. Returns `(done, failures, written paths)` — the plan's own
+    failures included; `progress(done, failures)` is called at the start and
+    after every file.
+
+    - **Every file's removed pictures are kept, on disk, before any file is
+      written**: the images, then one durable commit for the rows
+      (`_picture_changes_keep_all`). Raises sqlite3.Error or OSError when
+      that fails, **with nothing written**.
+    - A file whose only front already is `image` counts as done and is not
+      written (re-choosing a cover writes nothing twice); it gets no
+      snapshot of its own.
+    - A file that cannot be written is a failure (`_PICTURE_NOT_CHANGED`,
+      then the reason) and the rest go on. If it is as it was, a snapshot
+      this call made for it is dropped at once — kept, it is what the undo
+      would fail on for good.
+    - Copies a stop half way left beside the files are removed first.
+    """
+    new_sha = _picture_sha(image)
+    writes = list(plan.get("writes") or [])
+    failures = list(plan.get("failures") or [])
+    _picture_leftovers_recover(os.path.dirname(w[0]) for w in writes)
+    entries, as_wanted, snapshots = [], set(), {}
+    for path, labels, snapshot, fronts in writes:
+        if fronts == [new_sha]:
+            as_wanted.add(path)
+            entries.append((path, labels, None))
+            continue
+        snapshots[path] = snapshot
+        entries.append((path, labels, snapshot))
+    fresh = _picture_changes_keep_all(batch_id, entries, plan.get("images") or {}, new_sha)
+    done, written = 0, []
+    progress(done, failures)
+    for path, labels, _snapshot, _fronts in writes:
+        if path in as_wanted:
+            done += 1
+        else:
+            why = _picture_replace(path, image, mime)
+            if not why:
+                done += 1
+                written.append(path)
+            else:
+                failures.append({**labels, "reason": f"{_PICTURE_NOT_CHANGED}: {why}"})
+                if path in fresh:
+                    try:
+                        still = _fronts_of(_embedded_pictures(path)[2])
+                    except Exception:  # noqa: BLE001 — not known to be as it was
+                        still = None
+                    if still == [r["sha256"] for r in snapshots[path]["removed"]]:
+                        _picture_changes_drop(batch_id, path)
+        progress(done, failures)
+    _picture_backups_prune(batch_id)
+    return done, failures, written
+
+def _picture_changes_put_back(batch_id: str, progress, what: str = "a batch",
+                              outcomes=None) -> tuple:
+    """Put back the front pictures a batch's cover changes replaced — the
+    undo's loop for the cover inside the files, with `_tag_changes_put_back`'s
+    rules. Returns `(done, failures, restored paths, given up)`;
+    `progress(done, failures)` is called after every file.
+
+    Per file, by what one look says:
+
+    - **its front picture is one lb-bot wrote under this batch** (the only
+      front, its sha256 among the row's `wrote`): the removed pictures go
+      back where they were, with every field (`_picture_restore`);
+    - **its pictures are as they were before the batch** (a stop half way
+      before this file was reached): nothing is written, the row goes;
+    - **its picture was changed since** by somebody else: the file is left
+      alone and the row kept, said; **an undo run again** with the picture
+      still not lb-bot's gives up on it — the row goes, without another word,
+      and the file keeps the picture it has. (Kept for good, it would be a
+      row no undo could ever finish.);
+    - **not found**: kept by the first undo, given up on by the second, as
+      for the tags; **could not be looked at or read**: kept;
+    - **its folder not there**: kept;
+    - **a kept image lb-bot no longer has**: said, and the row stays;
+    - a row that is not usable JSON: dropped, and said; one whose `format`
+      this build does not know: kept, and said.
+
+    The kept images no remaining row needs are removed at the end, and copies
+    a stop half way left beside the files first.
+    """
+    with _index_lock:
+        kept = [dict(r) for r in _index_db().execute(
+            "SELECT path, before, wrote_sha FROM picture_changes WHERE batch_id = ? "
+            "ORDER BY path", (batch_id,))]
+    _picture_leftovers_recover(os.path.dirname(e["path"]) for e in kept)
+    failures, done, restored, given_up = [], 0, [], 0
+    unreadable = False
+
+    def give_up(path: str, snapshot: dict) -> bool:
+        """Let go of a file's record, keeping its picture apart first; a
+        picture that could not be kept apart keeps the record too."""
+        try:
+            _picture_backup_give_up(batch_id, snapshot)
+        except OSError:
+            return False
+        _picture_changes_drop(batch_id, path)
+        return True
+
+    for entry in kept:
+        path = entry["path"]
+        counts = (done, given_up, len(failures))
+        try:
+            before = json.loads(entry["before"] or "{}")
+        except ValueError:
+            before = None
+        usable = isinstance(before, dict) and isinstance(before.get("snapshot"), dict) \
+            and bool(before["snapshot"].get("format"))
+        labels = {"title": (before.get("title") if isinstance(before, dict) else "")
+                           or "A file"}
+        snapshot = before["snapshot"] if usable else {}
+
+        def fail(reason: str) -> None:
+            failures.append({**labels, "reason": reason})
+
+        if not (_path_in_library(path) and os.path.isdir(os.path.dirname(path))):
+            fail("its folder is no longer there; the cover that was inside it is still kept")
+        elif not usable:
+            fail("what lb-bot kept of the cover that was inside it cannot be read, so it was "
+                 "not put back; it is no longer kept")
+            _picture_changes_drop(batch_id, path)
+            unreadable = True           # the images it named are not known: none is pruned
+        elif snapshot["format"] not in ("flac", "opus", "id3"):
+            fail("this version of lb-bot cannot restore the cover that was inside it: it was "
+                 "kept in a form it does not know. It is still kept")
+        else:
+            look = _file_look(path)
+            if look == "missing" and before.get("missing"):
+                if give_up(path, snapshot):
+                    given_up += 1
+            elif look == "missing":
+                _picture_changes_note(batch_id, path, before, missing=True)
+                fail("the file was not found, so the cover that was inside it was not put "
+                     "back. It is still kept: undo again to restore it if it is back, or to "
+                     f"give up on it if it is still not there — {_PICTURE_STAYS_KEPT}")
+            elif look:
+                fail(f"the file could not be looked at ({look}); the cover that was inside "
+                     f"it is still kept")
+            else:
+                if before.get("missing"):
+                    before.pop("missing", None)
+                    _picture_changes_note(batch_id, path, before, missing=False)
+                try:
+                    fronts = _fronts_of(_embedded_pictures(path)[2])
+                except Exception as e:  # noqa: BLE001
+                    fronts = None
+                    fail(f"the file could not be read ({type(e).__name__}); the cover that "
+                         f"was inside it is still kept")
+                removed = [r for r in snapshot.get("removed") or [] if isinstance(r, dict)]
+                wrote = {w for w in before.get("wrote") or [] if isinstance(w, str)}
+                wrote.add(entry["wrote_sha"] or "")
+                wrote.discard("")
+                if fronts is None:
+                    pass
+                elif fronts == [r.get("sha256") for r in
+                                sorted(removed, key=lambda r: int(r.get("position") or 0))]:
+                    done += 1           # as it was already: nothing to write
+                    _picture_changes_drop(batch_id, path)
+                elif len(fronts) == 1 and fronts[0] in wrote:
+                    images = {r.get("sha256"): _picture_backup_read(batch_id, r.get("sha256"))
+                              for r in removed}
+                    if any(data is None for data in images.values()):
+                        fail("lb-bot no longer has the picture that was inside it, so it was "
+                             "not put back; what it knows of it is still kept")
+                    else:
+                        why = _picture_restore(path, snapshot, images)
+                        if why:
+                            fail(f"the cover that was inside it could not be put back ({why}); "
+                                 f"it is still kept")
+                        else:
+                            done += 1
+                            restored.append(path)
+                            _picture_changes_drop(batch_id, path)
+                elif before.get("changed"):
+                    if give_up(path, snapshot):     # said by the undo before, and still so
+                        given_up += 1
+                else:
+                    _picture_changes_note(batch_id, path, before, changed=True)
+                    fail("the picture inside it was changed since lb-bot wrote the cover, so it "
+                         "was left as it is. What was there before is still kept: undo again "
+                         f"to give up on it and leave the file as it is now — "
+                         f"{_PICTURE_STAYS_KEPT}")
+        _note_outcome(outcomes, path, counts, (done, given_up, len(failures)))
+        progress(done, failures)
+    if not unreadable:
+        _picture_backups_prune(batch_id)
+    if given_up:
+        print(f"  undo: gave up on the cover inside {given_up} file(s) of {what}; what was "
+              f"inside them stays in lb-bot's keeping")
+    return done, failures, restored, given_up
 
 def _album_override_remove_task(override_id: str, job=None) -> None:
     """Put every file's earlier tags back (`_tag_changes_put_back`, which has
@@ -13343,11 +15146,28 @@ def _album_override_remove_task(override_id: str, job=None) -> None:
                 "title": row["album"] or "This album",
                 "reason": f"a download for this album started ({busy}); nothing was restored"}])
             return
-        done, failures, restored, given_up = _tag_changes_put_back(
+        # Tags, then the pictures inside the files (B-297). `done` and
+        # `total` count FILES, as the clients say them ("3/12 files"): a file
+        # in both tables is one.
+        expected = {}
+        for path in _tag_changes_paths(override_id) + _picture_changes_paths(override_id):
+            expected[path] = expected.get(path, 0) + 1
+        outcomes = {}
+        _done, failures, restored, _given_up = _tag_changes_put_back(
             override_id, ALBUM_OVERRIDE_TAGS,
-            lambda done, failures: _album_override_write(
-                override_id, done=done, failures=failures),
-            what=repr(row["album"] or "an album"))
+            lambda _d, f: _album_override_write(
+                override_id, done=_undo_files(outcomes, expected)[0], failures=f),
+            what=repr(row["album"] or "an album"), outcomes=outcomes)
+        tag_failures = list(failures)
+        _done, pic_failures, pic_restored, _given_up = _picture_changes_put_back(
+            override_id,
+            lambda _d, f: _album_override_write(
+                override_id, done=_undo_files(outcomes, expected)[0],
+                failures=tag_failures + f),
+            what=repr(row["album"] or "an album"), outcomes=outcomes)
+        failures = tag_failures + pic_failures
+        restored = restored + [p for p in pic_restored if p not in restored]
+        done, given_up = _undo_files(outcomes, expected)
         if given_up:
             _album_override_write(override_id, total=_undo_total(row, given_up))
         try:
@@ -13814,11 +15634,158 @@ def _album_cover_restore(override_id: str, folder: str, own: str) -> list:
     _rmdir_if_empty(backup)
     return left
 
+# What a failure of the cover inside the songs as a whole begins with (the
+# image could not be had small enough, nothing could be kept): its row is
+# titled "Cover image", as the folder cover's are.
+_COVER_INSIDE_NOT_CHANGED = "the cover inside the songs was not changed"
+
+def _cover_inside_failure(failure: dict) -> bool:
+    """Whether a failures row is about the cover inside the songs — what the
+    next cover change replaces rather than adds to."""
+    reason = str((failure or {}).get("reason") or "")
+    return reason.startswith((_PICTURE_NOT_CHANGED, _COVER_INSIDE_NOT_CHANGED))
+
+def _cover_mime(ext: str) -> str:
+    return "image/png" if ext == "png" else "image/jpeg"
+
+def _cover_for_embedding(cover_url: str, image: bytes, ext: str) -> tuple:
+    """Rule 3: `(bytes, mime, note)` — what goes inside the songs for a cover
+    fetched as `image` from `cover_url` — or `(None, "", why not)`. The
+    image itself when it is `EMBEDDED_COVER_MAX_BYTES` or less; else the
+    Archive's 1200 px version of it, else its 500 px one (`_cover_renditions`,
+    fetched like any cover address), the first that is small enough — and
+    `note` then says which version went in. Both cover paths (the cover
+    route's task and an apply with `cover_url`) choose the image here."""
+    if len(image) <= EMBEDDED_COVER_MAX_BYTES:
+        return image, _cover_mime(ext), ""
+    unanswered = ""
+    for size, rendition in _cover_renditions(cover_url):
+        try:
+            data, rext = _fetch_cover_image(rendition)
+        except CoverNoSuchImage:
+            continue
+        except (ValueError, CoverArchiveUnavailable) as e:
+            unanswered = str(e)
+            continue
+        if len(data) <= EMBEDDED_COVER_MAX_BYTES:
+            return data, _cover_mime(rext), (f"the Cover Art Archive's {size} px version of it "
+                                             f"is what was put inside the songs")
+    limit = f"{EMBEDDED_COVER_MAX_BYTES / (1024 * 1024):g} MB"
+    if unanswered:
+        return None, "", (f"the image is larger than lb-bot puts inside a song ({limit}), and "
+                          f"its smaller version could not be had ({unanswered})")
+    return None, "", (f"the image is larger than lb-bot puts inside a song ({limit}), and the "
+                      f"Cover Art Archive has no smaller version of it that is small enough")
+
+def _album_embed_cover(override_id: str, files, cover_url: str, image: bytes, ext: str,
+                       base_failures=(), label: str = "") -> tuple:
+    """The cover inside the album's files (B-297), once the folder cover is
+    written: `files` are `(path, labels)`, every file of the album. Returns
+    `(done, failures, written paths)` — this step's own. **The row's state,
+    `done` and `total` are not touched**: they are the job's they were before
+    this build (a cover change's 0 and 0, an apply's tag count), and the
+    clients read them so. This step's failures are written on top of
+    `base_failures` as it goes.
+
+    Which files and how: `_picture_changes_plan` and `_picture_changes_apply`
+    (a file with no picture is left alone; every removed picture kept on
+    disk before the first write). What goes in: `_cover_for_embedding`; with
+    nothing small enough, nothing is written and one "Cover image" row says
+    why."""
+    base_failures = list(base_failures)
+    plan = _picture_changes_plan(files)
+    if not plan["writes"] and not plan["failures"]:
+        return 0, [], []
+    done, new, written, note = 0, list(plan["failures"]), [], ""
+    if plan["writes"]:
+        chosen, mime, note = _cover_for_embedding(cover_url, image, ext)
+        if chosen is None:
+            new.append({"title": "Cover image", "reason": f"{_COVER_INSIDE_NOT_CHANGED}: {note}"})
+            note = ""
+        else:
+            try:
+                done, new, written = _picture_changes_apply(
+                    override_id, plan, chosen, mime,
+                    lambda d, f: _album_override_write(override_id,
+                                                       failures=base_failures + f))
+            except (sqlite3.Error, OSError) as e:
+                print(f"  album override: could not keep the pictures inside the files: "
+                      f"{_os_error_text(e)}")
+                new = list(plan["failures"]) + [{
+                    "title": "Cover image",
+                    "reason": f"{_COVER_INSIDE_NOT_CHANGED}: the pictures that were inside them "
+                              f"could not be kept first, so none was changed"}]
+    _album_override_write(override_id, failures=base_failures + new)
+    _web_log(f"album override: the cover inside {len(written)} of "
+             f"{len(plan['writes']) + len(plan['failures'])} song(s) of {label or 'the album'}"
+             + (f" — {note}" if note else ""))
+    return done, new, written
+
+def _album_cover_embed_task(override_id: str, album: dict, release: str, files,
+                            cover_url: str, image: bytes, ext: str, album_ids,
+                            releases) -> None:
+    """A cover change's background half (`_album_cover_view`): the cover
+    inside the songs, then **one** Navidrome scan, then the `albumIndexed`
+    announce — those two in a `finally`, so that nothing that goes wrong in
+    between costs the folder cover its scan. Runs under the album's job
+    token, so a second change, an undo and Fill gaps are refused (409
+    `in_progress`) until it ends; holds the album's placement claims while
+    it writes. **The row's state, `done` and `total` are left as they were**
+    (clients read a cover change's row as the build before this one left
+    it): this step adds failures, and nothing else a client sees. That it is
+    running is the `embedding` marker, set by the route before its answer
+    and cleared here; a restart leaves it for the startup pass
+    (`_album_cover_embeds_interrupted`). The row's earlier failures stay,
+    less the ones about the cover inside the songs, which this change
+    replaces."""
+    label = f"{album.get('artist') or ''} - {album.get('name') or ''}".strip(" -")
+    try:
+        row = _album_override_row(override_id)
+        kept = ([f for f in _album_override_wire(row)["failures"]
+                 if not _cover_inside_failure(f)] if row else [])
+        try:
+            with contextlib.ExitStack() as claims:
+                groups = _review_group_ids_of_albums(album_ids)
+                _album_claim_groups(claims, groups)
+                if row is not None:
+                    busy = _album_fill_in_flight(album_ids, releases, claimed=groups)
+                    if busy:
+                        _album_override_write(override_id, failures=kept + [{
+                            "title": "Cover image",
+                            "reason": f"{_COVER_INSIDE_NOT_CHANGED}: a download for this album "
+                                      f"started ({busy})"}])
+                    else:
+                        _album_embed_cover(override_id, files, cover_url, image, ext,
+                                           base_failures=kept, label=label)
+        except Exception as e:  # noqa: BLE001 — said on the row; the scan still runs
+            print(f"  album override: the cover inside the songs of {label or 'an album'} "
+                  f"stopped: {type(e).__name__}")
+            now = _album_override_row(override_id)
+            if now is not None:
+                _album_override_write(override_id, failures=[
+                    f for f in _album_override_wire(now)["failures"]] + [{
+                        "title": "Cover image",
+                        "reason": f"{_COVER_INSIDE_NOT_CHANGED}: it stopped on an error "
+                                  f"({type(e).__name__})"}])
+        _album_override_write(override_id, embedding=0)
+    finally:
+        _album_scan()
+        _album_cover_announce(album, release)
+
 def _album_cover_view(data) -> tuple:
     """`POST /api/album/cover`: `(payload, status)`. The cover alone; the
-    release stays. Synchronous. It creates the album's override row, or
-    updates the one it has, so the change is listed and undone like any
-    other.
+    release stays. It creates the album's override row, or updates the one
+    it has, so the change is listed and undone like any other.
+
+    **The folder cover is written before the answer, the songs after it**
+    (B-297): `{"ok": true, "id"}` 200 means `cover.<ext>` is in the folder.
+    The front picture inside each of the album's files is then written by a
+    task (`_album_cover_embed_task`) that keeps the album's job token — a
+    second change, an undo and Fill gaps are refused meanwhile. The row's
+    state, `done` and `total` stay what they were (the clients read them);
+    a song that could not be changed is a `failures` row; Navidrome is asked
+    for one scan after the last write, and the clients told after it.
+    A whole album must not ride on the hub's proxy deadline.
 
     A job like the other two: refused 409 `in_progress` / `busy` on the same
     looks, the row on disk before a file is touched, and the files moved
@@ -13912,6 +15879,7 @@ def _album_cover_view(data) -> tuple:
                 print(f"  album override: could not take back an empty row: {e}")
         return answer
 
+    handed = False                      # the job is the background task's now
     try:
         with contextlib.ExitStack() as claims:
             groups = _review_group_ids_of_albums(album_ids)
@@ -13944,13 +15912,32 @@ def _album_cover_view(data) -> tuple:
                 _album_override_write(override_id, cover_url=cover_url, cover_file=name)
             except sqlite3.Error as e:
                 return {"error": f"The cover was written, but could not be recorded: {e}"}, 500
+        _web_log(f"album override: new cover for {album.get('artist') or ''} - "
+                 f"{album.get('name') or album_id}" + (f" — {smaller}" if smaller else ""))
+        # The songs' own pictures, the one scan after the last write, and the
+        # announce: in the background, still holding the album (`job`). The
+        # answer is what it always was — the folder cover is written; how the
+        # songs went is the row's to say (B-297).
+        files = [(path, {"title": str(song.get("title") or "") or "An untitled track"})
+                 for song in album.get("song") or []
+                 for path in [_song_abs_path(song)] if path and path in paths]
+        # Before the answer, and before a file is read: a restart from here on
+        # is said at the next start (`_album_cover_embeds_interrupted`).
+        try:
+            _index_commit_durably(lambda conn: conn.execute(
+                "UPDATE album_overrides SET embedding = ? WHERE id = ?",
+                (time.time(), override_id)))
+        except sqlite3.Error as e:
+            print(f"  album override: could not mark the cover inside the songs as begun: "
+                  f"{_os_error_text(e)}")
+        _album_task("album-cover", f"Cover: {album.get('name') or album_id}", override_id,
+                    lambda: _album_cover_embed_task(override_id, album, release, files,
+                                                    cover_url, image, ext, album_ids, releases),
+                    job=job)
+        handed = True
     finally:
-        _album_override_job_end(job)
-    _web_log(f"album override: new cover for {album.get('artist') or ''} - "
-             f"{album.get('name') or album_id}" + (f" — {smaller}" if smaller else ""))
-    _album_scan()
-    _album_task("album-cover", f"Cover: {album.get('name') or album_id}", "",
-                lambda: _album_cover_announce(album, release))
+        if not handed:
+            _album_override_job_end(job)
     return {"ok": True, "id": override_id}, 200
 
 def _album_cover_announce(album: dict, release_mbid: str) -> None:
@@ -16463,18 +18450,23 @@ def _listens_plays_of(artist_mbids, plays_by_mbid: dict, tags: dict) -> int:
 # POST every `INDEX_PUSH_POLL_SECS`.
 # ---------------------------------------------------------------------------
 
-def _index_push_post(seq: int, epoch: str) -> bool:
+def _index_push_post(seq: int, epoch: str, progress: dict | None = None) -> bool:
     """The real `poster`: one `POST <hub>/lb/index`, bearer-authed. Returns
     True on a 2xx; a non-2xx returns False and an exception (network down,
     DNS, timeout) propagates, exactly as `_index_push_tick` expects — it
-    catches on the caller's behalf and treats both the same way (retry)."""
+    catches on the caller's behalf and treats both the same way (retry).
+    `progress` (Worbus P1 S3) rides in the body when there is one."""
+    body = {"seq": seq, "epoch": epoch}
+    if progress is not None:
+        body["progress"] = progress
     resp = requests.post(f"{HUB_NOTIFY_URL}/lb/index",
-                         json={"seq": seq, "epoch": epoch},
+                         json=body,
                          headers={"Authorization": f"Bearer {HUB_NOTIFY_TOKEN}"},
                          timeout=5)
     return 200 <= resp.status_code < 300
 
-def _index_push_tick(state: dict, now: float, head: tuple, poster) -> dict:
+def _index_push_tick(state: dict, now: float, head: tuple, poster,
+                     progress: dict | None = None) -> dict:
     """One throttle decision for the index-push sender. Returns the (possibly
     unchanged) `state` for the next tick.
 
@@ -16505,10 +18497,33 @@ def _index_push_tick(state: dict, now: float, head: tuple, poster) -> dict:
     the first success. It used to retry every 1 s poll forever with a log
     line each time. Logged once when the writes start failing and once when
     they work again, never per retry.
+
+    **The index build's progress** (Worbus P1 S3; `_index_unindexed_progress`)
+    rides every send when there is one, so the hub's hint always has the
+    latest. A change of the progress alone also sends — the head unchanged —
+    at most every INDEX_PUSH_PROGRESS_GAP_SECS (since the previous progress
+    send attempt), and needs no HWM write: that head is recorded already.
+    `poster` is called `poster(seq, epoch)` without progress, and
+    `poster(seq, epoch, progress)` with it.
     """
     acked, attempted_at = state.get("acked"), state.get("attempted_at")
+    progress_due = progress is not None and progress != state.get("progress_acked")
     if head == acked:
-        return state
+        if not progress_due:
+            return state
+        progress_at = state.get("progress_at")
+        if progress_at is not None and now - progress_at < INDEX_PUSH_PROGRESS_GAP_SECS:
+            return state
+        if attempted_at is not None and now - attempted_at < INDEX_PUSH_MIN_GAP_SECS:
+            return state
+        seq, epoch = head
+        ok = False
+        try:
+            ok = bool(poster(seq, epoch, progress))
+        except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
+            print(f"  index push failed (seq={seq}, progress): {e}")
+        return {**state, "attempted_at": now, "progress_at": now,
+                "progress_acked": progress if ok else state.get("progress_acked")}
     if attempted_at is not None and now - attempted_at < INDEX_PUSH_MIN_GAP_SECS:
         return state
     retry_at = state.get("persist_retry_at")
@@ -16532,12 +18547,18 @@ def _index_push_tick(state: dict, now: float, head: tuple, poster) -> dict:
              if k not in ("persist_backoff", "persist_retry_at")}
     ok = False
     try:
-        ok = bool(poster(seq, epoch))
+        ok = bool(poster(seq, epoch) if progress is None else poster(seq, epoch, progress))
     except Exception as e:  # noqa: BLE001 — the hub is a nicety, never a dependency
         print(f"  index push failed (seq={seq}): {e}")
-    return {**state, "acked": head if ok else acked, "attempted_at": now}
+    state = {**state, "acked": head if ok else acked, "attempted_at": now}
+    if progress is not None:
+        state["progress_at"] = now
+        if ok:
+            state["progress_acked"] = progress
+    return state
 
-def _index_push_worker(clock=time.time, sleeper=time.sleep, poster=None) -> None:
+def _index_push_worker(clock=time.time, sleeper=time.sleep, poster=None,
+                       progress=None) -> None:
     """The `index-push` daemon thread. Polls `_index_head()` every
     `INDEX_PUSH_POLL_SECS` and hands each poll to `_index_push_tick`, which
     owns the actual throttle/send decision — kept out of this loop so a test
@@ -16558,11 +18579,15 @@ def _index_push_worker(clock=time.time, sleeper=time.sleep, poster=None) -> None
     """
     if poster is None:
         poster = _index_push_post
+        # The index build's progress rides the real push (Worbus P1 S3). A
+        # test that hands in its own poster hands in its own progress.
+        progress = progress or _index_unindexed_progress
+    progress = progress or (lambda: None)
     state = {"acked": None, "attempted_at": None}
     while True:
         try:
             if _push_enabled():
-                state = _index_push_tick(state, clock(), _index_head(), poster)
+                state = _index_push_tick(state, clock(), _index_head(), poster, progress())
                 acked = state.get("acked")
                 _index_push_public.update({
                     "ackedSeq": acked[0] if acked else None,
@@ -17045,6 +19070,116 @@ def meta_for_artist(mbid: str, refresh: bool = False) -> dict:
     _meta_cache_write("artist", mbid, payload, _meta_has_content(payload))
     return payload
 
+# ---------------------------------------------------------------------------
+# Find it (Worbus P1 S4): where a missing album can be bought or streamed.
+#
+# The release-group's own url-rels are sparse; its releases carry the store
+# and streaming links. One browse of the group's releases (`limit=100`, one
+# page: a group with more releases than that loses only the links of the
+# rest) gives the confirmed links, one per service; every search service with
+# no confirmed link gets a plain search for artist + title. Each row is
+# `{service, kind: "confirmed"|"search", url}`, never a credential.
+# ---------------------------------------------------------------------------
+
+# The relation types that say "get this release here".
+_FIND_IT_REL_TYPES = ("purchase for download", "download for free", "streaming",
+                      "free streaming", "purchase for mail-order")
+
+# The six search services, in display order, and their search URL templates —
+# the only place they live. `{q}` is "artist title", percent-quoted whole
+# (`urllib.parse.quote(..., safe="")`), which is safe in a path and a query.
+_FIND_IT_SEARCH = {
+    "bandcamp":      "https://bandcamp.com/search?q={q}&item_type=a",
+    "qobuz":         "https://www.qobuz.com/search?q={q}",
+    "apple-music":   "https://music.apple.com/search?term={q}",
+    "spotify":       "https://open.spotify.com/search/{q}",
+    "deezer":        "https://www.deezer.com/search/{q}",
+    "youtube-music": "https://music.youtube.com/search?q={q}",
+}
+
+# Host (or host suffix) -> service id, for confirmed links only. Everything
+# else is `other`. A plain youtube.com link is a video, not YouTube Music.
+_FIND_IT_HOSTS = (
+    ("bandcamp.com", "bandcamp"), ("qobuz.com", "qobuz"),
+    ("music.apple.com", "apple-music"), ("itunes.apple.com", "apple-music"),
+    ("spotify.com", "spotify"), ("deezer.com", "deezer"), ("deezer.page.link", "deezer"),
+    ("music.youtube.com", "youtube-music"), ("tidal.com", "tidal"),
+    ("beatport.com", "beatport"), ("soundcloud.com", "soundcloud"),
+)
+_FIND_IT_ORDER = (*_FIND_IT_SEARCH, "tidal", "amazon", "beatport", "soundcloud", "other")
+# `other` is kept one per host, up to this many.
+FIND_IT_OTHER_MAX = 3
+
+def _find_it_service(url: str) -> tuple:
+    """`(service id, host)` of a confirmed link."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    for suffix, service in _FIND_IT_HOSTS:
+        if host == suffix or host.endswith("." + suffix):
+            return service, host
+    labels = host.split(".")
+    if "amazon" in labels[-3:]:
+        return "amazon", host
+    return "other", host
+
+def _find_it_links(releases: list, artist: str, title: str) -> list:
+    """The `findIt` rows from a release browse's `releases`: confirmed
+    first (one per service, `other` one per host), then a search for each
+    search service with no confirmed link."""
+    confirmed: dict = {}
+    others: dict = {}
+    for release in releases or []:
+        for rel in (release.get("relations") or []):
+            if (rel.get("type") or "").lower() not in _FIND_IT_REL_TYPES:
+                continue
+            url = ((rel.get("url") or {}).get("resource") or "").strip()
+            if not url.lower().startswith(("https://", "http://")):
+                continue
+            service, host = _find_it_service(url)
+            if service == "other":
+                if host not in others and len(others) < FIND_IT_OTHER_MAX:
+                    others[host] = url
+            else:
+                confirmed.setdefault(service, url)
+    rows = [{"service": s, "kind": "confirmed", "url": confirmed[s]}
+            for s in _FIND_IT_ORDER if s in confirmed]
+    rows += [{"service": "other", "kind": "confirmed", "url": u} for u in others.values()]
+    query = " ".join(p for p in ((artist or "").strip(), (title or "").strip()) if p)
+    if query:
+        q = urllib.parse.quote(query, safe="")
+        rows += [{"service": s, "kind": "search", "url": template.format(q=q)}
+                 for s, template in _FIND_IT_SEARCH.items() if s not in confirmed]
+    return rows
+
+def _find_it_for_album(rgid: str, artist: str, title: str, strict: bool = False):
+    """`findIt` for one release-group, or None when it could not be read —
+    the browse not answered, or no names to search with. None leaves the key
+    out (a client says the links could not load, not that there are none).
+    One MusicBrainz request, at the caller's priority."""
+    try:
+        data = _meta_mbz_get("release", {"release-group": rgid, "inc": "url-rels",
+                                         "limit": "100"}, strict)
+    except MetaUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 — Find it is a section, never the page
+        print(f"  meta: find-it links unavailable for {rgid}: {e}")
+        return None
+    if not isinstance(data, dict) or "releases" not in data:
+        return None
+    rows = _find_it_links(data.get("releases") or [], artist, title)
+    return rows if rows else None
+
+def _meta_cache_patch(kind: str, mbid: str, payload: dict) -> None:
+    """Rewrite a stored payload in place, keeping its age and verdict: a key
+    added to an old entry does not make the rest of it new."""
+    try:
+        with _index_lock:
+            conn = _index_db()
+            conn.execute("UPDATE meta SET payload = ? WHERE kind = ? AND mbid = ?",
+                         (json.dumps(payload), kind, mbid))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"  meta: cache update failed for {kind}/{mbid}: {e}")
+
 def meta_for_album(rgid: str, release_mbid: str = "", refresh: bool = False) -> dict:
     """Editorial metadata for one MusicBrainz release-group.
 
@@ -17061,6 +19196,14 @@ def meta_for_album(rgid: str, release_mbid: str = "", refresh: bool = False) -> 
     if not refresh:
         cached = _meta_cache_read("album", rgid)
         if cached is not None:
+            if "findIt" not in cached:
+                # Stored before Find it, or when its browse failed: a miss
+                # for that key only (Worbus P1 S4).
+                find_it = _find_it_for_album(rgid, cached.get("artist", ""),
+                                             cached.get("title", ""))
+                if find_it is not None:
+                    cached = {**cached, "findIt": find_it}
+                    _meta_cache_patch("album", rgid, cached)
             return cached
     data = _meta_mbz_get(f"release-group/{rgid}", {"inc": "url-rels artist-credits"}, refresh)
     rels = data.get("relations") or []
@@ -17087,6 +19230,11 @@ def meta_for_album(rgid: str, release_mbid: str = "", refresh: bool = False) -> 
         print(f"  meta: album credits unavailable for {rgid}: {e}")
         payload.setdefault("releaseMbid", "")
         payload["credits"] = []
+    if payload.get("title"):
+        find_it = _find_it_for_album(rgid, payload.get("artist", ""), payload["title"],
+                                     strict=refresh)
+        if find_it is not None:
+            payload["findIt"] = find_it
     _meta_cache_write("album", rgid, payload, _meta_has_content(payload))
     return payload
 
@@ -17888,9 +20036,9 @@ def apply_group_retag(group: dict) -> dict:
         "ok": ok_all,
         "output": output[-4000:],
     })
-    token = USERS[0]["telegram_token"] if USERS else ""
-    if ok_all and token:
-        _nd_scan_after_import(token)
+    # Not gated on a Telegram token: a server with none still rescans.
+    if ok_all:
+        _nd_scan_after_import(_web_user_key())
     return {"ok": ok_all, "preview": preview, "output": output}
 
 # ---------------------------------------------------------------------------
@@ -18817,6 +20965,7 @@ def slskd_run_search(query: str, expected_track_count: int = 0,
                      track_titles: list = None) -> list:
     """
     Run a slskd search and return a list of FOLDER-level result dicts,
+    ([] without a request while downloading is off),
     one per (username, directory) pair, sorted best-first by _score_folder.
 
     `album`/`artist`/`year` are what the folder is scored *against*. Without
@@ -18833,6 +20982,8 @@ def slskd_run_search(query: str, expected_track_count: int = 0,
     is the only honest progress a slskd search has — there is no total to count
     towards — and without it the UI could say nothing for the 30-90s this takes.
     """
+    if not _downloads_on():
+        return []
     def _say(text):
         if progress:
             try:
@@ -19163,6 +21314,8 @@ def slskd_search_probe(query: str, wait: float = 45.0, stop_at: float = 0.0) -> 
     search, and it takes the API key the bot already holds so no credential has
     to be handled by hand.
     """
+    if not _downloads_on():
+        return {"ok": False, **DOWNLOADS_OFF_BODY}
     trace = {"query": query, "polls": [], "probes": [], "options": {}, "error": ""}
 
     def _probe(search_id, elapsed):
@@ -19874,6 +22027,8 @@ def slskd_enqueue(username: str, file: dict,
                   review_track_index: int = None,
                   match_mode: str = "auto",
                   target_release_mbid: str = "") -> bool:
+    if not _downloads_on():
+        return False
     # The single choke point every acquisition path goes through, which is why
     # the rejected-source memory is consulted here and nowhere else. Without
     # it, the ranked list hands back the same peer's same file on the next
@@ -20970,6 +23125,8 @@ def slskd_expand_directory(username: str, folder: dict,
 
     Returns a list of file dicts ready for slskd_enqueue, or [] on failure.
     """
+    if not _downloads_on():
+        return []
     import urllib.parse
     raw_path     = folder.get("raw_folder", "")
     display_path = folder.get("folder", raw_path)
@@ -21053,6 +23210,8 @@ def slskd_get_all_downloads(force: bool = False) -> list:
     the request thread. The background poller passes force=True so its own view
     is never stale.
     """
+    if not _downloads_on():
+        return []
     now = time.time()
     if not force:
         with _downloads_cache_lock:
@@ -21065,6 +23224,8 @@ def slskd_get_all_downloads(force: bool = False) -> list:
     return value
 
 def _slskd_fetch_all_downloads() -> list:
+    if not _downloads_on():
+        return []
     try:
         r = _http.get(f"{SLSKD_URL}/api/v0/transfers/downloads",
                          headers=_slskd_headers(), timeout=10)
@@ -21303,6 +23464,8 @@ def _slskd_cancel(username: str, filename: str, transfer_id: str = "",
     while slskd went on downloading every file, and the stall watchdog's
     "cancel" never cancelled anything either.
     """
+    if not _downloads_on():
+        return False
     import urllib.parse
     tid = transfer_id or _slskd_find_transfer_id(username, filename, downloads)
     if not tid:
@@ -22727,7 +24890,7 @@ def _deterministic_import_task(task_id: str, album_dir: str, release_mbid: str,
             # Only a folder with nothing left to file (`_note_folder_imported`):
             # a subset, or files this import refused, leave it in the list.
             _note_folder_imported(album_dir)
-            _nd_scan_after_import(_default_web_user().get("telegram_token", ""))
+            _nd_scan_after_import(_web_user_key())
             if group_id:
                 with _review_lock:
                     group = _find_review_group(group_id)
@@ -22818,7 +24981,7 @@ def _place_track_anyway(group: dict, track_index) -> dict:
         group["status"] = "placed"
         group["updated_at"] = now
         _start_placement_verification(group.get("id", ""))
-        _nd_scan_after_import((_default_web_user() or {}).get("telegram_token", ""))
+        _nd_scan_after_import(_web_user_key())
     elif hit and not hit["placed"] and hit.get("kind"):
         # Refused again, for something else (the same audio is already in
         # the album): the row shows that refusal, and its own offer.
@@ -22970,10 +25133,13 @@ async def _finalize_taken_group(bot, ag: dict):
     # Whose fill this was, for every failure below: a review group's never
     # arms the whole-album retry (`_album_fill_fail`).
     gap_of = ag.get("review_group_id", "")
+    # A gap fill's row is named at its first write (B-254), whichever of the
+    # writes below that is.
+    labels = _gap_fill_labels(gap_of, ag.get("artist", ""), ag.get("album", ""))
     if ag["completed"] <= 0 and not lost:
         _album_fill_fail(fill_mbid, "transfer_failed",
                          f"No file downloaded ({fails} failed)",
-                         review_group_id=gap_of, **counts)
+                         review_group_id=gap_of, labels=labels, **counts)
     # Transfers finished and none of their files was found (`lost`; for a
     # group an older build started, `completed` with no folder recorded).
     if (lost or ag["completed"] > 0) and not ag["local_dirs"]:
@@ -22985,7 +25151,7 @@ async def _finalize_taken_group(bot, ag: dict):
         _album_fill_fail(fill_mbid, "placement_failed",
                          "Downloaded, but the files could not be found in "
                          "the downloads volume", retryable=False,
-                         review_group_id=gap_of, **counts)
+                         review_group_id=gap_of, labels=labels, **counts)
     if ag["completed"] > 0 and ag["local_dirs"]:
         album_dir = max(ag["local_dirs"].items(), key=lambda kv: kv[1])[0]
         if ag.get("match_mode") == "manual" and ag.get("review_group_id"):
@@ -22998,7 +25164,8 @@ async def _finalize_taken_group(bot, ag: dict):
                 {"recommended_action": "manual_match", "still_in_downloads": True})
             _save_state()
             _save_review_state()
-            _album_fill_set(fill_mbid, "needs_match", groupId=recid, **counts)
+            _album_fill_set(fill_mbid, "needs_match", groupId=recid, labels=labels,
+                            **counts)
             await _tg_send(bot, ag["chat_id"],
                            f"Downloaded {label}. Waiting for web match/import review.",
                            reply_markup=_album_action_markup(recid, "needs_review"))
@@ -23007,7 +25174,8 @@ async def _finalize_taken_group(bot, ag: dict):
         # from here the files are on their way into the library, and the cancel
         # route answers "too late" rather than writing over this.
         if fill_mbid and not _album_fill_transition(fill_mbid, "placing",
-                                                    unless=("cancelled",), **counts):
+                                                    unless=("cancelled",), labels=labels,
+                                                    **counts):
             print(f"  {label}: cancelled before placement — files stay in "
                   f"{SLSKD_DOWNLOAD_DIR}")
             return
@@ -23065,7 +25233,7 @@ async def _finalize_taken_group(bot, ag: dict):
             # file that was downloaded and not found — not Telegram alone.)
             _album_fill_set(fill_mbid, "placed", moved=result.get("moved", 0),
                             destFolder=os.path.basename(result.get("dest_folder", "")),
-                            reason=lost_note)
+                            reason=lost_note, labels=labels)
             # The library index still says this release-group is missing, and
             # every client's "not in your library" list reads that row — so a
             # freshly filled album would sit in both lists until the next scan.
@@ -23115,7 +25283,7 @@ async def _finalize_taken_group(bot, ag: dict):
             _album_fill_fail(
                 fill_mbid,
                 "mb_unavailable" if result.get("retryable") else "placement_failed",
-                result.get("error", ""), review_group_id=gap_of)
+                result.get("error", ""), review_group_id=gap_of, labels=labels)
             # The review rows behind the fill say why too, not just the ledger
             # (Q-019) — once per dir the import tried, since the stamp matches a
             # row by the folder its file is in.
@@ -23262,7 +25430,7 @@ async def _wait_for_the_next_poll() -> None:
         await asyncio.sleep(nap)
         waited += nap
 
-async def poll_downloads_loop(apps: list):
+async def poll_downloads_loop(apps: list | None = None):
     """
     Background task: poll slskd transfer statuses.
     On completion: run beets, send Telegram confirmation.
@@ -23273,12 +25441,12 @@ async def poll_downloads_loop(apps: list):
     to matching by (username, basename) when the exact key misses. Album groups
     that never reach their total are finalized by a time-based sweep.
     """
-    token_to_app = {u["telegram_token"]: app for u, app in zip(USERS, apps)}
-
+    # `apps`: (user, Application) pairs; None reads the live `_TELEGRAM_APPS`
+    # on every tick, since main() starts this loop before any Telegram app.
     while True:
         await _wait_for_the_next_poll()
         try:
-            await _poll_downloads_once(token_to_app)
+            await _poll_downloads_once(_token_to_app(apps))
         except Exception as e:
             # The poll loop must never die — downloads would stop finalizing.
             import traceback
@@ -23339,6 +25507,10 @@ async def _settle_vanished_transfers(downloads: list) -> None:
         await asyncio.to_thread(_cancel_album_fill, fill_mbid, "Removed from slskd")
 
 async def _poll_downloads_once(token_to_app: dict):
+        # Downloading off (Worbus P1 S2): no poller work and no slskd call.
+        # Rows a poll would have settled are left as they are.
+        if not _downloads_on():
+            return
         def _match_key(username: str, filename: str):
             key = (username, filename)
             if key in pending_downloads:
@@ -24040,7 +26212,20 @@ def _nd_wait_ready(nd_user: str, nd_pass: str,
     print(f"  Navidrome search index not ready after {max_wait}s — proceeding anyway")
     return False
 
+# B-304: a stranger with no ListenBrainz account has no playlists, and the scan
+# asked ListenBrainz for `user//playlists/createdfor` (a 404) three times.
+NO_LISTENBRAINZ_USER = ("No ListenBrainz user is set, so there are no playlists to scan; "
+                        "set LISTENBRAINZ_USER and restart lb-bot to scan yours.")
+
+def _lbz_user_of(user: dict | None) -> str:
+    return ((user or {}).get("listenbrainz_user") or "").strip()
+
 def scan_user(user: dict) -> list:
+    """The playlist scan for one user. With no ListenBrainz user it asks
+    nobody and finds nothing (B-304)."""
+    if not _lbz_user_of(user):
+        print(f"  playlist scan: {NO_LISTENBRAINZ_USER}")
+        return []
     lbz_user = user["listenbrainz_user"]
     nd_user  = user["navidrome_user"]
     nd_pass  = user["navidrome_password"]
@@ -24241,6 +26426,21 @@ async def _edit_or_send(query, context, text, reply_markup=None):
         await context.bot.send_message(chat_id=chat_id, text=text,
                                        reply_markup=reply_markup)
 
+# The Telegram buttons that search Soulseek or enqueue (review S#12): with
+# downloading off they answer that plainly, instead of running into the
+# guarded slskd functions and reading as "nothing found".
+_TELEGRAM_DOWNLOAD_ACTIONS = frozenset({
+    "AP", "AY", "RT", "DF", "DA", "dlall", "DLA", "DLM", "DLC", "CD",
+    "ALD", "ALM", "ARETRY"})
+
+async def _telegram_downloads_off(update) -> bool:
+    """For `/album` and `/search`: True, after saying so, when downloading is
+    off."""
+    if _downloads_on():
+        return False
+    await update.message.reply_text(DOWNLOADS_OFF_BODY["error"])
+    return True
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import telegram.error
     query  = update.callback_query
@@ -24268,6 +26468,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"  callback answer() failed ({e}) — continuing with the action")
     parts  = query.data.split("|")
     action = parts[0]
+    if action in _TELEGRAM_DOWNLOAD_ACTIONS and not _downloads_on():
+        await _edit_or_send(query, context, DOWNLOADS_OFF_BODY["error"])
+        return
 
     # Album pick: user chose a specific folder
     if action == "AP":
@@ -25251,6 +27454,8 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage: /album Artist - Album   (or just the album name)")
         return
+    if await _telegram_downloads_off(update):
+        return
 
     await update.message.reply_text(f"🔎 Looking up \u201c{query}\u201d on MusicBrainz…")
     mb_query   = query.replace(" - ", " ")
@@ -25366,6 +27571,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args    = " ".join(context.args).strip()
     if not args:
         await update.message.reply_text("Usage: /search Artist - Title")
+        return
+    if await _telegram_downloads_off(update):
         return
     await update.message.reply_text(
         f"Searching slskd for: {args}\n(may take up to {SEARCH_TIMEOUT}s...)")
@@ -25992,6 +28199,64 @@ HELP_TEXT = (
     "Weekly scans run automatically Tuesday 09:00."
 )
 
+# B-070: Navidrome hands a Subsonic client a path it makes up from the tags
+# unless "Report Real Path" is on for that client's player (measured on the
+# NAS, 0.64.2: 74 of 15,084 songs really are named so, and the made-up folder
+# is right for 87% of albums). The health check used to read that as a stale
+# index and advise a rescan, which changes nothing. The setting's wording is
+# Navidrome 0.64.2's own (its English bundle: menu "Settings", resource
+# "Players", field "Report Real Path"); ND_CLIENT_NAME is the player's client
+# name there.
+REAL_PATH_ADVICE = (
+    "Navidrome isn't reporting the files' real paths. Turn on Report Real Path for "
+    f"lb-bot's player (\"{ND_CLIENT_NAME}\") in Navidrome (Settings › Players).")
+
+def _navidrome_fake_path(song: dict) -> str:
+    """The path Navidrome 0.64 makes up for a song (`fakePath` in its
+    server/subsonic), rebuilt from the song's own fields: `<album artist>/
+    <album>/`, then `DD-` when it has a disc number, `TT - ` when it has a
+    track number, then `<title>.<suffix>`; every `/` inside a name is `_`.
+    Confirmed on the stand-in Navidrome 0.64.2: a song with no disc tag is
+    `Kiosk/The Kids Live/01 - Denver Quinzenno 1.mp3`, one with disc 1
+    `R9 Disc Band/Two Disc Set/01-01 - Disc 1 Song 1.mp3`. "" when a field
+    it needs is missing (nothing to compare with)."""
+    def name(value) -> str:
+        return str(value or "").replace("/", "_")
+
+    def number(value) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    album_artist = song.get("displayAlbumArtist") or song.get("artist") or ""
+    title, suffix = song.get("title") or "", song.get("suffix") or ""
+    if not (album_artist and title and suffix):
+        return ""
+    disc, track = number(song.get("discNumber")), number(song.get("track"))
+    return (f"{name(album_artist)}/{name(song.get('album'))}/"
+            + (f"{disc:02d}-" if disc else "")
+            + (f"{track:02d} - " if track else "")
+            + f"{name(title)}.{suffix}")
+
+def _navidrome_made_up_path(song: dict) -> bool:
+    """Is the path Navidrome reported for this song the one it makes up from
+    the song's tags (Report Real Path off), rather than the file's own?"""
+    fake = _navidrome_fake_path(song)
+    return bool(fake) and _normalize_song_path(_song_relpath(song)) == \
+        _normalize_song_path(fake)
+
+def _real_path_advice_applies(checked: int, resolved: int, made_up: int) -> bool:
+    """Say "turn on Report Real Path" — not "rescan" — when no sampled file
+    resolves and every sampled path is the one Navidrome makes up. Whether the
+    made-up folder exists does not matter: it is right for most albums laid
+    out `artist/album/`, and for no album laid out otherwise. A real name
+    that is not on disk is a stale row, and keeps the old advice."""
+    return bool(checked) and not resolved and made_up == checked
+
+# The ListenBrainz health probe without a user (B-304): a site-wide route, one row.
+LBZ_HEALTH_SITEWIDE_PATH = "stats/sitewide/artists?count=1"
+
 def _run_diagnostics(user: dict) -> list:
     """Reachability/config checks. Returns list of (ok, label, detail).
 
@@ -26000,6 +28265,8 @@ def _run_diagnostics(user: dict) -> list:
     that inline on every request.
     """
     def _downloads_dir():
+        if not _downloads_on():
+            return (True, "Downloads folder", "not used: downloading is off")
         if not os.path.isdir(SLSKD_DOWNLOAD_DIR):
             return (False, "Downloads folder",
                     f"{SLSKD_DOWNLOAD_DIR} NOT mounted — beets/import cannot work")
@@ -26010,6 +28277,8 @@ def _run_diagnostics(user: dict) -> list:
             return (False, "Downloads folder", f"exists but unreadable: {e}")
 
     def _slskd():
+        if not _downloads_on():
+            return (True, "slskd", "downloading is off (SLSKD_API_KEY is not set)")
         try:
             r = _http.get(f"{SLSKD_URL}/api/v0/session",
                              headers=_slskd_headers(), timeout=8)
@@ -26028,10 +28297,23 @@ def _run_diagnostics(user: dict) -> list:
             return (False, "Navidrome", f"{NAVIDROME_URL} unreachable: {str(e)[:80]}")
 
     def _listenbrainz():
+        # B-304: with no user the playlists route is `user//playlists/createdfor`,
+        # which ListenBrainz answers 404, so the check was red for everyone
+        # without an account. Without one, ask a site-wide route (one row) only
+        # to see that ListenBrainz answers; what a stranger still uses of it is
+        # New releases, on `explore/fresh-releases`. A stats route answers 204
+        # with no body while its stats are being computed, and that is an
+        # answer (`empty_ok`).
+        lbz_user = _lbz_user_of(user)
         try:
-            _lbz_get(f"user/{user['listenbrainz_user']}/playlists/createdfor",
-                     timeout=15, retries=1)
-            return (True, "ListenBrainz", "reachable")
+            if lbz_user:
+                _lbz_get(f"user/{lbz_user}/playlists/createdfor", timeout=15, retries=1)
+                return (True, "ListenBrainz", "reachable")
+            _lbz_get(LBZ_HEALTH_SITEWIDE_PATH, timeout=15, retries=1, empty_ok=True)
+            return (True, "ListenBrainz",
+                    "reachable; no ListenBrainz user is set, so playlists and "
+                    "listening history are off; set LISTENBRAINZ_USER and "
+                    "restart lb-bot to turn them on")
         except Exception as e:
             return (False, "ListenBrainz", f"unreachable: {str(e)[:80]}")
 
@@ -26060,6 +28342,7 @@ def _run_diagnostics(user: dict) -> list:
             checked = 0
             resolved = 0
             folders_ok = 0
+            made_up = 0
             first_miss = ""
             # Spread the sample across the library rather than taking the first
             # few alphabetically — a second music folder or an odd mount usually
@@ -26082,6 +28365,8 @@ def _run_diagnostics(user: dict) -> list:
                         # one missing file, not a broken mount.
                         if path and os.path.isdir(os.path.dirname(path)):
                             folders_ok += 1
+                        if _navidrome_made_up_path(song):
+                            made_up += 1
                         first_miss = first_miss or f"{raw!r} → {path}"
                     break   # one song per album is enough
             if not checked:
@@ -26097,6 +28382,8 @@ def _run_diagnostics(user: dict) -> list:
                         f"{resolved}/{checked} sampled files resolved; "
                         f"{checked - resolved} missing (e.g. {first_miss}) — "
                         f"likely stale Navidrome rows, not the mount")
+            if _real_path_advice_applies(checked, resolved, made_up):
+                return (False, label, REAL_PATH_ADVICE)
             if folders_ok:
                 return (False, label,
                         f"album folders resolve but no sampled file does "
@@ -26978,7 +29265,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int,
                 claimed.append(best.get("filename", ""))
                 if slskd_enqueue(
                         fd_try["username"], best, track=track,
-                        token=user.get("telegram_token", ""),
+                        token=_web_user_key(),
                         chat_id=str(user.get("chat_id", "")),
                         candidates=ordered_sources[try_pos + 1:],
                         review_group_id=group.get("id", ""),
@@ -27024,7 +29311,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int,
         return bool(started and started[0].get("cancelled"))
 
     ok, total, ag_id = slskd_enqueue_folder(
-        fd["username"], full, token=user.get("telegram_token", ""),
+        fd["username"], full, token=_web_user_key(),
         chat_id=str(user.get("chat_id", "")), label=group.get("album", ""),
         release_mbid=group.get("canonical_mbid", ""),
         alt_sources=_unattended_alternates(folders, fd, 6, group.get("artist", ""),
@@ -27139,7 +29426,7 @@ def _rescue_leftover_tracks(group: dict, leftovers: list, folders: list,
             idx = track.get("_review_track_index")
             if slskd_enqueue(
                     alt["username"], best, track=track,
-                    token=user.get("telegram_token", ""),
+                    token=_web_user_key(),
                     chat_id=str(user.get("chat_id", "")),
                     candidates=alts[pos + 1:],
                     review_group_id=group.get("id", ""),
@@ -27238,7 +29525,7 @@ def _pick_file_for_track(group: dict, track_index: int, source_index: int,
     user = _default_web_user() or {}
     if not slskd_enqueue(
             fd.get("username", ""), chosen, track=t,
-            token=user.get("telegram_token", ""),
+            token=_web_user_key(),
             chat_id=str(user.get("chat_id", "")),
             review_group_id=group.get("id", ""),
             review_track_index=idx,
@@ -27626,17 +29913,31 @@ def _playlist_loose_group_id(user: dict) -> str:
 
 def _playlist_scan_task(task_id: str) -> None:
     user = _default_web_user()
+    if not _lbz_user_of(user):
+        # Done, not failed, and the review's playlist groups are left alone.
+        _task_finish(task_id, NO_LISTENBRAINZ_USER)
+        return
     _task_update(task_id, current="ListenBrainz playlists")
     missing = scan_user(user)
+    _land_playlist_scan(
+        user, missing,
+        progress=lambda d, t: _task_update(task_id, done=d, total=t,
+                                           current="Grouping missing tracks"))
+    if not missing:
+        _task_finish(task_id, "No missing tracks")
+        return
+    _task_finish(task_id, f"Found {len(missing)} missing track(s)")
+
+def _land_playlist_scan(user: dict, missing: list, progress=None) -> None:
+    """A playlist scan's missing tracks into the review's playlist origin:
+    what the web UI's "Scan playlists" does, and what the scheduled scan does
+    for a user with no Telegram app (Worbus P1 S1)."""
     if not missing:
         _replace_review_groups("playlist", [], "Playlist scan found no missing tracks")
-        _task_finish(task_id, "No missing tracks")
         return
     nd_user, nd_pass = user["navidrome_user"], user["navidrome_password"]
     album_groups, solo_tracks = group_missing_by_album(
-        missing, nd_user, nd_pass,
-        progress=lambda d, t: _task_update(task_id, done=d, total=t,
-                                           current="Grouping missing tracks"))
+        missing, nd_user, nd_pass, progress=progress)
     review_groups = [_review_group_from_album_download(g, "playlist")
                      for g in album_groups]
     if solo_tracks:
@@ -27664,7 +29965,6 @@ def _playlist_scan_task(task_id: str) -> None:
         })
     _replace_review_groups("playlist", review_groups,
                            f"Playlist scan found {len(missing)} missing track(s)")
-    _task_finish(task_id, f"Found {len(missing)} missing track(s)")
 
 def _spotify_scan_task(task_id: str, playlist: str) -> None:
     user = _default_web_user()
@@ -28168,7 +30468,7 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
         started = []
         ok, total, ag_id = slskd_enqueue_folder(
             candidate["username"], full or candidate.get("files", []),
-            token=_default_web_user().get("telegram_token", ""),
+            token=_web_user_key(),
             chat_id=str(_default_web_user().get("chat_id", "")),
             label=album, release_mbid=release_mbid,
             alt_sources=rest,
@@ -28230,6 +30530,20 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
 _artist_scans: dict = {}
 _artist_scans_lock = threading.Lock()
 ARTIST_SCANS_MAX = 500
+# Worbus P1 S3: an entry not updated for this long reads as no scan. A scan
+# updates its entry on every release it classifies, so only a scan whose
+# thread is gone (lb-bot restarted under it, or it died) gets this old, and a
+# page waiting on it must not wait forever.
+ARTIST_SCAN_EXPIRY_SECS = 600.0
+# The `task_id` of the auto-index worker's own scans: they are no task row,
+# and the worker scans one artist at a time.
+AUTO_INDEX_SCAN_TASK = "auto-index"
+# Scan now's single flight (Worbus P1 S3): `scan key -> task id` of the scans
+# `POST /api/artist/discography` started, set under `_artist_scan_start_lock`
+# in the same hold as the check, so a second tap between a scan's start and
+# its thread's first write is answered with the first one.
+_artist_scan_pending: dict = {}
+_artist_scan_start_lock = threading.Lock()
 
 def _artist_scan_keys(mbid: str = "", nd_id: str = "") -> list:
     return [k for k in ((f"mb:{mbid}" if mbid else ""),
@@ -28243,18 +30557,64 @@ def _artist_scan_set(mbid: str, nd_id: str, **fields) -> None:
         while len(_artist_scans) > ARTIST_SCANS_MAX:
             _artist_scans.pop(next(iter(_artist_scans)))
 
-def _artist_scan_get(mbid: str = "", nd_id: str = "") -> dict | None:
-    """The newest scan either key knows about, in wire shape, or None."""
+def _artist_scan_progress(mbid: str, nd_id: str, task_id: str,
+                          done: int, total: int) -> None:
+    """A running scan's counts (`done` of `total` release-groups), on the
+    entries this scan holds — never on a newer scan's. Each one also renews
+    the entry against ARTIST_SCAN_EXPIRY_SECS."""
     with _artist_scans_lock:
-        found = [_artist_scans[k] for k in _artist_scan_keys(mbid, nd_id)
-                 if k in _artist_scans]
+        for key in _artist_scan_keys(mbid, nd_id):
+            entry = _artist_scans.get(key)
+            if entry and entry.get("task_id") == task_id and entry.get("state") == "running":
+                entry.update(done=int(done or 0), total=int(total or 0),
+                             updated_at=time.time())
+
+def _artist_scan_just_started(mbid: str = "", nd_id: str = "") -> dict | None:
+    """A scan `POST /api/artist/discography` started whose thread has not
+    written its entry yet, in `_artist_scan_get`'s wire shape (`running`, 0
+    of 0), or None. The POST answers with the task id at once, and the
+    thread writes `running` only after its first step (a MusicBrainz name
+    lookup, for a page that sent an MBID and no name), so a poll in between
+    read "no scan" — and the hub cached it (lane H review). Same test as
+    `_artist_scan_in_flight`: the task still runs and no entry of either key
+    carries its id. Read without `_artist_scan_start_lock`: the POST sets
+    `_artist_scan_pending` before it answers."""
+    for key in _artist_scan_keys(mbid, nd_id):
+        task_id = _artist_scan_pending.get(key)
+        if not task_id:
+            continue
+        with _review_lock:
+            task = (_review_state.get("tasks") or {}).get(task_id) or {}
+            running = task.get("status") == "running"
+            started = float(task.get("started_at") or 0)
+        if not running:
+            continue
+        with _artist_scans_lock:
+            written = any((_artist_scans.get(k) or {}).get("task_id") == task_id
+                          for k in _artist_scan_keys(mbid, nd_id))
+        if written:
+            continue
+        return {"state": "running", "error": "", "taskId": task_id,
+                "startedAt": started, "finishedAt": 0, "done": 0, "total": 0}
+    return None
+
+def _artist_scan_get(mbid: str = "", nd_id: str = "") -> dict | None:
+    """The newest scan either key knows about, in wire shape, or None — also
+    for an entry not updated in ARTIST_SCAN_EXPIRY_SECS (Worbus P1 S3).
+    `done`/`total` are the scan's counts, 0 while unknown."""
+    cutoff = time.time() - ARTIST_SCAN_EXPIRY_SECS
+    with _artist_scans_lock:
+        found = [dict(_artist_scans[k]) for k in _artist_scan_keys(mbid, nd_id)
+                 if k in _artist_scans
+                 and float(_artist_scans[k].get("updated_at") or 0) >= cutoff]
     if not found:
         return None
     scan = max(found, key=lambda r: r.get("updated_at", 0))
     return {"state": scan.get("state", ""), "error": scan.get("error", ""),
             "taskId": scan.get("task_id", ""),
             "startedAt": scan.get("started_at", 0),
-            "finishedAt": scan.get("finished_at", 0)}
+            "finishedAt": scan.get("finished_at", 0),
+            "done": int(scan.get("done") or 0), "total": int(scan.get("total") or 0)}
 
 def _reconcile_artist_review_groups(result: dict) -> dict:
     """B-040: bring the artist's older library review groups up to date after a
@@ -28352,6 +30712,7 @@ def _artist_discography_task(task_id: str, artist_mbid: str, artist_name: str,
     def _progress(done, total, artist="", album=""):
         _task_update(task_id, done=done, total=total,
                      current=f"{artist} - {album}".strip(" -"))
+        _artist_scan_progress(artist_mbid, nd_artist_id, task_id, done, total)
     started = time.time()
     if not artist_name or artist_name == artist_mbid:
         # An `mb:` page knows only the id. Posting that as the name stored the
@@ -28446,6 +30807,50 @@ def _artist_scan_task(mbid: str, name: str, nd_id: str, user: dict,
         f"Scan discography: {name or mbid}",
         lambda tid: _artist_discography_task(tid, mbid, name, user, nd_id,
                                              skip_library=skip_library))
+
+def _artist_resolve_scan_task(nd_id: str, name: str, user: dict) -> str:
+    """Scan now for a library artist with no MBID (Worbus P1 S3): a task that
+    resolves the artist the way the auto-index worker does
+    (`_index_library_artist_mbid`, strict: an outage is never "no match"),
+    then runs the ordinary scan. Returns the task id."""
+    return _task_run(
+        "artist-discography", f"Scan discography: {name or nd_id}",
+        lambda tid: _artist_resolve_and_scan(tid, nd_id, name, user))
+
+def _artist_resolve_and_scan(task_id: str, nd_id: str, name: str, user: dict) -> None:
+    started = time.time()
+    _artist_scan_set("", nd_id, state="running", task_id=task_id, started_at=started)
+
+    def _end(state: str, summary: str = "", error: str = "", **extra) -> None:
+        with _artist_scans_lock:
+            holder = (_artist_scans.get(f"nd:{nd_id}") or {}).get("task_id")
+        if holder in (None, task_id):
+            _artist_scan_set("", nd_id, state=state, error=error, task_id=task_id,
+                             started_at=started, finished_at=time.time())
+        _task_finish(task_id, summary, error, **extra)
+        _notify_hub_library_change("", event="artistScanned",
+                                   artist=name, nd_artist_id=nd_id)
+
+    artist = next((a for a in _apply_artist_overrides(_nd_artist_index())
+                   if a.get("id") == nd_id), None) or {}
+    # Navidrome's name wins over the caller's: it drives the name search.
+    name = artist.get("name") or name or ""
+    row = {"id": nd_id, "name": name, "mbid": artist.get("musicBrainzId") or ""}
+    try:
+        mbid = _index_library_artist_mbid(row, _index_get_artist("", nd_id), strict=True)
+    except MusicBrainzUnavailable as e:
+        _end("failed", error=f"{e} — try again in a minute")
+        return
+    if not mbid:
+        if not name:
+            _end("failed", error="Navidrome does not list this artist")
+            return
+        _index_store_unresolved_artist(name, nd_id)
+        _end("done", "MusicBrainz has no match for this artist",
+             result={"artist_mbid": "", "artist_name": name, "releases": [],
+                     "unresolved": True})
+        return
+    _artist_discography_task(task_id, mbid, name, user, nd_id)
 
 def _task_cancelled(task_id: str) -> bool:
     """Read one task's status directly.
@@ -28881,7 +31286,7 @@ def _auto_index_covering_row(mbid: str, nd_id: str, now: float, live_ids) -> dic
     return row if _auto_index_row_fresh(row, now) else None
 
 def _auto_index_scan(cand: dict, user: dict, now: float | None = None,
-                     live_ids=frozenset()) -> str:
+                     live_ids=frozenset(), progress=None) -> str:
     """Scan one candidate and store it. Returns `indexed`, `unresolved` (a
     genuine MusicBrainz no-match, recorded as the miss-stub), `covered` (the
     resolved mbid's fresh row belongs to another library artist; nothing is
@@ -28905,7 +31310,8 @@ def _auto_index_scan(cand: dict, user: dict, now: float | None = None,
     if _auto_index_covering_row(mbid, nd_id, now, live_ids) is not None:
         return "covered"
     result = build_artist_discography(mbid, name, user["navidrome_user"],
-                                      user["navidrome_password"], nd_artist_id=nd_id)
+                                      user["navidrome_password"], nd_artist_id=nd_id,
+                                      **({"progress": progress} if progress else {}))
     # I-019: an override set or removed while this ran. Checked before the
     # union so the review does not get groups the store is about to refuse.
     if _artist_scan_superseded(result, nd_id):
@@ -28927,19 +31333,58 @@ def _auto_index_record_failure(state: dict, nd_id: str, now: float, error: str) 
     state["failures"][nd_id] = {"count": count, "error": error,
                                 "retry_at": now + _auto_index_backoff(count)}
 
-def _auto_index_progress(state: dict, total: int, remaining: int) -> None:
+def _auto_index_progress(state: dict, total: int, remaining: int,
+                         unindexed: int | None = None) -> None:
     """Publish how far the worker is (`_auto_index_public`: `total`,
-    `remaining`), and say it once in the log when a backlog starts and once
-    when it is done — not once an artist."""
+    `remaining`, and `unindexed` for the hub's bar), and say it once in the
+    log when a backlog starts and once when it is done — not once an
+    artist."""
     remaining = max(0, int(remaining))
     state["total"], state["remaining"] = int(total), remaining
     _auto_index_public.update({"total": int(total), "remaining": remaining})
+    if unindexed is not None:
+        state["unindexed"] = max(0, int(unindexed))
+        _auto_index_public["unindexed"] = state["unindexed"]
     if remaining and not state.get("backlog"):
         state["backlog"] = True
         print(f"  auto-index: {remaining:,} artist{'' if remaining == 1 else 's'} to index")
     elif not remaining and state.get("backlog"):
         state["backlog"] = False
         print("  auto-index: every artist is indexed and fresh")
+
+def _auto_index_queue(state: dict, now: float) -> list:
+    """The worker's queue from the artist list it holds, with its progress
+    published from it (ruling U1): `total` and `remaining` once the list has
+    been read, before the scan; also while the worker is paused or backed
+    off, so the numbers follow what a manual build or an earlier tick wrote
+    instead of freezing where the pause found them.
+
+    `unindexed` (Worbus P1 S3, the hub's bar) is narrower than `remaining`:
+    the artists with no row at all that the worker will attempt now and has
+    never failed on — not one in back-off (`waiting`), not one that failed
+    before and is due again (review S#4: the bar of a finished library would
+    blip "1 left" each time its back-off ended), not one covered by another
+    artist's fresh row (`_auto_index_select` leaves those out), not stale or
+    stub work — so a real library reaches 0."""
+    waiting: list = []
+    # I-019: the list is this worker's own copy, up to AUTO_INDEX_DIFF_SECS
+    # old; an override set or removed since is applied to it here.
+    queue = _auto_index_select(_apply_artist_overrides(state["nd_artists"]),
+                               _auto_index_read_meta(),
+                               now, state["failures"],
+                               state.setdefault("scanned", {}),
+                               state.setdefault("covered", {}),
+                               backed_off=waiting)
+    if state["nd_fetched_at"] is not None:
+        # Not before the list has been read: "0 of 0" is a number nobody
+        # measured. An artist waiting out its back-off is not up to date.
+        _auto_index_progress(state, sum(1 for a in state["nd_artists"] if a.get("id")),
+                             len(queue) + len(waiting),
+                             sum(1 for c in queue if _auto_index_counts_unindexed(state, c)))
+    return queue
+
+def _auto_index_counts_unindexed(state: dict, cand: dict) -> bool:
+    return cand["reason"] == "missing" and not state["failures"].get(cand["nd_id"])
 
 def _auto_index_tick(state: dict, now: float, user: dict) -> str:
     """One step of the worker: at most one artist scanned. Mutates `state`,
@@ -28954,33 +31399,65 @@ def _auto_index_tick(state: dict, now: float, user: dict) -> str:
     `current` is the artist's name for the length of its scan.
     """
     if _auto_index_manual_build_running():
+        _auto_index_queue(state, now)
         return "paused"
     if now < state["paused_until"]:
+        _auto_index_queue(state, now)
         return "outage"
     _auto_index_refresh(state, now, user)
-    # I-019: the list is this worker's own copy, up to AUTO_INDEX_DIFF_SECS
-    # old; an override set or removed since is applied to it here.
-    waiting: list = []
-    queue = _auto_index_select(_apply_artist_overrides(state["nd_artists"]),
-                               _auto_index_read_meta(),
-                               now, state["failures"],
-                               state.setdefault("scanned", {}),
-                               state.setdefault("covered", {}),
-                               backed_off=waiting)
-    if state["nd_fetched_at"] is not None:
-        # Not before the list has been read: "0 of 0" is a number nobody
-        # measured. An artist waiting out its back-off is not up to date.
-        _auto_index_progress(state, sum(1 for a in state["nd_artists"] if a.get("id")),
-                             len(queue) + len(waiting))
-    if not queue:
+    queue = _auto_index_queue(state, now)
+    # An artist a page is scanning right now is left to that scan (Scan now
+    # jumps the queue; two scans of one artist would race to store it).
+    with _artist_scan_start_lock:
+        cand = next((c for c in queue if not _artist_scan_in_flight("", c["nd_id"])), None)
+    if cand is None:
         return "idle"
-    cand = queue[0]
     live_ids = {a.get("id") for a in state["nd_artists"] if a.get("id")}
+    counted = _auto_index_counts_unindexed(state, cand)
     _auto_index_public["current"] = cand["name"]
+    _auto_index_public["progressCurrent"] = cand["name"]
+    started = time.time()
+    # Any scan of an artist shows on its discography route, the worker's
+    # too, under both keys when the artist is tagged (review S#6: a page that
+    # asks by MBID alone saw nothing) — unless the tag's row is another
+    # library artist's (covered), whose own entry is not this scan's.
+    tag_mbid = cand["row"].get("mbid", "") or ""
+    start_mbid = (tag_mbid if tag_mbid and _auto_index_covering_row(
+        tag_mbid, cand["nd_id"], now, live_ids) is None else "")
+    _artist_scan_set(start_mbid, cand["nd_id"], state="running",
+                     task_id=AUTO_INDEX_SCAN_TASK, started_at=started)
+
+    def _scan_progress(done, total, *_):
+        _artist_scan_progress(cand.get("mbid", "") or start_mbid, cand["nd_id"],
+                              AUTO_INDEX_SCAN_TASK, done, total)
+
+    def _scan_end(state_word: str, error: str = "", own_mbid: bool = True) -> None:
+        with _artist_scans_lock:
+            holder = (_artist_scans.get(f"nd:{cand['nd_id']}") or {}).get("task_id")
+            if not own_mbid and start_mbid:
+                # Covered after all: the entry this scan opened under the
+                # tag is not this artist's to finish; take it back.
+                mine = _artist_scans.get(f"mb:{start_mbid}") or {}
+                if mine.get("task_id") == AUTO_INDEX_SCAN_TASK and mine.get("state") == "running":
+                    _artist_scans.pop(f"mb:{start_mbid}", None)
+        if holder in (None, AUTO_INDEX_SCAN_TASK):
+            _artist_scan_set((cand.get("mbid", "") or start_mbid) if own_mbid else "",
+                             cand["nd_id"], state=state_word,
+                             error=error, task_id=AUTO_INDEX_SCAN_TASK,
+                             started_at=started, finished_at=time.time())
+
+    def _failed() -> str:
+        # Failed: it waits out a back-off now, so it is no longer counted
+        # as not indexed (review S#4); `remaining` still counts it.
+        if counted and "remaining" in state:
+            _auto_index_progress(state, state["total"], state["remaining"],
+                                 state.get("unindexed", 0) - 1)
+        return "failed"
     try:
         with mbz_background():
-            outcome = _auto_index_scan(cand, user, now, live_ids)
+            outcome = _auto_index_scan(cand, user, now, live_ids, progress=_scan_progress)
     except MusicBrainzNoSuchEntity as e:
+        _scan_end("failed", str(e))
         # R14: a permanent 4xx (a bad or merged mbid) is this ONE artist's
         # problem, not MusicBrainz's — pausing the whole worker for it meant
         # every tick that landed on this artist again after its own backoff
@@ -28990,30 +31467,36 @@ def _auto_index_tick(state: dict, now: float, user: dict) -> str:
         print(f"  auto-index: {cand['name']}: {e}; per-artist backoff only "
               f"(bad mbid, not an outage)")
         _auto_index_record_failure(state, cand["nd_id"], now, str(e))
-        return "failed"
+        return _failed()
     except MusicBrainzUnavailable as e:
+        _scan_end("failed", str(e))
         print(f"  auto-index: {cand['name']}: {e}; backing off")
         _auto_index_record_failure(state, cand["nd_id"], now, str(e))
         state["paused_until"] = now + AUTO_INDEX_MB_OUTAGE_PAUSE
-        return "failed"
+        return _failed()
     except Exception as e:  # noqa: BLE001 — one artist must not stop the worker
+        _scan_end("failed", str(e))
         print(f"  auto-index: {cand['name']} failed: {e}")
         _auto_index_record_failure(state, cand["nd_id"], now, str(e))
-        return "failed"
+        return _failed()
     finally:
         _auto_index_public["current"] = ""
+    # A covered artist's MBID is another library artist's row: its own
+    # scan entry is left alone.
+    _scan_end("failed" if outcome in ("kept", "superseded") else "done",
+              own_mbid=outcome != "covered")
     if outcome == "kept":
         print(f"  auto-index: {cand['name']}: MusicBrainz listed no releases; "
               f"kept the stored discography")
         _auto_index_record_failure(state, cand["nd_id"], now, "no releases listed")
-        return "failed"
+        return _failed()
     if outcome == "superseded":
         # I-019. Backed off like any failure: the set or the remove started
         # the artist's scan itself, and this is the retry if that one fails.
         print(f"  auto-index: {cand['name']}: its MusicBrainz override changed "
               f"during the scan; nothing stored")
         _auto_index_record_failure(state, cand["nd_id"], now, "override changed mid-scan")
-        return "failed"
+        return _failed()
     state["failures"].pop(cand["nd_id"], None)
     # C1: whatever the DB now says about this id, it is not picked again
     # inside the TTL (unless its tag mbid changes).
@@ -29026,8 +31509,130 @@ def _auto_index_tick(state: dict, now: float, user: dict) -> str:
         state["covered"].pop(cand["nd_id"], None)
     if "remaining" in state:
         # This one is up to date now (indexed, unresolved or covered).
-        _auto_index_progress(state, state["total"], state["remaining"] - 1)
+        _auto_index_progress(state, state["total"], state["remaining"] - 1,
+                             (state.get("unindexed", 0) - 1) if counted
+                             else state.get("unindexed"))
     return outcome
+
+# B-060's title half: the one-time step that marks stale the index rows whose
+# verdicts `_title_key` can change (ruling: no INDEX_SCAN_VERSION bump, which
+# would rescan every artist of a large library against MusicBrainz's 1 req/s).
+_TITLE_KEY_STALE_MIGRATION = "b060_title_key_stale"
+# Seconds between tries while Navidrome's album list cannot be read whole.
+TITLE_KEY_STALE_RETRY_SECS = 300
+
+def _title_key_changed(title: str) -> bool:
+    """Can `_title_key` pair this title otherwise than `_fuzzy_album_text` did?
+    Only for a title that is not ASCII, or whose key is '' (which paired with
+    every other '' and now pairs only by its symbols). Every other ASCII title
+    keys exactly as it did (the parity rule)."""
+    title = title or ""
+    return not title.isascii() or not _title_key(title)
+
+def _index_mark_title_key_stale(albums: list) -> int:
+    """Mark stale, once, the index rows a `_title_key` rescan can change
+    (B-060). Returns how many rows it marked; records itself in `migrations`
+    in the same commit, so it never runs again. Raises when the index cannot
+    be read or written (the caller tries again later).
+
+    Marked: an artist row at the current `INDEX_SCAN_VERSION` whose name is
+    not ASCII; or that holds (by Navidrome artist id, or by an album id on one
+    of its rows) a library album whose title or artist is not ASCII or keys to
+    ''; or that holds an untagged library album and a release-group whose
+    title is such. Every other row keeps its verdict: for an all-ASCII artist
+    the matcher answers exactly as before. Stubs (`scan_version` 0) and rows
+    already stale are left as they are; a mark is `scan_version` one below the
+    current one, so the row reads stale everywhere (here, and in both clients'
+    mirrors, which compare it to the feed's `scanVersion`) and keeps its
+    `scanned_at`. It marks; it does not scan: the auto-index worker rescans
+    stale rows in its own order, yielding MusicBrainz to every page.
+
+    `albums` is Navidrome's whole album list, read by the caller with no lock
+    held. Takes `_index_lock` for one read and one write, never `_review_lock`.
+    """
+    with _index_lock:
+        conn = _index_db()
+        if conn.execute("SELECT 1 FROM migrations WHERE name = ?",
+                        (_TITLE_KEY_STALE_MIGRATION,)).fetchone():
+            return 0
+        artists = conn.execute(
+            "SELECT artist_key, nd_artist_id, name, scan_version FROM artists").fetchall()
+        rg_rows = conn.execute(
+            "SELECT artist_key, title, nd_album_ids FROM release_groups").fetchall()
+    by_nd: dict = {}
+    for a in artists:
+        for nd_id in {a["nd_artist_id"] or "",
+                      a["artist_key"][3:] if a["artist_key"].startswith("nd:") else ""}:
+            if nd_id:
+                by_nd.setdefault(nd_id, set()).add(a["artist_key"])
+    by_album: dict = {}
+    for r in rg_rows:
+        try:
+            ids = json.loads(r["nd_album_ids"] or "[]")
+        except (TypeError, ValueError):
+            ids = []
+        for album_id in ids if isinstance(ids, list) else []:
+            by_album.setdefault(str(album_id), set()).add(r["artist_key"])
+    marked, untagged_holders = set(), set()
+    for album in albums or []:
+        holders = set(by_album.get(str(album.get("id") or ""), ()))
+        for nd_id in [album.get("artistId")] + [
+                (a or {}).get("id") for a in (album.get("artists") or [])
+                if isinstance(a, dict)]:
+            holders |= by_nd.get(nd_id or "", set())
+        if (_title_key_changed(album.get("name", ""))
+                or not (album.get("artist") or "").isascii()):
+            marked |= holders
+        if not album.get("musicBrainzId"):
+            untagged_holders |= holders
+    marked |= {a["artist_key"] for a in artists if not (a["name"] or "").isascii()}
+    marked |= {r["artist_key"] for r in rg_rows
+               if r["artist_key"] in untagged_holders and _title_key_changed(r["title"])}
+    fresh = {a["artist_key"] for a in artists
+             if int(a["scan_version"] or 0) == INDEX_SCAN_VERSION}
+    keys = sorted(marked & fresh)
+    with _index_lock:
+        conn = _index_db()
+        with conn:
+            conn.executemany(
+                "UPDATE artists SET scan_version = ? "
+                "WHERE artist_key = ? AND scan_version = ?",
+                [(INDEX_SCAN_VERSION - 1, key, INDEX_SCAN_VERSION) for key in keys])
+            conn.execute(
+                "INSERT OR IGNORE INTO migrations (name, applied_at, detail) VALUES (?, ?, ?)",
+                (_TITLE_KEY_STALE_MIGRATION, time.time(),
+                 json.dumps({"marked": len(keys), "albums": len(albums or [])})))
+    print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: marked {len(keys)} artist(s) "
+          f"with titles in other scripts stale, for the auto-indexer to rescan")
+    return len(keys)
+
+def _title_key_stale_step(state: dict, now: float, user: dict) -> None:
+    """The worker's once-per-process attempt at `_index_mark_title_key_stale`,
+    retried every TITLE_KEY_STALE_RETRY_SECS until it has run. Navidrome's
+    album list must be read whole: a partial or empty answer marks nothing and
+    records nothing. Never raises."""
+    if state.get("title_keys_done") or now < float(state.get("title_keys_retry_at") or 0):
+        return
+    state["title_keys_retry_at"] = now + TITLE_KEY_STALE_RETRY_SECS
+    try:
+        # Recorded already (every start after the first): nothing to read.
+        with _index_lock:
+            done = _index_db().execute("SELECT 1 FROM migrations WHERE name = ?",
+                                       (_TITLE_KEY_STALE_MIGRATION,)).fetchone()
+        if done:
+            state["title_keys_done"] = True
+            return
+        stats: dict = {}
+        albums = nd_get_all_albums((user or {}).get("navidrome_user", ""),
+                                   (user or {}).get("navidrome_password", ""), stats)
+        if not albums or stats.get("partial"):
+            print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: Navidrome's album list "
+                  f"was not read whole; will try again")
+            return
+        _index_mark_title_key_stale(albums)
+        state["title_keys_done"] = True
+    except Exception as e:  # noqa: BLE001 — a background errand never exits
+        print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: skipped ({e}); will try again")
 
 def _auto_index_worker(clock=time.time, sleeper=time.sleep) -> None:
     """The `auto-index` daemon thread. A no-op when LB_BOT_AUTO_INDEX is off or
@@ -29044,6 +31649,8 @@ def _auto_index_worker(clock=time.time, sleeper=time.sleep) -> None:
     _auto_index_public.update({"running": True})
     while True:
         outcome = "idle"
+        # Before the first tick, so a rescan it asks for is in the first queue.
+        _title_key_stale_step(state, clock(), _default_web_user())
         try:
             outcome = _auto_index_tick(state, clock(), _default_web_user())
         except Exception as e:  # noqa: BLE001 — a background errand never exits
@@ -29446,17 +32053,31 @@ def _settings_cards(user: dict = None, diagnostics: list = None) -> dict:
             "password": "[redacted]" if user.get("navidrome_password") else "not set",
         }, "navidrome" not in failed,
             "Check NAVIDROME_URL and keep credentials in environment variables."),
-        _config_card("slskd", "slskd", {
+        (_config_card("slskd", "slskd", {
             "url": _redacted_url(SLSKD_URL),
             "api_key": "[redacted]" if SLSKD_API_KEY else "not set",
             "downloads": SLSKD_DOWNLOAD_DIR,
         }, "slskd" not in failed,
-            "Set SLSKD_URL, SLSKD_API_KEY, and mount slskd downloads at /downloads."),
-        _config_card("listenbrainz", "ListenBrainz", {
+            "Set SLSKD_URL, SLSKD_API_KEY, and mount slskd downloads at /downloads.")
+         if _downloads_on() else
+         # Worbus P1 S2: not an error, a mode. Says how to turn it on.
+         {**_config_card("slskd", "Downloading", {
+             "status": "not set up",
+         }, True,
+             "Downloading is off. To turn it on, set SLSKD_URL and SLSKD_API_KEY "
+             "for your slskd, mount its downloads folder at /downloads, and "
+             "restart lb-bot."), "state": "off"}),
+        (_config_card("listenbrainz", "ListenBrainz", {
             "user": user.get("listenbrainz_user", ""),
             "playlists": ", ".join((user.get("playlist_sources") or {}).values()),
-        }, bool(user.get("listenbrainz_user")),
-            "Set listenbrainz_user and playlist_sources for the dashboard user."),
+        }, True)
+         if _lbz_user_of(user) else
+         # B-304: no user is a mode, not an error (like Downloading above).
+         {**_config_card("listenbrainz", "ListenBrainz", {
+             "status": "not set up",
+         }, True,
+             "ListenBrainz is off. To turn on playlists and listening history, "
+             "set LISTENBRAINZ_USER and restart lb-bot."), "state": "off"}),
         _config_card("spotify", "Spotify", {
             "client_id": "[redacted]" if SPOTIFY_CLIENT_ID else "not set",
             "client_secret": "[redacted]" if SPOTIFY_CLIENT_SECRET else "not set",
@@ -31624,9 +34245,10 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
             # every per-track state write (the poller, the cancel routes) puts
             # its text in `error`. Read both, the latter only while the row is
             # still failed/cancelled — `error` outlives a retry.
-            # Without the mount prefixes: a stored text can name a host path
-            # (Q-021), and this reaches both clients.
-            "downloadError": _strip_host_paths(
+            # Through `_wire_text` (audit L3-04, fix round): a stored text can
+            # name a host path (Q-021), a token or URL userinfo, and this
+            # reaches both clients as /lb/gap.
+            "downloadError": _wire_text(
                 (m or {}).get("download_error", "")
                 or ((m or {}).get("error", "")
                     if decision in ("failed", "cancelled") else "")),
@@ -31643,7 +34265,7 @@ def _gap_detail_view(group: dict, source_page: int = 0) -> dict:
             "forcePlaceKind": _force_place_kind(m),
             # Said of a row that was placed as another recording of its
             # track (ruling J6); "" otherwise.
-            "placementNote": _strip_host_paths((m or {}).get("placement_note", "")),
+            "placementNote": _wire_text((m or {}).get("placement_note", "")),
             "forcePlaceConflict": (m or {}).get("force_place_conflict", ""),
             # A downloaded Loose-tracks row has no release to be filed under, so
             # its fix is "Pick the release" on this download folder (B-017).
@@ -32333,6 +34955,24 @@ def _index_build_progress() -> dict | None:
                         "current": task.get("current") or ""}
     return None
 
+def _index_unindexed_progress() -> dict | None:
+    """The index build's progress for the hub (Worbus P1 S3; the plan names
+    it `_index_progress_view`, a name `/api/summary`'s `index` block already
+    has): `{"unindexed", "total", "current"}` — the artists the worker will
+    still attempt that have no index row (`_auto_index_tick`), Navidrome's
+    artist count, and the artist being (or last) scanned, a name only.
+
+    None with LB_BOT_AUTO_INDEX=0, or before the worker has read the artist
+    list: the push then carries no `progress`, and a client shows no bar."""
+    if not LB_BOT_AUTO_INDEX:
+        return None
+    public = dict(_auto_index_public)
+    if not isinstance(public.get("unindexed"), int) or not isinstance(public.get("total"), int):
+        return None
+    unindexed = max(0, public["unindexed"])
+    return {"unindexed": unindexed, "total": max(0, public["total"]),
+            "current": (public.get("progressCurrent") or "") if unindexed else ""}
+
 def _index_progress_view() -> dict:
     """`index` on `GET /api/summary` (ruling U1): how far the background
     re-index is, for the header of every screen — `{enabled, running, outcome,
@@ -32355,6 +34995,9 @@ def _index_progress_view() -> dict:
     build = _index_build_progress()
     if build is not None:
         view["build"] = build
+    progress = _index_unindexed_progress()
+    if progress is not None:
+        view["progress"] = progress
     return view
 
 def _active_gap_fills(transfers: list) -> list:
@@ -32418,6 +35061,7 @@ def _summary_view() -> dict:
             "withGaps": _library_gap_album_count(albums),
         },
         "index": _index_progress_view(),
+        "downloads": "on" if _downloads_on() else "off",
         "ts": time.time(),
     }
 
@@ -32560,18 +35204,33 @@ def _activity_view() -> dict:
     most ACTIVITY_TRANSFERS_MAX). How long a terminal row stays is the ledger's
     own rule (`_ALBUM_FILL_TERMINAL_TTL`); nothing here prunes. A gap fill's
     row, written under the release id alone, is named from its review group and
-    marked `gapFill`, as `/api/fills` does."""
+    marked `gapFill`, as `/api/fills` does; once that group is gone, by the
+    names stamped on the row at its first write (`labelArtist` / `labelAlbum`
+    / `labelRgid`, B-254), still `gapFill`. A row still nameless is named from
+    the library index by its release-group (`_names_by_rgid`), then by the
+    Navidrome albums it was verified as (`_names_by_nd_album_ids`) and by its
+    release in the MusicBrainz cache (`_release_names_cached`) — never a
+    request. `state`, `done`,
+    `total`, `failed` and `percent` are `_album_fill_view`'s, so this list and
+    /api/album/status never disagree about one fill."""
     with _album_fill_lock:
         ledger = [(mbid, dict(entry or {})) for mbid, entry in _album_fill_status.items()]
     ledger.sort(key=lambda kv: float(kv[1].get("updated_at") or 0), reverse=True)
     names = None
     requests_out = []
+    cut_requests = 0
+    nd_ids_of: dict = {}     # a still-nameless row's `ndAlbumIds`
     for mbid, entry in ledger:
         state = entry.get("state") or ""
         if not state or state == "unknown":
             continue
+        if len(requests_out) >= ACTIVITY_REQUESTS_MAX:
+            # Past the cap: counted for `truncated`, not built.
+            cut_requests += 1
+            continue
         artist, album = entry.get("artist", "") or "", entry.get("album", "") or ""
         group_id, album_id, gap_fill = entry.get("groupId", "") or "", "", False
+        rgid = entry.get("rgid", "") or ""
         if not (artist or album):
             if names is None:
                 names = _fill_names_by_release()
@@ -32580,24 +35239,77 @@ def _activity_view() -> dict:
                 artist, album = known["artist"], known["album"]
                 group_id = group_id or known["groupId"]
                 album_id, gap_fill = known["albumId"], True
-        total = int(entry.get("total") or 0)
-        done = int(entry.get("done") or 0)
+            elif entry.get("labelArtist") or entry.get("labelAlbum"):
+                # Its review group is gone; the names it had were stamped on
+                # the row at its first write (B-254).
+                artist = entry.get("labelArtist", "") or ""
+                album = entry.get("labelAlbum", "") or ""
+                gap_fill = True
+            rgid = rgid or entry.get("labelRgid", "") or ""
+        if not (artist or album):
+            nd_ids_of[mbid] = list(entry.get("ndAlbumIds") or [])
+        # Progress is the live group's, as /api/album/status reports it (S2,
+        # audit L3-01): the ledger row is not advanced during a download, so
+        # its own done/total read 0 of N on a fill that was nearly finished.
+        live = _album_fill_view(mbid, include_files=False)
         requests_out.append({
-            "releaseMbid": mbid, "rgid": entry.get("rgid", "") or "",
+            "releaseMbid": mbid, "rgid": rgid,
             "groupId": group_id, "albumId": album_id,
-            "artist": artist, "album": album, "state": state,
-            "percent": int(done * 100 / total) if total else 0,
-            "done": done, "total": total,
+            "artist": artist, "album": album, "state": live["state"],
+            "percent": live["percent"],
+            "done": live["done"], "total": live["total"], "failed": live["failed"],
             "failureKind": entry.get("failureKind", "") or "",
-            "reason": _strip_host_paths(entry.get("reason", "") or ""),
+            "reason": _wire_text(entry.get("reason", "")),
             "retryable": bool(entry.get("retryable")),
             "gapFill": gap_fill,
             "updatedAt": float(entry.get("updated_at") or 0),
         })
-        if len(requests_out) >= ACTIVITY_REQUESTS_MAX:
-            break
+    # A row neither its own text nor a review group could name, but which holds
+    # a release-group, is named from the library index: one query for all of
+    # them. `gapFill` stays False: that flag is for a name from a review group.
+    unnamed = [r for r in requests_out if not (r["artist"] or r["album"]) and r["rgid"]]
+    if unnamed:
+        try:
+            found = _names_by_rgid([r["rgid"] for r in unnamed])
+        except Exception:
+            found = {}
+        for r in unnamed:
+            known = found.get(r["rgid"])
+            if known:
+                r["artist"], r["album"] = known["artist"], known["album"]
+    # B-254: what is still nameless — a gap fill placed before its rows were
+    # named, its review group gone — is named by the Navidrome albums it was
+    # verified as (the index, then the album list in memory), then by its
+    # release from the MusicBrainz cache. Never a request on this path.
+    unnamed = [r for r in requests_out if not (r["artist"] or r["album"])]
+    if unnamed:
+        by_album = _names_by_nd_album_ids(
+            [a for r in unnamed for a in nd_ids_of.get(r["releaseMbid"], [])])
+        for r in unnamed:
+            known = next((by_album[str(a)] for a in nd_ids_of.get(r["releaseMbid"], [])
+                          if str(a) in by_album), None) or _release_names_cached(
+                r["releaseMbid"])
+            if known:
+                r["artist"], r["album"] = known["artist"], known["album"]
+                r["rgid"] = r["rgid"] or known.get("rgid", "") or ""
+    # B-317: still nameless — its release is cached only under lookups with no
+    # artist credit — is named from the index by the release group a cached
+    # document of its release names. One query; never a request.
+    unnamed = [r for r in requests_out if not (r["artist"] or r["album"]) and not r["rgid"]]
+    if unnamed:
+        cached_rgid = {r["releaseMbid"]: _release_rgid_cached(r["releaseMbid"]) for r in unnamed}
+        try:
+            found = _names_by_rgid([g for g in cached_rgid.values() if g])
+        except Exception:
+            found = {}
+        for r in unnamed:
+            known = found.get(cached_rgid.get(r["releaseMbid"], ""))
+            if known:
+                r["artist"], r["album"] = known["artist"], known["album"]
+                r["rgid"] = cached_rgid[r["releaseMbid"]]
     transfers = []
-    for t in (_transfers_view().get("transfers") or [])[:ACTIVITY_TRANSFERS_MAX]:
+    all_transfers = _transfers_view().get("transfers") or []
+    for t in all_transfers[:ACTIVITY_TRANSFERS_MAX]:
         sub = t.get("sub", "") or ""
         transfers.append({
             "id": t.get("id", ""), "kind": t.get("kind", ""),
@@ -32607,7 +35319,394 @@ def _activity_view() -> dict:
             "peer": t.get("username", "") or (sub[len("from @"):] if sub.startswith("from @") else ""),
         })
     return {"version": 1, "serverTime": time.time(),
-            "requests": requests_out, "transfers": transfers}
+            "requests": requests_out, "transfers": transfers,
+            # How many rows the two caps cut, as /api/attention's own
+            # `truncated` says it (S4): additive, an older client ignores it.
+            "truncated": {"requests": cut_requests,
+                          "transfers": max(0, len(all_transfers) - ACTIVITY_TRANSFERS_MAX)}}
+
+# Worbus P1 S5: who may call each route, `"<METHOD> <rule>" -> "open" |
+# "user" | "admin"`. The gate (`_web_auth_gate`) reads it before every request:
+# - open: the hub's probe, signing in and out, and the SPA's shell and assets;
+# - user: any signed-in Navidrome user — the library views, Discover, charts,
+#   search and meta, the wishlist, and Scan now for one artist;
+# - admin: a Navidrome admin, or the hub's service token — everything else:
+#   downloads, fills and placement, review decisions, overrides, merges,
+#   library-wide index builds and playlist scans, preferences, settings, logs,
+#   system status and diagnostics (which show library paths and peer names).
+# A route missing from the table is admin (fail closed), and a test fails on
+# it (`test_every_route_is_tagged`): a new route is tagged here when it lands.
+_ROUTE_ACCESS_OPEN = (
+    "GET /api/health",
+    "POST /api/session",
+    "GET /api/session",
+    "DELETE /api/session",
+    "GET /",
+    "GET /assets/<path:filename>",
+    "GET /<path:path>",
+)
+_ROUTE_ACCESS_USER = (
+    "GET /api/library",
+    "GET /api/artists",
+    "GET /api/artist/discography",
+    "GET /api/gaps",
+    "GET /api/gaps/<group_id>",
+    "GET /api/cover/<album_id>",
+    "GET /api/album/lookup",
+    "GET /api/album/releases",
+    "GET /api/album/tracklist",
+    "GET /api/album/similar",
+    "GET /api/album/status",
+    "GET /api/fills",
+    "GET /api/library-index/status",
+    "GET /api/overrides",
+    "GET /api/index/changes",
+    "GET /api/index/keys",
+    "GET /api/meta/artist",
+    "GET /api/meta/album",
+    "GET /api/artist/lookup",
+    "GET /api/artist/similar",
+    "GET /api/artist/related",
+    "GET /api/deezer/genres",
+    "GET /api/deezer/chart",
+    "GET /api/deezer/editorial",
+    "POST /api/resolve-link",
+    "GET /api/fresh-releases",
+    "GET /api/listening/status",
+    "GET /api/listening/summary",
+    "GET /api/listening/unowned",
+    "GET /api/listening/recent",
+    "GET /api/summary",
+    "GET /api/tasks/<task_id>",
+    "GET /api/wishlist",
+    "POST /api/wishlist",
+    "POST /api/wishlist/remove",
+    "POST /api/artist/discography",
+)
+_ROUTE_ACCESS_ADMIN = (
+    # Writes a release under whatever artist the body names: Match manually.
+    "POST /api/artist/release",
+    "GET /api/review",
+    "GET /api/duplicates",
+    "GET /api/duplicate-files",
+    "GET /api/gaps/<group_id>/duplicate-files",
+    "POST /api/library/delete-file",
+    "GET /api/library/trash",
+    "POST /api/library/trash/restore",
+    "POST /api/library/trash/empty",
+    "GET /api/tasks",
+    "GET /api/operations",
+    "GET /api/operations/<operation_id>",
+    "POST /api/tasks/<task_id>/cancel",
+    "GET /api/downloads",
+    "GET /api/action-center",
+    "GET /api/transfers",
+    "GET /api/attention",
+    "GET /api/activity",
+    "GET /api/system/health",
+    "POST /api/system/recheck",
+    "GET /api/prefs",
+    "PUT /api/prefs",
+    "POST /api/gaps/<group_id>/allow-mp3",
+    "POST /api/gaps/<group_id>/rescan",
+    "POST /api/gaps/<group_id>/fetch",
+    "POST /api/gaps/<group_id>/auto",
+    "POST /api/gaps/<group_id>/cancel",
+    "GET /api/placements",
+    "POST /api/placements/identify",
+    "POST /api/placements/<placement_id>/confirm",
+    "POST /api/placements/<placement_id>/dismiss",
+    "POST /api/placements/<placement_id>/delete",
+    "POST /api/scan",
+    "POST /api/scan-all",
+    "POST /api/playlists/scan",
+    "POST /api/spotify/scan",
+    "GET /api/debug/slskd-search",
+    "GET /api/debug/album-search",
+    "POST /api/search",
+    "GET /api/searches",
+    "POST /api/searches/<sid>/download",
+    "GET /api/album/sources",
+    "POST /api/album/download",
+    "POST /api/album/cancel",
+    "POST /api/listening/sync",
+    "GET /api/album/override",
+    "GET /api/album/covers",
+    "POST /api/album/override/preview",
+    "POST /api/album/override",
+    "POST /api/album/cover",
+    "POST /api/album/override/remove",
+    "GET /api/artist/merge/preview",
+    "POST /api/artist/merge",
+    "GET /api/artist/merge",
+    "POST /api/artist/merge/undo",
+    "POST /api/artist/override",
+    "POST /api/artist/override/remove",
+    "POST /api/library-index/build",
+    "GET /api/beets/folders",
+    "GET /api/download-folders",
+    "POST /api/beets/release-candidates",
+    "POST /api/place-folder/candidates",
+    "POST /api/beets/import",
+    "POST /api/place-folder",
+    "POST /api/beets/import-preview",
+    "GET /api/diagnostics",
+    "POST /api/rescan",
+    "GET /api/system/status",
+    "POST /api/acoustid/rejected/clear",
+    "GET /api/settings",
+    "GET /api/logs",
+    "POST /api/groups/<group_id>/sources",
+    "GET /api/groups/<group_id>/sources",
+    "GET /api/groups/<group_id>/sources/<int:source_index>/files",
+    "POST /api/groups/<group_id>/tracks/<int:track_index>/pick-file",
+    "POST /api/groups/<group_id>/tracks/<int:track_index>/place-anyway",
+    "GET /api/groups/<group_id>/downloads/<download_id>/match",
+    "POST /api/groups/<group_id>/reconcile-downloads",
+    "POST /api/groups/<group_id>/downloads/<download_id>/match-preview",
+    "POST /api/groups/<group_id>/sources/<int:source_index>/download",
+    "POST /api/downloads/cancel",
+    "POST /api/downloads/clear",
+    "POST /api/transfers/<transfer_id>/dismiss",
+    "POST /api/imports/<recid>/retry",
+    "POST /api/imports/<recid>/remove-stale-and-retry",
+    "POST /api/imports/<recid>/merge-retry",
+    "POST /api/groups/<group_id>/match-mode",
+    "POST /api/groups/<group_id>/downloads/<download_id>/match-selected",
+    "POST /api/groups/<group_id>/downloads/<download_id>/match",
+    "POST /api/groups/<group_id>/release-details",
+    "GET /api/groups/<group_id>/preview",
+    "POST /api/groups/<group_id>/canonical",
+    "POST /api/groups/<group_id>/hide",
+    "POST /api/groups/<group_id>/missing",
+    "POST /api/groups/<group_id>/retag",
+    "POST /api/groups/<group_id>/decisions",
+    "POST /api/groups/<group_id>/download",
+    "GET /api/status",
+)
+_ROUTE_ACCESS: dict = {
+    **{k: "open" for k in _ROUTE_ACCESS_OPEN},
+    **{k: "user" for k in _ROUTE_ACCESS_USER},
+    **{k: "admin" for k in _ROUTE_ACCESS_ADMIN},
+}
+
+SESSION_COOKIE = "lb_session"
+SESSION_TTL_SECS = 30 * 86400
+SESSIONS_MAX = 1000
+# One user's sign-ins are capped on their own, so a single account signing
+# in over and over evicts only its own oldest sessions, never everyone's.
+SESSIONS_PER_USER_MAX = 20
+LOGIN_FAIL_MAX = 5
+LOGIN_FAIL_WINDOW_SECS = 600.0
+# sid -> {"user", "admin", "expires"}. In memory: a restart signs everyone
+# out, which the docs say. Never holds a password.
+_web_sessions: dict = {}
+_web_sessions_lock = threading.Lock()
+# (remote address, lowercased username) -> [when each failed attempt was]
+_login_failures: dict = {}
+_login_failures_lock = threading.Lock()
+
+def _web_session_create(user: str, admin: bool) -> str:
+    """A new session for a signed-in Navidrome user; returns its opaque id."""
+    sid = secrets.token_urlsafe(32)
+    now = time.time()
+    who = str(user).lower()
+    with _web_sessions_lock:
+        for old in [k for k, v in _web_sessions.items() if now >= v["expires"]]:
+            _web_sessions.pop(old, None)
+        _web_sessions[sid] = {"user": str(user), "admin": bool(admin),
+                              "expires": now + SESSION_TTL_SECS}
+        # Insertion order is age order: this user's oldest go first.
+        mine = [k for k, v in _web_sessions.items() if v["user"].lower() == who]
+        for old in mine[:max(0, len(mine) - SESSIONS_PER_USER_MAX)]:
+            _web_sessions.pop(old, None)
+        while len(_web_sessions) > SESSIONS_MAX:
+            _web_sessions.pop(next(iter(_web_sessions)))
+    return sid
+
+def _web_session_get(sid: str) -> dict | None:
+    """`{"user", "admin"}` of a live session, or None. An expired one is
+    dropped on the way."""
+    if not sid:
+        return None
+    with _web_sessions_lock:
+        session = _web_sessions.get(sid)
+        if session is None:
+            return None
+        if time.time() >= session["expires"]:
+            _web_sessions.pop(sid, None)
+            return None
+        return {"user": session["user"], "admin": session["admin"]}
+
+def _web_session_end(sid: str) -> None:
+    with _web_sessions_lock:
+        _web_sessions.pop(sid or "", None)
+
+def _login_reserve(key: tuple, now: float) -> bool:
+    """Take one attempt for `key`, or refuse: False when it already has
+    LOGIN_FAIL_MAX attempts inside the window. The check and the count are
+    one step under `_login_failures_lock`, before Navidrome is asked, so
+    concurrent attempts cannot all pass the check first (each one in flight
+    already counts). A wrong password keeps its attempt; a right one clears
+    the key (`_login_succeeded`); Navidrome not answering gives it back
+    (`_login_release`)."""
+    with _login_failures_lock:
+        recent = [t for t in _login_failures.get(key, []) if now - t < LOGIN_FAIL_WINDOW_SECS]
+        if len(recent) >= LOGIN_FAIL_MAX:
+            _login_failures[key] = recent
+            return False
+        recent.append(now)
+        _login_failures.pop(key, None)
+        _login_failures[key] = recent
+        if len(_login_failures) > 10000:
+            # Bounded whatever is thrown at it: the oldest keys go first.
+            for old in list(_login_failures)[:1000]:
+                if old != key:
+                    _login_failures.pop(old, None)
+        return True
+
+def _login_release(key: tuple, now: float) -> None:
+    """Give back an attempt `_login_reserve` took at `now`: it was not a
+    wrong password (Navidrome did not answer)."""
+    with _login_failures_lock:
+        attempts = _login_failures.get(key)
+        if attempts and now in attempts:
+            attempts.remove(now)
+        if not attempts:
+            _login_failures.pop(key, None)
+
+def _login_succeeded(key: tuple) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(key, None)
+
+def _nd_check_login(username: str, password: str) -> dict | None:
+    """`{"user": <the name Navidrome stores>, "admin": bool}` for a Navidrome
+    login, or None for wrong credentials. Subsonic `ping`, then `getUser` for
+    its `adminRole` and its `username`, against NAVIDROME_URL with salted-token
+    auth for exactly those credentials (`_nd_auth_params`, so the password
+    itself is never sent). The password is never stored or logged.
+
+    **The user is `getUser`'s `username`, not the typed string** (Worbus P2):
+    `OWNER` and `owner` are one account, and the session, the primary-user test
+    and the wishlist's `addedBy` all use the name Navidrome keeps. A server
+    that answers none keeps what was typed.
+
+    Raises NavidromeUnavailable when Navidrome did not answer — that is not
+    a wrong password, and is not counted as one."""
+    def _ask(endpoint: str, **extra) -> dict:
+        try:
+            r = _http.get(f"{NAVIDROME_URL}/rest/{endpoint}",
+                          params={**_nd_auth_params(username, password), **extra},
+                          timeout=8)
+            return (r.json() or {}).get("subsonic-response") or {}
+        except Exception:  # noqa: BLE001 — what failed is never printed: it holds the login
+            raise NavidromeUnavailable("Navidrome did not answer") from None
+
+    if not username or not password:
+        return None
+    if _ask("ping").get("status") != "ok":
+        return None
+    body = _ask("getUser", username=username)
+    if body.get("status") != "ok":
+        return None
+    found = body.get("user") or {}
+    canonical = str(found.get("username") or "").strip() or username
+    return {"user": canonical, "admin": found.get("adminRole") is True}
+
+def _primary_nd_user() -> str:
+    """The account this lb-bot runs as (`NAVIDROME_USER`), or ''."""
+    return str((_default_web_user() or {}).get("navidrome_user") or "").strip()
+
+def _is_primary_user(name) -> bool:
+    """Whether `name` is the primary user: equal to NAVIDROME_USER without
+    regard to case. Nobody is when no primary user is configured."""
+    primary = _primary_nd_user().lower()
+    return bool(primary) and str(name or "").strip().lower() == primary
+
+def _header_text(value: str) -> str:
+    """A header value as text. WSGI hands over latin-1; a hub that sent a
+    non-ASCII name as UTF-8 bytes gets its name back, anything else is kept."""
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+def _request_identity(req) -> dict | None:
+    """Who is calling, as `{"user", "admin", "primary"}`, or None.
+
+    - **The hub's service token** (`Authorization: Bearer <LB_BOT_HUB_TOKEN>`,
+      the secret lb-bot already sends with its pushes) with the hub's identity
+      headers: the user from `X-Worbus-User`, and `admin` and `primary` true
+      only when `X-Worbus-Admin` / `X-Worbus-Primary` are exactly `"1"`. A
+      blank name is the least-privileged caller, not "no headers".
+    - **The bearer alone** (an older hub, or a legacy shared-token client
+      through this one): `{"user": "hub", "admin": True, "primary": True}`, as
+      before the headers existed.
+    - **Otherwise the `lb_session` cookie's session** (lb-bot's own web UI):
+      `primary` when its user is NAVIDROME_USER.
+    - Otherwise None.
+
+    **The headers count only with the bearer.** Without a matching bearer they
+    are never read, so no browser can claim to be anyone by sending them. They
+    are also never logged."""
+    auth = req.headers.get("Authorization", "") or ""
+    if HUB_NOTIFY_TOKEN and auth.startswith("Bearer "):
+        offered = auth[len("Bearer "):].strip()
+        if offered and hmac.compare_digest(offered.encode("utf-8"),
+                                           HUB_NOTIFY_TOKEN.encode("utf-8")):
+            named = req.headers.get("X-Worbus-User")
+            if named is None:
+                return {"user": "hub", "admin": True, "primary": True}
+            user = _header_text(named).strip()
+            return {"user": user,
+                    "admin": bool(user) and req.headers.get("X-Worbus-Admin") == "1",
+                    "primary": bool(user) and req.headers.get("X-Worbus-Primary") == "1"}
+    session = _web_session_get(req.cookies.get(SESSION_COOKIE, ""))
+    if session is None:
+        return None
+    return {**session, "primary": _is_primary_user(session["user"])}
+
+def _downloads_off_response():
+    """The answer of a route that needs downloading, while it is off: 409
+    with the fixed body (Worbus P1). A client reads the code and shows its
+    downloads-off state; it is never an empty 200."""
+    from flask import jsonify
+    return jsonify(DOWNLOADS_OFF_BODY), 409
+
+def needs_downloads(view):
+    """Route decorator: the route searches, enqueues, places, fills, retries,
+    cancels a transfer or expands a peer folder, so it answers
+    `_downloads_off_response()` while downloading is off, before any work.
+    Applied under the `@app.<method>` line(s); `_needs_downloads` marks the
+    view for the test that the decorated set is the expected one."""
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        if not _downloads_on():
+            return _downloads_off_response()
+        return view(*args, **kwargs)
+    wrapper._needs_downloads = True
+    return wrapper
+
+def primary_only(view):
+    """Route decorator (Worbus P2): the route answers the primary user only —
+    NAVIDROME_USER on lb-bot's own web UI, or the caller the hub says is the
+    primary user — and 403 `{"code": "primary_only"}` to anyone else, before
+    any work. Applied under the `@app.<method>` line(s), like
+    `needs_downloads`. It is for what is one person's: the listening history
+    in `listens.db` is the primary user's ListenBrainz account, and showing it
+    to another account would show them a stranger's listening.
+
+    The auth gate has already answered an unknown caller 401, so a caller with
+    no identity is refused here too rather than let through."""
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        from flask import jsonify, request
+        who = _request_identity(request)
+        if not who or not who.get("primary"):
+            return jsonify({"code": "primary_only"}), 403
+        return view(*args, **kwargs)
+    wrapper._primary_only = True
+    return wrapper
 
 def start_web_dashboard() -> None:
     if not WEB_UI_ENABLED:
@@ -32636,11 +35735,100 @@ def start_web_dashboard() -> None:
                 import traceback
                 print(f"  web API error {request.path}: {e}")
                 traceback.print_exc()
-            msg = getattr(e, "description", None) or str(e) or "Internal error"
-            return jsonify({"error": msg}), code
+            msg = getattr(e, "description", None) or str(e)
+            if not isinstance(e, HTTPException):
+                # An unexpected exception's text can quote a path, a URL with
+                # credentials or a token (S3, audit L3-05): the log above keeps
+                # the traceback, the answer carries the redacted message.
+                msg = _wire_text(msg)
+            return jsonify({"error": msg or "Internal error"}), code
         if isinstance(e, HTTPException):
             return e          # non-API: keep Flask's normal handling (SPA/assets)
         raise e
+
+    @app.after_request
+    def _say_identity_is_honoured(res):
+        """Worbus P2 R17: every /api/ answer (a refusal and the error handler's
+        500 too) carries `X-Worbus-Identity: 1`. It is the one place the hub
+        learns on each call that this lb-bot reads the acting-user headers: an
+        older lb-bot, after a rollback, has no such header, and the hub must
+        not go on trusting a probe made before it."""
+        if request.path.startswith("/api/"):
+            res.headers["X-Worbus-Identity"] = "1"
+        return res
+
+    @app.before_request
+    def _web_auth_gate():
+        """Worbus P1 S5: the Navidrome login in front of every route, by
+        `_ROUTE_ACCESS`. Open routes pass; anything else needs a signed-in
+        session (401 `signin_required`), and an admin route a Navidrome
+        admin or the hub's token (403 `admin_only`). A route the table does
+        not name is admin. A path no route matches falls to the 404.
+
+        Worbus P2: "admin" is the identity's `admin` (`_request_identity`),
+        which for the hub's token is whatever the hub says the acting user is
+        (`X-Worbus-Admin`), not always yes. This table stays the only rights
+        table; the hub does not copy it."""
+        rule = request.url_rule
+        if rule is None or request.method == "OPTIONS":
+            return None
+        method = "GET" if request.method == "HEAD" else request.method
+        access = _ROUTE_ACCESS.get(f"{method} {rule.rule}", "admin")
+        if access == "open":
+            return None
+        who = _request_identity(request)
+        if who is None:
+            return jsonify({"code": "signin_required"}), 401
+        if access == "admin" and not who["admin"]:
+            return jsonify({"code": "admin_only"}), 403
+        return None
+
+    @app.post("/api/session")
+    def api_session_create():
+        """Sign in with a Navidrome username and password: 200 `{user,
+        admin, primary}` (`user` is Navidrome's own spelling of the account)
+        and the `lb_session` cookie; 401 `bad_credentials`; 429
+        `too_many_attempts` after LOGIN_FAIL_MAX failures of one (address,
+        username) inside LOGIN_FAIL_WINDOW_SECS; 503 when Navidrome did not
+        answer. The password is checked against Navidrome and dropped."""
+        data = request.get_json(silent=True) or {}
+        username = str(data.get("username") or "").strip()
+        password = str(data.get("password") or "")
+        now = time.time()
+        key = (request.remote_addr or "", username.lower())
+        if not _login_reserve(key, now):
+            return jsonify({"code": "too_many_attempts"}), 429
+        try:
+            checked = _nd_check_login(username, password)
+        except NavidromeUnavailable:
+            _login_release(key, now)
+            return jsonify({"code": "navidrome_unavailable",
+                            "error": "Navidrome did not answer; try again in a moment."}), 503
+        if not checked:
+            return jsonify({"code": "bad_credentials"}), 401
+        _login_succeeded(key)
+        # The session is Navidrome's name for the account, not the typed one.
+        user, admin = checked["user"], checked["admin"]
+        sid = _web_session_create(user, admin)
+        res = jsonify({"user": user, "admin": admin, "primary": _is_primary_user(user)})
+        res.set_cookie(SESSION_COOKIE, sid, max_age=SESSION_TTL_SECS, path="/",
+                       httponly=True, samesite="Strict")
+        return res
+
+    @app.get("/api/session")
+    def api_session_get():
+        who = _request_identity(request)
+        if who is None:
+            return jsonify({"code": "signin_required"}), 401
+        return jsonify({"user": who["user"], "admin": who["admin"],
+                        "primary": who["primary"]})
+
+    @app.delete("/api/session")
+    def api_session_delete():
+        _web_session_end(request.cookies.get(SESSION_COOKIE, ""))
+        res = jsonify({"ok": True})
+        res.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="Strict")
+        return res
 
     _NO_BUILD_PAGE = (
         "<!doctype html><meta charset=utf-8><title>lb-bot</title>"
@@ -32652,10 +35840,23 @@ def start_web_dashboard() -> None:
         "running from a source checkout. The JSON API under <code>/api/</code> "
         "works either way.</p></body>")
 
+    def _web_page():
+        """index.html with the build id in it (`_web_page_with_build`), served
+        no-cache as `send_from_directory` served it."""
+        try:
+            with open(os.path.join(_DIST_DIR, "index.html"), encoding="utf-8") as fh:
+                page = fh.read()
+        except OSError:
+            abort(404)
+        res = app.response_class(_web_page_with_build(page, _web_build_id()),
+                                 mimetype="text/html")
+        res.headers["Cache-Control"] = "no-cache"
+        return res
+
     @app.get("/")
     def web_index():
         if os.path.isdir(_DIST_DIR):
-            return send_from_directory(_DIST_DIR, "index.html")
+            return _web_page()
         return _NO_BUILD_PAGE
 
     @app.get("/assets/<path:filename>")
@@ -32667,7 +35868,7 @@ def start_web_dashboard() -> None:
         if path.startswith("api/"):
             abort(404)
         if os.path.isdir(_DIST_DIR):
-            return send_from_directory(_DIST_DIR, "index.html")
+            return _web_page()
         abort(404)
 
     @app.get("/api/review")
@@ -33127,6 +36328,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": False, "error": why or ALBUM_OVERRIDE_FILL_REFUSAL}), 409
 
     @app.post("/api/gaps/<group_id>/fetch")
+    @needs_downloads
     def api_gap_fetch(group_id):
         data = request.get_json(silent=True) or {}
         with _review_lock:
@@ -33234,6 +36436,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload), (200 if payload.get("ok") else 400)
 
     @app.post("/api/gaps/<group_id>/auto")
+    @needs_downloads
     def api_gap_auto(group_id):
         """Search, rank and download the best source without a manual pick.
         Backs the Fill-gaps 'Auto-select best source' button. Source search is
@@ -33260,6 +36463,7 @@ def start_web_dashboard() -> None:
         return jsonify(_with_operation({"ok": True, "task_id": task_id}, op))
 
     @app.post("/api/gaps/<group_id>/cancel")
+    @needs_downloads
     def api_gap_cancel(group_id):
         with _review_lock:
             group = _find_review_group(group_id)
@@ -33288,6 +36492,7 @@ def start_web_dashboard() -> None:
                             [i for i in items if not i.get("filed")])})
 
     @app.post("/api/placements/identify")
+    @needs_downloads
     def api_placements_identify():
         """Resolve download folders to MusicBrainz releases in the background.
         User-initiated: the sweep is rate-limited to 1 MB req/sec."""
@@ -33305,6 +36510,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": True, "task_id": task_id})
 
     @app.post("/api/placements/<placement_id>/confirm")
+    @needs_downloads
     def api_placement_confirm(placement_id):
         data = request.get_json(silent=True) or {}
         folders = _download_folders_cached(force=True)
@@ -33376,6 +36582,7 @@ def start_web_dashboard() -> None:
             None)
 
     @app.post("/api/placements/<placement_id>/dismiss")
+    @needs_downloads
     def api_placement_dismiss(placement_id):
         """Hide a download folder from Needs placement (persisted). Files
         stay on disk; the Import tab still lists the folder."""
@@ -33389,6 +36596,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": True, "path": folder["path"]})
 
     @app.post("/api/placements/<placement_id>/delete")
+    @needs_downloads
     def api_placement_delete(placement_id):
         """Delete a download folder's files from the slskd downloads dir.
         Requires {"confirm": true}; the folder must resolve strictly inside
@@ -33451,6 +36659,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": True, "task_id": task_id})
 
     @app.get("/api/debug/slskd-search")
+    @needs_downloads
     def api_debug_slskd_search():
         """Raw slskd search trace for one query — see slskd_search_probe."""
         query = (request.args.get("q", "") or "").strip()
@@ -33467,6 +36676,7 @@ def start_web_dashboard() -> None:
         return jsonify(slskd_search_probe(query, wait, stop_at))
 
     @app.get("/api/debug/album-search")
+    @needs_downloads
     def api_debug_album_search():
         """Scored album-search trace — see _debug_album_search_view."""
         artist = (request.args.get("artist", "") or "").strip()
@@ -33479,6 +36689,7 @@ def start_web_dashboard() -> None:
             (request.args.get("release_mbid", "") or "").strip()))
 
     @app.post("/api/search")
+    @needs_downloads
     def api_search():
         data = request.get_json(silent=True) or {}
         query = data.get("query", "").strip()
@@ -33493,6 +36704,7 @@ def start_web_dashboard() -> None:
         return jsonify(_review_snapshot().get("searches", {}))
 
     @app.post("/api/searches/<sid>/download")
+    @needs_downloads
     def api_search_download(sid):
         data = request.get_json(silent=True) or {}
         idx = int(data.get("index", 0))
@@ -33508,12 +36720,12 @@ def start_web_dashboard() -> None:
         user = _default_web_user()
         if mode == "file":
             file = min(fd.get("files", []), key=lambda f: _score_file(f, fd.get("upload_speed", 0)) or (99,))
-            ok = slskd_enqueue(fd["username"], file, token=user.get("telegram_token", ""),
+            ok = slskd_enqueue(fd["username"], file, token=_web_user_key(),
                                chat_id=str(user.get("chat_id", "")))
             return jsonify({"ok": ok})
         full = slskd_expand_directory(fd["username"], fd, fd["files"][0] if fd.get("files") else {})
         ok, total, ag_id = slskd_enqueue_folder(
-            fd["username"], full or fd.get("files", []), token=user.get("telegram_token", ""),
+            fd["username"], full or fd.get("files", []), token=_web_user_key(),
             chat_id=str(user.get("chat_id", "")), label=fd.get("folder", ""))
         return jsonify({"ok": bool(ok), "queued": ok, "total": total, "album_group_id": ag_id})
 
@@ -33673,6 +36885,7 @@ def start_web_dashboard() -> None:
         })
 
     @app.get("/api/album/sources")
+    @needs_downloads
     def api_album_sources():
         """Ranked slskd folders for a release-group — the kept list while there
         is one, `refresh=1` to search again and merge (`_album_sources_view`)."""
@@ -33690,6 +36903,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload), status
 
     @app.post("/api/album/download")
+    @needs_downloads
     def api_album_download():
         """Fetch a whole release-group from Soulseek.
 
@@ -33783,6 +36997,7 @@ def start_web_dashboard() -> None:
                         "allFiles": all_files, "resolved": resolved})
 
     @app.post("/api/album/cancel")
+    @needs_downloads
     def api_album_cancel():
         """Stop one album fill — searching, queued or downloading.
 
@@ -33815,7 +37030,10 @@ def start_web_dashboard() -> None:
             release_mbid = (mbz_resolve_album(rgid) or {}).get("release_mbid", "")
         if not release_mbid:
             return jsonify({"error": "release_mbid or rgid is required"}), 400
-        return jsonify(_album_fill_view(release_mbid))
+        view = _album_fill_view(release_mbid)
+        if not (_request_identity(request) or {}).get("admin"):
+            view = _without_peer_names(view)
+        return jsonify(view)
 
     @app.get("/api/fills")
     def api_fills():
@@ -33827,7 +37045,10 @@ def start_web_dashboard() -> None:
         # ?recent=1: the newest album fills, for a screen that did not start them.
         if request.args.get("recent", "") in ("1", "true"):
             mbids = _recent_album_fill_mbids() + mbids
-        return jsonify(_fills_view(mbids, _ids("group_ids")))
+        view = _fills_view(mbids, _ids("group_ids"))
+        if not (_request_identity(request) or {}).get("admin"):
+            view = _without_peer_names(view)
+        return jsonify(view)
 
     @app.get("/api/album/tracklist")
     def api_album_tracklist():
@@ -34072,7 +37293,8 @@ def start_web_dashboard() -> None:
         """Release-groups whose fill ended in `no_source`, kept for the slow
         re-search. See the wishlist section for why that failure kind gets a
         list instead of the auto-retry the transient kinds get."""
-        rows = _wishlist_list()
+        admin = bool((_request_identity(request) or {}).get("admin"))
+        rows = _wishlist_list(admin)
         return jsonify({"wishlist": rows, "total": len(rows),
                         "intervalSeconds": WISHLIST_RESEARCH_INTERVAL,
                         "cooldownSeconds": WISHLIST_ROW_COOLDOWN})
@@ -34080,13 +37302,15 @@ def start_web_dashboard() -> None:
     @app.post("/api/wishlist")
     def api_wishlist_add():
         data = request.get_json(silent=True) or {}
+        who = _request_identity(request) or {}
         result = _wishlist_add(str(data.get("rgid") or ""),
                                str(data.get("artist") or ""),
-                               str(data.get("title") or ""))
+                               str(data.get("title") or ""),
+                               added_by=who.get("user") or "web")
         if not result.get("ok"):
             return jsonify(_api_error_payload(
                 "wishlist_add_failed", result.get("error", "Could not add"))), 400
-        return jsonify({**result, "wishlist": _wishlist_list()})
+        return jsonify({**result, "wishlist": _wishlist_list(bool(who.get("admin")))})
 
     @app.post("/api/wishlist/remove")
     def api_wishlist_remove():
@@ -34095,7 +37319,8 @@ def start_web_dashboard() -> None:
         if not result.get("ok"):
             return jsonify(_api_error_payload(
                 "wishlist_remove_failed", result.get("error", "Could not remove"))), 400
-        return jsonify({**result, "wishlist": _wishlist_list()})
+        admin = bool((_request_identity(request) or {}).get("admin"))
+        return jsonify({**result, "wishlist": _wishlist_list(admin)})
 
     @app.get("/api/fresh-releases")
     def api_fresh_releases():
@@ -34112,7 +37337,9 @@ def start_web_dashboard() -> None:
             itself — those rows carry no album ids until the backfill runs.
           - `artistPlays`: how often the user has played the row's artists,
             all-time, from the listens mirror; 0 when never, and while the
-            mirror is off or its first import has not finished.
+            mirror is off or its first import has not finished. **Only in
+            the primary user's answer** (Worbus P2): for any other caller
+            the key is absent from every row.
         `owned` is kept as a backward-compatible alias for `artistOwned`."""
         try:
             days = int(request.args.get("days", "30"))
@@ -34161,11 +37388,17 @@ def start_web_dashboard() -> None:
         # `artistPlays` (I-006): the user's own all-time plays of the row's
         # artists, from the listens mirror. Best-effort like the badges, and
         # on its own so that neither failure takes the other's answer down.
+        # **Only for the primary user** (Worbus P2): the mirror is their
+        # ListenBrainz account. For anyone else it is not read at all, the rows
+        # carry no `artistPlays`, and the cut (`_fresh_apply_limit`) keeps the
+        # library's artists, which is the fallback scope.
+        primary = bool((_request_identity(request) or {}).get("primary"))
         plays_by_mbid: dict = {}
         tags_of: dict = {}
         try:
-            plays_by_mbid = _listens_artist_plays()
-            tags_of = _listens_tags_of_overrides() if plays_by_mbid else {}
+            if primary:
+                plays_by_mbid = _listens_artist_plays()
+                tags_of = _listens_tags_of_overrides() if plays_by_mbid else {}
         except Exception as e:
             print(f"  fresh-releases: listening counts unavailable: {e}")
         out = []
@@ -34181,7 +37414,8 @@ def start_web_dashboard() -> None:
             row["releaseAlbumId"] = (album_id_by_rgid.get(r.get("releaseGroupMbid") or "", "")
                                      if release_owned else "")
             row["owned"] = bool(artist_id)   # compat alias for artistOwned
-            row["artistPlays"] = _listens_plays_of(r.get("artistMbids"), plays_by_mbid, tags_of)
+            if primary:
+                row["artistPlays"] = _listens_plays_of(r.get("artistMbids"), plays_by_mbid, tags_of)
             out.append(row)
         # Cut AFTER enrichment, so the cut can be ownership-aware at all.
         total = len(out)
@@ -34194,12 +37428,14 @@ def start_web_dashboard() -> None:
         return jsonify(payload)
 
     @app.get("/api/listening/status")
+    @primary_only
     def api_listening_status():
         """The listens mirror's state (I-006). See `_listening_status_view`."""
         payload, status = _listening_status_view()
         return jsonify(payload), status
 
     @app.get("/api/listening/summary")
+    @primary_only
     def api_listening_summary():
         """See `_listening_summary_view`."""
         payload, status = _listening_summary_view(
@@ -34207,6 +37443,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload), status
 
     @app.get("/api/listening/unowned")
+    @primary_only
     def api_listening_unowned():
         """See `_listening_unowned_view`."""
         payload, status = _listening_unowned_view(
@@ -34215,6 +37452,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload), status
 
     @app.get("/api/listening/recent")
+    @primary_only
     def api_listening_recent():
         """See `_listening_recent_view`."""
         payload, status = _listening_recent_view(
@@ -34265,7 +37503,9 @@ def start_web_dashboard() -> None:
 
     @app.post("/api/artist/discography")
     def api_artist_discography():
-        payload, status = _artist_rescan_view(request.get_json(silent=True) or {})
+        who = _request_identity(request) or {}
+        payload, status = _artist_rescan_view(request.get_json(silent=True) or {},
+                                              admin=bool(who.get("admin")))
         return jsonify(payload), status
 
     @app.post("/api/artist/release")
@@ -34472,6 +37712,7 @@ def start_web_dashboard() -> None:
     # plain names, the old ones stay for anything still calling them.
     @app.post("/api/place-folder")
     @app.post("/api/beets/import")
+    @needs_downloads
     def api_beets_import():
         data = request.get_json(silent=True) or {}
         path = data.get("path", "")
@@ -34599,6 +37840,7 @@ def start_web_dashboard() -> None:
         return jsonify({"entries": entries})
 
     @app.post("/api/groups/<group_id>/sources")
+    @needs_downloads
     def api_group_sources(group_id):
         # Results younger than SOURCE_RESULTS_TTL are reused unless the caller
         # asks for a fresh search ("Search again").
@@ -34631,6 +37873,7 @@ def start_web_dashboard() -> None:
             return jsonify(_group_source_page(group, page))
 
     @app.get("/api/groups/<group_id>/sources/<int:source_index>/files")
+    @needs_downloads
     def api_group_source_files(group_id, source_index):
         """The peer's full folder listing for one source, re-paired against the
         gaps. Triggered by opening the file disclosure in the picker."""
@@ -34649,6 +37892,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload)
 
     @app.post("/api/groups/<group_id>/tracks/<int:track_index>/pick-file")
+    @needs_downloads
     def api_group_track_pick_file(group_id, track_index):
         """Assign one specific file from one specific source to one missing
         track, overriding the automatic matcher."""
@@ -34674,6 +37918,7 @@ def start_web_dashboard() -> None:
         return jsonify(_with_operation(result, op)), (200 if result.get("ok") else 400)
 
     @app.post("/api/groups/<group_id>/tracks/<int:track_index>/place-anyway")
+    @needs_downloads
     def api_group_track_place_anyway(group_id, track_index):
         """"Place anyway": place the file of the row at this index, which
         lb-bot refused to place — as audio the album already has (`duplicate`,
@@ -34726,6 +37971,7 @@ def start_web_dashboard() -> None:
         return jsonify(payload)
 
     @app.post("/api/groups/<group_id>/reconcile-downloads")
+    @needs_downloads
     def api_group_reconcile_downloads(group_id):
         data = request.get_json(silent=True) or {}
         with _review_lock:
@@ -34756,6 +38002,7 @@ def start_web_dashboard() -> None:
         })
 
     @app.post("/api/groups/<group_id>/sources/<int:source_index>/download")
+    @needs_downloads
     def api_group_source_download(group_id, source_index):
         with _review_lock:
             group = _find_review_group(group_id)
@@ -34776,6 +38023,7 @@ def start_web_dashboard() -> None:
         return jsonify(_with_operation(result, op)), (200 if result.get("ok") else 400)
 
     @app.post("/api/downloads/cancel")
+    @needs_downloads
     def api_download_cancel():
         data = request.get_json(silent=True) or {}
         username = data.get("username", "")
@@ -34798,6 +38046,7 @@ def start_web_dashboard() -> None:
         return jsonify(_with_operation({"ok": True}, op))
 
     @app.post("/api/downloads/clear")
+    @needs_downloads
     def api_downloads_clear():
         """Drop finished transfers from slskd's history and the bot's records."""
         op = _operation_create("clear_downloads", "Clearing finished transfers")
@@ -34836,6 +38085,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": True, "kind": kind})
 
     @app.post("/api/imports/<recid>/retry")
+    @needs_downloads
     def api_import_retry(recid):
         rec = _albums.get(recid)
         if not rec:
@@ -34865,6 +38115,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": imported, "status": rec["status"], "import_result": result})
 
     @app.post("/api/imports/<recid>/remove-stale-and-retry")
+    @needs_downloads
     def api_import_remove_stale_and_retry(recid):
         rec = _albums.get(recid)
         if not rec:
@@ -34893,6 +38144,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": imported, "status": rec["status"], "import_result": result})
 
     @app.post("/api/imports/<recid>/merge-retry")
+    @needs_downloads
     def api_import_merge_retry(recid):
         rec = _albums.get(recid)
         if not rec:
@@ -34943,6 +38195,7 @@ def start_web_dashboard() -> None:
         return jsonify({"ok": True, "mode": mode})
 
     @app.post("/api/groups/<group_id>/downloads/<download_id>/match-selected")
+    @needs_downloads
     def api_group_download_match_selected(group_id, download_id):
         data = request.get_json(silent=True) or {}
         rec = _albums.get(download_id)
@@ -35000,6 +38253,7 @@ def start_web_dashboard() -> None:
                         "import_result": result}, op))
 
     @app.post("/api/groups/<group_id>/downloads/<download_id>/match")
+    @needs_downloads
     def api_group_download_match(group_id, download_id):
         data = request.get_json(silent=True) or {}
         rec = _albums.get(download_id)
@@ -35170,6 +38424,7 @@ def start_web_dashboard() -> None:
         return jsonify(_with_operation({"ok": True}, op))
 
     @app.post("/api/groups/<group_id>/download")
+    @needs_downloads
     def api_download(group_id):
         if not _find_review_group(group_id):
             return jsonify({"error": "Group not found"}), 404
@@ -35236,6 +38491,9 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Could not identify user.")
         return
     lbz_user = user["listenbrainz_user"]
+    if not _lbz_user_of(user):
+        await update.message.reply_text(NO_LISTENBRAINZ_USER)
+        return
     if lbz_user in _scans_running:
         await update.message.reply_text(
             "A scan is already running for you — results will arrive when it "
@@ -35269,9 +38527,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List in-progress albums and any finished albums needing attention."""
     token = _resolve_token(context)
-    groups = [ag for ag in pending_album_groups.values() if ag.get("token") == token]
+    groups = [ag for ag in pending_album_groups.values()
+              if _token_owns(ag.get("token"), token)]
     review = [(rid, r) for rid, r in _albums.items()
-              if r.get("token") == token and r.get("status") in ("needs_review", "failed")]
+              if _token_owns(r.get("token"), token)
+              and r.get("status") in ("needs_review", "failed")]
 
     if groups:
         for ag in groups:
@@ -35292,8 +38552,9 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show active transfers and album-group progress for this user."""
     token = _resolve_token(context)
-    mine  = [v for v in pending_downloads.values() if v.get("token") == token]
-    groups = [ag for ag in pending_album_groups.values() if ag.get("token") == token]
+    mine  = [v for v in pending_downloads.values() if _token_owns(v.get("token"), token)]
+    groups = [ag for ag in pending_album_groups.values()
+              if _token_owns(ag.get("token"), token)]
 
     lines = []
     if groups:
@@ -35321,9 +38582,29 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Scheduler
 # ---------------------------------------------------------------------------
 
-async def scheduled_scan(apps: list, force: bool = False):
+def _scan_users() -> list:
+    """The users the scheduled playlist scan is for: those with a
+    ListenBrainz user. Telegram has nothing to do with it any more."""
+    return [u for u in USERS if (u.get("listenbrainz_user") or "").strip()]
+
+async def _telegram_apps_settled(timeout: float = 300.0) -> None:
+    """Wait (bounded) until main() has finished starting the Telegram apps,
+    so a scan that finishes early does not read "no Telegram" for a user
+    whose app is still starting. No-op outside main()."""
+    event = _TELEGRAM_STARTED
+    if event is None:
+        return
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+    except Exception:  # noqa: BLE001 — a slow start only changes where results go
+        pass
+
+async def scheduled_scan(force: bool = False):
+    users = _scan_users()
+    if not users:
+        return
     print(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] Running weekly scan...")
-    for user, app in zip(USERS, apps):
+    for user in users:
         lbz_user = user["listenbrainz_user"]
         last     = _last_scan_ts.get(lbz_user, 0)
         if lbz_user in _scans_running:
@@ -35350,19 +38631,38 @@ async def scheduled_scan(apps: list, force: bool = False):
             continue
         finally:
             _scans_running.discard(lbz_user)
+        await _telegram_apps_settled()
+        app = _token_to_app().get(user.get("telegram_token") or "")
         if missing:
             print(f"  {len(missing)} missing tracks for {lbz_user}")
-            await send_missing_tracks(app, user, missing)
         else:
             print(f"  Everything up to date for {lbz_user}")
+        if app is not None:
+            # As before Worbus P1: the results are a Telegram message.
+            if missing:
+                await send_missing_tracks(app, user, missing)
+        elif user is _default_web_user():
+            # No Telegram for this user: the results land where the web UI's
+            # own "Scan playlists" puts them, the review's playlist origin.
+            try:
+                await asyncio.to_thread(_land_playlist_scan, user, missing)
+            except Exception as e:  # noqa: BLE001
+                print(f"  playlist scan results not saved for {lbz_user}: {e}")
     _save_state()
 
-async def tuesday_scheduler(apps: list):
+async def _playlist_scan_loop():
+    """The startup and Tuesday 09:00 playlist scan, independent of Telegram
+    (Worbus P1 S1). It used to run inside the Telegram apps' scheduler, so a
+    server with no Telegram never scanned. Returns at once when no user has
+    a ListenBrainz user: there is nothing to scan, and nothing to log."""
+    if not _scan_users():
+        print("  playlist scan: no ListenBrainz user configured — off")
+        return
     if RUN_SCAN_ON_START:
         # Throttled: a crash-loop or routine restart won't re-hammer MusicBrainz
         # or re-spam the missing-tracks list.
         try:
-            await scheduled_scan(apps, force=False)
+            await scheduled_scan(force=False)
         except Exception as e:
             print(f"  startup scan failed: {e}")
     while True:
@@ -35376,7 +38676,7 @@ async def tuesday_scheduler(apps: list):
         print(f"Next scan: {next_run:%Y-%m-%d %H:%M} ({wait_sec/3600:.1f}h away)")
         await asyncio.sleep(wait_sec)
         try:
-            await scheduled_scan(apps, force=True)  # the weekly run always fires
+            await scheduled_scan(force=True)  # the weekly run always fires
         except Exception as e:
             # Never let one bad week kill the scheduler permanently.
             import traceback
@@ -35396,7 +38696,7 @@ async def state_flush_loop():
         await asyncio.to_thread(_save_state)
         await asyncio.to_thread(_save_mbz_cache)
 
-async def housekeeping_loop(apps: list):
+async def housekeeping_loop():
     """Drop untouched button state so memory doesn't grow without bound."""
     while True:
         await asyncio.sleep(SWEEP_INT)
@@ -35475,11 +38775,86 @@ def _mark_interrupted_jobs() -> None:
     raising left every merge row `merging` — `in_progress` to each request —
     until the next restart. Neither is ever a reason not to start."""
     for what, check in (("album overrides", _album_overrides_interrupted),
+                        ("album covers", _album_cover_embeds_interrupted),
                         ("artist merges", _artist_merges_interrupted)):
         try:
             check()
         except Exception as e:  # noqa: BLE001
             print(f"  {what}: could not check for interrupted work: {e}")
+
+def _missing_required_config() -> list:
+    """The names of the settings a stranger's server needs that are empty:
+    NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD, LB_BOT_HUB_URL and
+    LB_BOT_HUB_TOKEN (Worbus P1). Names only — never a value.
+
+    NAVIDROME_URL is read from the environment, not from the module value:
+    that one has a default (`http://navidrome:4533`), so it was never empty
+    and the setting was never reported (review S#7)."""
+    user = _default_web_user() or {}
+    checks = (("NAVIDROME_URL", os.environ.get("NAVIDROME_URL", "")),
+              ("NAVIDROME_USER", user.get("navidrome_user", "")),
+              ("NAVIDROME_PASSWORD", user.get("navidrome_password", "")),
+              ("LB_BOT_HUB_URL", HUB_NOTIFY_URL),
+              ("LB_BOT_HUB_TOKEN", HUB_NOTIFY_TOKEN))
+    return [name for name, value in checks if not str(value or "").strip()]
+
+def _telegram_app_for(user: dict):
+    """One user's Telegram Application, built with every handler."""
+    app = Application.builder().token(user["telegram_token"].strip()).build()
+    app.add_error_handler(on_telegram_error)
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CommandHandler("start", help_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("pending", pending_command))
+    app.add_handler(CommandHandler("diag", diag_command))
+    app.add_handler(CommandHandler("album", album_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("checkalbums", checkalbums_command))
+    app.add_handler(CommandHandler("spplaylist", spplaylist_command))
+    app.add_handler(CommandHandler("beets", beets_command))
+    app.add_handler(CommandHandler("rescan", rescan_command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    return app
+
+async def _build_telegram_apps(users: list) -> list:
+    """`[(user, Application)]`: one started app per user with a non-empty
+    token. A build, initialise or start-polling failure is logged once — the
+    exception's type and a redacted message, never the token — and that user
+    is skipped; everything else keeps running (Worbus P1 S1)."""
+    pairs = []
+    for n, user in enumerate(users, 1):
+        if not (user.get("telegram_token") or "").strip():
+            continue
+        app = None
+        try:
+            app = _telegram_app_for(user)
+            await app.initialize()
+            await app.start()
+            # Explicit allowed_updates: Telegram persists the previous setting
+            # server-side when omitted, so a past poller with a restricted set
+            # would silently drop callback_query updates (dead buttons).
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:  # noqa: BLE001 — Telegram never stops the rest
+            print(f"  Telegram bot for user {n} could not start "
+                  f"({type(e).__name__}: {_redact_secrets(e)[:200]}) — "
+                  f"running without it")
+            if app is not None:
+                for step in ("stop", "shutdown"):
+                    try:
+                        await getattr(app, step)()
+                    except Exception:  # noqa: BLE001 — best effort
+                        pass
+            continue
+        # Register the Telegram command menu for autocomplete + the "/" menu
+        try:
+            await app.bot.set_my_commands(BOT_COMMANDS)
+        except Exception as e:
+            print(f"  set_my_commands failed: {_redact_secrets(e)[:200]}")
+        pairs.append((user, app))
+        print(f"  Bot started for {user.get('listenbrainz_user') or f'user {n}'}")
+    return pairs
 
 async def main():
     if WEB_UI_ENABLED:
@@ -35520,51 +38895,37 @@ async def main():
     print(f"  config: WEB_UI={'on' if WEB_UI_ENABLED else 'off'} "
           f"{WEB_UI_HOST}:{WEB_UI_PORT}")
     print(f"  config: WEB_BUILD={WEB_BUILD}")
-    if not os.path.isdir(SLSKD_DOWNLOAD_DIR):
+    print(f"  config: downloading is {'on' if _downloads_on() else 'off'}"
+          + ("" if _downloads_on() else " (SLSKD_API_KEY is not set)"))
+    if _downloads_on() and not os.path.isdir(SLSKD_DOWNLOAD_DIR):
         print(f"  WARNING: SLSKD_DOWNLOAD_DIR '{SLSKD_DOWNLOAD_DIR}' does not exist "
               f"inside this container. Completed downloads cannot be imported and "
               f"/beets will be empty until you mount slskd's downloads volume here.")
-    apps = []
-    for user in USERS:
-        app = Application.builder().token(user["telegram_token"]).build()
-        app.add_error_handler(on_telegram_error)
-        app.add_handler(CallbackQueryHandler(callback_handler))
-        app.add_handler(CommandHandler("start", help_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("scan", scan_command))
-        app.add_handler(CommandHandler("status", status_command))
-        app.add_handler(CommandHandler("pending", pending_command))
-        app.add_handler(CommandHandler("diag", diag_command))
-        app.add_handler(CommandHandler("album", album_command))
-        app.add_handler(CommandHandler("search", search_command))
-        app.add_handler(CommandHandler("checkalbums", checkalbums_command))
-        app.add_handler(CommandHandler("spplaylist", spplaylist_command))
-        app.add_handler(CommandHandler("beets", beets_command))
-        app.add_handler(CommandHandler("rescan", rescan_command))
-        app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-        await app.initialize()
-        await app.start()
-        # Explicit allowed_updates: Telegram persists the previous setting
-        # server-side when omitted, so a past poller with a restricted set
-        # would silently drop callback_query updates (dead buttons).
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        # Register the Telegram command menu for autocomplete + the "/" menu
-        try:
-            await app.bot.set_my_commands(BOT_COMMANDS)
-        except Exception as e:
-            print(f"  set_my_commands failed: {e}")
-        apps.append(app)
-        print(f"  Bot started for {user['listenbrainz_user']}")
+    missing_config = _missing_required_config()
+    # Names only, never a value.
+    print("  config: required settings missing: " + ", ".join(missing_config)
+          if missing_config else "  config: required settings all present")
 
-    # Stash apps so on-demand commands (/scan) can reach every bot instance
-    global _APPS
-    _APPS = apps
+    # The web UI and the workers first, and independently of Telegram
+    # (Worbus P1 S1): an empty or rejected TELEGRAM_TOKEN used to raise at
+    # the Telegram app's build before any of them started, and the container
+    # crash-looped.
+    global _APPS, _TELEGRAM_APPS, _TELEGRAM_STARTED
+    _TELEGRAM_STARTED = asyncio.Event()
     start_web_dashboard()
 
-    asyncio.create_task(tuesday_scheduler(apps))
-    asyncio.create_task(poll_downloads_loop(apps))
+    asyncio.create_task(_playlist_scan_loop())
+    asyncio.create_task(poll_downloads_loop())
     asyncio.create_task(state_flush_loop())
-    asyncio.create_task(housekeeping_loop(apps))
+    asyncio.create_task(housekeeping_loop())
+
+    # Then the Telegram apps, one per user with a token; one that fails to
+    # start is logged and skipped.
+    pairs = await _build_telegram_apps(USERS)
+    _TELEGRAM_APPS = pairs
+    # So on-demand commands (/scan) can reach every bot instance.
+    _APPS = [app for _user, app in pairs]
+    _TELEGRAM_STARTED.set()
 
     try:
         while True:

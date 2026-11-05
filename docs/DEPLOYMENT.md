@@ -68,8 +68,10 @@ at import (`LB_BOT_UMASK`).
 > into pre-existing folders fails).
 
 Network: `media` (an external Docker network shared with Navidrome and slskd, so the
-default URLs `http://navidrome:4533` and `http://slskd:5030` resolve). The web UI has
-no login of its own — do not publish port `8899` beyond your own network.
+default URLs `http://navidrome:4533` and `http://slskd:5030` resolve). The web UI asks
+for a Navidrome login (any Navidrome user; only Navidrome admins get the actions that
+change files; sessions live in memory, so a restart signs everyone out). Still, do not
+publish port `8899` beyond your own network.
 
 ### What Navidrome must be set to
 
@@ -133,14 +135,14 @@ value itself.
 | `NAVIDROME_URL` (`http://navidrome:4533`) | from `.env` |  |
 | `NAVIDROME_USER`, `NAVIDROME_PASSWORD` (empty) | from `.env` | A Navidrome login. Without one nothing can be checked against the library, and the background indexer does not run |
 | `SLSKD_URL` (`http://slskd:5030`) | from `.env` |  |
-| `SLSKD_API_KEY` (empty) | from `.env` | slskd UI → Options → API Keys |
-| `LISTENBRAINZ_USER` (empty) | from `.env` | Whose playlists are scanned and whose listens are mirrored |
+| `SLSKD_API_KEY` (empty) | from `.env` | Optional. slskd UI → Options → API Keys. **Downloading is on only when this is set** (read once at start); without it lb-bot makes no slskd call and every download route answers 409 `downloads_off` |
+| `LISTENBRAINZ_USER` (empty) | from `.env` | Optional. Whose playlists are scanned and whose listens are mirrored; unset, no playlist scan runs. Through navi-connect, listening history is shown to the hub's primary user only |
 | `MBZ_CONTACT` (empty) | from `.env` | Contact email the MusicBrainz API terms require |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (empty) | from `.env` | The Telegram bot. Optional if you only use the web UI |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` (empty) | from `.env` | Optional: Spotify playlist import, and resolving a pasted Spotify link |
 | `LASTFM_API_KEY` (empty) | from `.env` | Optional: cross-checks the similar-artists lookup. Without it the ListenBrainz half runs alone |
 | `ACOUSTID_API_KEY` (empty) | from `.env` | Optional: with it a downloaded file is fingerprinted before it is placed — a different song under the right name is refused, another recording of the same track is placed and said. Without it nothing is checked and nothing is refused on that ground |
-| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` (empty) | from `.env` | Optional, for [navi-connect](https://github.com/illuminator69/navi-connect): the hub's *http* address and its token, so the players hear of a fill and of index changes as they happen |
+| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` (empty) | from `.env` | **Required.** The [navi-connect](https://github.com/illuminator69/navi-connect) hub's *http* address and its `HUB_TOKEN`. lb-bot sends the token with its pushes (fills, index changes), and the hub sends it back as `Authorization: Bearer` on every `/lb/*` call, naming the signed-in user (`X-Worbus-User`, `-Admin`, `-Primary`); without the token every hub call except `/api/health` is refused. Deploy a new lb-bot before a new hub |
 
 **Paths and files**
 

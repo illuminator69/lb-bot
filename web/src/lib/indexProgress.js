@@ -58,3 +58,15 @@ export function indexHeaderLabel(p, nowSecs, fmt = n => n.toLocaleString(), cloc
   }
   return [`Indexing library · ${fmt(p.done)} of ${fmt(p.total)} artists`, `Indexing · ${fmt(p.done)}/${fmt(p.total)}`]
 }
+
+/** What a page following the background index's scan of one artist does next,
+ *  from the `scan` its discography route answers (review S#9): `running`
+ *  (keep watching), `failed` (say `scan.error`), `done` (show what is stored),
+ *  or `lost` — only when the entry is gone (lb-bot restarted, or the entry
+ *  expired after ten minutes without news). */
+export function autoScanStep(scan) {
+  if (!scan || typeof scan !== 'object' || !scan.state) return 'lost'
+  if (scan.state === 'running') return 'running'
+  if (scan.state === 'failed') return 'failed'
+  return 'done'
+}

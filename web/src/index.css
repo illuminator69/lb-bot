@@ -142,6 +142,9 @@ button.back:hover:not(:disabled) { background: var(--sunk); }
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 9px 20px;
   background: var(--bad-tint); border-bottom: 1px solid var(--line); font-size: 13px;
 }
+.banner.note { background: var(--accent-tint); }
+/* A banner's own action, pressed on a phone: at least 44 px tall (B-095 review 13). */
+.banner button.target { min-height: 44px; }
 
 /* ── Controls ──────────────────────────────────────────────────────────── */
 @layer components {
@@ -234,6 +237,17 @@ button.back:hover:not(:disabled) { background: var(--sunk); }
   }
   button.chip:active:not(:disabled) { transform: scale(.95); }
   button.chip[aria-pressed="true"] { background: var(--fg); border-color: var(--fg); color: var(--surface); }
+
+  /* A way out of the app (Find it, Worbus P1): a chip that is a link. A link
+     MusicBrainz lists is in the accent; a search is plain. */
+  a.chip {
+    display: inline-block; background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 12px; color: var(--accent); white-space: nowrap; max-width: 100%; overflow: hidden;
+    text-overflow: ellipsis; font-size: 13px; text-decoration: none;
+    transition: border-color .14s ease;
+  }
+  a.chip.quiet { color: var(--fg2); }
+  a.chip:hover { border-color: var(--muted); }
 
   /* Small non-interactive label. */
   span.chip {

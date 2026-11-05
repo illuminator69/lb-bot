@@ -1,5 +1,6 @@
 import { createContext, useContext, useReducer, useEffect, useCallback, useRef, useState } from 'react'
-import { api, post } from './lib/api.js'
+import { api, del, onSignedOut, post } from './lib/api.js'
+import { downloadsOn, routeDownloads, routeRedirect } from './lib/access.js'
 import { jobs } from './lib/jobs.js'
 import {
   isSection, navigate, onRoute, parseHash, replaceRoute, routeHash, currentKind,
@@ -15,6 +16,7 @@ import System from './panels/System.jsx'
 import Search from './panels/Search.jsx'
 import { ArtistPage, AlbumPage, forgetDiscography } from './panels/Artist.jsx'
 import Placement from './panels/Placement.jsx'
+import SignIn from './panels/SignIn.jsx'
 
 // ── Context ──────────────────────────────────────────────────────────────────
 export const AppContext = createContext(null)
@@ -103,6 +105,9 @@ export function gapDetailId(ui) {
 
 const boot = parseHash()
 const initialState = {
+  // Worbus P1: who is signed in, `{ user, admin }` from GET /api/session;
+  // undefined while that is being asked, null when nobody is (the sign-in page).
+  session: undefined,
   summary: null,
   gaps: null,          // { items, counts, origins, scanTask } — the visible queue
   hiddenGaps: null,    // the same shape, for albums the user hid
@@ -139,6 +144,10 @@ const initialState = {
 
 function reducer(state, action) {
   switch (action.type) {
+    case 'SET_SESSION':
+      return action.session ? { ...state, session: action.session }
+        // Signed out: nothing read under the last session stays on screen.
+        : { ...initialState, session: null, tab: state.tab, routeParams: state.routeParams }
     case 'LOAD_SCREEN': {
       const next = { ...state, ...action.data }
       if (action.data.gaps) next.gapsStale = false
@@ -262,8 +271,10 @@ function jobsFor(ui, want, signal) {
       break
     }
     case 'album':
-      // An incomplete album shows its gap's download as it runs.
-      if (want('transfers') && (ui.summary?.transfers?.active || 0) + (ui.summary?.transfers?.queued || 0) > 0) {
+      // An incomplete album shows its gap's download as it runs (an admin's
+      // page: the transfers are not a non-admin's to read).
+      if (want('transfers') && ui.session?.admin && downloadsOn(ui.summary)
+          && (ui.summary?.transfers?.active || 0) + (ui.summary?.transfers?.queued || 0) > 0) {
         jobs.transfers = soft(api('/api/transfers', { signal }))
       }
       break
@@ -280,6 +291,9 @@ function jobsFor(ui, want, signal) {
       if (want('wishlist')) jobs.wishlist = soft(api('/api/wishlist', { signal }))
       break
     case 'library':
+      // Library › Wishlist (Worbus P1: the wishlist's own place, both modes).
+      // A few rows: read on every Library tab, for the Wishlist tab's count.
+      if (want('wishlist')) jobs.wishlist = soft(api('/api/wishlist', { signal }))
       if (sub === 'albums' && want('library')) {
         const q = new URLSearchParams({ filter: ui.libFilter, q: ui.libSearch, page: ui.libPage, sort: ui.libSort })
         jobs.library = api(`/api/library?${q}`, { signal })
@@ -357,6 +371,9 @@ export default function App() {
   const refresh = useCallback(async ({ silent = false, force = false, only = null } = {}) => {
     if (refreshTimerRef.current) { clearTimeout(refreshTimerRef.current); refreshTimerRef.current = null }
     if (refreshingRef.current && !force) return
+    // Nothing is read while nobody is signed in: every route but the sign-in
+    // answers 401, and the sign-in page is showing.
+    if (!uiRef.current.session) return
     if (abortControllerRef.current) abortControllerRef.current.abort()
     abortControllerRef.current = new AbortController()
     const signal = abortControllerRef.current.signal
@@ -394,13 +411,45 @@ export default function App() {
     if (!stale()) scheduleRefresh(refreshIntervalRef.current)
   }, [scheduleRefresh, pushToast])
 
+  // Who is signed in, once; and a 401 from any route later signs the page
+  // out (the session expired, or lb-bot restarted: sessions live in memory).
   useEffect(() => {
-    refresh()
+    onSignedOut(() => dispatch({ type: 'SET_SESSION', session: null }))
+    let dead = false
+    api('/api/session')
+      .then(who => { if (!dead) dispatch({ type: 'SET_SESSION', session: who }) })
+      .catch(() => { if (!dead) dispatch({ type: 'SET_SESSION', session: null }) })
+    return () => { dead = true; onSignedOut(null) }
+  }, [])
+
+  const signedIn = !!state.session
+  useEffect(() => {
+    if (!signedIn) {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+      if (abortControllerRef.current) abortControllerRef.current.abort()
+      return undefined
+    }
+    refresh({ force: true })
     return () => {
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
       if (abortControllerRef.current) abortControllerRef.current.abort()
     }
-  }, [refresh])
+  }, [refresh, signedIn])
+
+  // A page this user, or this server, cannot show goes somewhere that can
+  // (lib/access.js): a non-admin has no Needs you, Activity or settings; a
+  // server that does not download has no Activity, no folders to file and no
+  // source rules.
+  const isAdmin = !!state.session?.admin
+  // Hidden until the summary says (lib/access.js); routing waits for it.
+  const downloads = downloadsOn(state.summary)
+  const routeDl = routeDownloads(state.summary)
+  const routeSub = state.routeParams[0] || ''
+  useEffect(() => {
+    if (!signedIn) return
+    const to = routeRedirect(state.tab, routeSub, { admin: isAdmin, downloads: routeDl })
+    if (to) replaceRoute(...to)
+  }, [signedIn, isAdmin, routeDl, state.tab, routeSub])
 
   // Refetch when the screen or its parameters change so navigation feels
   // instant instead of poll-paced. Skips the first run (the mount did it).
@@ -473,9 +522,26 @@ export default function App() {
     return action(path, body)
   }, [action, requestConfirm])
 
-  const ctx = { state, dispatch, refresh, scheduleRefresh, action, confirmAction, requestConfirm, pushToast }
+  const signOut = useCallback(async () => {
+    try { await del('/api/session') } catch { /* signed out either way */ }
+    dispatch({ type: 'SET_SESSION', session: null })
+  }, [])
 
-  const Panel = PAGES[tab] || null
+  // `isAdmin`: a Navidrome admin (the routes that change files are theirs);
+  // `downloadsOn`: this server downloads; `canDownload`: both — every download
+  // control is shown only then, and is absent, not disabled, otherwise.
+  const ctx = {
+    state, dispatch, refresh, scheduleRefresh, action, confirmAction, requestConfirm, pushToast,
+    session: state.session, isAdmin, downloadsOn: downloads, canDownload: isAdmin && downloads, signOut,
+  }
+
+  const blocked = signedIn && routeRedirect(tab, routeSub, { admin: isAdmin, downloads: routeDl })
+  const Panel = blocked ? null : (PAGES[tab] || null)
+
+  if (state.session === undefined) return <main className="h-full" style={{ background: 'var(--bg)' }} aria-busy="true" />
+  if (state.session === null) {
+    return <SignIn onSignedIn={who => dispatch({ type: 'SET_SESSION', session: who })} />
+  }
 
   return (
     <AppContext.Provider value={ctx}>

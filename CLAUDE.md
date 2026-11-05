@@ -92,6 +92,10 @@ review survives a restart until this is fixed. Fix on the
 host once: `chown -R 99:100 /mnt/user/appdata/lb-bot` (and `/mnt/user/Music` if
 placement into pre-existing album folders fails).
 
+The required set for a stranger's server is `NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD`,
+`LB_BOT_HUB_URL` and `LB_BOT_HUB_TOKEN` (§ A stranger's server). `TELEGRAM_TOKEN` and `SLSKD_API_KEY` are
+optional: no token, no Telegram; no key, downloading is off.
+
 New environment variables, all optional and all degrading to "feature off"
 rather than to an error:
 
@@ -111,6 +115,118 @@ Deezer needs no configuration at all — the browse API is open.
 `LB_BOT_UMASK` (default `002` in compose) is applied by the bot itself via
 `os.umask()` at import. The image is `python:3.11-slim` with a bare `python`
 CMD — there is no s6/linuxserver init, so a bare `UMASK` var would do nothing.
+
+### A stranger's server — Worbus P1 (2026-10-28)
+
+lb-bot runs with only Navidrome and the hub configured: no Telegram, no slskd. The pieces, each with its tests in
+`test_album_review.py` (`NoTelegramTests`, `DownloadsModeTests`, `IndexProgressScanNowTests`, `FindItTests`,
+`WebLoginTests`):
+
+- **Required env** (`_missing_required_config()`, names only, never values): `NAVIDROME_URL`, `NAVIDROME_USER`,
+  `NAVIDROME_PASSWORD`, `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN`. `main()` logs them in one line ("required settings
+  missing: …" or "all present"), and `/api/health` carries them as `missingConfig`. `NAVIDROME_URL` is judged by
+  `os.environ` (the module value has a default, so it was never empty). `HUB_NOTIFY_TOKEN` is read stripped.
+- **Start-up order.** `main()` starts the web dashboard and the four loops (`_playlist_scan_loop`,
+  `poll_downloads_loop`, `state_flush_loop`, `housekeeping_loop`) **first**, then `_build_telegram_apps(USERS)`: one
+  app per user with a non-empty token; a build, initialise or start-polling failure is logged once (the exception's
+  type and a redacted message, never the token) and that user is skipped. Before this an empty `TELEGRAM_TOKEN` raised
+  `InvalidToken` at the builder and the container crash-looped. `_TELEGRAM_APPS` holds the `(user, app)` pairs,
+  `_TELEGRAM_STARTED` is set once they are final.
+- **The web user's key.** Web-started (and hub-started) state is owned by `_web_user_key()` = `"web"`, never the
+  Telegram token: `_user_for_token("web")` is the default web user, `_token_to_app()` maps `"web"` to that user's app
+  (so the owner keeps completion messages), `_token_owns()` lets `/status` and `/pending` list it. The retag's
+  Navidrome rescan no longer needs a token.
+- **The playlist scan** (`_playlist_scan_loop`, was `tuesday_scheduler`) runs for each user with a
+  `listenbrainz_user`, independent of Telegram, and returns at once when there is none. Results go to Telegram when
+  that user has an app (as before), else into the review's playlist origin (`_land_playlist_scan`, what the web UI's
+  "Scan playlists" does).
+- **Downloading is a mode.** `DOWNLOADS_ON` = `SLSKD_API_KEY.strip()` non-empty, read once at import; `_downloads_on()`
+  reads it at call time. Off: `slskd_run_search`, `slskd_search_probe`, `slskd_enqueue`, `slskd_expand_directory`,
+  `slskd_get_all_downloads`, `_slskd_fetch_all_downloads`, `_slskd_cancel` and the diagnostics' slskd probe answer
+  empty without a request; `_poll_downloads_once` returns at once (rows it holds stay as they are); the wishlist
+  sweep neither reads nor searches. Every route that searches, enqueues, places, fills, retries, cancels a transfer
+  or expands a peer folder is decorated `@needs_downloads` (under its `@app.<method>` line) and answers **409
+  `{"code": "downloads_off", "error": "Downloading is not set up on this server."}`** before any work. The set is
+  pinned by `DownloadsModeTests.DOWNLOAD_ROUTES`; a new download route goes into both. `/api/health` and
+  `/api/summary` carry `"downloads": "on"|"off"`; the settings card says downloading is off and how to turn it on
+  (`state: "off"`). **The suite runs with `bot.DOWNLOADS_ON = True`** (set at the top of the test file): tests that
+  want it off patch it. Off, `_startup_placement` and `_resume_placement_verification` do nothing (they move files
+  and ask Navidrome to scan).
+- **Index progress on the push.** `_index_unindexed_progress()` → `{"unindexed", "total", "current"}` (the plan
+  called it `_index_progress_view`, a name `/api/summary`'s `index` block already had). `unindexed` is what the
+  worker's tick counts: queue entries with reason `missing` and no failure on record, so artists covered by another
+  artist's fresh row and artists that ever failed (in back-off or due again) are out and a real library reaches 0
+  without blipping "1 left"; stub and stale work is not counted. `_auto_index_queue` publishes it, also on a paused
+  or outage tick, and a failed candidate is taken off at once. None with
+  `LB_BOT_AUTO_INDEX=0` or before the artist list is read. The push (`_index_push_tick`) carries it on every send,
+  and a change of it alone sends at most every `INDEX_PUSH_PROGRESS_GAP_SECS` (5 s) with no HWM write; the poster is
+  called `poster(seq, epoch)` without progress and `poster(seq, epoch, progress)` with it. `/api/summary`'s `index`
+  gains it as `progress`.
+- **Scan now for any artist.** `POST /api/artist/discography {"nd_id"}` with no `mbid` (a library artist; an `mb:` id
+  still needs one, 400) runs `_artist_resolve_scan_task`: on the task's thread, `_index_library_artist_mbid(strict=True)`
+  (the tag, the stored row, then a name search), then the ordinary scan. No match → `_index_store_unresolved_artist`;
+  MusicBrainz down → the scan reads `failed`, nothing written. **Single flight**: the check and the start are one hold
+  of `_artist_scan_start_lock`, and `_artist_scan_pending` covers the moment before a task's thread writes its entry,
+  so a second tap (or a page that knows the MBID) gets `{"ok", "task_id", "running": true}` of the first.
+- **Any scan shows on the route.** The worker sets `_artist_scans` for its own scans (`task_id`
+  `AUTO_INDEX_SCAN_TASK` = `"auto-index"`, no task row) — under `nd:<id>` and, for a tagged artist whose tag row is
+  not another library artist's, `mb:<tag>` — and leaves an artist a page is scanning. A scan the POST started whose
+  thread has not written its entry yet reads `running`, 0 of 0, on the GET (`_artist_scan_just_started`, off
+  `_artist_scan_pending`), ahead of any older entry, so a poll right after the tap never reads "no scan". `scan` gains `done` /
+  `total` (0 while unknown), renewed by every classified release (`_artist_scan_progress`); an entry not updated for
+  `ARTIST_SCAN_EXPIRY_SECS` (10 min) reads as no scan, so a page never waits on a scan whose thread is gone.
+- **`unresolved`** on `GET /api/artist/discography`: `true` iff the stored row's `artist_mbid` is empty (the
+  miss-stub), `false` for an indexed artist with an MBID; absent when not indexed.
+- **Find it** (`findIt` on `/api/meta/album`): one browse `release?release-group=<rgid>&inc=url-rels&limit=100`
+  (one page) at the caller's priority; relation types `purchase for download`, `download for free`, `streaming`,
+  `free streaming`, `purchase for mail-order`; host → service id (`_FIND_IT_HOSTS`), one confirmed link per service
+  (`other` one per host, up to 3), then a search link for each of the six search services with no confirmed one.
+  The templates live only in `_FIND_IT_SEARCH`; `{q}` is "artist title" percent-quoted whole. Rows are `{service,
+  kind: "confirmed"|"search", url}`. The browse failing (or no names) leaves the key **absent**, never `[]`; a cached
+  payload without `findIt` is a miss for that key only (browsed, merged, rewritten in place keeping its age,
+  `_meta_cache_patch`). `links` is unchanged.
+- **The Navidrome login.** `_ROUTE_ACCESS` (`"<METHOD> <rule>"` → `open` | `user` | `admin`) is read by the
+  `before_request` gate `_web_auth_gate`: open = `/api/health`, the three `/api/session` routes and the SPA shell and
+  assets; user = library views, Discover, charts, search, meta, the wishlist, `/api/summary`, `/api/tasks/<id>` and
+  Scan now; admin = everything else. **An untagged route is admin**, and `WebLoginTests.test_every_route_is_tagged`
+  fails on it: tag a new route when it lands. Identity (`_request_identity` → `{user, admin, primary}`): `Authorization: Bearer
+  <LB_BOT_HUB_TOKEN>` (constant-time compare, never when the token is empty) is the hub, see "The acting user" below;
+  otherwise the `lb_session` cookie. 401 `{"code":"signin_required"}`, 403 `{"code":"admin_only"}`. `POST /api/session {"username","password"}`
+  checks Navidrome (`_nd_check_login`: Subsonic `ping`, then `getUser` for `adminRole` and `username`, salted token for those
+  credentials; the password is neither stored nor printed; the session's `user` is `getUser`'s spelling, not the typed
+  one) → 200 `{user, admin, primary}` and the cookie (`HttpOnly`,
+  `SameSite=Strict`, `Path=/`, 30 days); 401 `bad_credentials`; 429 `too_many_attempts` after 5 attempts of one
+  (remote address, username) in 10 minutes (Navidrome is not asked then); 503 `navidrome_unavailable` when Navidrome
+  did not answer (not counted). The attempt is taken **before** Navidrome is asked (`_login_reserve`, one hold of
+  `_login_failures_lock`), so a concurrent burst reaches Navidrome at most 5 times; a 503 gives it back, a success
+  clears the key. One user holds at most `SESSIONS_PER_USER_MAX` (20) sessions, their oldest evicted first.
+  **Non-admin limits inside user routes:** `POST /api/artist/discography` keeps to the MBIDs the library artist
+  already carries (override, Navidrome tag, stored row; `_artist_rescan_caller_limits`) and Navidrome's name, so
+  "Match manually" stays an admin's; `POST /api/artist/release` is admin; `/api/fills` and `/api/album/status`
+  drop Soulseek peer names (`_without_peer_names`) for a non-admin. `GET /api/session` → `{user, admin, primary}` or 401; `DELETE` ends it. **Sessions live in
+  memory (`_web_sessions`): a restart signs everyone out.** No secure flag (lb-bot serves plain HTTP on a LAN). Route
+  tests sign in through `_web_app(as_role="admin")`, the default; `"user"` and `"anon"` are the other two.
+- **The acting user (Worbus P2).** The hub sends its bearer plus `X-Worbus-User`, `X-Worbus-Admin` and
+  `X-Worbus-Primary` on every proxied call. **The headers count only with the matching bearer**; without it they are never
+  read, and they are never logged. `admin` / `primary` are true only when their header is exactly `"1"`; a blank name is
+  the least-privileged caller; the bearer with no headers (an older hub, a legacy shared-token client) is `{hub, admin,
+  primary}` as before. A cookie session is `primary` when its user is `NAVIDROME_USER` (case-insensitive). `/api/health`
+  has `"identity": 1` (the hub reads it: without it only the primary user may use this lb-bot). **`primary_only`** (a
+  route decorator, 403 `{"code":"primary_only"}` before any work) is on the four `/api/listening` GETs; `POST
+  /api/listening/sync` stays admin. `GET /api/fresh-releases` for a non-primary caller never reads the listens mirror:
+  no `artistPlays`, and the cut keeps the library's artists. `wishlist.added_by` (guarded ALTER) records who added a row;
+  `addedBy` is in an admin's answers only. Every `/api/*` answer, refusals and the 500 included, carries `X-Worbus-Identity: 1`
+  (one `after_request`; R17: the hub tells an older lb-bot, after a rollback, on any call). The route table above stays the only rights table.
+- **The SPA** (`web/src`): a 401 shows `panels/SignIn.jsx` (`lib/api.js` `onSignedOut`); `GET /api/session` is held
+  in the app's state. `lib/access.js` says what shows: a non-admin has Discover and Library (plus System ›
+  Appearance) and no admin control anywhere (absent, not disabled); with `summary.downloads == "off"` Activity, the
+  tray, File a folder, System › Source rules and Needs you's download groups are gone and every "Find sources" /
+  download / pick / place control is absent (`canDownload` = admin and downloading). The wishlist lives in **Library ›
+  Wishlist** in both modes (`#/discover/wishlist` aliases there); off, its copy says Worbus looks once downloading is
+  set up and shows no searches or attempts. The album page of a missing album has Add to wishlist and **Find it**
+  (confirmed links first, then "Search <service>"; last on the page). An `unresolved` artist page offers Retry and,
+  for an admin, Match manually. A library artist with no MBID is scanned by its Navidrome id (no client-side name
+  lookup any more); a worker-held scan (`task_id: "auto-index"`) is followed on the discography route.
 
 ### Deployment
 
@@ -2263,7 +2379,8 @@ the hub is the only thing that reaches them.
   ~120 KB, for the drift repair. Tombstones are not listed — a tombstoned key is
   simply absent.
 - **`GET /api/health`** (`_index_health_view`): `{"ok": true, "epoch", "headSeq"}`,
-  nothing else — no Navidrome, no MusicBrainz, no summary. It is the hub's liveness
+  plus (Worbus P1) `downloads` and `missingConfig` (names only), and nothing else —
+  no Navidrome, no MusicBrainz, no summary. It is open: the login gate passes it. It is the hub's liveness
   probe; before it existed the hub probed `/api/summary`, the heaviest read in the
   module. (Not `_health_view`: that name is the SPA's unrelated
   `/api/system/health`.) **It never writes and never answers 503.** Its `headSeq`
@@ -2274,7 +2391,8 @@ the hub is the only thing that reaches them.
 
 **The `index-push` thread** (`_index_push_worker`, `_index_push_tick` is the pure
 throttle) polls the head every `INDEX_PUSH_POLL_SECS` (1 s) and POSTs `{seq,
-epoch}` to `<LB_BOT_HUB_URL>/lb/index` with `LB_BOT_HUB_TOKEN`: leading edge, at most
+epoch}` (plus `progress` since Worbus P1, see § A stranger's server) to
+`<LB_BOT_HUB_URL>/lb/index` with `LB_BOT_HUB_TOKEN`: leading edge, at most
 one attempt per `INDEX_PUSH_MIN_GAP_SECS` (2 s), retried until a 2xx, and once at
 boot even with nothing new. A trailing debounce would never fire during a steady
 bulk build, which is why it is leading-edge. It is **not** `/lb/notify` — that
@@ -2951,9 +3069,11 @@ is the long form. What binds a future change:
   `_album_override_jobs` (in memory, `_album_override_job_begin` / `_end`) is
   the albums a job has right now: an apply or a remove from the request's
   answer until the album is listed again and the index told (or the minute's
-  wait is over, or the job died), a cover change for the length of its
-  request. It is what 409 `in_progress` reads besides the row's state — a
-  cover change gives the row no state of its own — and what the Fill-gaps
+  wait is over, or the job died), a cover change from its request until the
+  cover inside the songs is written and the scan asked for (B-297, below). It
+  is what 409 `in_progress` reads besides the row's state — a cover change
+  gives the row no state of its own, not even while it writes the songs —
+  and what the Fill-gaps
   routes read: **fetch, auto, pick-file and source download answer 409
   `{"ok": false, "error": …}`, no `code`, and queue nothing** for a review
   group that holds such an album (`_album_override_holds_group`, which returns
@@ -3140,6 +3260,154 @@ is the long form. What binds a future change:
   of the folder** — not before (the undo could then never remove it) and not
   later (a `cover.jpg` the user puts there afterwards would be taken for
   lb-bot's and deleted).
+- **A cover change reaches the songs too** (B-297, 2026-10-31). Navidrome
+  0.64.2 serves a **song's** picture from the picture inside its file and
+  falls back to the album's folder cover only for a file with none (measured
+  on a stand-in of the NAS's version: `RESULTS-lbbot-embedded-cover-task1`).
+  Feishin and Navic ask for the song's picture wherever the playing song is
+  shown, so `cover.jpg` alone changed the album page and left Now playing on
+  the old CD scan. Now, after the folder cover:
+  - **Which files**: every file of the album that has a picture inside it,
+    FLAC (picture blocks), MP3 (`APIC`) and Opus (`METADATA_BLOCK_PICTURE`).
+    A file with **no picture is left alone** (it already shows the folder
+    cover). An m4a or a WAV that has a picture is left as it is with a
+    failures row, in the tag writes' words ("lb-bot cannot write the pictures
+    of a .m4a file, so it was left as it is"); `covr` can come later.
+  - **Which picture** (measured): Navidrome shows a front (type 3) wherever it
+    sits, the first of several, else the first picture of any type — a back
+    cover included. So every front is removed and the new image goes in as
+    the front where the first front was, **appended** when there was none;
+    every other picture stays where it is (`_pictures_with_front`).
+  - **What goes in** (`_cover_for_embedding`, one rule for both paths): the
+    fetched image when it is `EMBEDDED_COVER_MAX_BYTES` (1.5 MB) or less,
+    else the Archive's 1200 px version, else its 500 px one; none small
+    enough → nothing inside the songs and one `Cover image` row that says why
+    (the folder cover still changes).
+  - **Written in place, behind a copy** (`_picture_rewrite`). **Never a
+    rename onto the file**: on Unraid's user share (shfs) a new file can be
+    created on another array disk than the original, and a rename then leaves
+    the old file visible from the lower disk — the change would silently not
+    happen, and the disks would hold two files. So: a byte-for-byte copy of
+    the file is made beside it as `.<name>.lbbot-cover.copying`, fsynced, and
+    renamed `.<name>.lbbot-cover.part` once whole (dot-names with no audio
+    extension: no scan lists them); the change is rehearsed on a second copy
+    (`….try`) and checked (mutagen reads it again: the pictures are the ones
+    written, and the audio is byte for byte what it was — FLAC `STREAMINFO`
+    and every frame byte, MP3 the bytes between the tags, Opus every audio
+    packet); then **the file itself is written by mutagen, as a tag write
+    is**, fsynced and checked the same way; on any failure the copy's bytes
+    are put back into it, in place, and checked byte for byte. Then the
+    copies go. The same file throughout — inode, mode, owner, hard links; a
+    symlink is written through only when its target is in the library (else
+    a failure row). **The mtime must move**: measured, Navidrome ignores a
+    picture change whose mtime was put back. **Cost:** a song streaming while
+    its file is written may glitch, as with a tag write. **A stop half way**
+    is dealt with by the next run over the folder
+    (`_picture_leftovers_recover`): a `.copying` or `.try` is removed; a
+    `.part` is put back into a file that does not read or whose audio is not
+    the copy's, else removed; a `.part` whose song is gone is left (lb-bot
+    does not bring a removed song back).
+  - **An MP3's tag is written as stored** (`_id3_untranslated`,
+    `_id3v1_tail`): loaded with `translate=False`, so a v2.3 tag keeps
+    `TYER`/`TDAT`/`TORY`/`IPLS`/`TSIZ` (the ordinary load turns them into
+    v2.4 frames a v2.3 save writes back changed, and the undo — which keeps
+    only `APIC` — could not put them back); saved as its own version; and an
+    ID3v1 tag (with an extended `TAG+` before it) keeps its bytes: mutagen's
+    v1 options rewrite it from the v2 tag or delete it, so the save deletes
+    it and its bytes are put back after. A v2.2 tag is refused (a failure
+    row): mutagen cannot write one. Not the tag code's way (item 7 below
+    still holds for tag writes).
+  - **Kept before written** (`picture_changes`, `_picture_changes_keep_all`):
+    a table beside `tag_changes`, **first write wins**, `before` = the
+    removed pictures' places and fields (FLAC/Opus type, mime, description,
+    width, height, depth, colours; MP3 encoding, mime, type, description) and
+    sha256s, plus every sha256 lb-bot has written into the file under the
+    row; `wrote_sha` = the last, **set before the write**. The bytes go to
+    **`picture-backups/<override>/<sha256>`** beside the index, one per
+    distinct image, fsynced, and every row in one durable commit, before the
+    first file is touched. **Never inside `cover-backups/<override>/`**: the
+    folder cover's undo moves every entry of that folder into the album
+    folder — this build's and, after a rollback, the build before's. A table
+    of its own because `tag_changes` keeps a file's first snapshot only:
+    after an edition change a later cover change would find the file's row
+    there with no picture in it.
+  - **In the background, under the album's job** (`_album_cover_embed_task`).
+    `POST /api/album/cover` answers `{"ok": true, "id"}` 200 as soon as the
+    folder cover is written, as before — **200 means the folder cover, not
+    the songs**. The songs are an `album-cover` task that keeps the job token
+    (409 `in_progress` for a second change and for Undo, Fill gaps refused)
+    and the placement claims. **The row's `state`, `done` and `total` are not
+    the songs'** — the wire is the build before's: a cover change's row is
+    `applied` with its 0/0 (or an apply's row keeps its own state and tag
+    count), because Navic (`albumRowDetail`: `done == 0` is "cover only"),
+    lb-bot's SPA ("Retagged — lb-bot wrote the tags of N files") and Feishin
+    (an `applying` row is followed as a retag) read them. The songs add
+    `failures` rows only (by title); earlier failures stay, less the ones
+    about the cover inside the songs, which the new change replaces. That
+    the songs are being written is the **`embedding`** column of
+    `album_overrides` (a guarded ALTER, never on the wire), written durably
+    by the route **before its answer and before a file is read**, cleared
+    by the task. **One** `_album_scan()` after the last write, then the
+    existing `album-cover` announce — both in a `finally`, so an error while
+    the files are read still gets the folder cover its scan. An apply with
+    `cover_url` embeds after the folder cover, before
+    `_album_override_follow`, so one scan covers both; its `done`/`total`
+    stay its tag writes'.
+  - **The undo** (`_picture_changes_put_back`, in `_album_override_remove_task`
+    after the tags and before the folder cover): a file is restored only when
+    its one front is a picture lb-bot wrote under the row; the removed
+    pictures go back at their places with every field (FLAC/Opus order kept;
+    an MP3's frames are in mutagen's own order after any write). Already as
+    it was (a stop half way) → dropped, not rewritten. **Changed since** by
+    somebody else → left, kept, said; a **second** undo gives up on it (kept
+    for good it would be a row no undo could finish). Not found → kept by the
+    first undo, given up by the second, as for tags. **A file given up on
+    keeps its picture in lb-bot's keeping**: the record goes, the image is
+    kept as `picture-backups/<override>/given-up-<sha256>.<ext>` — it may be
+    the only copy of a picture that was the user's — and no prune or row
+    deletion removes it (the first press says so, without a path). A kept
+    image lb-bot no longer has → said, the row stays. An unknown snapshot
+    form → kept. The prune removes only sha256-named images that no row of
+    the batch names anywhere in its JSON (a newer build's row shape
+    included), and nothing when a row cannot be read. **`done`/`total` on an
+    undo count files** (Feishin says "`done/total` files"): a file in both
+    `tag_changes` and `picture_changes` is one (`_undo_files`).
+  - **A restart mid-run**: the startup pass `_album_cover_embeds_interrupted`
+    finds the `embedding` marker, gives the row one `Cover image` failure —
+    "lb-bot stopped while it was changing the cover inside the songs; choose
+    the cover again, or undo" — and clears it; the row keeps its state. An
+    apply's row is `applying` and goes `failed` as before. A row that kept no
+    tags (a cover change alone) is never told to "restore the previous tags"
+    (restart and error texts say "undo to put the earlier cover back").
+  - **No backfill, no wire change.** Albums changed before this build have no
+    picture rows: their undo is as before; choosing the same cover again
+    embeds it. Route answers and row fields are unchanged.
+  - **After a rollback** to the build before this one: it ignores
+    `picture_changes` and the `embedding` column (it names its columns), and
+    never looks in `picture-backups/`. Its Undo restores the tags and the
+    folder cover, deletes the override row (and its `tag_changes` rows) — and
+    leaves the songs with lb-bot's picture inside them (the split the other
+    way round), the row's `picture_changes` rows and its
+    `picture-backups/<override>/` on disk. **Going forward again**, those
+    rows are orphans: no route reaches them (an undo is asked for by the
+    override row, which is gone), and a new cover change on the album makes
+    a new row whose snapshot records lb-bot's earlier picture as "before" —
+    its undo puts that back, not the user's original. The user's original
+    pictures are still in `picture-backups/<old override>/<sha256>`, and the
+    orphaned rows say which file each was in (`path`, `before`): putting them
+    back is a person's job, by hand. No unattended pass does it. An override
+    whose Undo the old build never ran keeps its rows whole, and this build's
+    Undo works on it as usual.
+  - **Known and left:** a second cover change on a file whose picture someone
+    else changed after the first keeps the first snapshot and loses that
+    intermediate picture; the Telegram cover path (`_set_cover_worker`) writes
+    `cover.jpg` only; an MP3's `APIC` frames come out in mutagen's order, and
+    two `APIC` frames with one description get a space added by mutagen; an
+    Opus file's legacy `COVERART` comment (the pre-`METADATA_BLOCK_PICTURE`
+    way) is neither read nor written, so a file holding only that is
+    "no picture" and left alone; `ND_RECENTLYADDEDBYMODTIME=true` on
+    Navidrome would move every album whose cover changes to the top of
+    newest (it is off on the live server).
 - **Read strictly.** Navidrome through `_nd_album` / `_nd_search_albums`
   (`NavidromeUnavailable`, never `[]`) and MusicBrainz with `strict=True`: a
   dependency that did not answer is a 502 `retryable` with nothing written,
@@ -3152,16 +3420,17 @@ is the long form. What binds a future change:
   them lower-cased, Navidrome hands on what the files say. The polled route is the
   exception by design: asked by `id` it answers from the row when Navidrome is
   away.
-- **Paths are stored, never sent**: `folder`, `tag_changes.path` and the backup
-  folder do not leave the process — a refusal about where the files are says
+- **Paths are stored, never sent**: `folder`, `tag_changes.path`,
+  `picture_changes.path` and the backup folder do not leave the process — a refusal about where the files are says
   how many, not where. `GET /api/overrides` gains `albums` (every row, newest
   first). **It is read on its own and left out when it cannot be**, like
   `toCheck` (and `merges` and `siblings`, below): read with the artist map it
   took the map down with it, and both clients resolve every artist through
   that map. `_album_override_wire` reads
   a `failures` value that is not a list as none.
-- The two tables are outside the change feed, like `artist_overrides`: no seq
-  trigger, no `INDEX_SCAN_VERSION` / `WIRE_VERSION` bump. `tag_changes` is shared
+- The tables (`album_overrides`, `tag_changes`, `picture_changes`) are outside
+  the change feed, like `artist_overrides`: no seq trigger, no
+  `INDEX_SCAN_VERSION` / `WIRE_VERSION` bump. `tag_changes` is shared
   with the artist merge (a batch id is an override's or a merge's).
 
 - **lb-bot's own web UI is a third client of these routes** (I-029, U1 —
@@ -4167,7 +4436,7 @@ section comment above `LISTENS_PAGE_SIZE` is the long form; what binds a change:
   of a held album, shown or not. `status.error` is redacted (`_redact_secrets`)
   before it is stored.
 - **`artistPlays` on `/api/fresh-releases`** is the sum of the row's artists'
-  all-time plays, `0` until the first import has finished (a partial count is not
+  all-time plays (the primary user's only, Worbus P2: absent for anyone else), `0` until the first import has finished (a partial count is not
   shown as the count). `_fresh_apply_limit` keeps `artistPlays > 0` rows through
   the cut the way it keeps owned-artist rows. Only the **first** artist MBID of a
   listen is stored, so a collaboration counts for its lead artist. **A listen
@@ -4198,10 +4467,41 @@ a chat id. `/api/downloads` (its review rows carry the Telegram token and chat i
   never `_gaps_view()`'s per-album view (1.4 MB on a 3,098-group library).
 - **`/api/activity`**: every row the fill ledger holds, live or terminal, newest first, at most 200 (what is
   there is the ledger's own TTL rule, `_ALBUM_FILL_TERMINAL_TTL`; the endpoint prunes nothing), a gap fill's
-  nameless row named from its group with `gapFill`; `reason` through `_strip_host_paths`. `transfers`: at most
+  nameless row named from its group with `gapFill`; `reason` through `_wire_text`. `transfers`: at most
   100, `{id, kind, album, artist, groupId, state, pct, peer}`, never `filename`, `path` or the composed `title`.
+  `truncated: {requests, transfers}` says how many rows the two caps cut (additive; `_album_fill_set` and
+  `_album_fill_restore` both keep the ledger to `_ALBUM_FILL_STATUS_MAX` = 200 rows, the request cap's own
+  number, so `requests` reads 0 in practice and starts to matter only if either number moves).
 
-Tests: `AttentionActivityTests` (12; every guard mutation-checked). Live, read-only, 2026-10-21 (before this was
+**Three rules from the 2026-10-22 audit (fix round 2026-10-24, lane S).**
+
+1. **Progress is the live group's.** The download poller never advances the ledger row ("the poller must stay
+   free of bookkeeping"), so a ledger `done`/`total` on a downloading fill is stale by design. `_activity_view`
+   takes `state/done/total/failed/percent` from `_album_fill_view(mbid, include_files=False)`, the call
+   `/api/album/status` makes, and a test asserts the two agree for every state. Never recompute progress from
+   the row.
+2. **An rgid is carried in the list snapshot.** `_review_list_snapshot` copies a fixed field list, so a key a
+   view reads off a group must be added there (`rgid` was not: 19 of 19 live gap rows had no release-group and
+   no cover). It reads memory, so it is not a `review_groups` column and needs no `INDEX_SCAN_VERSION` bump. A
+   ledger row with an rgid and no name is named from the index in one query (`_names_by_rgid`).
+3. **`_wire_text` is the choke point for free text that reaches a device**: `_redact_secrets`, then
+   `_strip_host_paths`, then URL userinfo, paths under the other roots, Windows and UNC paths, cut at 300
+   characters on a word boundary. The activity and album-status `reason`, `_os_error_text`'s fall-back text and
+   the message of a non-HTTP exception in an `/api/*` 500, and `_gap_detail_view`'s `downloadError` and
+   `placementNote` (the hub's `/lb/gap`) all go through it. It cuts its input at `_WIRE_INPUT_CEILING` (4,000
+   characters, or 8 × `limit`) before any regex runs, and the userinfo pattern anchors its scheme with a
+   lookbehind, not `\b`: both exist because a 50 KB run with no spaces took 6.8 s. A new free-text field on a
+   device route goes through it too; do not add another ad hoc `_strip_host_paths`. Not yet through it:
+   the refusal texts at `REFUSAL_TEXT_MAX` and one `_web_log` call (`_strip_host_paths` alone).
+
+**The lesson: a fixture for a view is built from what its producer writes.** The first tests
+(`AttentionActivityTests._group`) used a group with no `rgid` and a ledger row holding `done: 4` on a
+downloading fill, shapes production never writes, and both bugs passed. `AttentionActivityProductionShapeTests`
+builds groups with `_make_review_group` plus the discography path's keys, ledger rows with `_album_fill_begin` /
+`_album_fill_set`, transfer groups with the keys the enqueue writes, and names with `_index_store_artist`. When a
+view reads a field, find the writer of that field and use it in the test.
+
+Tests: `AttentionActivityTests` (12; every guard mutation-checked) and `AttentionActivityProductionShapeTests`. Live, read-only, 2026-10-21 (before this was
 deployed): `/api/summary` 0.88 s and 3 failed gaps + 1 failed request + 16 folders (12 unidentified) = 20;
 `/api/placements` 16 rows, 7 KB, `formats` a string and `confidence` a word (`likely`, `possible`, `unknown`);
 both new routes answered 404 `{"error"}` with no `code`, which the clients read as "older".

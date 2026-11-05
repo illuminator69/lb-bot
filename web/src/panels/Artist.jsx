@@ -6,6 +6,7 @@ import { useViewState } from '../lib/useView.js'
 import { albumState, countsMeasured, inLibrary as inLibraryStatus } from '../lib/indexStatus.js'
 import { selectionOfRelease } from '../lib/overrides.js'
 import { SHARED_NOTE, pageRead, quietLine } from '../lib/artistMatch.js'
+import { autoScanStep } from '../lib/indexProgress.js'
 import { setOf } from '../lib/merges.js'
 import {
   askedText, sourcesAgeText, sourceKey, SAMPLED_NOTE, extraFilesText, downloadAllLabel,
@@ -21,6 +22,7 @@ import { ArtistMatchView, matchJobRunning, useArtistMatch, useOverridesRead } fr
 import ArtistMerge from './ArtistMerge.jsx'
 import GapDetail, { GapFoot, GapTracks } from './GapDetail.jsx'
 import { RequestFailure, RequestProgress, useRequest } from './requests.jsx'
+import { findItRows } from '../lib/access.js'
 
 // ── Routing ──────────────────────────────────────────────────────────────────
 // Artist and album pages belong to no section: they open on top of whatever
@@ -111,6 +113,9 @@ function useArtists() {
 // claimed only for `covered: true` — the one answer that supports it
 // (`SHARED_NOTE`, lib/artistMatch.js: the match picker says it too).
 const NOT_STARTED = 'lb-bot did not start the scan, and has no discography stored for this artist.'
+// The `task_id` lb-bot answers with when its background index is the one
+// scanning the artist (S3: `AUTO_INDEX_SCAN_TASK`).
+const AUTO_INDEX_SCAN = 'auto-index'
 const SCAN_LOST_NOTE = 'The scan did not finish: lb-bot restarted while it ran. This is what it has stored; rescan to walk it again.'
 const SCAN_LOST = 'The scan was lost: lb-bot restarted while it ran.'
 
@@ -170,19 +175,16 @@ function useDiscography(artist, { autoScan = true } = {}) {
         // Whether to walk the artist's whole MusicBrainz discography (minutes)
         // is the caller's decision; an album page never does.
         if (!autoScan) return
-        let mbid = artist.mbid
-        if (!mbid) {
-          const r = await api('/api/artist/lookup?q=' + encodeURIComponent(artist.name))
-          mbid = (r.candidates || [])[0]?.mbid
-          if (!mbid) {
-            if (!dead) setNobody(true)
-            throw new Error(`No MusicBrainz match for “${artist.name}”`)
-          }
-        }
+        const mbid = artist.mbid || ''
         // No name for an `mb:` page is fine: the server looks the real one up.
         // Posting the mbid in its place stored the UUID as the artist's name.
-        const r = await action('/api/artist/discography',
-          { mbid, name: artist.name || '', nd_id: artistId, external: !!artist.external })
+        // A library artist with no MBID is sent by its Navidrome id alone
+        // (Worbus P1): lb-bot finds the MusicBrainz artist the way its own
+        // index build does, and an artist MusicBrainz cannot match comes back
+        // `unresolved` — the page then says so, with Retry.
+        const r = await action('/api/artist/discography', mbid
+          ? { mbid, name: artist.name || '', nd_id: artistId, external: !!artist.external }
+          : { name: artist.name || '', nd_id: artistId })
         if (dead) return
         // With no scan to follow, show what the server has stored. Asked for
         // under the mbid that was POSTED: `artist.mbid` is empty for an
@@ -205,6 +207,33 @@ function useDiscography(artist, { autoScan = true } = {}) {
         // `/api/tasks/`, a 404, for as long as the page stayed open.
         if (!r.task_id) {
           await settle(r.covered ? SHARED_NOTE : null, NOT_STARTED)
+          return
+        }
+        // lb-bot's own background index is scanning this artist right now: it
+        // is no task to poll, and the artist's discography route says how far
+        // it is (`scan`), then holds the result.
+        if (r.task_id === AUTO_INDEX_SCAN) {
+          const watch = async () => {
+            try {
+              const idx = await api('/api/artist/discography'
+                + `?mbid=${encodeURIComponent(mbid)}&nd_id=${encodeURIComponent(artistId)}`)
+              if (dead) return
+              const step = autoScanStep(idx.scan)
+              if (step === 'running') {
+                setProgress({ done: idx.scan.done, total: idx.scan.total, current: '' })
+                pollRef.current = setTimeout(watch, 3000)
+                return
+              }
+              if (step === 'failed') {
+                const why = `The scan failed: ${idx.scan.error || 'lb-bot gave no reason'}`
+                await settle(why, why)
+                return
+              }
+              if (step === 'done') { await settle(null, NOT_STARTED); return }
+              await settle(SCAN_LOST_NOTE, SCAN_LOST)
+            } catch (e) { if (!dead) setError(e.message) }
+          }
+          pollRef.current = setTimeout(watch, 1500)
           return
         }
         let delay = 2000
@@ -324,6 +353,7 @@ function SkeletonRows({ rows = 6 }) {
 // with nothing kept folds the place away (`indexLineStands`).
 let indexStatusKept = null
 export function IndexLine({ guess }) {
+  const { isAdmin } = useApp()
   const [s, setS] = useState(indexStatusKept)
   const [failed, setFailed] = useState(false)
   useEffect(() => {
@@ -337,7 +367,7 @@ export function IndexLine({ guess }) {
   return (
     <Roll open={indexLineStands({ status: s, failed })}>
       {v.known ? (
-        <button className="quiet sm block" onClick={() => navigate('system', 'status')}
+        <button className="quiet sm block" onClick={isAdmin ? () => navigate('system', 'status') : undefined}
           title="How many of your artists have their full discography indexed">
           <span className="num">{v.counts}</span> indexed{v.tail}
         </button>
@@ -603,6 +633,7 @@ function relTime(epoch) {
 }
 
 function ReleaseRow({ r, artistId }) {
+  const { canDownload } = useApp()
   const type = typeKey(r)
   const missing = Math.max(0, (r.total || 0) - (r.present || 0))
   const open = pick => goArtist(artistId, r.rgid, pick)
@@ -620,7 +651,7 @@ function ReleaseRow({ r, artistId }) {
           numbers from before the fill. */}
       {r.total > 0 && countsMeasured(r.status) && <span className="num muted hide-sm">{r.present || 0}/{r.total}</span>}
       <AlbumStateChip state={r.status} count={r.status === 'incomplete' ? missing : null} />
-      {(r.status === 'missing' || r.status === 'incomplete') && (
+      {canDownload && (r.status === 'missing' || r.status === 'incomplete') && (
         <button className="sm" onClick={() => open(true)}>Find sources</button>
       )}
     </div>
@@ -664,7 +695,7 @@ function StateGroup({ label, releases, artistId, right }) {
 
 function DiscographyView({ artist }) {
   const { disco, progress, error, nobody, note, rescan, reread } = useDiscography(artist)
-  const { requestConfirm, pushToast } = useApp()
+  const { requestConfirm, pushToast, isAdmin, downloadsOn } = useApp()
   const [type, setType] = useViewState('artist.type', 'all')
   const [sort, setSort] = useViewState('artist.sort', 'new')
   const mbid = artist.mbid || disco?.artist_mbid || ''
@@ -698,7 +729,8 @@ function DiscographyView({ artist }) {
       if (what === 'ended') reread(row ? row.mbid || '' : undefined)
     },
   })
-  const matchLine = artist.external ? null : quietLine(match.now, match.mb)
+  // Which MusicBrainz artist this is may be changed by an admin only.
+  const matchLine = artist.external || !isAdmin ? null : quietLine(match.now, match.mb)
 
   // One artist, two names (ArtistMerge.jsx). When a merge or its undo has
   // ended, what the session kept of both names' discographies is let go of —
@@ -750,7 +782,8 @@ function DiscographyView({ artist }) {
 
   async function wishlistMissing() {
     const ok = await requestConfirm(
-      `Add ${missingAlbums.length} missing album(s) and EP(s) by ${name} to the wishlist? lb-bot searches for one every few hours.`,
+      `Add ${missingAlbums.length} missing album(s) and EP(s) by ${name} to the wishlist? ${downloadsOn
+        ? 'lb-bot searches for one every few hours.' : 'Worbus looks for them once downloading is set up.'}`,
       { confirmLabel: 'Add to wishlist' })
     if (!ok) return
     let added = 0
@@ -806,7 +839,7 @@ function DiscographyView({ artist }) {
         </div>
       </div>
 
-      {!artist.external && (
+      {!artist.external && isAdmin && (
         // `slow`, like the search fold inside it: with its candidates listed the
         // picker is most of a screen, and shut in the ordinary time it was twice
         // as brisk as everything around it.
@@ -817,7 +850,7 @@ function DiscographyView({ artist }) {
         </Roll>
       )}
 
-      {!artist.external && (
+      {!artist.external && isAdmin && (
         <ArtistMerge set={setOf(overrides.state.data, artist.id)} pageArtistId={artist.id}
           merges={overrides.state.data?.merges} art={art} onRead={overrides.read} onChanged={afterMerge} />
       )}
@@ -842,6 +875,18 @@ function DiscographyView({ artist }) {
           </div>
           <SkeletonRows />
         </>
+      ) : disco.unresolved ? (
+        // Worbus P1: a name search that found nobody, said as that — not as an
+        // artist with no releases. Match manually is the match picker above.
+        <EmptyState title="lb-bot couldn’t find this artist on MusicBrainz"
+          hint={isAdmin && !artist.external
+            ? 'Without a MusicBrainz match there is no discography to show. Try again, or pick the artist yourself.'
+            : 'Without a MusicBrainz match there is no discography to show. Try again later.'}>
+          <button className="primary" onClick={rescan}>Retry</button>
+          {isAdmin && !artist.external && (
+            <button aria-expanded={fixOpen} onClick={() => setFixOpen(true)}>Match manually</button>
+          )}
+        </EmptyState>
       ) : !releases.length ? (
         <p className="empty">MusicBrainz lists no releases for this artist.</p>
       ) : !shown.length ? (
@@ -856,7 +901,8 @@ function DiscographyView({ artist }) {
             <StateGroup key={`${state}-${type}`} label={label} releases={group} artistId={artist.id}
               right={state === 'missing' && missingAlbums.length > 0 && (type === 'all' || type === 'album' || type === 'ep') && (
                 <button className="link" onClick={wishlistMissing}
-                  title="Albums and EPs you don’t have. lb-bot looks for them slowly in the background">
+                  title={downloadsOn ? 'Albums and EPs you don’t have. lb-bot looks for them slowly in the background'
+                    : 'Albums and EPs you don’t have, saved for later'}>
                   Wishlist {missingAlbums.length} missing album{missingAlbums.length === 1 ? '' : 's'}
                 </button>
               )} />
@@ -992,8 +1038,46 @@ function useGap(groupId) {
   return [detail, setDetail]
 }
 
-function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
-  const { state, action, pushToast } = useApp()
+const NO_IDS = []
+
+// Find it (Worbus P1): `findIt` on `/api/meta/album` — the links MusicBrainz
+// has for the album's releases first, each by its service, then a search on
+// each other service, "Search <service>". A link opens in a new tab. While
+// the album's meta is still being read the section holds its place with a
+// skeleton; with no `findIt` in the answer (MusicBrainz did not answer, and
+// nothing was stored) it says the links could not load, not that there are none.
+function FindIt({ meta }) {
+  const rows = meta === null ? null : findItRows(meta?.findIt)
+  return (
+    <>
+      <Grp>Find it<span className="note">where this album is sold or streamed</span></Grp>
+      {meta === null ? (
+        <div className="chips"><Skeleton className="h-7 w-24" /><Skeleton className="h-7 w-28" /><Skeleton className="h-7 w-24" /></div>
+      ) : rows === null ? (
+        <p className="muted">Couldn’t load the links just now. They come from MusicBrainz; try again in a minute.</p>
+      ) : !rows.length ? (
+        <p className="muted">MusicBrainz knows no place to get this album.</p>
+      ) : (
+        <div className="chips fadein">
+          {rows.map(l => (
+            <a key={`${l.kind}:${l.url}`} className={`chip${l.kind === 'confirmed' ? '' : ' quiet'}`}
+              href={l.url} target="_blank" rel="noopener noreferrer"
+              title={l.kind === 'confirmed' ? `${l.label}: listed by MusicBrainz` : `${l.label} for this album`}>
+              {l.label}
+            </a>
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+function AlbumDetail({ artist, rgid, autoPick: askedToPick = false, toEdition = false }) {
+  const { state, action, pushToast, isAdmin, downloadsOn, canDownload } = useApp()
+  // Getting the album is an admin's, where the server downloads (Worbus P1):
+  // otherwise the page keeps what it is and what is missing, and offers the
+  // wishlist and Find it.
+  const autoPick = askedToPick && canDownload
   // autoScan:false — an album page never starts a whole-artist MusicBrainz walk.
   const { disco, indexed, error: discoError, refreshIndex, reread: rereadIndex } = useDiscography(artist, { autoScan: false })
   const [variants, setVariants] = useState(null)
@@ -1071,6 +1155,9 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
     if (indexed === null || indexedRelease || addedRelease || variants === null) return
     if (addedRef.current === rgid) return
     addedRef.current = rgid
+    // Writing a release into an artist's index is an admin's (it names the
+    // artist): anyone else reads the release as not in the library yet.
+    if (!isAdmin) { setIndexAdd('failed'); return }
     let dead = false
     setIndexAdd('adding')
     setAddError('')
@@ -1099,7 +1186,7 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
       })
     return () => { dead = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist, variants, addNonce])
+  }, [indexed, indexedRelease, addedRelease, rgid, releaseArtist, variants, addNonce, isAdmin])
 
   const retryIndexAdd = () => { addedRef.current = ''; setIndexAdd(null); setAddError(''); setAddNonce(n => n + 1) }
 
@@ -1196,8 +1283,10 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
     once()
     rereadTimers.current = [6000, 20000].map(ms => setTimeout(once, ms))
   }
+  // An override is an admin's: for anyone else nothing is read, and the
+  // page has none of its controls (`ov.has` stays false).
   const ov = useAlbumOverride({
-    rgid, indexIds, variants, sel, tint: incomplete, onChanged: rereadAfterJob,
+    rgid, indexIds: isAdmin ? indexIds : NO_IDS, variants, sel, tint: incomplete, onChanged: rereadAfterJob,
     openAlbum: rg => goArtist(artist.id, rg),
   })
   // Read presence by the albums as they are listed now, once a job has moved
@@ -1551,7 +1640,21 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
 
         {/* What to do about this album sits here: under what it is, above its
             tracks. */}
-        {status === 'missing' && (
+        {status === 'missing' && !canDownload && (
+          // The wishlist, whatever the server does: the one thing to do here
+          // when it does not download (or it is not this user's to do).
+          <div className="next">
+            <Grp>Next step<span className="note">{wishlisted ? 'on the wishlist' : 'keep it for later'}</span></Grp>
+            <div className="acts" style={{ paddingTop: 10 }}>
+              <button className={wishlisted ? 'done-state' : 'primary'} disabled={wishlisted} aria-pressed={wishlisted} onClick={addToWishlist}
+                title={downloadsOn ? 'lb-bot searches the wishlist again every few hours'
+                  : 'Saved for later. Worbus looks for it once downloading is set up'}>
+                {wishlisted ? 'On the wishlist' : 'Add to wishlist'}
+              </button>
+            </div>
+          </div>
+        )}
+        {status === 'missing' && canDownload && (
           <div className="next">
             <Grp>Next step<span className="note">
               {reqLive || reqPending ? 'file the album into the library'
@@ -1578,7 +1681,7 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
             </Roll>
           </div>
         )}
-        {reqFailed && (
+        {canDownload && reqFailed && (
           <RequestFailure f={request}
             onRetried={r => {
               setReq(q => ({ n: q.n + 1, asked: '' }))
@@ -1586,16 +1689,16 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
             }}
             extra={<button onClick={() => { setRequested(''); findSources() }}>Pick a source</button>} />
         )}
-        <Roll open={reqLive || reqPending}>
+        <Roll open={canDownload && (reqLive || reqPending)}>
           <Grp>Source<span className="note">{request ? request.state : 'starting'}</span></Grp>
           <RequestProgress f={request} asked={req.asked} />
         </Roll>
 
-        <Roll open={showActs && searching}>
+        <Roll open={canDownload && showActs && searching}>
           <Grp>Sources<span className="note">searching peers, this can take up to a minute</span></Grp>
           <SkeletonRows rows={3} />
         </Roll>
-        <Roll open={showActs && !!found}>
+        <Roll open={canDownload && showActs && !!found}>
           <Grp n={found?.length ?? ''} right={found?.length > 0 && <SourceFilters value={srcFilters} onChange={setSrcFilters} />}>
             Sources<span className="note">ranked by <button className="link plain underline"
               onClick={() => navigate('system', 'sources')}>your preferences</button>{listAge ? ` · ${listAge}` : ''}</span>
@@ -1619,7 +1722,7 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
           )}
         </Roll>
 
-        {incomplete && (
+        {incomplete && canDownload && (
           gap
             ? <GapDetail key={groupId} bare flowOnly row={gap} detail={gap} transfers={state.transfers}
                 autoFind={autoPick} onDetail={setGap} />
@@ -1655,9 +1758,9 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
               {!tracks.rows.length && (
                 <p className="why quiet">
                   {{
-                    timeout: 'MusicBrainz did not answer within 10 seconds. The tracklist is only a reference. Finding sources and downloading still work.',
-                    error: `Could not load the tracklist${tracks.error ? `: ${tracks.error}` : ''}. Finding sources and downloading still work.`,
-                    'no-release': 'MusicBrainz lists no release for this album, so there is no tracklist to show. You can still search Soulseek for it.',
+                    timeout: `MusicBrainz did not answer within 10 seconds. The tracklist is only a reference.${canDownload ? ' Finding sources and downloading still work.' : ''}`,
+                    error: `Could not load the tracklist${tracks.error ? `: ${tracks.error}` : ''}.${canDownload ? ' Finding sources and downloading still work.' : ''}`,
+                    'no-release': `MusicBrainz lists no release for this album, so there is no tracklist to show.${canDownload ? ' You can still search Soulseek for it.' : ''}`,
                   }[tracks.reason] || 'MusicBrainz has no track data for this edition.'}
                 </p>
               )}
@@ -1672,6 +1775,10 @@ function AlbumDetail({ artist, rgid, autoPick = false, toEdition = false }) {
           </div>
         )}
         {incomplete && gap && <GapFoot detail={gap} bare />}
+
+        {/* Find it (Worbus P1): where a missing album can be bought or
+            streamed. Last on the page, so a late answer moves nothing above it. */}
+        {status === 'missing' && <FindIt meta={meta} />}
 
       </div>
     </Page>

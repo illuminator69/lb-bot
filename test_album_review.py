@@ -14,6 +14,7 @@ import itertools
 import json
 import threading
 import time
+import urllib.parse
 from unittest.mock import AsyncMock, patch
 
 requests_stub = types.SimpleNamespace(get=lambda *a, **k: None, post=lambda *a, **k: None,
@@ -34,6 +35,12 @@ sys.modules.setdefault("telegram", telegram_stub)
 sys.modules.setdefault("telegram.ext", telegram_ext_stub)
 
 import listenbrainz_bot as bot
+
+# Worbus P1 S2: downloading is a mode, on iff SLSKD_API_KEY is set, and this
+# suite runs with no key. Every test written before the mode exercises the
+# download paths, so the suite runs with it on; the downloads-off tests patch
+# it off (`DownloadsModeTests`).
+bot.DOWNLOADS_ON = True
 
 
 _album_import = bot._deterministic_album_import
@@ -7264,6 +7271,79 @@ class ResolveLinkTests(unittest.TestCase):
         # Capped below 1.0: the names are exact but MusicBrainz's match is not.
         self.assertEqual(out["confidence"], 0.9)
 
+    # B-170: Deezer 302127 is Daft Punk's "Discovery" (Deezer's API, checked
+    # 2026-10-31). With the fielded query empty — MusicBrainz had nothing or did
+    # not answer, which `mbz_get` cannot tell apart — the free-text fallback's
+    # first title match decided alone, and the link resolved to Blue Tribe's.
+    FREE_TEXT = [  # what "Daft Punk Discovery" free text answers, best score first
+        {"rgid": "rg-blue", "title": "Discovery", "artist": "Blue Tribe",
+         "primary_type": "album", "year": "2004", "score": 100},
+        {"rgid": "rg-sm64", "title": "Daft Punk's Discovery but it's in the SM64 Soundfont",
+         "artist": "Pignickel", "primary_type": "album", "year": "2021", "score": 99},
+        {"rgid": "rg-milk", "title": "Discovery (Daft Punk cover)", "artist": "verymilkee",
+         "primary_type": "single", "year": "2020", "score": 91},
+        {"rgid": "rg-disc", "title": "Discovery", "artist": "Daft Punk",
+         "primary_type": "album", "year": "2001", "score": 70},
+    ]
+
+    def _resolve_302127(self, free_text, fielded=(), deezer=None):
+        asked = []
+
+        def search(query, limit=5):
+            asked.append((query, limit))
+            return list(fielded if "artist:" in query else free_text)[:int(limit)]
+
+        album = deezer if deezer is not None else {"title": "Discovery",
+                                                   "artist": {"name": "Daft Punk"}}
+        with patch("listenbrainz_bot.deezer_album", return_value=album), \
+             patch("listenbrainz_bot._fetch_page_head",
+                   return_value="<title>Discovery</title>"), \
+             patch("listenbrainz_bot.mbz_search_release_groups", search), \
+             contextlib.redirect_stdout(io.StringIO()):
+            return bot.resolve_music_link("https://www.deezer.com/album/302127"), asked
+
+    def test_deezer_302127_never_resolves_to_another_artists_discovery(self):
+        out, asked = self._resolve_302127(self.FREE_TEXT)
+        self.assertEqual((out["rgid"], out["artist"]), ("rg-disc", "Daft Punk"))
+        self.assertEqual(asked[-1], ("Daft Punk Discovery", bot.RELEASE_GROUP_GATED_LIMIT))
+        # The real one past the first three, as on 2026-09-23: no match, never
+        # the first title match by somebody else.
+        out, _ = self._resolve_302127(self.FREE_TEXT[:3])
+        self.assertEqual((out["rgid"], out["confidence"]), ("", 0.0))
+        self.assertEqual(out["reason"], "No MusicBrainz release-group matched")
+
+    def test_an_artist_that_disagrees_gives_not_found(self):
+        out, _ = self._resolve_302127(
+            [{"rgid": "rg-blue", "title": "Discovery", "artist": "Blue Tribe",
+              "primary_type": "album", "year": "2004", "score": 100},
+             {"rgid": "rg-pink", "title": "Discovery", "artist": "Pink Floyd",
+              "primary_type": "album", "year": "2011", "score": 90}],
+            deezer={"title": "Discovery", "artist": {"name": "Pink"}})
+        self.assertEqual(out["rgid"], "")
+        # With no artist at all (Deezer down, a page that names only the
+        # title) there is nothing to agree with: no free-text guess.
+        with patch("listenbrainz_bot.deezer_album", side_effect=bot.DeezerError("503")), \
+             patch("listenbrainz_bot._fetch_page_head", return_value="<title>Discovery</title>"), \
+             patch("listenbrainz_bot.mbz_search_release_groups",
+                   return_value=list(self.FREE_TEXT)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            out = bot.resolve_music_link("https://www.deezer.com/album/302127")
+        self.assertEqual(out["rgid"], "")
+
+    def test_the_gate_reads_a_credit_as_acts_and_never_by_containment(self):
+        agrees = bot._artist_agrees
+        self.assertTrue(agrees("Daft Punk", "Daft Punk"))
+        self.assertTrue(agrees("Beyonce", "Beyoncé"))
+        self.assertTrue(agrees("Weeknd", "The Weeknd"))
+        self.assertTrue(agrees("Belle and Sebastian", "Belle & Sebastian"))
+        self.assertTrue(agrees("Кино", "Кино"))
+        self.assertTrue(agrees("Daft Punk", "Daft Punk feat. Pharrell Williams"))
+        self.assertTrue(agrees("Future & Juice WRLD", "Future"))
+        self.assertFalse(agrees("Pink", "Pink Floyd"))
+        self.assertFalse(agrees("Кино", "Ария"))
+        self.assertFalse(agrees("", "Daft Punk"))
+        self.assertFalse(agrees("Daft Punk", "Blue Tribe"))
+
     def test_a_scraped_link_is_capped_lower_than_an_api_one(self):
         """Apple, TIDAL, YouTube Music and Qobuz publish no free metadata API,
         so their artist and title come out of a page title that a redesign
@@ -7564,6 +7644,108 @@ class WishlistTests(unittest.TestCase):
             row = bot._wishlist_list()[0]
         self.assertEqual(row["attempts"], 1)
         self.assertIn("MusicBrainz unavailable", row["lastReason"])
+
+    # -- Worbus P2 S3: who added a row ------------------------------------------
+
+    HUB = {"Authorization": "Bearer hub-secret-token"}
+
+    def hub(self, user, admin):
+        return {**self.HUB, "X-Worbus-User": user, "X-Worbus-Admin": admin,
+                "X-Worbus-Primary": "0"}
+
+    def wished(self, who_headers=None, client=None):
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            res = (client or _web_app(as_role="anon").test_client()).get(
+                "/api/wishlist", headers=who_headers or {})
+        self.assertEqual(res.status_code, 200)
+        return res.get_json()["wishlist"]
+
+    def test_wishlist_add_records_added_by(self):
+        with isolated_review(), patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            c = _web_app(as_role="anon").test_client()
+            res = c.post("/api/wishlist", json={"rgid": "rg-1", "artist": "Band", "title": "One"},
+                         headers=self.hub("bob", "1"))
+            self.assertEqual(res.status_code, 200)
+            # The answer of the add itself is the list, for an admin with `addedBy`.
+            self.assertEqual([(r["rgid"], r["addedBy"]) for r in res.get_json()["wishlist"]],
+                             [("rg-1", "bob")])
+            # An older hub (bearer, no headers) is "hub"; lb-bot's own web UI
+            # is the cookie user's name; an add with no identity at all is "web".
+            c.post("/api/wishlist", json={"rgid": "rg-2"}, headers=self.HUB)
+            _web_app(as_role="admin").test_client().post("/api/wishlist", json={"rgid": "rg-3"})
+            bot._wishlist_add("rg-4", "Band", "Four")
+            rows = {r["rgid"]: r["addedBy"] for r in self.wished(self.HUB)}
+            self.assertEqual(rows, {"rg-1": "bob", "rg-2": "hub", "rg-3": "test-admin",
+                                    "rg-4": "web"})
+            # Adding a row somebody else added again refreshes the names and
+            # keeps the first adder: the wishlist is shared.
+            c.post("/api/wishlist", json={"rgid": "rg-1", "title": "One!"},
+                   headers=self.hub("carol", "1"))
+            row = next(r for r in self.wished(self.HUB) if r["rgid"] == "rg-1")
+            self.assertEqual((row["addedBy"], row["title"]), ("bob", "One!"))
+            # The re-search bookkeeping does not touch it.
+            bot._wishlist_mark_tried("rg-1", "re-searching")
+            row = next(r for r in self.wished(self.HUB) if r["rgid"] == "rg-1")
+            self.assertEqual((row["addedBy"], row["attempts"]), ("bob", 1))
+
+    def test_wishlist_added_by_hidden_from_non_admin(self):
+        with isolated_review(), patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            c = _web_app(as_role="anon").test_client()
+            res = c.post("/api/wishlist", json={"rgid": "rg-1", "artist": "Band", "title": "One"},
+                         headers=self.hub("bob", "0"))
+            self.assertEqual(res.status_code, 200)
+            text = []
+            text.append(res.get_data(as_text=True))
+            text.append(c.get("/api/wishlist", headers=self.hub("bob", "0")).get_data(as_text=True))
+            text.append(c.get("/api/wishlist", headers=self.hub("carol", "0")).get_data(as_text=True))
+            text.append(c.post("/api/wishlist/remove", json={"rgid": "none"},
+                               headers=self.hub("bob", "0")).get_data(as_text=True))
+            text.append(_web_app(as_role="user").test_client().get("/api/wishlist")
+                        .get_data(as_text=True))
+            for body in text:
+                self.assertNotIn("addedBy", body)
+                self.assertNotIn("added_by", body)
+            # ... but the row is there, with its other fields, and the admin sees who.
+            rows = self.wished(self.hub("bob", "0"))
+            self.assertEqual([(r["rgid"], r["title"]) for r in rows], [("rg-1", "One")])
+            self.assertEqual(self.wished(self.hub("dan", "1"))[0]["addedBy"], "bob")
+
+    def test_wishlist_old_db_gains_column(self):
+        """A library index made before this build has a `wishlist` without
+        `added_by`: opening it adds the column, keeps the rows (who added them is
+        not known: ""), and adding works."""
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        path = os.path.join(td, "index.db")
+        old = sqlite3.connect(path)
+        old.executescript("""
+            CREATE TABLE wishlist (
+              rgid TEXT PRIMARY KEY, artist TEXT NOT NULL DEFAULT '',
+              title TEXT NOT NULL DEFAULT '', added_at REAL NOT NULL DEFAULT 0,
+              last_tried_at REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+              last_reason TEXT NOT NULL DEFAULT '');
+            INSERT INTO wishlist (rgid, artist, title, added_at) VALUES ('rg-old', 'Old', 'Row', 5);
+        """)
+        old.commit()
+        old.close()
+        scratch_index(self, path)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with bot._index_lock:
+                columns = [r["name"] for r in bot._index_db().execute("PRAGMA table_info(wishlist)")]
+            self.assertIn("added_by", columns)
+            self.assertEqual(columns.count("added_by"), 1)
+            rows = bot._wishlist_list(admin=True)
+            self.assertEqual([(r["rgid"], r["addedBy"]) for r in rows], [("rg-old", "")])
+            self.assertEqual(bot._wishlist_add("rg-new", "New", "Row", added_by="bob")["ok"], True)
+            self.assertEqual({r["rgid"]: r["addedBy"] for r in bot._wishlist_list(admin=True)},
+                             {"rg-old": "", "rg-new": "bob"})
+            # Opened again (a restart): the column is not added twice, nothing is lost.
+            swap_index(path)
+            with bot._index_lock:
+                again = [r["name"] for r in bot._index_db().execute("PRAGMA table_info(wishlist)")]
+            self.assertEqual(again, columns)
+            self.assertNotIn("addedBy", bot._wishlist_list()[0])
 
 
 class SourceFailoverTests(unittest.TestCase):
@@ -8389,7 +8571,7 @@ class IndexChangesFeedTests(unittest.TestCase):
                           side_effect=AssertionError("health must not write")):
             page, status = bot._index_health_view()
         self.assertEqual(status, 200)
-        self.assertEqual(page, {"ok": True, "epoch": epoch, "headSeq": recorded})
+        self.assertEqual((page["ok"], page["epoch"], page["headSeq"]), (True, epoch, recorded))
 
     def test_health_reports_zero_before_any_head_was_recorded(self):
         self.store("mb-a", "A", [self.rel("rg1")])
@@ -8424,7 +8606,57 @@ class IndexChangesFeedTests(unittest.TestCase):
         bot._index_persist_hwm(head_seq, head_epoch)
         page, status = bot._index_health_view()
         self.assertEqual(status, 200)
-        self.assertEqual(page, {"ok": True, "epoch": head_epoch, "headSeq": head_seq})
+        # Worbus P1 added `downloads` and `missingConfig` (names, never values),
+        # and B-095 `build`, and nothing else: the route is open.
+        missing = page.pop("missingConfig")
+        self.assertTrue(all(isinstance(n, str) and n.isupper() for n in missing))
+        self.assertEqual(page.pop("build"), bot._web_build_id())
+        # Worbus P2 S1: `identity` says this lb-bot reads the hub's headers.
+        self.assertEqual(page.pop("identity"), 1)
+        self.assertEqual(page, {"ok": True, "epoch": head_epoch, "headSeq": head_seq,
+                                "downloads": "on"})
+
+    def test_the_build_id_names_the_revision_and_the_page_it_serves(self):
+        # B-095: an open tab compares it to the one it read when it loaded.
+        with tempfile.TemporaryDirectory() as td:
+            page = os.path.join(td, "index.html")
+            with open(page, "w") as fh:
+                fh.write('<script src="/assets/index-AAAA.js"></script>')
+            first = bot._web_build_id_of("6a2ae1b-dev", page)
+            self.assertRegex(first, r"^6a2ae1b-dev\+[0-9a-f]{12}$")
+            self.assertNotEqual(bot._web_build_id_of("e29390a-dev", page), first)
+            with open(page, "w") as fh:
+                fh.write('<script src="/assets/index-BBBB.js"></script>')
+            # A rebuilt page reads as new even when the revision is unknown.
+            self.assertNotEqual(bot._web_build_id_of("unknown", page),
+                                bot._web_build_id_of("unknown", page + ".gone"))
+            self.assertNotEqual(bot._web_build_id_of("6a2ae1b-dev", page), first)
+        self.assertEqual(bot._web_build_id_of("unknown", "/nonexistent/index.html"),
+                         "unknown+no-page")
+
+    def test_the_page_says_which_build_served_it(self):
+        # B-095 review 12: the tab's baseline is the page it loaded. Its first
+        # /api/health answer is not: for a page loaded just before a restart
+        # it is already the new build, and no banner ever came.
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "web", "dist"))
+            with open(os.path.join(td, "web", "dist", "index.html"), "w") as fh:
+                fh.write('<!doctype html><html><head><meta charset="utf-8">'
+                         '<title>lb-bot</title></head><body></body></html>')
+            with patch.object(bot, "__file__", os.path.join(td, "listenbrainz_bot.py")), \
+                    patch.object(bot, "_WEB_BUILD_ID", ['walk-a+"<0123456789ab>']):
+                client = _web_app(as_role="anon").test_client()
+                for route in ("/", "/needs/gaps"):
+                    res = client.get(route)
+                    self.assertEqual(res.status_code, 200)
+                    self.assertEqual(res.headers["Cache-Control"], "no-cache")
+                    self.assertIn("text/html", res.headers["Content-Type"])
+                    body = res.get_data(as_text=True)
+                    self.assertIn('<head><meta name="lb-bot-build" '
+                                  'content="walk-a+&quot;&lt;0123456789ab&gt;">'
+                                  '<meta charset="utf-8">', body)
+                    self.assertEqual(client.get("/api/health").get_json()["build"],
+                                     'walk-a+"<0123456789ab>')
 
     # -- the artist_key tiebreak in _index_get_artist -------------------
 
@@ -10005,11 +10237,17 @@ class ReviewFixRoundTests(unittest.TestCase):
                 bot._review_state = old
 
 
-def _web_app():
+def _web_app(as_role: str = "admin"):
     """The real Flask app `start_web_dashboard` builds, without serving it or
     starting its background threads. The app is local to that function, so the
-    Flask class is swapped for one that records the instance."""
+    Flask class is swapped for one that records the instance.
+
+    `as_role` (Worbus P1 S5, the web UI is behind the Navidrome login): every
+    test client the app makes is signed in with a session of that role —
+    `"admin"` (the default, so every route test written before the login
+    passes unchanged) or `"user"`; `"anon"` signs nobody in."""
     import flask
+    import flask.testing
 
     apps = []
 
@@ -10029,7 +10267,19 @@ def _web_app():
             patch.object(bot, "WEB_UI_ENABLED", True), \
             patch.object(bot.threading, "Thread", _NoThread):
         bot.start_web_dashboard()
-    return apps[0]
+    app = apps[0]
+    if as_role in ("admin", "user"):
+        sid = bot._web_session_create(f"test-{as_role}", as_role == "admin")
+
+        class _SignedIn(flask.testing.FlaskClient):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.set_cookie(bot.SESSION_COOKIE, sid)
+
+        app.test_client_class = _SignedIn
+    elif as_role != "anon":
+        raise ValueError(f"as_role: {as_role!r}")
+    return app
 
 
 class AlbumReleasesOwnedTests(unittest.TestCase):
@@ -12633,7 +12883,7 @@ class RescanKeepsLiveTransfersTests(unittest.TestCase):
         resumed = src.index("_resume_placement_verification()")
         self.assertLess(loaded, resumed)
         self.assertLess(resumed, src.index("start_web_dashboard()"))
-        self.assertLess(resumed, src.index("tuesday_scheduler"))
+        self.assertLess(resumed, src.index("_playlist_scan_loop"))
 
     def test_the_linker_writes_the_rows_it_matched_even_after_a_rescan(self):
         """The loose-track linker collects (index, outcome) under the lock and
@@ -13364,12 +13614,17 @@ class ArtistOverrideTests(unittest.TestCase):
         self.assertEqual(self.rescan("nd-3", self.PICK, "Other"),
                          (200, {"ok": True, "task_id": "task-3"}))
         # A scan already running is still answered, not started again.
+        # (Worbus P1 S3: an entry not updated for 10 minutes reads as no scan,
+        # so this one is current.)
         with patch.dict(bot._artist_scans, {f"mb:{self.TAG}": {
-                "state": "running", "task_id": "task-7", "updated_at": 1.0}}):
+                "state": "running", "task_id": "task-7", "updated_at": time.time()}}):
             self.assertEqual(self.rescan("nd-1", self.TAG),
                              (200, {"ok": True, "task_id": "task-7", "running": True}))
         self.assertEqual(len(self.scans), 3)
-        self.assertEqual(self.rescan("nd-1", "")[0], 400)
+        # Worbus P1 S3: a library artist with no MBID is scanned by its
+        # Navidrome id now; with neither, or an `mb:` page with none, it is not.
+        self.assertEqual(self.rescan("", "")[0], 400)
+        self.assertEqual(self.rescan(f"mb:{self.GUESS}", "")[0], 400)
 
     def test_an_mb_page_rescan_is_as_it_was(self):
         """An artist the library does not have: nothing to be covered by."""
@@ -14163,7 +14418,11 @@ class ListeningMirrorTests(unittest.TestCase):
     ListenBrainz fetch, the clock and Navidrome are the only fakes, and the
     sync worker's thread is never started — its tick is driven by hand."""
 
-    USER = {"listenbrainz_user": "ilya", "navidrome_user": "u", "navidrome_password": "p"}
+    # `navidrome_user` is the primary user (Worbus P2): the web client of these
+    # tests signs in as the cookie user "test-admin", so the listening routes,
+    # which answer the primary user only, are open to it.
+    USER = {"listenbrainz_user": "ilya", "navidrome_user": "test-admin",
+            "navidrome_password": "p"}
     BERLIN = "Europe/Berlin"
 
     @classmethod
@@ -15829,6 +16088,142 @@ class ListeningMirrorTests(unittest.TestCase):
                 {"n": 3, "listenCount": 9, "artistOwned": True}, {"n": 4, "listenCount": 40},
                 {"n": 5, "listenCount": 2, "artistPlays": 0}]
         self.assertEqual([r["n"] for r in bot._fresh_apply_limit(rows, 3)], [1, 2, 3])
+
+    # -- Worbus P2 S2: listening is the primary user's -------------------------------
+
+    HUB = {"Authorization": "Bearer hub-secret-token"}
+
+    def hub(self, user="bob", admin="0", primary="0"):
+        return {**self.HUB, "X-Worbus-User": user, "X-Worbus-Admin": admin,
+                "X-Worbus-Primary": primary}
+
+    def listening_gets(self):
+        """Every GET route under /api/listening/, from the url map."""
+        app = _web_app(as_role="anon")
+        rules = sorted(r.rule for r in app.url_map.iter_rules()
+                       if r.rule.startswith("/api/listening/") and "GET" in r.methods)
+        self.assertEqual(rules, ["/api/listening/recent", "/api/listening/status",
+                                 "/api/listening/summary", "/api/listening/unowned"])
+        return app, rules
+
+    def test_listening_routes_refuse_non_primary(self):
+        app, rules = self.listening_gets()
+        asked = []
+        views = {name: (lambda *a, _n=name, **k: (asked.append(_n) or ({"x": 1}, 200)))
+                 for name in ("_listening_status_view", "_listening_summary_view",
+                              "_listening_unowned_view", "_listening_recent_view")}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"))
+            for name, view in views.items():
+                stack.enter_context(patch.object(bot, name, view))
+            c = app.test_client()
+            callers = {
+                "hub user": self.hub("bob", "0", "0"),
+                "hub admin who is not primary": self.hub("bob", "1", "0"),
+                "hub primary header not exactly 1": self.hub("bob", "1", "true"),
+            }
+            for who, headers in callers.items():
+                for rule in rules:
+                    res = c.get(rule, headers=headers)
+                    self.assertEqual((res.status_code, res.get_json()),
+                                     (403, {"code": "primary_only"}), f"{who}: {rule}")
+            # A cookie user who is not NAVIDROME_USER, admin or not.
+            for role in ("user", "admin"):
+                with patch.object(bot, "USERS", [{"navidrome_user": "someone-else"}]), \
+                        patch.object(bot, "_default_web_user",
+                                     lambda: {"navidrome_user": "someone-else"}):
+                    mine = _web_app(as_role=role).test_client()
+                    for rule in rules:
+                        res = mine.get(rule)
+                        self.assertEqual((res.status_code, res.get_json()),
+                                         (403, {"code": "primary_only"}), f"{role}: {rule}")
+            # Signed out is still "sign in", not "primary only".
+            for rule in rules:
+                self.assertEqual(c.get(rule).status_code, 401, rule)
+        self.assertEqual(asked, [], "a refused caller reached a listening view")
+        # Sync stays an admin's route, primary or not.
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            c = app.test_client()
+            res = c.post("/api/listening/sync", headers=self.hub("bob", "0", "0"))
+            self.assertEqual((res.status_code, res.get_json()), (403, {"code": "admin_only"}))
+            res = c.post("/api/listening/sync", headers=self.hub("bob", "1", "0"))
+            self.assertEqual(res.status_code, 200)
+            bot._listens_wake.clear()
+
+    def test_listening_routes_open_to_primary_and_cookie_owner(self):
+        app, rules = self.listening_gets()
+        self.load(self.fixture())
+        self.index_library()
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            c = app.test_client()
+            for who, headers in {
+                    "hub primary (not admin)": self.hub("owner", "0", "1"),
+                    "hub primary admin": self.hub("owner", "1", "1"),
+                    "an older hub (no headers)": self.HUB}.items():
+                for rule in rules:
+                    res = c.get(rule, headers=headers)
+                    self.assertEqual(res.status_code, 200, f"{who}: {rule}")
+            # The cookie owner: this client is signed in as the primary user.
+            for rule in rules:
+                self.assertEqual(self.client.get(rule).status_code, 200, rule)
+            # ... whatever case NAVIDROME_USER is written in.
+            with patch.object(bot, "_default_web_user",
+                              lambda: {**self.USER, "navidrome_user": "TEST-ADMIN"}):
+                self.assertEqual(self.client.get("/api/listening/status").status_code, 200)
+
+    def fresh_rows(self, headers=None, query="", client=None):
+        fresh = [{"releaseName": "New", "artist": "Gamma", "artistMbids": ["a-3"],
+                  "releaseGroupMbid": "rg-new", "listenCount": 5},
+                 {"releaseName": "Duet", "artist": "Alpha & Gamma", "artistMbids": ["a-1", "a-3"],
+                  "releaseGroupMbid": "rg-duet", "listenCount": 4},
+                 {"releaseName": "Other", "artist": "Nobody", "artistMbids": ["a-x"],
+                  "releaseGroupMbid": "rg-other", "listenCount": 900}]
+        self.load(self.fixture())
+        reads = []
+        real = bot._listens_artist_plays
+        with patch.object(bot, "lbz_fresh_releases", lambda days: [dict(r) for r in fresh]), \
+                patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                patch.object(bot, "_listens_artist_plays",
+                             lambda: (reads.append(1) or real())):
+            res = (client or self.client).get("/api/fresh-releases" + query,
+                                              headers=headers or {})
+        self.assertEqual(res.status_code, 200)
+        return res.get_json()["releases"], len(reads)
+
+    def test_fresh_for_non_primary_has_no_artist_plays(self):
+        app = _web_app(as_role="anon")
+        for who, headers, client in (
+                ("hub user", self.hub("bob", "0", "0"), app.test_client()),
+                ("hub admin", self.hub("bob", "1", "0"), app.test_client())):
+            rows, reads = self.fresh_rows(headers, client=client)
+            self.assertEqual([r["releaseName"] for r in rows], ["New", "Duet", "Other"], who)
+            for r in rows:
+                self.assertNotIn("artistPlays", r, who)
+            self.assertEqual(reads, 0, f"{who}: the listens mirror was read")
+            # Ownership still marks the library's artists: the fallback scope.
+            self.assertEqual({r["releaseName"]: r["artistOwned"] for r in rows},
+                             {"New": False, "Duet": True, "Other": False}, who)
+            # The cut keeps owned artists only; a played artist is no reason to keep a row.
+            rows, _ = self.fresh_rows(headers, "?limit=1", client=client)
+            self.assertEqual([r["releaseName"] for r in rows], ["Duet"], who)
+        # A cookie user who is not the primary user is the same.
+        with patch.object(bot, "_default_web_user",
+                          lambda: {**self.USER, "navidrome_user": "someone-else"}):
+            rows, reads = self.fresh_rows(client=_web_app(as_role="user").test_client())
+        self.assertEqual((reads, ["artistPlays" in r for r in rows]), (0, [False] * 3))
+
+    def test_fresh_for_primary_unchanged(self):
+        app = _web_app(as_role="anon")
+        for who, headers, client in (
+                ("hub primary", self.hub("owner", "0", "1"), app.test_client()),
+                ("an older hub", self.HUB, app.test_client()),
+                ("the cookie owner", {}, self.client)):
+            rows, reads = self.fresh_rows(headers, client=client)
+            self.assertEqual([(r["releaseName"], r["artistPlays"]) for r in rows],
+                             [("New", 2), ("Duet", 6), ("Other", 0)], who)
+            self.assertEqual(reads, 1, who)
+            rows, _ = self.fresh_rows(headers, "?limit=1", client=client)
+            self.assertEqual([r["releaseName"] for r in rows], ["New", "Duet"], who)
 
     # -- the routes ------------------------------------------------------------
 
@@ -18252,6 +18647,27 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(bot._startup_placement(pause=lambda seconds: None), 0)
         self.assertEqual(self.imports, [])
+
+    def test_with_downloads_off_the_startup_pass_places_nothing(self):
+        """Review S#5: a server that does not download moves no file and asks
+        Navidrome for no scan at start, and resumes no verifier."""
+        stranded = self._downloaded("Two", self.other_dir, "02 - Two.flac")
+        started = []
+        with patch.object(bot, "DOWNLOADS_ON", False), \
+                patch.object(bot, "nd_start_scan", lambda *a, **k: self.fail("scan asked")), \
+                patch.object(bot, "_start_placement_verification",
+                             lambda gid, resumed=False: started.append(gid)):
+            placed, waits, _log = self.startup([True])
+            with bot._review_lock:
+                bot._find_review_group("g1")["missing_tracks"][0]["decision"] = "placed"
+            self.assertEqual(bot._resume_placement_verification(), 0)
+        self.assertEqual((placed, waits, self.imports, started), (0, [], [], []))
+        self.assertTrue(os.path.isfile(stranded))
+        # On: the same start places it.
+        with bot._review_lock:
+            bot._find_review_group("g1")["missing_tracks"][0]["decision"] = "downloaded"
+        with patch.object(bot, "DOWNLOADS_ON", True):
+            self.assertEqual(self.startup([True])[0], 1)
 
     def test_with_no_navidrome_login_there_is_nothing_to_wait_for(self):
         self._downloaded("Two", self.other_dir, "02 - Two.flac")
@@ -23956,6 +24372,278 @@ class SharedDiscographyBucketTests(unittest.TestCase):
                               "stored": None}, self.USER, live_ids={"ar1"})
         self.assertEqual(calls, ["ar1", "ar1", "ar1"])
 
+    # ── titles in any script (B-060, the title half) ────────────────────────
+
+    def claims(self):
+        claims, meta = bot._match_albums_to_release_groups(self.rgs, self.albums)
+        return {rgid: [a["id"] for a in albums] for rgid, albums in claims.items()}
+
+    def test_untagged_non_latin_titles_are_matched_by_their_own_title(self):
+        # `_fuzzy_album_text` keyed all three '' and "Группа крови", first in
+        # browse order, claimed both albums at SequenceMatcher('', '') == 1.0.
+        self.artist("ar-k", "Кино")
+        self.album("a1", "Звезда по имени Солнце", "Кино", "ar-k")
+        self.album("a2", "Ночь", "Кино", "ar-k")
+        self.discography("Группа крови", "Звезда по имени Солнце", "Ночь", "45")
+        self.assertEqual(self.claims(), {"rg-Звезда по имени Солнце": ["a1"],
+                                         "rg-Ночь": ["a2"]})
+        self.assertEqual(self.scan("mbid-kino", "Кино", "ar-k")[0],
+                         {"Группа крови": "missing", "Звезда по имени Солнце": "untagged",
+                          "Ночь": "untagged", "45": "missing"})
+
+    def test_an_album_the_discography_lacks_is_claimed_by_nobody(self):
+        self.album("a1", "Ночь", "Кино")
+        self.discography("Группа крови", "Звезда по имени Солнце")
+        self.assertEqual(self.claims(), {})
+
+    def test_untagged_japanese_titles_are_matched_by_their_own_title(self):
+        self.album("a1", "惑星", "松木美定")
+        self.album("a2", "夜明けのうた", "松木美定")
+        self.discography("ぎがもえか", "惑星", "夜明けのうた")
+        self.assertEqual(self.claims(), {"rg-惑星": ["a1"], "rg-夜明けのうた": ["a2"]})
+
+    def test_a_partly_latin_title_keeps_its_other_letters(self):
+        # "Кино 2" was "2", one key with the release-group "2".
+        self.album("a1", "Кино 2", "Кино")
+        self.discography("2", "Кино 2")
+        self.assertEqual(self.claims(), {"rg-Кино 2": ["a1"]})
+
+    def test_an_accent_does_not_split_a_latin_title(self):
+        self.album("a1", "Cafe Tacvba", "Café Tacvba")
+        self.album("a2", "Medulla", "Björk")
+        self.discography("Café Tacvba", "Medúlla")
+        self.assertEqual(self.claims(), {"rg-Café Tacvba": ["a1"], "rg-Medúlla": ["a2"]})
+
+    def test_a_title_that_keys_to_nothing_never_pairs_by_score(self):
+        self.album("a1", "!!!", "X")
+        self.album("a2", "( )", "X")
+        self.discography("Звезда", "...", "?")
+        self.assertEqual(bot._title_key("!!!"), "")
+        self.assertEqual(self.claims(), {})
+        # The very same symbols are the same title: "★" is an album's whole name.
+        self.albums, self.rgs = [], []
+        self.album("a3", "★", "David Bowie")
+        self.discography("★", "Hunky Dory")
+        self.assertEqual(self.claims(), {"rg-★": ["a3"]})
+
+    def test_an_edition_word_is_dropped_in_any_script(self):
+        self.assertEqual(bot._title_key("Ночь (Deluxe Edition)"), "ночь")
+        self.album("a1", "Ночь (Deluxe Edition)", "Кино")
+        self.discography("Группа крови", "Ночь")
+        self.assertEqual(self.claims(), {"rg-Ночь": ["a1"]})
+
+    def test_a_title_with_a_long_latin_part_pairs_with_that_part(self):
+        # The review's lost pairing (S1 review 3): the base keyed "Live at
+        # Budokan 武道館" as "live at budokan" and paired it with "Live at
+        # Budokan"; the new key keeps 武道館 and scored 0.83. The Latin part
+        # of a mixed-script key also scores against the other title's whole
+        # key, when that part is at least two words and six letters.
+        self.album("a1", "Live at Budokan 武道館", "Cheap Trick")
+        self.discography("Live at Budokan", "In Color")
+        self.assertEqual(self.claims(), {"rg-Live at Budokan": ["a1"]})
+        self.albums, self.rgs = [], []
+        self.album("a1", "Live at Budokan", "Cheap Trick")
+        self.discography("Live at Budokan 武道館", "In Color")
+        self.assertEqual(self.claims(), {"rg-Live at Budokan 武道館": ["a1"]})
+        # Never Latin part against Latin part: two live albums from two
+        # cities stay two albums.
+        self.albums, self.rgs = [], []
+        self.album("a1", "Live in 東京", "X")
+        self.discography("Live in 大阪")
+        self.assertEqual(self.claims(), {})
+        # A short Latin part is no title: "2" (one word), "pt 1" (three letters).
+        self.albums, self.rgs = [], []
+        self.album("a1", "Кино 2", "Кино")
+        self.album("a2", "花様年華 pt.1", "BTS")
+        self.discography("2", "Ночь 2", "pt.1")
+        self.assertEqual(self.claims(), {})
+
+    @staticmethod
+    def _fixture_titles() -> set:
+        """Every album title this file's fixtures name: the string values of
+        `name`, `title`, `album`, `albumName` and `album_name` keys and keyword
+        arguments, and the title arguments of the `album(…)` and
+        `discography(…)` helpers."""
+        import ast
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        keys = {"name", "title", "album", "albumName", "album_name"}
+        found = set()
+
+        def take(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                found.add(node.value)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if isinstance(k, ast.Constant) and k.value in keys:
+                        take(v)
+            elif isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg in keys:
+                        take(kw.value)
+                fn = node.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+                if name == "album" and len(node.args) >= 2:
+                    take(node.args[1])
+                elif name == "discography":
+                    for arg in node.args:
+                        take(arg)
+        return found
+
+    def test_ascii_title_keys_are_unchanged(self):
+        # The parity rule: nothing about an ASCII library changes.
+        titles = {t for t in self._fixture_titles() if t.isascii()}
+        self.assertGreater(len(titles), 300, "the collector found the fixtures' titles")
+        extra = {"", " ", "!!!", "( )", "1979", "OK Computer (Deluxe Edition)",
+                 "  Remastered  2011 ", "Led Zeppelin IV", "Mono", "X&Y", "AC/DC",
+                 "Don't Stop Me Now - 2011 Remaster", "Version 2.0", "...Baby One More Time"}
+        for t in sorted(titles | extra):
+            self.assertEqual(bot._title_key(t), bot._fuzzy_album_text(t), t)
+            self.assertEqual(bot._letters_key(t), bot._norm_album_text(t), t)
+        print(f"  B-060 parity: {len(titles)} ASCII fixture titles (+{len(extra)} edge cases)")
+
+    def test_deezer_names_in_another_script_are_not_one_name(self):
+        hits = {"data": [{"id": 1, "name": "Ария", "picture_medium": "https://e/1.jpg"},
+                         {"id": 2, "name": "Кино", "picture_medium": "https://e/2.jpg"},
+                         {"id": 3, "name": "!!!", "picture_medium": "https://e/3.jpg"}]}
+        with patch.object(bot, "_deezer_get", lambda *a, **k: hits):
+            self.assertEqual(bot.deezer_search_artist_id("Кино"), "2")
+            self.assertEqual(bot.deezer_artist_picture("Кино"), "https://e/2.jpg")
+            self.assertEqual(bot.deezer_search_artist_id("ДДТ"), "")
+            self.assertEqual(bot.deezer_search_artist_id("!!!"), "3")
+            self.assertEqual(bot.deezer_search_artist_id("Кино!"), "2")
+
+    # ── the one-time stale step ─────────────────────────────────────────────
+
+    def _stale_index(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        scratch_index(self, os.path.join(td.name, "index.db"))
+
+        def store(mbid, name, nd_id, *rows):
+            self.assertTrue(bot._index_store_artist(
+                {"artist_mbid": mbid, "artist_name": name,
+                 "releases": [{"rgid": f"rg-{t}", "title": t, "status": "complete",
+                               "navidrome_album_ids": ids} for t, ids in rows]}, nd_id))
+
+        store("mb-kino", "Кино", "ar-kino", ("Группа крови", ["al-k"]))
+        store("mb-ddt", "DDT", "ar-ddt", ("Black Album", []))
+        store("mb-radiohead", "Radiohead", "ar-rh", ("OK Computer", ["al-ok"]))
+        store("mb-bowie", "David Bowie", "ar-db", ("★", []), ("Hunky Dory", ["al-hd"]))
+        store("mb-tagged", "Tagged Band", "ar-tb", ("Café", ["al-c"]))
+        store("mb-gone", "", "ar-gone", ("Some Album", ["al-ddt"]))
+        # A stub stays a stub, whatever its name.
+        bot._index_mark_release_present(rgid="rg-x", artist_key="nd:ar-stub", title="Ночь")
+        with bot._index_lock:
+            bot._index_db().execute(
+                "UPDATE artists SET name = 'Ария' WHERE artist_key = 'nd:ar-stub'")
+            bot._index_db().commit()
+        albums = [
+            {"id": "al-k", "name": "Группа крови", "artist": "Кино", "artistId": "ar-kino"},
+            {"id": "al-ddt", "name": "Пропавший без вести", "artist": "DDT",
+             "artistId": "ar-ddt", "musicBrainzId": "rel-1"},
+            {"id": "al-ok", "name": "OK Computer", "artist": "Radiohead",
+             "artistId": "ar-rh"},
+            {"id": "al-hd", "name": "Hunky Dory", "artist": "David Bowie",
+             "artistId": "ar-db"},
+            {"id": "al-c", "name": "Cafe", "artist": "Tagged Band", "artistId": "ar-tb",
+             "musicBrainzId": "rel-2"},
+        ]
+        return albums
+
+    def _versions(self):
+        with bot._index_lock:
+            return {r["artist_key"]: r["scan_version"] for r in bot._index_db().execute(
+                "SELECT artist_key, scan_version FROM artists")}
+
+    def test_the_stale_step_marks_only_artists_titles_can_change_for(self):
+        albums = self._stale_index()
+        now = bot.INDEX_SCAN_VERSION
+        self.assertEqual(bot._index_mark_title_key_stale(albums), 4)
+        self.assertEqual(self._versions(), {
+            "mb-kino": now - 1,        # its name
+            "mb-ddt": now - 1,         # a library album titled in Cyrillic
+            "mb-gone": now - 1,        # holds that album by its id
+            "mb-bowie": now - 1,       # an untagged album beside the release-group "★"
+            "mb-radiohead": now,       # ASCII throughout
+            "mb-tagged": now,          # "Café" is a release-group, its albums are tagged
+            "nd:ar-stub": 0})          # a stub stays a stub
+        stale = bot._index_get_artist("mb-kino", "ar-kino")
+        self.assertTrue(stale["stale"])
+        self.assertGreater(stale["scanned_at"], 0, "the scan time is kept")
+        self.assertFalse(bot._index_get_artist("mb-radiohead", "ar-rh")["stale"])
+
+    def test_the_stale_step_runs_once(self):
+        albums = self._stale_index()
+        self.assertEqual(bot._index_mark_title_key_stale(albums), 4)
+        # A rescan brings the row back to the current version; the step does
+        # not mark it again, at this start or the next.
+        with bot._index_lock:
+            bot._index_db().execute("UPDATE artists SET scan_version = ? "
+                                    "WHERE artist_key = 'mb-kino'", (bot.INDEX_SCAN_VERSION,))
+            bot._index_db().commit()
+        self.assertEqual(bot._index_mark_title_key_stale(albums), 0)
+        swap_index(bot.LIBRARY_INDEX_FILE)          # a restart
+        self.assertEqual(bot._index_mark_title_key_stale(albums), 0)
+        self.assertEqual(self._versions()["mb-kino"], bot.INDEX_SCAN_VERSION)
+
+    def test_the_workers_step_waits_for_navidromes_whole_album_list(self):
+        albums = self._stale_index()
+        answers = iter([([], {"partial": True}), (albums[:1], {"partial": True}),
+                        (albums, {"partial": False})])
+
+        def fetch(user, password, stats):
+            got, flags = next(answers)
+            stats.update(flags)
+            return got
+
+        real, me, taken = bot._review_lock, threading.current_thread(), []
+
+        class Watched:                       # `_review_lock`, noting this thread's holds
+            def __enter__(self):
+                if threading.current_thread() is me:
+                    taken.append(1)
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+            def __getattr__(self, attr):
+                return getattr(real, attr)
+
+        state = {}
+        with patch.object(bot, "nd_get_all_albums", fetch), \
+                patch.object(bot, "_review_lock", Watched()):
+            bot._title_key_stale_step(state, 0.0, self.USER)
+            self.assertFalse(state.get("title_keys_done"))
+            bot._title_key_stale_step(state, 10.0, self.USER)    # inside the retry gap
+            bot._title_key_stale_step(state, bot.TITLE_KEY_STALE_RETRY_SECS, self.USER)
+            self.assertFalse(state.get("title_keys_done"))
+            self.assertEqual(self._versions()["mb-kino"], bot.INDEX_SCAN_VERSION)
+            bot._title_key_stale_step(state, 2 * bot.TITLE_KEY_STALE_RETRY_SECS, self.USER)
+            self.assertTrue(state["title_keys_done"])
+            bot._title_key_stale_step(state, 9e9, self.USER)     # done: asks nothing
+        self.assertEqual(self._versions()["mb-kino"], bot.INDEX_SCAN_VERSION - 1)
+        self.assertEqual(taken, [], "the step never takes _review_lock")
+
+    def test_once_it_has_run_the_step_reads_no_album_list(self):
+        # Review 4: every start after the first read Navidrome's whole album
+        # list before learning from `migrations` that there was nothing to do.
+        albums = self._stale_index()
+        self.assertEqual(bot._index_mark_title_key_stale(albums), 4)
+        swap_index(bot.LIBRARY_INDEX_FILE)          # a restart
+
+        def fetch(*a, **k):
+            raise AssertionError("the album list was read")
+
+        state = {}
+        with patch.object(bot, "nd_get_all_albums", fetch), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bot._title_key_stale_step(state, 0.0, self.USER)
+        self.assertTrue(state["title_keys_done"])
+
 
 _REAL_ND_ARTIST_INDEX = bot._nd_artist_index
 
@@ -26258,8 +26946,18 @@ class AlbumOverrideApplyTests(_OverridableAlbum, unittest.TestCase):
             plans.append(1)
             return real_plan(*a, **k)
 
+        asked = threading.Event()
+        real_wait = bot._placing_cond.wait
+
+        def wait(*a, **k):
+            # Set while the worker still holds the condition's lock, so the claim
+            # cannot be released before the real wait below has begun.
+            asked.set()
+            return real_wait(*a, **k)
+
         with patch.object(bot, "_album_override_plan", plan), \
-                patch.object(bot, "_album_fill_in_flight", lambda *a, **k: ""):
+                patch.object(bot, "_album_fill_in_flight", lambda *a, **k: ""), \
+                patch.object(bot._placing_cond, "wait", wait):
             with bot._group_placement("g1"):
                 worker = threading.Thread(target=lambda: answers.append(self.apply()))
                 worker.start()
@@ -26268,6 +26966,11 @@ class AlbumOverrideApplyTests(_OverridableAlbum, unittest.TestCase):
                     time.sleep(0.01)
                 (row,) = self.rows()
                 self.assertEqual((row["state"], row["total"], row["done"]), ("applying", 12, 0))
+                # The wait must be a real one: the row is written before the task asks
+                # for the claim, and a claim released before it was asked for is no wait
+                # (the test failed about half its runs for that).
+                self.assertTrue(asked.wait(max(0.0, deadline - time.time())),
+                                "the task never asked for the claim (no wait on _placing_cond)")
                 # What the placement did meanwhile: one file already says the release.
                 bot._mutagen_write_tags(os.path.join(self.folder, "1-01 - song 1.flac"),
                                         {"mb_albumid": PLAIN})
@@ -28212,8 +28915,16 @@ class AlbumOverrideHoldsFillGapsTests(_OverridableAlbum, unittest.TestCase):
         with patch.object(bot, "_mutagen_write_tags", write), \
                 patch.object(bot, "_tag_restore", restore), \
                 patch.object(bot, "_album_cover_write", cover):
-            payload, status = bot._album_cover_view({"album_id": self.old_id, "cover_url": url})
+            cover_task = []
+            with patch.object(bot, "_task_run", lambda kind, label, target, **k:
+                              cover_task.append(target) or "t1"):
+                payload, status = bot._album_cover_view({"album_id": self.old_id,
+                                                         "cover_url": url})
             self.assertEqual(status, 200, payload)
+            # The album is held until the cover inside its songs is written
+            # (B-297), and let go when that is over.
+            self.assertTrue(refused())
+            cover_task[0]("t1")
             self.assertFalse(refused())
             with patch.object(bot, "_task_run", run):
                 override_id = self.applied()
@@ -34447,7 +35158,7 @@ class AttentionActivityTests(unittest.TestCase):
     FOLDER_KEYS = {"id", "fileCount", "formats", "matchLabel", "confidence",
                    "canConfirm", "groupId", "releaseMbid", "identified"}
     REQUEST_KEYS = {"releaseMbid", "rgid", "groupId", "albumId", "artist", "album", "state",
-                    "percent", "done", "total", "failureKind", "reason", "retryable",
+                    "percent", "done", "total", "failed", "failureKind", "reason", "retryable",
                     "gapFill", "updatedAt"}
     TRANSFER_KEYS = {"id", "kind", "album", "artist", "groupId", "state", "pct", "peer"}
 
@@ -34664,6 +35375,3980 @@ class AttentionActivityTests(unittest.TestCase):
         self.assertEqual(att.get_json()["counts"]["folders"], 0)
         self.assertEqual(act.status_code, 200)
         self.assertEqual((act.get_json()["requests"], act.get_json()["transfers"]), ([], []))
+
+
+class AttentionActivityProductionShapeTests(unittest.TestCase):
+    """The audit of 2026-10-22 (L3): `AttentionActivityTests` built a review group
+    with no `rgid` and a ledger row that held `done: 4` on a downloading fill,
+    shapes production never writes, and both bugs passed. These fixtures come
+    from the producers: groups from `_make_review_group` plus the keys the
+    artist-discography path sets, ledger rows through `_album_fill_begin` /
+    `_album_fill_set`, transfer groups with the keys the enqueue writes, and
+    names from an index written by `_index_store_artist`."""
+
+    SECRET_TOKEN = "123456:TELEGRAM-token-secret"
+    SECRET_CHAT = "-100987654321"
+    ALBUM_KEYS = AttentionActivityTests.ALBUM_KEYS
+    REQUEST_KEYS = AttentionActivityTests.REQUEST_KEYS
+
+    def setUp(self):
+        self._saved_ledger = dict(bot._album_fill_status)
+        with bot._album_fill_lock:
+            bot._album_fill_status.clear()
+        self._saved_groups = dict(bot.pending_album_groups)
+        bot.pending_album_groups.clear()
+        for name, value in (("_push_fill", lambda *a, **k: None),
+                            ("mbz_release_tracks", lambda mbid, *a, **k: [
+                                {"title": f"T{i}", "mbid": f"t{i}"} for i in range(3)])):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        with bot._album_fill_lock:
+            bot._album_fill_status.clear()
+            bot._album_fill_status.update(self._saved_ledger)
+        bot.pending_album_groups.clear()
+        bot.pending_album_groups.update(self._saved_groups)
+
+    def _gap(self, n, *, rgid="rg-7", failed=True, **extra):
+        """A review group as the artist-discography path leaves it: built by
+        `_make_review_group`, then `source` and `rgid` set on it."""
+        record = {"id": f"nd-{n}", "name": f"Album {n}", "artist": f"Artist {n}",
+                  "musicBrainzId": f"rel-{n}", "songCount": 0, "duration": 0, "tracks": []}
+        group = bot._make_review_group([record], "incomplete", f"rel-{n}")
+        group["source"] = "artist_discography"
+        if rgid is not None:
+            group["rgid"] = rgid
+        if failed:
+            for t in group["missing_tracks"]:
+                t["decision"] = "failed"
+        # credentials a careless copy of the record would carry along
+        group["token"], group["chat_id"] = self.SECRET_TOKEN, self.SECRET_CHAT
+        group.update(extra)
+        return group
+
+    def _attention(self, groups):
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = groups
+            with patch.object(bot, "_nd_album_artist_map", lambda: {}), \
+                 patch.object(bot, "_needs_placement_view", lambda include_filed=False: []):
+                return bot._attention_view()
+
+    @staticmethod
+    def _seed_index(rows):
+        """`rows` = [(rgid, title, artist)] written into the current index the
+        way a discography scan writes them."""
+        for i, (rgid, title, artist) in enumerate(rows):
+            bot._index_store_artist(
+                {"artist_mbid": f"art-{i}", "artist_name": artist,
+                 "releases": [{"rgid": rgid, "title": title, "status": "complete"}]},
+                nd_artist_id=f"nd-art-{i}")
+
+    def _index_names(self, rows):
+        """A scratch index holding `rows`, for a test that calls the helper itself."""
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        self._seed_index(rows)
+
+    def _activity(self, groups=(), index=()):
+        with isolated_review():
+            self._seed_index(index)
+            with bot._review_lock:
+                bot._review_state["groups"] = list(groups)
+            with patch.object(bot, "_transfers_view", lambda: {"transfers": []}), \
+                 patch.object(bot, "_nd_album_artist_map", lambda: {}):
+                return bot._activity_view()
+
+    # --- S1 ---------------------------------------------------------------
+
+    def test_the_list_snapshot_keeps_a_groups_rgid(self):
+        with isolated_review():
+            with bot._review_lock:
+                bot._review_state["groups"] = [self._gap(1, rgid="rg-7"),
+                                               self._gap(2, rgid=None)]
+            groups = {g["id"]: g for g in bot._review_list_snapshot()["groups"]}
+        with_rgid, without = [groups[g["id"]] for g in
+                              (self._gap(1, rgid="rg-7"), self._gap(2, rgid=None))]
+        self.assertEqual(with_rgid["rgid"], "rg-7")
+        self.assertNotIn("rgid", without, "absent like canonical_mbid, not '' and not None")
+
+    def test_a_gap_attention_row_has_its_rgid_and_cover(self):
+        view = self._attention([self._gap(1, rgid="rg-7"), self._gap(2, rgid=None)])
+        rows = {a["key"]: a for a in view["albums"]}
+        with_rgid, without = rows[self._gap(1)["id"]], rows[self._gap(2)["id"]]
+        self.assertEqual(with_rgid["rgid"], "rg-7")
+        self.assertEqual(with_rgid["coverUrl"],
+                         "https://coverartarchive.org/release-group/rg-7/front-250")
+        self.assertEqual((without["rgid"], without["coverUrl"]), ("", ""),
+                         "never a URL built from an empty id")
+
+    def test_a_request_row_with_only_an_rgid_is_named_from_the_index(self):
+        bot._album_fill_set("rel-9", "placed", rgid="rg-9")
+        row = self._activity(index=[("rg-9", "Some Album", "Some Artist")])["requests"][0]
+        self.assertEqual((row["artist"], row["album"]), ("Some Artist", "Some Album"))
+        self.assertFalse(row["gapFill"], "gapFill is only for a name from a review group")
+
+    def test_a_row_the_index_cannot_name_stays_nameless_and_the_view_still_answers(self):
+        bot._album_fill_set("rel-9", "placed", rgid="rg-9")
+
+        def broken(rgids):
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch.object(bot, "_names_by_rgid", broken):
+            view = self._activity()
+        row = view["requests"][0]
+        self.assertEqual((row["artist"], row["album"]), ("", ""))
+        self.assertEqual(row["state"], "placed")
+
+    def test_the_name_lookup_is_one_query_for_all_nameless_rows(self):
+        for i in range(30):
+            bot._album_fill_set(f"rel-{i}", "placed", rgid=f"rg-{i}")
+        calls = []
+
+        def spy(rgids):
+            calls.append(sorted(rgids))
+            return {}
+
+        with patch.object(bot, "_names_by_rgid", spy):
+            self._activity()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], sorted(f"rg-{i}" for i in range(30)))
+
+    def test_names_by_rgid_skips_untitled_and_unnamed_rows_and_never_raises(self):
+        self._index_names([("rg-1", "Real", "Someone"), ("rg-2", "", "Someone Else"),
+                           ("rg-3", "Titled", "")])
+        self.assertEqual(bot._names_by_rgid(["rg-1", "rg-2", "rg-3", "rg-none"]),
+                         {"rg-1": {"artist": "Someone", "album": "Real"}})
+        self.assertEqual(bot._names_by_rgid([]), {})
+        with patch.object(bot, "_index_db", side_effect=sqlite3.OperationalError("boom")):
+            self.assertEqual(bot._names_by_rgid(["rg-1"]), {})
+
+    def test_no_key_outside_the_allowlist_appears_with_the_new_fields(self):
+        groups = [self._gap(1, rgid="rg-7")]
+        view = self._attention(groups)
+        for row in view["albums"]:
+            self.assertEqual(set(row), self.ALBUM_KEYS)
+        bot._album_fill_set("rel-9", "placed", rgid="rg-9", token=self.SECRET_TOKEN,
+                            chat_id=self.SECRET_CHAT)
+        activity = self._activity(groups, index=[("rg-9", "Some Album", "Some Artist")])
+        self.assertEqual(activity["requests"][0]["artist"], "Some Artist")
+        for row in activity["requests"]:
+            self.assertEqual(set(row), self.REQUEST_KEYS)
+        for answer in (view, activity):
+            text = json.dumps(answer)
+            for leak in (self.SECRET_TOKEN, self.SECRET_CHAT, '"token"', '"chat_id"'):
+                self.assertNotIn(leak, text)
+
+    # --- S2 ---------------------------------------------------------------
+
+    @staticmethod
+    def _live_group(mbid, *, total=10, completed=0, failed=0):
+        """A transfer group with the keys `_enqueue_album_group` writes."""
+        gid = f"ag-{mbid}"
+        bot.pending_album_groups[gid] = {
+            "label": "peer1", "token": AttentionActivityProductionShapeTests.SECRET_TOKEN,
+            "chat_id": AttentionActivityProductionShapeTests.SECRET_CHAT,
+            "total": total, "completed": completed, "failed": failed, "ts": time.time(),
+            "release_mbid": mbid, "target_release_mbid": mbid, "local_dirs": {},
+            "local_files": [], "progress_msg_id": None, "alt_sources": [],
+            "source_user": "peer1", "artist": "Live Artist", "album": "Live Album",
+            "missing_tracks": [], "review_group_id": "", "match_mode": "auto",
+            "switching": False, "progress_at": time.time(),
+        }
+        return gid
+
+    def _begin(self, mbid, state, **fields):
+        """A whole-album request's row as production writes it: `_album_fill_begin`
+        (state `searching`, `done` 0), then the poller/finalizer's `_album_fill_set`."""
+        bot._album_fill_begin(mbid, artist="Some Artist", album="Some Album",
+                              total=int(fields.pop("total", 10)), rgid=f"rg-{mbid}")
+        if state != "searching":
+            bot._album_fill_set(mbid, state, **fields)
+
+    def _row(self, view, mbid):
+        return next(r for r in view["requests"] if r["releaseMbid"] == mbid)
+
+    def test_a_downloading_request_reads_its_live_counts(self):
+        # The ledger row is not advanced during a download, by design: it holds
+        # total 10 and no `done` while the group holds the truth.
+        self._begin("rel-d", "downloading", total=10)
+        self._live_group("rel-d", total=10, completed=3, failed=1)
+        row = self._row(self._activity(), "rel-d")
+        self.assertEqual((row["state"], row["done"], row["total"], row["failed"], row["percent"]),
+                         ("downloading", 3, 10, 1, 30))
+
+    def test_a_queued_row_with_a_live_group_reads_downloading(self):
+        for state in ("searching", "queued"):
+            with self.subTest(state=state):
+                mbid = f"rel-{state}"
+                self._begin(mbid, state)
+                self._live_group(mbid, total=4, completed=2)
+                row = self._row(self._activity(), mbid)
+                self.assertEqual((row["state"], row["done"], row["percent"]),
+                                 ("downloading", 2, 50))
+
+    def test_a_placed_or_verified_row_reads_100_percent(self):
+        for state in ("placing", "placed", "verified"):
+            with self.subTest(state=state):
+                mbid = f"rel-{state}"
+                self._begin(mbid, state, total=0)
+                row = self._row(self._activity(), mbid)
+                self.assertEqual((row["state"], row["done"], row["total"], row["percent"]),
+                                 (state, 0, 0, 100))
+
+    def test_a_terminal_row_with_no_group_keeps_its_ledger_counts(self):
+        self._begin("rel-f", "failed", total=8, done=8, failed=0, failureKind="no_source",
+                    reason="nobody had it")
+        row = self._row(self._activity(), "rel-f")
+        self.assertEqual((row["state"], row["done"], row["total"], row["failed"], row["percent"]),
+                         ("failed", 8, 8, 0, 100))
+        self.assertEqual((row["failureKind"], row["reason"]), ("no_source", "nobody had it"))
+
+    def test_activity_and_album_status_agree_for_every_state(self):
+        states = ("searching", "queued", "downloading", "placing", "placed", "verified",
+                  "failed", "cancelled", "needs_match")
+        for i, state in enumerate(states):
+            mbid = f"rel-{state}"
+            self._begin(mbid, state, total=6)
+            if i % 2 == 0:       # some rows have a live group, some do not
+                self._live_group(mbid, total=6, completed=2, failed=1)
+        view = self._activity()
+        for state in states:
+            with self.subTest(state=state):
+                mbid = f"rel-{state}"
+                want = bot._album_fill_view(mbid, include_files=False)
+                row = self._row(view, mbid)
+                self.assertEqual(
+                    {k: row[k] for k in ("state", "done", "total", "failed", "percent")},
+                    {k: want[k] for k in ("state", "done", "total", "failed", "percent")})
+
+    def test_a_200_row_ledger_is_served_in_the_time_of_the_old_view(self):
+        for i in range(200):
+            self._begin(f"rel-{i}", "downloading" if i < 3 else "verified", total=10)
+        for i in range(3):
+            self._live_group(f"rel-{i}", total=10, completed=i)
+        with isolated_review():
+            with patch.object(bot, "_transfers_view", lambda: {"transfers": []}), \
+                 patch.object(bot, "_nd_album_artist_map", lambda: {}):
+                started = time.perf_counter()
+                view = bot._activity_view()
+                elapsed = time.perf_counter() - started
+        self.assertEqual(len(view["requests"]), 200)
+        self.assertLess(elapsed, 0.05, f"{elapsed * 1000:.0f} ms for 200 rows")
+
+    # --- S3 ---------------------------------------------------------------
+
+    SLSKD_KEY = "slskd-key-0000secret"
+    # Every shape the audit found free text carrying to a device, with the
+    # fragments that must not survive it.
+    LEAKS = (
+        ("a Subsonic URL", "stream failed http://nd:4533/rest/stream?u=bob&t=abc&s=xyz&id=1",
+         ("u=bob", "t=abc", "s=xyz", "bob", "nd:4533")),
+        ("URL userinfo", "fetch failed for https://bob:hunter2@host/x",
+         ("bob", "hunter2", "@host")),
+        ("URL user only", "fetch failed for ftp://carol@files.example/x", ("carol", "files.example")),
+        ("the state file", "could not write /config/lb_bot_state.json", ("/config",)),
+        ("a root outside the mounts", "cannot read /home/ilya/secrets/key.txt", ("/home", "ilya")),
+        ("a Windows path", "no file at C:\\Users\\bob\\Music\\x.flac", ("C:", "Users", "bob")),
+        ("a UNC path", "no file at \\\\nas\\share\\x", ("nas", "share")),
+        ("the Telegram token", f"bot said {SECRET_TOKEN} is wrong", (SECRET_TOKEN, "TELEGRAM")),
+        ("the slskd key", f"slskd refused key {SLSKD_KEY}", (SLSKD_KEY,)),
+    )
+
+    def _secrets(self):
+        for patcher in (patch.object(bot, "SLSKD_API_KEY", self.SLSKD_KEY),
+                        patch.object(bot, "USERS", [{"telegram_token": self.SECRET_TOKEN}]),
+                        patch.object(bot, "SLSKD_DOWNLOAD_DIR", "/downloads"),
+                        patch.object(bot, "MUSIC_LIBRARY_PATH", "/music")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_wire_text_removes_every_shape_the_audit_found(self):
+        self._secrets()
+        for name, text, gone in self.LEAKS:
+            with self.subTest(shape=name):
+                out = bot._wire_text(text)
+                for fragment in gone:
+                    self.assertNotIn(fragment, out)
+                self.assertTrue(out, "something of the sentence is left")
+        long = bot._wire_text("x" * 5000)
+        self.assertEqual(len(long), 300)
+        self.assertTrue(long.endswith("\u2026"))
+        words = bot._wire_text("word " * 1000)
+        self.assertLessEqual(len(words), 300)
+        self.assertTrue(words.endswith("word\u2026"), "cut on a word boundary")
+        self.assertEqual(bot._wire_text("y" * 50, limit=10), "y" * 9 + "\u2026")
+        self.assertEqual((bot._wire_text(None), bot._wire_text("")), ("", ""))
+
+    def test_wire_text_keeps_what_a_person_needs(self):
+        self._secrets()
+        self.assertEqual(bot._wire_text("No audio files found in /downloads/Peer Folder"),
+                         "No audio files found in Peer Folder")
+        self.assertEqual(bot._wire_text("103 peers offered 2,047 files, but none in FLAC"),
+                         "103 peers offered 2,047 files, but none in FLAC")
+        # a URL's own path is not a filesystem path
+        self.assertEqual(bot._wire_text("see http://localhost/data/x"), "see http://localhost/data/x")
+
+    def test_wire_text_never_raises(self):
+        for odd in (None, 0, 12.5, b"bytes", ["a", "/config/x"], {"k": "v"}, object()):
+            with self.subTest(odd=repr(odd)[:20]):
+                self.assertIsInstance(bot._wire_text(odd), str)
+
+    def test_wire_text_is_linear_on_a_long_run_with_no_spaces(self):
+        self._secrets()
+        started = time.perf_counter()
+        for blob in ("a." * 25000, "a" * 50000, "x-" * 25000 + "://", "ab+" * 20000):
+            out = bot._wire_text(blob)
+            self.assertLessEqual(len(out), 300)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0, f"{elapsed:.2f} s for four 50 KB runs")
+
+    def test_userinfo_is_still_redacted_after_the_anchor_change(self):
+        self._secrets()
+        for text in ("fetch failed for https://bob:hunter2@host/x",
+                     "x-y.z+w://carol@files.example/x",
+                     "(ftp://dave:pw@h.example/a)",
+                     "HTTPS://Erin:pw@Host.Example/a"):
+            with self.subTest(text=text):
+                out = bot._wire_text(text)
+                for fragment in ("bob", "hunter2", "carol", "dave", "pw@", "Erin", "files.example"):
+                    self.assertNotIn(fragment, out)
+                self.assertIn("[redacted]@", out)
+        # a scheme glued to word characters before it is not a scheme start
+        self.assertEqual(bot._wire_text("see http://localhost/data/x"),
+                         "see http://localhost/data/x")
+
+    def test_input_past_the_ceiling_is_cut_before_the_regexes_run(self):
+        self._secrets()
+        out = bot._wire_text(("word " * 2000) + "https://bob:pw@h.example/x")
+        self.assertLessEqual(len(out), 300)
+        self.assertNotIn("bob", out)
+
+    def test_the_gap_view_free_text_goes_through_wire_text(self):
+        self._secrets()
+        patcher = patch.object(bot, "_nd_album_artist_map", lambda: {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        leaks = (
+            ("a token", f"bot said {self.SECRET_TOKEN} is wrong", (self.SECRET_TOKEN,)),
+            ("URL userinfo", "fetch failed for https://bob:hunter2@host/x", ("bob", "hunter2")),
+            ("a non-mount root", "cannot read /home/ilya/secrets/key.txt", ("/home", "ilya")),
+        )
+        for field, key in (("downloadError", "download_error"), ("placementNote", "placement_note")):
+            for shape, text, gone in leaks:
+                with self.subTest(field=field, shape=shape):
+                    group = {"id": "g-wire", "artist": "A", "album": "B",
+                             "missing_tracks": [{"title": "T", "mbid": "r1", "position": 1,
+                                                 "decision": "failed", key: text}]}
+                    view = bot._gap_detail_view(group)
+                    got = view["tracks"][0][field]
+                    self.assertTrue(got)
+                    for fragment in gone:
+                        self.assertNotIn(fragment, got)
+                    self.assertEqual(got, bot._wire_text(text))
+        # the mount rule still holds, and a long text is cut
+        group = {"id": "g-wire2", "artist": "A", "album": "B",
+                 "missing_tracks": [{"title": "T", "mbid": "r1", "position": 1,
+                                     "decision": "failed",
+                                     "download_error": "No audio files found in /downloads/Peer Folder",
+                                     "placement_note": "word " * 400}]}
+        row = bot._gap_detail_view(group)["tracks"][0]
+        self.assertEqual(row["downloadError"], "No audio files found in Peer Folder")
+        self.assertLessEqual(len(row["placementNote"]), 300)
+
+    def test_the_activity_reason_and_the_album_status_reason_go_through_it(self):
+        self._secrets()
+        # One row per shape, so a long sentence's cut cannot hide a leak.
+        for i, (_, text, _) in enumerate(self.LEAKS):
+            bot._album_fill_set(f"rel-r{i}", "failed", rgid=f"rg-r{i}", reason=text,
+                                failureKind="x", token=self.SECRET_TOKEN)
+        activity = self._activity()
+        for i, (shape, text, gone) in enumerate(self.LEAKS):
+            status = bot._album_fill_view(f"rel-r{i}")
+            self.assertEqual(self._row(activity, f"rel-r{i}")["reason"], status["reason"])
+            self.assertEqual(status["reason"], bot._wire_text(text))
+            for name, answer in (("activity", self._row(activity, f"rel-r{i}")),
+                                 ("album status", status)):
+                for fragment in gone:
+                    with self.subTest(view=name, shape=shape, fragment=fragment):
+                        self.assertNotIn(fragment, json.dumps(answer))
+        bot._album_fill_set("rel-long", "failed", reason="word " * 400)
+        self.assertLessEqual(len(bot._album_fill_view("rel-long")["reason"]), 300)
+
+    def test_an_os_error_without_strerror_is_redacted_too(self):
+        self._secrets()
+        err = OSError()
+        err.strerror = None
+        err.args = ("could not open /config/x with token=abc via http://bob:pw@h/",)
+        out = bot._os_error_text(err)
+        for fragment in ("/config", "abc", "bob", "pw@"):
+            self.assertNotIn(fragment, out)
+
+    def test_a_500_answers_a_redacted_message(self):
+        self._secrets()
+        app = _web_app()
+
+        @app.get("/api/_boom")
+        def boom():
+            raise RuntimeError("could not open /config/x with token=abc")
+
+        @app.get("/api/_boom_empty")
+        def boom_empty():
+            raise RuntimeError("")
+
+        client = app.test_client()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            res = client.get("/api/_boom")
+            empty = client.get("/api/_boom_empty")
+            missing = client.get("/api/nothing-here")
+        self.assertEqual(res.status_code, 500)
+        message = res.get_json()["error"]
+        self.assertNotIn("/config", message)
+        self.assertNotIn("abc", message)
+        self.assertIn("could not open", message)
+        self.assertIn("Traceback", err.getvalue(), "the log keeps the traceback")
+        self.assertEqual(empty.get_json()["error"], "Internal error")
+        self.assertEqual(missing.status_code, 404, "an HTTP error keeps its own description")
+
+    # --- S4 ---------------------------------------------------------------
+
+    def test_activity_says_how_many_rows_it_cut(self):
+        # `_album_fill_set` and `_album_fill_restore` both keep the ledger to
+        # _ALBUM_FILL_STATUS_MAX (200) rows, the request cap's own number, so the
+        # rows past it have to be written into the dict directly.
+        with bot._album_fill_lock:
+            for i in range(250):
+                bot._album_fill_status[f"rel-{i}"] = {
+                    "state": "verified", "artist": "A", "album": f"B{i}",
+                    "updated_at": 1000.0 + i}
+            bot._album_fill_status["rel-unknown"] = {"state": "unknown", "updated_at": 5000.0}
+        transfers = [{"id": f"t{i}", "kind": "track", "state": "active", "pct": 1,
+                      "username": "peer"} for i in range(120)]
+        with isolated_review(), \
+             patch.object(bot, "_transfers_view", lambda: {"transfers": transfers}), \
+             patch.object(bot, "_nd_album_artist_map", lambda: {}):
+            view = bot._activity_view()
+        self.assertEqual((len(view["requests"]), len(view["transfers"])),
+                         (bot.ACTIVITY_REQUESTS_MAX, bot.ACTIVITY_TRANSFERS_MAX))
+        self.assertEqual(view["truncated"], {"requests": 50, "transfers": 20})
+
+    def test_nothing_cut_says_zero(self):
+        bot._album_fill_set("rel-1", "verified", artist="A", album="B")
+        self.assertEqual(self._activity()["truncated"], {"requests": 0, "transfers": 0})
+
+    # --- B-254: a gap fill's row keeps its name -----------------------------
+
+    def _finalize_gap(self, group, *, completed=2, manual=False, ok=True):
+        """`_finalize_group` for a gap fill of `group`, as the poller runs it:
+        the transfer group the enqueue registers, everything past the ledger
+        stubbed. Returns the release id."""
+        release = group["canonical_mbid"]
+        # The finalize records what it placed in `_albums` (and its token):
+        # put both back, other tests read them whole.
+        for live in (bot._albums, bot._uid_to_token):
+            self.addCleanup(lambda live=live, old=dict(live): (live.clear(), live.update(old)))
+        bot.pending_album_groups["ag1"] = {
+            "label": f"{group['artist']} - {group['album']}", "total": 2,
+            "completed": completed, "failed": 2 - completed,
+            "local_dirs": {"/downloads/Album": completed} if completed else {},
+            "token": "web", "chat_id": "", "release_mbid": release,
+            "artist": group["artist"], "album": group["album"],
+            "review_group_id": group["id"], "match_mode": "manual" if manual else "auto"}
+        result = ({"ok": True, "moved": 2, "dest_folder": "/music/A/B", "per_file": []}
+                  if ok else {"ok": False, "error": "nothing matched", "per_file": []})
+        stubs = {
+            "_look_again_for_landed_files": AsyncMock(return_value=0),
+            "_finalize_import_selection": lambda dirs, gid, files: (dirs, None),
+            "_deterministic_album_import": lambda *a, **k: dict(result),
+            "_note_folder_imported": lambda *a, **k: None,
+            "_nd_scan_after_import": lambda *a, **k: False,
+            "_mark_group_tracks_placed": lambda *a, **k: None,
+            "_save_review_state": lambda *a, **k: None,
+            "_save_state": lambda *a, **k: None,
+            "rgid_from_release": lambda *a, **k: "",
+            "_index_mark_release_present": lambda **k: True,
+            "_notify_hub_library_change": lambda *a, **k: None,
+            "_record_import_recovery": lambda *a, **k: "rec-1",
+            "_stamp_early_placement_failure": lambda *a, **k: None,
+            "_album_action_markup": lambda *a, **k: None,
+            "_tg_send": AsyncMock(),
+        }
+        with contextlib.ExitStack() as stack:
+            for name, value in stubs.items():
+                stack.enter_context(patch.object(bot, name, value))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            asyncio.run(bot._finalize_group(None, "ag1"))
+        return release
+
+    def test_a_gap_fill_row_is_named_at_its_first_write_by_each_path(self):
+        cases = (("placed", dict()), ("needs_match", dict(manual=True)),
+                 ("failed", dict(completed=0)), ("failed", dict(ok=False)))
+        for want, how in cases:
+            with self.subTest(state=want, **how):
+                with bot._album_fill_lock:
+                    bot._album_fill_status.clear()
+                group = self._gap(1, rgid="rg-7", failed=False)
+                with isolated_review():
+                    with bot._review_lock:
+                        bot._review_state["groups"] = [group]
+                    release = self._finalize_gap(group, **how)
+                    self.assertEqual(bot._album_fill_get(release)["state"], want)
+                # The group is gone (retired by a rescan): the row still says
+                # which album it was.
+                row = self._activity()["requests"][0]
+                self.assertEqual(
+                    {k: row[k] for k in ("releaseMbid", "artist", "album", "rgid", "gapFill")},
+                    {"releaseMbid": release, "artist": "Artist 1", "album": "Album 1",
+                     "rgid": "rg-7", "gapFill": True})
+                # A label, not a whole-album request's name: a failed gap fill
+                # is no failed request, and arms no whole-album retry.
+                entry = bot._album_fill_get(release)
+                self.assertFalse(entry.get("artist") or entry.get("album") or entry.get("rgid"))
+                self.assertEqual(bot._album_fill_counts()["failed"], 0)
+                self.assertFalse(entry.get("retryAt"))
+
+    def test_the_first_names_stay_and_a_whole_album_requests_own_win(self):
+        bot._album_fill_set("rel-1", "placing", labels={
+            "labelArtist": "First", "labelAlbum": "Album", "labelRgid": "rg-1"})
+        bot._album_fill_set("rel-1", "placed", labels={
+            "labelArtist": "Second", "labelAlbum": "Other", "labelRgid": "rg-2"})
+        self.assertEqual({k: bot._album_fill_get("rel-1")[k] for k in bot._FILL_LABEL_KEYS},
+                         {"labelArtist": "First", "labelAlbum": "Album", "labelRgid": "rg-1"})
+        bot._album_fill_begin("rel-2", artist="Real", album="Record", total=3)
+        bot._album_fill_set("rel-2", "placed", labels={"labelArtist": "Gap", "labelAlbum": "G"})
+        self.assertNotIn("labelArtist", bot._album_fill_get("rel-2"))
+        rows = {r["releaseMbid"]: r for r in self._activity()["requests"]}
+        self.assertEqual((rows["rel-2"]["artist"], rows["rel-2"]["album"]), ("Real", "Record"))
+
+    def test_the_group_verifier_names_a_row_placed_before_rows_were_named(self):
+        bot._album_fill_set("rel-v", "placed", groupId="g-v")
+        bot._album_fill_mark_group_verified("g-v", {"rel-v"}, ["nd-1"], labels={
+            "labelArtist": "Verified Artist", "labelAlbum": "Verified Album",
+            "labelRgid": "rg-v"})
+        row = self._activity()["requests"][0]
+        self.assertEqual((row["state"], row["artist"], row["album"], row["rgid"]),
+                         ("verified", "Verified Artist", "Verified Album", "rg-v"))
+
+    def test_an_old_nameless_row_is_named_on_read_and_nothing_is_asked(self):
+        # Rows a build before this left: only the release id, and for a
+        # verified one the Navidrome albums it was verified as.
+        bot._album_fill_set("rel-idx", "verified", ndAlbumIds=["nd-77"])
+        bot._album_fill_set("rel-mem", "verified", ndAlbumIds=["nd-88"])
+        bot._album_fill_set("rel-mb", "placed")
+        bot._album_fill_set("rel-none", "placed", ndAlbumIds=["nd-99"])
+        cached_key = bot._mbz_cache_key("release/rel-mb", {"inc": "artist-credits"})
+        bot._mbz_cache[cached_key] = {
+            "title": "Cached Album",
+            "artist-credit": [{"name": "Cached Artist", "joinphrase": ""}]}
+        self.addCleanup(bot._mbz_cache.pop, cached_key, None)
+        saved = dict(bot._ND_ALBUM_INDEX)
+        self.addCleanup(bot._ND_ALBUM_INDEX.update, saved)
+        # Long expired: it is read, never refreshed.
+        bot._ND_ALBUM_INDEX.update(ts=0.0, albums=[
+            {"id": "nd-88", "name": "Held Album", "artist": "Held Artist"}])
+
+        def no(*a, **k):
+            raise AssertionError("the read path asked something")
+
+        with isolated_review(), \
+                patch.object(bot, "_http", NoListenBrainzUserTests._NoNetwork()), \
+                patch.object(bot, "mbz_get", no), \
+                patch.object(bot, "nd_get_all_albums", no), \
+                patch.object(bot, "_nd_album_index", no), \
+                patch.object(bot, "_transfers_view", lambda: {"transfers": []}), \
+                patch.object(bot, "_nd_album_artist_map", lambda: {}):
+            self.assertTrue(bot._index_store_artist(
+                {"artist_mbid": "art-old", "artist_name": "Index Artist",
+                 "releases": [{"rgid": "rg-old", "title": "Index Album",
+                               "status": "complete", "navidrome_album_ids": ["nd-77"]}]},
+                nd_artist_id="nd-art-old"))
+            rows = {r["releaseMbid"]: r for r in bot._activity_view()["requests"]}
+        names = {m: (r["artist"], r["album"], r["rgid"]) for m, r in rows.items()}
+        self.assertEqual(names, {
+            "rel-idx": ("Index Artist", "Index Album", "rg-old"),
+            "rel-mem": ("Held Artist", "Held Album", ""),
+            "rel-mb": ("Cached Artist", "Cached Album", ""),
+            "rel-none": ("", "", "")})
+        self.assertFalse(any(r["gapFill"] for r in rows.values()),
+                         "gapFill is only for a name from a review group")
+
+    def test_an_old_row_is_named_by_the_release_group_its_cached_release_names(self):
+        # B-317, the owner's live rows: a `placed` row with only its release
+        # id — no rgid, no ndAlbumIds — and that release cached only under
+        # lookups that carry its title and its release group but no artist
+        # credit (`inc=release-groups`, `inc=recordings`). The release group
+        # names it from the index; the cache alone could not.
+        bot._album_fill_set("rel-rg", "placed")
+        bot._album_fill_set("rel-rec-only", "placed")
+        cached = {
+            bot._mbz_cache_key("release/rel-rg", {"inc": "release-groups"}): {
+                "title": "Surf’s Up", "release-group": {"id": "rg-surf", "title": "Surf’s Up"}},
+            bot._mbz_cache_key("release/rel-rec-only", {"inc": "recordings"}): {
+                "title": "Recordings Only", "media": []},
+        }
+        for key, doc in cached.items():
+            bot._mbz_cache[key] = doc
+            self.addCleanup(bot._mbz_cache.pop, key, None)
+
+        def no(*a, **k):
+            raise AssertionError("the read path asked something")
+
+        with isolated_review(), \
+                patch.object(bot, "_http", NoListenBrainzUserTests._NoNetwork()), \
+                patch.object(bot, "mbz_get", no), \
+                patch.object(bot, "nd_get_all_albums", no), \
+                patch.object(bot, "_nd_album_index", no), \
+                patch.object(bot, "_transfers_view", lambda: {"transfers": []}), \
+                patch.object(bot, "_nd_album_artist_map", lambda: {}):
+            self.assertTrue(bot._index_store_artist(
+                {"artist_mbid": "art-bb", "artist_name": "The Beach Boys",
+                 "releases": [{"rgid": "rg-surf", "title": "Surf's Up",
+                               "status": "complete", "navidrome_album_ids": ["nd-surf"]}]},
+                nd_artist_id="nd-art-bb"))
+            rows = {r["releaseMbid"]: r for r in bot._activity_view()["requests"]}
+        names = {m: (r["artist"], r["album"], r["rgid"]) for m, r in rows.items()
+                 if m in ("rel-rg", "rel-rec-only")}
+        self.assertEqual(names, {
+            "rel-rg": ("The Beach Boys", "Surf's Up", "rg-surf"),
+            # Its cache names no release group: nothing can name it without a
+            # request, so it stays nameless.
+            "rel-rec-only": ("", "", "")})
+        self.assertFalse(rows["rel-rg"]["gapFill"],
+                         "gapFill is only for a name from a review group")
+
+
+
+class NoListenBrainzUserTests(unittest.TestCase):
+    """B-304: a stranger with no `LISTENBRAINZ_USER` sees nothing red and
+    nothing failing. The health probe asked `user//playlists/createdfor`
+    (ListenBrainz answers 404), and the playlist scan asked it three times and
+    failed the task with the raw 404."""
+
+    class _NoNetwork:
+        """`bot._http` for a test in which no request may be made."""
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, verb):
+            def call(url, **kwargs):
+                self.calls.append((verb, url))
+                raise AssertionError(f"no request may be made: {verb} {url}")
+            return call
+
+    def _user(self, lbz=""):
+        return {"telegram_token": "", "chat_id": "", "navidrome_user": "nd",
+                "navidrome_password": "nd-pass", "listenbrainz_user": lbz,
+                "playlist_sources": {"weekly-jams": "Weekly Jams"}}
+
+    def _listenbrainz_check(self, user):
+        asked = []
+
+        def lbz_get(path, timeout=25, retries=3, **kwargs):
+            asked.append(path)
+            return {}
+
+        with patch.object(bot, "_lbz_get", lbz_get), \
+                patch.object(bot, "_downloads_on", lambda: False), \
+                patch.object(bot, "_http", self._NoNetwork()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            checks = {label: (ok, detail) for ok, label, detail
+                      in bot._run_diagnostics(user)}
+        return checks["ListenBrainz"], asked
+
+    def test_the_health_probe_without_a_user_asks_the_sitewide_route(self):
+        (ok, detail), asked = self._listenbrainz_check(self._user(lbz=""))
+        self.assertEqual(asked, ["stats/sitewide/artists?count=1"])
+        self.assertTrue(ok)
+        self.assertEqual(detail, "reachable; no ListenBrainz user is set, so playlists "
+                                 "and listening history are off; set LISTENBRAINZ_USER "
+                                 "and restart lb-bot to turn them on")
+        # Blank is no user either.
+        _, asked = self._listenbrainz_check(self._user(lbz="  "))
+        self.assertEqual(asked, ["stats/sitewide/artists?count=1"])
+
+    def test_the_health_probe_with_a_user_asks_their_playlists(self):
+        (ok, detail), asked = self._listenbrainz_check(self._user(lbz="alice"))
+        self.assertEqual(asked, ["user/alice/playlists/createdfor"])
+        self.assertEqual((ok, detail), (True, "reachable"))
+
+    def test_the_playlist_scan_without_a_user_asks_nobody(self):
+        finished, http = [], self._NoNetwork()
+
+        def refuse(*a, **k):
+            raise AssertionError("nothing may be asked or replaced")
+
+        with patch.object(bot, "_default_web_user", lambda: self._user(lbz="")), \
+                patch.object(bot, "_http", http), \
+                patch.object(bot, "_lbz_get", refuse), \
+                patch.object(bot, "_nd_wait_ready", refuse), \
+                patch.object(bot, "_replace_review_groups", refuse), \
+                patch.object(bot, "_task_finish",
+                             lambda task_id, summary="", error="", **k:
+                             finished.append((task_id, summary, error))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bot._playlist_scan_task("t1")
+            self.assertEqual(bot.scan_user(self._user(lbz="")), [])
+        self.assertEqual(finished, [("t1", "No ListenBrainz user is set, so there are "
+                                           "no playlists to scan; set LISTENBRAINZ_USER "
+                                           "and restart lb-bot to scan yours.", "")])
+        self.assertEqual(http.calls, [])
+
+    def test_the_settings_card_without_a_user_is_off_not_a_failure(self):
+        # Review 2: `ok` false drew a red "Check" on System › Configuration.
+        card = next(c for c in bot._settings_cards(self._user(lbz="  "))["cards"]
+                    if c["key"] == "listenbrainz")
+        self.assertEqual(card["state"], "off")
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["fix"], "ListenBrainz is off. To turn on playlists and "
+                                      "listening history, set LISTENBRAINZ_USER and "
+                                      "restart lb-bot.")
+        card = next(c for c in bot._settings_cards(self._user(lbz="alice"))["cards"]
+                    if c["key"] == "listenbrainz")
+        self.assertNotIn("state", card)
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["values"]["user"], "alice")
+
+    def test_a_probe_answered_204_with_no_body_is_reachable(self):
+        # Review 7: ListenBrainz's stats routes answer 204 with an empty body
+        # while their stats are being computed; `r.json()` raised and the
+        # check read "unreachable". Nothing but ListenBrainz may be asked.
+        asked = []
+
+        class Empty:                         # what `requests` hands back for a 204
+            status_code, content, text, ok = 204, b"", "", True
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class Answer204:
+            def get(self, url, **kwargs):
+                asked.append(url)
+                if not url.startswith(bot.LBZ_ENDPOINT):
+                    raise AssertionError(f"no other request may be made: {url}")
+                return Empty()
+
+        with patch.object(bot, "_http", Answer204()), \
+                patch.object(bot, "nd_get_all_albums", lambda *a, **k: []), \
+                patch.object(bot, "_downloads_on", lambda: False), \
+                patch.object(bot.time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            checks = {label: (ok, detail) for ok, label, detail
+                      in bot._run_diagnostics(self._user(lbz=""))
+                      if label == "ListenBrainz"}
+        self.assertEqual(checks["ListenBrainz"][0], True, checks)
+        self.assertEqual([u for u in asked if u.startswith(bot.LBZ_ENDPOINT)],
+                         [f"{bot.LBZ_ENDPOINT}/stats/sitewide/artists?count=1"])
+        # Everywhere else an empty answer is still a failure, as it was.
+        with patch.object(bot, "_http", Answer204()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(bot.LBZError):
+                bot._lbz_get("stats/sitewide/artists?count=1", retries=1)
+
+
+class RealPathAdviceTests(unittest.TestCase):
+    """B-070: with "Report Real Path" off for lb-bot's player, Navidrome hands
+    out paths made up from the tags; no file resolves, and the health check
+    called that a stale index and advised a rescan, which changes nothing.
+
+    Navidrome 0.64's made-up path (`fakePath`, measured on the stand-in): the
+    album artist and the album, then `DD-` when the song has a disc number,
+    `TT - ` when it has a track number, the title and the suffix; every `/` in
+    a name is `_`. A song with no disc tag gets no `DD-` (11,793 of the
+    stand-in's 11,821 songs)."""
+
+    LABEL = "Library path ↔ Navidrome"
+
+    @staticmethod
+    def song(path, title, track=0, disc=0, album="Lonerism", artist="Tame Impala",
+             suffix="flac"):
+        song = {"path": path, "title": title, "album": album, "artist": artist,
+                "displayAlbumArtist": artist, "suffix": suffix}
+        if track:
+            song["track"] = track
+        if disc:
+            song["discNumber"] = disc
+        return song
+
+    def _check(self, song, on_disk, folder=("Tame Impala", "Lonerism")):
+        with tempfile.TemporaryDirectory() as music:
+            os.makedirs(os.path.join(music, *folder))
+            open(os.path.join(music, *folder, on_disk), "wb").close()
+            saved = dict(bot._nd_path_prefix)
+            self.addCleanup(bot._nd_path_prefix.update, saved)
+            with patch.object(bot, "MUSIC_LIBRARY_PATH", music), \
+                    patch.object(bot, "nd_get_all_albums", lambda *a, **k: [{"id": "al-1"}]), \
+                    patch.object(bot, "nd_get_album_tracks", lambda *a, **k: [song]), \
+                    patch.object(bot, "_lbz_get", lambda *a, **k: {}), \
+                    patch.object(bot, "_downloads_on", lambda: False), \
+                    patch.object(bot, "_http", NoListenBrainzUserTests._NoNetwork()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                checks = {label: (ok, detail) for ok, label, detail
+                          in bot._run_diagnostics({"navidrome_user": "u",
+                                                   "navidrome_password": "p",
+                                                   "listenbrainz_user": ""})}
+        return checks[self.LABEL]
+
+    ADVICE = ("Navidrome isn't reporting the files' real paths. Turn on "
+              "Report Real Path for lb-bot's player (\"listenbrainz-bot\") "
+              "in Navidrome (Settings › Players).")
+
+    def test_a_made_up_path_asks_for_report_real_path_not_a_rescan(self):
+        ok, detail = self._check(
+            self.song("Tame Impala/Lonerism/01-05 - Music to Walk Home By.flac",
+                      "Music to Walk Home By", track=5, disc=1),
+            "05 - Music to Walk Home By.flac")
+        self.assertFalse(ok)
+        self.assertEqual(detail, self.ADVICE)
+        self.assertNotIn("rescan", detail)
+
+    def test_a_made_up_path_with_no_disc_tag_asks_for_report_real_path(self):
+        # The commonest made-up path: no disc tag, so no `DD-` (review 1).
+        ok, detail = self._check(
+            self.song("Tame Impala/Lonerism/05 - Music to Walk Home By.flac",
+                      "Music to Walk Home By", track=5),
+            "05. Music to Walk Home By.flac")
+        self.assertEqual((ok, detail), (False, self.ADVICE))
+
+    def test_a_made_up_path_whose_folder_is_not_on_disk_asks_for_it_too(self):
+        # The stand-in's own layout: the real folder is `00001 Kiosk/1983 The
+        # Kids Live 0/`, so the made-up folder does not resolve either. That
+        # read "none of N sampled files resolved", a mount problem.
+        ok, detail = self._check(
+            self.song("Kiosk/The Kids Live/01 - Denver Quinzenno 1.mp3",
+                      "Denver Quinzenno 1", track=1, album="The Kids Live",
+                      artist="Kiosk", suffix="mp3"),
+            "01.mp3", folder=("00001 Kiosk", "1983 The Kids Live 0"))
+        self.assertEqual((ok, detail), (False, self.ADVICE))
+
+    def test_a_real_name_that_is_not_on_disk_is_still_a_stale_row(self):
+        for reported, title in (("06 Gone.flac", "Gone"),
+                                # Shaped like a made-up name, but not this
+                                # song's: its title tag is another.
+                                ("06 - Gone.flac", "Gone (Live)")):
+            with self.subTest(reported=reported):
+                ok, detail = self._check(
+                    self.song(f"Tame Impala/Lonerism/{reported}", title, track=6),
+                    "05 - Music to Walk Home By.flac")
+                self.assertFalse(ok)
+                self.assertIn("index looks stale; trigger a rescan", detail)
+
+    def test_the_advice_condition(self):
+        applies = bot._real_path_advice_applies
+        self.assertTrue(applies(checked=8, resolved=0, made_up=8))
+        self.assertFalse(applies(checked=8, resolved=1, made_up=7))   # some resolve
+        self.assertFalse(applies(checked=8, resolved=0, made_up=6))   # real names missing
+        self.assertFalse(applies(checked=0, resolved=0, made_up=0))
+        fake = bot._navidrome_fake_path
+        self.assertEqual(fake(self.song("", "Music to Walk Home By", track=5, disc=1)),
+                         "Tame Impala/Lonerism/01-05 - Music to Walk Home By.flac")
+        self.assertEqual(fake(self.song("", "Music to Walk Home By", track=5)),
+                         "Tame Impala/Lonerism/05 - Music to Walk Home By.flac")
+        self.assertEqual(fake(self.song("", "Intro")), "Tame Impala/Lonerism/Intro.flac")
+        self.assertEqual(fake(self.song("", "A/B", track=2, album="X/Y", artist="AC/DC")),
+                         "AC_DC/X_Y/02 - A_B.flac")
+        self.assertEqual(fake({"path": "a/b.flac", "title": "b"}), "")   # no suffix: unknown
+        made_up = bot._navidrome_made_up_path
+        self.assertTrue(made_up(self.song("Tame Impala\\Lonerism\\02-11 - T.opus", "T",
+                                          track=11, disc=2, suffix="opus")))
+        self.assertFalse(made_up(self.song("/music/Tame Impala/Lonerism/05 - T.flac", "T",
+                                           track=5)))
+        self.assertFalse(made_up(self.song("Smashing Pumpkins/Mellon Collie/1979.flac",
+                                           "1979", track=5, album="Mellon Collie",
+                                           artist="Smashing Pumpkins")))
+
+
+class NoTelegramTests(unittest.TestCase):
+    """Worbus P1 task S1: lb-bot starts and runs with no Telegram. An empty
+    `TELEGRAM_TOKEN` used to raise `InvalidToken` at `Application.builder()`
+    in `main()`, before the web UI and every worker started."""
+
+    SECRET_TOKEN = "123456:TELEGRAM-token-secret"
+
+    class _Stop(BaseException):
+        """Ends `main()`'s or a loop's endless sleep from inside."""
+
+    def _user(self, token="", lbz="", nd_user="nd", nd_pass="nd-pass"):
+        return {"telegram_token": token, "chat_id": "42" if token else "",
+                "navidrome_user": nd_user, "navidrome_password": nd_pass,
+                "listenbrainz_user": lbz,
+                "playlist_sources": {"weekly-jams": "Weekly Jams"}}
+
+    def test_main_starts_web_and_workers_with_no_telegram_token(self):
+        started = []
+
+        def loop(name):
+            async def _loop(*a, **k):
+                started.append(name)
+            return _loop
+
+        real_sleep = asyncio.sleep
+
+        async def sleep(seconds):
+            if seconds == 3600:
+                # main()'s idle wait: give the tasks it created a turn first.
+                await real_sleep(0)
+                raise self._Stop()
+            await real_sleep(0)
+
+        def no_builder():
+            raise AssertionError("no Telegram app may be built without a token")
+
+        noop = lambda *a, **k: None
+        out = io.StringIO()
+        with patch.object(bot, "USERS", [self._user(token="")]), \
+                patch.object(bot, "WEB_UI_ENABLED", False), \
+                patch.object(bot, "start_web_dashboard",
+                             lambda: started.append("dashboard")), \
+                patch.object(bot, "_playlist_scan_loop", loop("playlist-scan")), \
+                patch.object(bot, "poll_downloads_loop", loop("poll")), \
+                patch.object(bot, "state_flush_loop", loop("flush")), \
+                patch.object(bot, "housekeeping_loop", loop("housekeeping")), \
+                patch.object(bot.Application, "builder", no_builder), \
+                patch.object(bot, "_TELEGRAM_APPS", ["unset"]), \
+                patch.object(bot, "_APPS", ["unset"]), \
+                patch.object(bot, "_TELEGRAM_STARTED", None), \
+                patch.object(bot.asyncio, "sleep", sleep), \
+                patch.object(bot.threading, "Thread"), \
+                patch.multiple(bot, _sweep_orphaned_state_tmp_files=noop,
+                               _load_state=noop, _load_review_state=noop,
+                               _hide_retired_repair_groups=noop,
+                               _recheck_old_recording_refusals=noop,
+                               _resume_placement_verification=noop,
+                               _load_prefs=noop, _mark_interrupted_jobs=noop,
+                               _flush_all_state=noop), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(self._Stop):
+                asyncio.run(bot.main())
+            self.assertEqual((bot._TELEGRAM_APPS, bot._APPS), ([], []))
+            self.assertTrue(bot._TELEGRAM_STARTED.is_set())
+        self.assertEqual(sorted(started), sorted(
+            ["dashboard", "playlist-scan", "poll", "flush", "housekeeping"]))
+        self.assertIn("required settings", out.getvalue())
+
+    def test_main_starts_the_web_ui_before_any_telegram_app(self):
+        src = inspect.getsource(bot.main)
+        built = src.index("_build_telegram_apps(")
+        for first in ("start_web_dashboard()", "_playlist_scan_loop()",
+                      "poll_downloads_loop()", "state_flush_loop()",
+                      "housekeeping_loop()"):
+            self.assertLess(src.index(first), built, first)
+        self.assertNotIn("Application.builder()", src)
+
+    def _fake_application(self, fail_for=()):
+        made = []
+
+        class _App:
+            def __init__(self, token):
+                self.token = token
+                self.bot = types.SimpleNamespace(
+                    token=token, set_my_commands=AsyncMock())
+                self.updater = types.SimpleNamespace(start_polling=AsyncMock())
+                self.initialize = AsyncMock()
+                self.start = AsyncMock()
+                self.stop = AsyncMock()
+                self.shutdown = AsyncMock()
+                self.running = False
+
+            def add_error_handler(self, *a):
+                pass
+
+            def add_handler(self, *a):
+                pass
+
+        class _Builder:
+            def token(self, token):
+                self._token = token
+                return self
+
+            def build(self):
+                if self._token in fail_for:
+                    raise RuntimeError(f"The token `{self._token}` was rejected")
+                app = _App(self._token)
+                made.append(app)
+                return app
+
+        return types.SimpleNamespace(builder=lambda: _Builder()), made
+
+    def _telegram_parts(self):
+        """The handler classes are bare `object` stubs in this file."""
+        part = lambda *a, **k: None
+        return patch.multiple(bot, CallbackQueryHandler=part, CommandHandler=part,
+                              MessageHandler=part,
+                              Update=types.SimpleNamespace(ALL_TYPES=None))
+
+    def test_a_telegram_build_failure_skips_that_user_only(self):
+        bad, good = self._user(token=self.SECRET_TOKEN), self._user(token="999:good")
+        fake, made = self._fake_application(fail_for=(self.SECRET_TOKEN,))
+        out = io.StringIO()
+        with patch.object(bot, "Application", fake), self._telegram_parts(), \
+                patch.object(bot, "USERS", [bad, good]), \
+                contextlib.redirect_stdout(out):
+            pairs = asyncio.run(bot._build_telegram_apps([bad, good]))
+        self.assertEqual([(u is good, app.token) for u, app in pairs],
+                         [(True, "999:good")])
+        made[0].updater.start_polling.assert_awaited()
+        log = out.getvalue()
+        self.assertEqual(log.count("could not start"), 1, log)
+        self.assertNotIn(self.SECRET_TOKEN, log)
+        self.assertNotIn("TELEGRAM-token-secret", log)
+
+    def test_a_polling_failure_also_skips_only_that_user(self):
+        user = self._user(token=self.SECRET_TOKEN)
+        fake, made = self._fake_application()
+        out = io.StringIO()
+
+        async def run():
+            # The failure comes after initialise and start: the half-started
+            # app is stopped, not left running.
+            orig = fake.builder
+
+            def builder():
+                b = orig()
+                real_build = b.build
+
+                def build():
+                    app = real_build()
+                    app.updater.start_polling = AsyncMock(
+                        side_effect=RuntimeError(f"bad {self.SECRET_TOKEN}"))
+                    return app
+                b.build = build
+                return b
+            fake.builder = builder
+            return await bot._build_telegram_apps([user])
+
+        with patch.object(bot, "Application", fake), self._telegram_parts(), \
+                patch.object(bot, "USERS", [user]), \
+                contextlib.redirect_stdout(out):
+            pairs = asyncio.run(run())
+        self.assertEqual(pairs, [])
+        made[0].shutdown.assert_awaited()
+        self.assertNotIn(self.SECRET_TOKEN, out.getvalue())
+
+    def test_users_without_a_token_get_no_app_and_no_log_line(self):
+        fake, made = self._fake_application()
+        out = io.StringIO()
+        with patch.object(bot, "Application", fake), contextlib.redirect_stdout(out):
+            pairs = asyncio.run(bot._build_telegram_apps([self._user(token="  ")]))
+        self.assertEqual((pairs, made), ([], []))
+        self.assertNotIn("could not start", out.getvalue())
+
+    def test_web_started_download_owner_is_the_web_key_not_a_token(self):
+        self.assertEqual(bot._web_user_key(), "web")
+        self.assertNotIn(":", bot._web_user_key())
+        user = self._user(token=self.SECRET_TOKEN)
+        search = {"sid1": {"folders": [{
+            "username": "peer", "folder": "A - B",
+            "files": [{"filename": "A - B/01.flac", "size": 1}]}]}}
+        seen = []
+
+        def enqueue(username, file, **kw):
+            seen.append(("file", kw.get("token")))
+            return True
+
+        def enqueue_folder(username, files, **kw):
+            seen.append(("folder", kw.get("token")))
+            return True, 1, "ag1"
+
+        client = _web_app().test_client()
+        with patch.object(bot, "USERS", [user]), \
+                patch.object(bot, "SLSKD_API_KEY", "k"), \
+                patch.object(bot, "_review_snapshot", lambda: {"searches": search}), \
+                patch.object(bot, "slskd_enqueue", enqueue), \
+                patch.object(bot, "slskd_enqueue_folder", enqueue_folder), \
+                patch.object(bot, "slskd_expand_directory", lambda *a, **k: []):
+            for mode in ("file", "folder"):
+                res = client.post("/api/searches/sid1/download",
+                                  json={"index": 0, "mode": mode})
+                self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        self.assertEqual(seen, [("file", "web"), ("folder", "web")])
+        # And no web-started enqueue keys its state by the Telegram token.
+        src = inspect.getsource(bot)
+        self.assertNotIn('token=user.get("telegram_token"', src)
+        self.assertNotIn('token=_default_web_user().get("telegram_token"', src)
+
+    def test_the_web_key_resolves_to_the_web_user_and_its_telegram_app(self):
+        user = self._user(token=self.SECRET_TOKEN)
+        app = types.SimpleNamespace(bot="the-bot")
+        with patch.object(bot, "USERS", [user]):
+            self.assertIs(bot._user_for_token("web"), user)
+            table = bot._token_to_app([(user, app)])
+        # The owner's setup keeps its completion messages for web-started work.
+        self.assertIs(table["web"], app)
+        self.assertIs(table[self.SECRET_TOKEN], app)
+        with patch.object(bot, "USERS", [self._user(token="")]):
+            self.assertEqual(bot._token_to_app([]), {})
+            self.assertEqual(bot._user_for_token("web")["navidrome_user"], "nd")
+
+    def test_telegram_status_still_lists_web_started_work(self):
+        user = self._user(token=self.SECRET_TOKEN)
+        with patch.object(bot, "USERS", [user]):
+            self.assertTrue(bot._token_owns("web", self.SECRET_TOKEN))
+            self.assertTrue(bot._token_owns(self.SECRET_TOKEN, self.SECRET_TOKEN))
+            self.assertFalse(bot._token_owns("web", "other:token"))
+            self.assertFalse(bot._token_owns("web", ""))
+
+    def test_retag_rescans_navidrome_without_a_token(self):
+        group = {"canonical_album_id": "canon", "canonical_mbid": "rel1",
+                 "albums": [{"id": "canon", "tracks": []},
+                            {"id": "other", "artist": "A", "name": "B",
+                             "tracks": [{"path": "/music/A/B/01.flac"}]}]}
+        scans = []
+        with patch.object(bot, "USERS", [self._user(token="")]), \
+                patch.object(bot, "MUSIC_LIBRARY_PATH", "/music"), \
+                patch.object(bot, "beets_merge_album_folders",
+                             lambda folders, mbid, albums=None: (True, "")), \
+                patch.object(bot, "nd_start_scan",
+                             lambda u, p: scans.append((u, p)) or True):
+            result = bot.apply_group_retag(group)
+        self.assertTrue(result["ok"])
+        self.assertEqual(scans, [("nd", "nd-pass")])
+
+    def _run_scan_loop(self, users, missing):
+        calls = {"scanned": [], "sent": [], "landed": []}
+
+        async def sleep(seconds):
+            raise self._Stop()
+
+        def scan(user):
+            calls["scanned"].append(user["listenbrainz_user"])
+            return list(missing)
+
+        async def send(app, user, tracks):
+            calls["sent"].append(user["listenbrainz_user"])
+
+        with patch.object(bot, "USERS", users), \
+                patch.object(bot, "RUN_SCAN_ON_START", True), \
+                patch.object(bot, "_TELEGRAM_APPS", []), \
+                patch.object(bot, "_last_scan_ts", {}), \
+                patch.object(bot, "scan_user", scan), \
+                patch.object(bot, "send_missing_tracks", send), \
+                patch.object(bot, "_land_playlist_scan",
+                             lambda user, tracks, progress=None:
+                             calls["landed"].append((user["listenbrainz_user"], len(tracks)))), \
+                patch.object(bot, "_save_state", lambda: None), \
+                patch.object(bot.asyncio, "sleep", sleep), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(self._Stop):
+                asyncio.run(bot._playlist_scan_loop())
+        return calls
+
+    def test_playlist_scan_runs_without_telegram(self):
+        track = {"artist": "A", "title": "T", "mbid": "", "playlist": "Weekly Jams"}
+        calls = self._run_scan_loop(
+            [self._user(token="", lbz="me"), self._user(token="", lbz="")], [track])
+        self.assertEqual(calls["scanned"], ["me"])
+        self.assertEqual(calls["sent"], [])
+        self.assertEqual(calls["landed"], [("me", 1)])
+
+    def test_playlist_scan_with_no_listenbrainz_user_scans_nothing(self):
+        calls = {"n": 0}
+
+        def scan(user):
+            calls["n"] += 1
+            return []
+
+        with patch.object(bot, "USERS", [self._user(token="", lbz="")]), \
+                patch.object(bot, "scan_user", scan), \
+                contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(bot._playlist_scan_loop())  # returns: nothing to do
+        self.assertEqual(calls["n"], 0)
+
+    def test_missing_required_config_names_only(self):
+        with patch.object(bot, "USERS", [self._user(nd_user="", nd_pass="s3cret-pass")]), \
+                patch.dict(os.environ, {"NAVIDROME_URL": "http://nd:4533"}), \
+                patch.object(bot, "HUB_NOTIFY_URL", ""), \
+                patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-value"):
+            missing = bot._missing_required_config()
+        self.assertEqual(missing, ["NAVIDROME_USER", "LB_BOT_HUB_URL"])
+        joined = " ".join(missing)
+        for value in ("s3cret-pass", "hub-secret-value", "http://nd:4533"):
+            self.assertNotIn(value, joined)
+        with patch.object(bot, "USERS", [self._user()]), \
+                patch.dict(os.environ, {"NAVIDROME_URL": "http://nd:4533"}), \
+                patch.object(bot, "HUB_NOTIFY_URL", "http://hub"), \
+                patch.object(bot, "HUB_NOTIFY_TOKEN", "t"):
+            self.assertEqual(bot._missing_required_config(), [])
+            # Review S#7: the module value has a default, so it is the
+            # environment that says whether the setting was given.
+            for unset in ("", "  "):
+                with patch.dict(os.environ, {"NAVIDROME_URL": unset}), \
+                        patch.object(bot, "NAVIDROME_URL", "http://navidrome:4533"):
+                    self.assertEqual(bot._missing_required_config(), ["NAVIDROME_URL"])
+            env = {k: v for k, v in os.environ.items() if k != "NAVIDROME_URL"}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(bot._missing_required_config(), ["NAVIDROME_URL"])
+
+    def test_hub_token_is_read_stripped(self):
+        """Review S#10: a token from a secrets file ends in a newline, which
+        the hub's `Bearer` never carries."""
+        line = next(l for l in inspect.getsource(bot).splitlines()
+                    if l.startswith("HUB_NOTIFY_TOKEN = "))
+        for raw in ("hub-token\n", "  hub-token \r\n", "hub-token"):
+            ns = {"os": types.SimpleNamespace(environ={"LB_BOT_HUB_TOKEN": raw})}
+            exec(line, ns)
+            self.assertEqual(ns["HUB_NOTIFY_TOKEN"], "hub-token", repr(raw))
+        ns = {"os": types.SimpleNamespace(environ={})}
+        exec(line, ns)
+        self.assertEqual(ns["HUB_NOTIFY_TOKEN"], "")
+
+
+
+class DownloadsModeTests(unittest.TestCase):
+    """Worbus P1 task S2: downloading is a mode, off without an slskd API key.
+    With it off lb-bot makes no slskd call at all, and every route that would
+    start or need a download answers 409 `downloads_off`."""
+
+    SLSKD = "http://slskd.test:5030"
+
+    # Every route that searches, enqueues, places, fills, retries, cancels a
+    # transfer or expands a peer folder. A new download route is added here
+    # and decorated `@needs_downloads`; the test below fails on either alone.
+    DOWNLOAD_ROUTES = {
+        "POST /api/gaps/<group_id>/fetch",
+        "POST /api/gaps/<group_id>/auto",
+        "POST /api/gaps/<group_id>/cancel",
+        "POST /api/placements/identify",
+        "POST /api/placements/<placement_id>/confirm",
+        "POST /api/placements/<placement_id>/dismiss",
+        "POST /api/placements/<placement_id>/delete",
+        "GET /api/debug/slskd-search",
+        "GET /api/debug/album-search",
+        "POST /api/search",
+        "POST /api/searches/<sid>/download",
+        "GET /api/album/sources",
+        "POST /api/album/download",
+        "POST /api/album/cancel",
+        "POST /api/place-folder",
+        "POST /api/beets/import",
+        "POST /api/groups/<group_id>/sources",
+        "GET /api/groups/<group_id>/sources/<int:source_index>/files",
+        "POST /api/groups/<group_id>/tracks/<int:track_index>/pick-file",
+        "POST /api/groups/<group_id>/tracks/<int:track_index>/place-anyway",
+        "POST /api/groups/<group_id>/reconcile-downloads",
+        "POST /api/groups/<group_id>/sources/<int:source_index>/download",
+        "POST /api/downloads/cancel",
+        "POST /api/downloads/clear",
+        "POST /api/imports/<recid>/retry",
+        "POST /api/imports/<recid>/remove-stale-and-retry",
+        "POST /api/imports/<recid>/merge-retry",
+        "POST /api/groups/<group_id>/downloads/<download_id>/match-selected",
+        "POST /api/groups/<group_id>/downloads/<download_id>/match",
+        "POST /api/groups/<group_id>/download",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _web_app()
+
+    def _decorated(self):
+        out = {}
+        for rule in self.app.url_map.iter_rules():
+            view = self.app.view_functions[rule.endpoint]
+            if not getattr(view, "_needs_downloads", False):
+                continue
+            for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
+                out[f"{method} {rule.rule}"] = rule
+        return out
+
+    @staticmethod
+    def _url(rule):
+        return re.sub(r"<(?:int:)?([a-z_]+)>",
+                      lambda m: "0" if "int:" in m.group(0) else "x", rule.rule)
+
+    def test_downloads_flag_follows_the_api_key(self):
+        # The module's own line, evaluated against each key.
+        line = next(l for l in inspect.getsource(bot).splitlines()
+                    if l.startswith("DOWNLOADS_ON = "))
+
+        def flag(key):
+            ns = {"SLSKD_API_KEY": key}
+            exec(line, ns)
+            return ns["DOWNLOADS_ON"]
+
+        self.assertFalse(flag(""))
+        self.assertFalse(flag("   \t"))
+        self.assertTrue(flag("abc"))
+        with patch.object(bot, "DOWNLOADS_ON", False):
+            self.assertFalse(bot._downloads_on())
+        with patch.object(bot, "DOWNLOADS_ON", True):
+            self.assertTrue(bot._downloads_on())
+
+    def test_every_download_route_answers_409_downloads_off(self):
+        decorated = self._decorated()
+        self.assertEqual(set(decorated), self.DOWNLOAD_ROUTES)
+        client = self.app.test_client()
+        with patch.object(bot, "DOWNLOADS_ON", False):
+            for key, rule in sorted(decorated.items()):
+                method = key.split(" ", 1)[0]
+                res = client.open(self._url(rule), method=method, json={})
+                self.assertEqual(res.status_code, 409, key)
+                self.assertEqual(res.get_json(), {
+                    "code": "downloads_off",
+                    "error": "Downloading is not set up on this server."}, key)
+
+    # Routes whose path looks like downloading but which do none, reviewed
+    # one by one (review S#11): reads, a flag, a rescan of disk, a task or
+    # transfer-row dismissal, the wishlist (kept in both modes). A new route
+    # whose path matches DOWNLOAD_SHAPED must be decorated `@needs_downloads`
+    # (and added to DOWNLOAD_ROUTES) or added here, deliberately.
+    DOWNLOAD_SHAPED = re.compile(
+        r"download|fetch|plac|source|retry|cancel|search|expand|enqueue|pick|match|"
+        r"fill|sweep|transfer|slskd|import|peer|folder|wishlist|gap")
+    NOT_DOWNLOAD_ROUTES = {
+        "GET /api/beets/folders",
+        "POST /api/beets/import-preview",
+        "GET /api/download-folders",
+        "GET /api/downloads",
+        "GET /api/fills",
+        "GET /api/gaps",
+        "GET /api/gaps/<group_id>",
+        "POST /api/gaps/<group_id>/allow-mp3",
+        "GET /api/gaps/<group_id>/duplicate-files",
+        "POST /api/gaps/<group_id>/rescan",
+        "GET /api/groups/<group_id>/downloads/<download_id>/match",
+        "POST /api/groups/<group_id>/downloads/<download_id>/match-preview",
+        "POST /api/groups/<group_id>/match-mode",
+        "GET /api/groups/<group_id>/sources",
+        "POST /api/place-folder/candidates",
+        "GET /api/placements",
+        "GET /api/searches",
+        "POST /api/tasks/<task_id>/cancel",
+        "GET /api/transfers",
+        "POST /api/transfers/<transfer_id>/dismiss",
+        "GET /api/wishlist",
+        "POST /api/wishlist",
+        "POST /api/wishlist/remove",
+    }
+
+    def test_a_download_shaped_route_is_decorated_or_listed(self):
+        """Review S#11: DOWNLOAD_ROUTES is pinned to the decorated set, and a
+        new route that looks like a download route cannot slip past both."""
+        decorated = set(self._decorated())
+        routes = {f"{m} {r.rule}" for r in self.app.url_map.iter_rules()
+                  for m in r.methods - {"HEAD", "OPTIONS"}}
+        shaped = {k for k in routes if self.DOWNLOAD_SHAPED.search(k.split(" ", 1)[1])}
+        self.assertEqual(sorted(shaped - decorated - self.NOT_DOWNLOAD_ROUTES), [],
+                         "download-shaped routes neither decorated nor listed")
+        self.assertEqual(sorted(self.NOT_DOWNLOAD_ROUTES & decorated), [])
+        self.assertEqual(sorted(self.NOT_DOWNLOAD_ROUTES - routes), [], "listed, no such route")
+        # Every decorated route is one of the download-shaped ones too, so the
+        # pattern is not too narrow for the set it guards.
+        self.assertEqual(sorted(decorated - shaped), [])
+
+    # Every function that names SLSKD_URL, by its nesting (`outer.inner`).
+    # All but the display-only one send requests to slskd, and each sits in
+    # a function that checks `_downloads_on()` in its own body or is a route
+    # decorated `@needs_downloads`.
+    SLSKD_URL_SITES = {
+        "slskd_run_search", "slskd_run_search._fetch_responses",
+        "slskd_run_search._fetch_inline_responses",
+        "slskd_search_probe", "slskd_search_probe._probe", "slskd_enqueue",
+        "slskd_expand_directory", "_slskd_fetch_all_downloads", "_slskd_cancel",
+        "_run_diagnostics._slskd", "start_web_dashboard.api_downloads_clear",
+        "_settings_cards",
+    }
+    SLSKD_URL_DISPLAY_ONLY = {"_settings_cards"}
+
+    def test_telegram_says_downloading_is_off(self):
+        """Review S#12: `/album`, `/search` and the download buttons say
+        downloading is not set up, instead of "nothing found"."""
+        said = []
+
+        async def reply(text, **k):
+            said.append(text)
+
+        def update(data=None):
+            q = types.SimpleNamespace(
+                data=data, message=types.SimpleNamespace(chat_id=1),
+                answer=lambda *a, **k: asyncio.sleep(0),
+                edit_message_text=lambda text, **k: reply(text))
+            return types.SimpleNamespace(
+                message=types.SimpleNamespace(reply_text=reply),
+                effective_chat=types.SimpleNamespace(id=1), callback_query=q)
+
+        ctx = types.SimpleNamespace(args=["Kino", "-", "Gruppa", "krovi"], bot=None)
+        searched = []
+        errors = types.ModuleType("telegram.error")
+        for name in ("TelegramError", "BadRequest", "TimedOut", "NetworkError"):
+            setattr(errors, name, type(name, (Exception,), {}))
+        with patch.dict(sys.modules, {"telegram.error": errors}), \
+                patch.object(sys.modules["telegram"], "error", errors, create=True), \
+                patch.object(bot, "DOWNLOADS_ON", False), \
+                patch.object(bot, "_resolve_token", lambda c: "tok"), \
+                patch.object(bot, "mbz_search_release_groups",
+                             lambda *a, **k: searched.append(a) or []), \
+                patch.object(bot, "_do_search_and_render",
+                             lambda *a, **k: searched.append(a) or asyncio.sleep(0)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(bot.album_command(update(), ctx))
+            asyncio.run(bot.search_command(update(), ctx))
+            for data in ("dlall|p1", "DLA|p1", "ALD|x", "AP|a|0", "DA|s|0", "ARETRY|x"):
+                asyncio.run(bot.callback_handler(update(data), ctx))
+        off = bot.DOWNLOADS_OFF_BODY["error"]
+        self.assertEqual(said, [off] * 8)
+        self.assertEqual(searched, [])
+
+    def test_every_slskd_request_site_is_guarded(self):
+        """Review S#11: a new use of SLSKD_URL outside the guarded functions
+        fails here, before it can reach slskd with downloading off. Read from
+        the module's source (AST), not by line numbers."""
+        import ast
+        tree = ast.parse(inspect.getsource(bot))
+        funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+        def own_nodes(fn):
+            # The function's own body, without the functions nested in it: a
+            # check in a sibling helper guards nothing here.
+            todo = list(ast.iter_child_nodes(fn))
+            while todo:
+                node = todo.pop()
+                yield node
+                if not isinstance(node, funcs + (ast.Lambda,)):
+                    todo.extend(ast.iter_child_nodes(node))
+
+        def guarded(fn):
+            if any(isinstance(d, ast.Name) and d.id == "needs_downloads"
+                   for d in fn.decorator_list):
+                return True
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                       and n.func.id == "_downloads_on" for n in own_nodes(fn))
+
+        sites = {}
+
+        def walk(node, chain):
+            for child in ast.iter_child_nodes(node):
+                inner = chain + [child] if isinstance(child, funcs) else chain
+                if isinstance(child, ast.Name) and child.id == "SLSKD_URL" \
+                        and isinstance(child.ctx, ast.Load) and inner:
+                    sites[".".join(f.name for f in inner)] = (inner, child.lineno)
+                walk(child, inner)
+
+        walk(tree, [])
+        self.assertEqual(sorted(sites), sorted(self.SLSKD_URL_SITES),
+                         "a new use of SLSKD_URL: guard it, then list it here")
+        for name, (chain, line) in sorted(sites.items()):
+            if name in self.SLSKD_URL_DISPLAY_ONLY:
+                continue
+            # `start_web_dashboard` only holds the routes; it guards nothing.
+            holders = [f for f in chain if f.name != "start_web_dashboard"]
+            self.assertTrue(any(guarded(f) for f in holders),
+                            f"{name} (line {line}) uses SLSKD_URL without a "
+                            f"_downloads_on() check or @needs_downloads")
+
+    class _NoSlskd:
+        """`bot._http` that fails the test on any request to slskd. Anything
+        else answers as an unreachable host would."""
+
+        def __init__(self, test, slskd):
+            self.test, self.slskd, self.calls = test, slskd, []
+
+        def _call(self, method, url, *a, **k):
+            self.calls.append((method, url))
+            if str(url).startswith(self.slskd):
+                raise AssertionError(f"slskd called while off: {method} {url}")
+            raise ConnectionError("unreachable in this test")
+
+        def get(self, url, *a, **k):
+            return self._call("GET", url, *a, **k)
+
+        def post(self, url, *a, **k):
+            return self._call("POST", url, *a, **k)
+
+        def put(self, url, *a, **k):
+            return self._call("PUT", url, *a, **k)
+
+        def delete(self, url, *a, **k):
+            return self._call("DELETE", url, *a, **k)
+
+        def slskd_calls(self):
+            return [c for c in self.calls if str(c[1]).startswith(self.slskd)]
+
+    class _Stop(BaseException):
+        pass
+
+    def test_no_slskd_call_when_off(self):
+        http = self._NoSlskd(self, self.SLSKD)
+        client = self.app.test_client()
+        saved = dict(bot.pending_downloads)
+        self.addCleanup(lambda: (bot.pending_downloads.clear(),
+                                 bot.pending_downloads.update(saved)))
+        # A transfer a poll would otherwise ask slskd about.
+        bot.pending_downloads[("peer", "A/01.flac")] = {
+            "token": "web", "chat_id": "", "track": {"artist": "A", "title": "T"}}
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) > 1:
+                raise self._Stop()
+
+        with patch.object(bot, "DOWNLOADS_ON", False), \
+                patch.object(bot, "SLSKD_URL", self.SLSKD), \
+                patch.object(bot, "SLSKD_API_KEY", ""), \
+                patch.object(bot, "_http", http), \
+                patch.object(bot, "_DOWNLOADS_CACHE", {"ts": 0.0, "value": []}), \
+                patch.object(bot, "_nd_album_index", lambda *a, **k: {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            # Every view a client polls.
+            for path in ("/api/summary", "/api/transfers", "/api/downloads",
+                         "/api/activity", "/api/attention", "/api/system/health",
+                         "/api/diagnostics", "/api/action-center", "/api/settings"):
+                res = client.get(path)
+                self.assertLess(res.status_code, 500, path)
+            # Every download route.
+            for key, rule in sorted(self._decorated().items()):
+                client.open(self._url(rule), method=key.split(" ", 1)[0], json={})
+            # The poller, once.
+            asyncio.run(bot._poll_downloads_once({}))
+            # The wishlist sweep, once: it neither searches nor reads the list.
+            with patch.object(bot.time, "sleep", sleep), \
+                    patch.object(bot, "_wishlist_due",
+                                 lambda *a: self.fail("the sweep read its rows")):
+                with self.assertRaises(self._Stop):
+                    bot._wishlist_sweep_loop()
+            # Diagnostics, and each slskd function directly.
+            checks = {label: (ok, detail) for ok, label, detail
+                      in bot._run_diagnostics(bot._default_web_user())}
+            self.assertEqual(bot.slskd_run_search("A - B"), [])
+            self.assertEqual(bot.slskd_get_all_downloads(True), [])
+            self.assertEqual(bot._slskd_fetch_all_downloads(), [])
+            self.assertFalse(bot.slskd_enqueue("peer", {"filename": "x.flac"}))
+            self.assertEqual(bot.slskd_expand_directory(
+                "peer", {"raw_folder": "A\\B"}, {}), [])
+            self.assertFalse(bot._slskd_cancel("peer", "x.flac", "t1"))
+            self.assertFalse(bot.slskd_search_probe("A - B")["ok"])
+            self.assertFalse(bot._wishlist_retry_one({"rgid": "rg1"}))
+        self.assertEqual(http.slskd_calls(), [])
+        self.assertTrue(checks["slskd"][0])
+        self.assertIn("off", checks["slskd"][1])
+        self.assertTrue(checks["Downloads folder"][0])
+        # The poller left its row as it was.
+        self.assertIn(("peer", "A/01.flac"), bot.pending_downloads)
+
+    def test_health_and_summary_carry_downloads(self):
+        client = self.app.test_client()
+        for on, word in ((True, "on"), (False, "off")):
+            with patch.object(bot, "DOWNLOADS_ON", on), \
+                    patch.object(bot, "_index_read_head", lambda conn: (3, "ep")), \
+                    patch.object(bot, "_index_db", lambda: None), \
+                    patch.object(bot, "_index_read_hwm", lambda: {"epoch": "ep", "hwm": 2}):
+                body, status = bot._index_health_view()
+                self.assertEqual(status, 200)
+                self.assertEqual(body["downloads"], word)
+                self.assertIsInstance(body["missingConfig"], list)
+            with patch.object(bot, "DOWNLOADS_ON", on), \
+                    patch.object(bot, "_gaps_view", lambda *a, **k: {
+                        "counts": {}, "scanStatus": "", "scanMessage": ""}), \
+                    patch.object(bot, "_transfers_view",
+                                 lambda: {"counts": {}, "transfers": []}), \
+                    patch.object(bot, "_nd_album_index", lambda *a, **k: {}):
+                self.assertEqual(client.get("/api/summary").get_json()["downloads"], word)
+
+    def test_settings_card_says_how_to_turn_downloading_on(self):
+        with patch.object(bot, "DOWNLOADS_ON", False):
+            card = next(c for c in bot._settings_cards({})["cards"] if c["key"] == "slskd")
+        self.assertEqual(card["state"], "off")
+        self.assertIn("SLSKD_URL", card["fix"])
+        self.assertIn("SLSKD_API_KEY", card["fix"])
+        with patch.object(bot, "DOWNLOADS_ON", True):
+            card = next(c for c in bot._settings_cards({})["cards"] if c["key"] == "slskd")
+        self.assertNotIn("state", card)
+        self.assertEqual(card["title"], "slskd")
+
+    def test_download_routes_unchanged_when_on(self):
+        """`/api/searches/<sid>/download` as `test_web_started_download_owner_…`
+        drives it, with the key set: the route works as before."""
+        search = {"sid1": {"folders": [{
+            "username": "peer", "folder": "A - B",
+            "files": [{"filename": "A - B/01.flac", "size": 1}]}]}}
+        seen = []
+        client = self.app.test_client()
+        with patch.object(bot, "DOWNLOADS_ON", True), \
+                patch.object(bot, "_review_snapshot", lambda: {"searches": search}), \
+                patch.object(bot, "slskd_enqueue",
+                             lambda username, file, **kw: seen.append(username) or True):
+            res = client.post("/api/searches/sid1/download", json={"index": 0, "mode": "file"})
+        self.assertEqual((res.status_code, res.get_json()), (200, {"ok": True}))
+        self.assertEqual(seen, ["peer"])
+
+    def test_wishlist_add_works_when_off(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        client = self.app.test_client()
+        with patch.object(bot, "DOWNLOADS_ON", False):
+            res = client.post("/api/wishlist", json={"rgid": "rg-1", "artist": "A",
+                                                     "title": "B"})
+            self.assertEqual(res.status_code, 200)
+            rows = client.get("/api/wishlist").get_json()["wishlist"]
+            self.assertEqual([r["rgid"] for r in rows], ["rg-1"])
+            res = client.post("/api/wishlist/remove", json={"rgid": "rg-1"})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(client.get("/api/wishlist").get_json()["wishlist"], [])
+
+
+
+class IndexProgressScanNowTests(unittest.TestCase):
+    """Worbus P1 task S3: the index build's progress rides the push to the
+    hub, Scan now works for an artist with no MBID, any scan of an artist
+    (the worker's too) shows on its discography route with counts, and an
+    artist MusicBrainz cannot match says so (`unresolved`)."""
+
+    USER = AutoIndexWorkerTests.USER
+    nd = staticmethod(AutoIndexWorkerTests.nd)
+    meta = staticmethod(AutoIndexWorkerTests.meta)
+    patched = AutoIndexWorkerTests.patched
+    state_with = AutoIndexWorkerTests.state_with
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(isolated_review())
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        stack.enter_context(patch.dict(bot._auto_index_public, {}, clear=True))
+        stack.enter_context(patch.dict(bot._artist_scans, {}, clear=True))
+        stack.enter_context(patch.dict(bot._artist_scan_pending, {}, clear=True))
+        stack.enter_context(patch.object(bot, "LB_BOT_AUTO_INDEX", True))
+        self.now = 1_000_000_000.0
+        self.client = _web_app().test_client()
+
+    def discog(self, mbid, name, *a, **k):
+        return {"artist_mbid": mbid, "artist_name": name, "review_groups": [],
+                "releases": [{"rgid": "rg-" + mbid, "title": "A", "status": "complete"}]}
+
+    # ── progress ────────────────────────────────────────────────────────────
+
+    def test_unindexed_counts_missing_only(self):
+        fresh, old = self.now - 86400, self.now - (bot.LB_BOT_INDEX_TTL_DAYS * 1.3) * 86400
+        artists = [self.nd("1", "Ay", "mb-1"), self.nd("2", "Bee"), self.nd("3", "Cee", "mb-3"),
+                   self.nd("4", "Dee", "mb-4"), self.nd("5", "Eee")]
+        meta = [self.meta("mb-1", "1", scanned_at=fresh),
+                self.meta("mb-3", "", scan_version=0),          # a stub: not "missing"
+                self.meta("mb-4", "4", scanned_at=old)]          # stale: not "missing"
+        seen = []
+
+        def discog(mbid, name, *a, **k):
+            seen.append(bot._index_unindexed_progress())
+            return self.discog(mbid, name)
+
+        state = self.state_with(artists)
+        with self.patched(build_artist_discography=discog,
+                          _auto_index_refresh=lambda *a: None,
+                          _auto_index_read_meta=lambda: list(meta),
+                          mbz_search_artists=lambda *a, **k: [{"mbid": "mb-" + a[0]}]):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "indexed")
+        # Two artists have no row at all; the stub and the stale row are work,
+        # but not "not indexed yet".
+        self.assertEqual(seen, [{"unindexed": 2, "total": 5, "current": "Bee"}])
+        self.assertEqual(bot._index_unindexed_progress(),
+                         {"unindexed": 1, "total": 5, "current": "Bee"})
+
+    def test_unindexed_excludes_covered_and_backoff(self):
+        artists = [self.nd("1", "Held back"), self.nd("2", "Covered"),
+                   self.nd("3", "Plain"), self.nd("9", "Holder", "mb-x")]
+        meta = [self.meta("mb-x", "9", scanned_at=self.now - 3600)]
+        state = self.state_with(artists)
+        state["failures"]["1"] = {"count": 1, "retry_at": self.now + 600, "error": "MB"}
+        state["covered"]["2"] = "mb-x"
+        seen = []
+
+        def discog(mbid, name, *a, **k):
+            seen.append(bot._index_unindexed_progress()["unindexed"])
+            return self.discog(mbid, name)
+
+        with self.patched(build_artist_discography=discog,
+                          _auto_index_refresh=lambda *a: None,
+                          _auto_index_read_meta=lambda: list(meta),
+                          mbz_search_artists=lambda *a, **k: [{"mbid": "mb-plain"}]):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "indexed")
+            self.assertEqual(bot._auto_index_tick(state, self.now + 1, self.USER), "idle")
+        self.assertEqual(seen, [1])
+        # Reaches 0 although "Held back" and "Covered" have no row of their own.
+        self.assertEqual(bot._index_unindexed_progress()["unindexed"], 0)
+        with patch.object(bot, "LB_BOT_AUTO_INDEX", False):
+            self.assertIsNone(bot._index_unindexed_progress())
+
+    def test_unindexed_follows_a_failure_and_a_pause(self):
+        """Review S#4: a failed candidate is no longer counted as not indexed
+        (it waits), also while the worker is backed off; and one whose
+        back-off has ended does not come back as "1 left"."""
+        artists = [self.nd("1", "Ay flaky"), self.nd("2", "Bee fine")]
+        state = self.state_with(artists)
+
+        def down(*a, **k):
+            raise bot.MusicBrainzUnavailable("MusicBrainz did not answer (HTTP 503)")
+
+        with self.patched(_auto_index_refresh=lambda *a: None, mbz_search_artists=down):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "failed")
+        # "Ay flaky" (first in the queue) failed: it waits; "Bee fine" is left.
+        self.assertEqual(bot._index_unindexed_progress()["unindexed"], 1)
+        self.assertGreater(state["paused_until"], self.now)
+        # A manual build wrote "Bee fine" during the pause: the outage tick says so.
+        bot._index_store_artist({"artist_mbid": "mb-fine", "artist_name": "Bee fine",
+                                 "releases": []}, nd_artist_id="2")
+        with self.patched(_auto_index_refresh=lambda *a: self.fail("refreshed in a pause")):
+            self.assertEqual(bot._auto_index_tick(state, self.now + 1, self.USER), "outage")
+        self.assertEqual(bot._index_unindexed_progress()["unindexed"], 0)
+        with self.patched(_auto_index_manual_build_running=lambda: True):
+            self.assertEqual(bot._auto_index_tick(state, self.now + 2, self.USER), "paused")
+        self.assertEqual(bot._index_unindexed_progress()["unindexed"], 0)
+        # Back-off and pause over: "Ay flaky" is due again but is not "1 left".
+        later = max(state["paused_until"], state["failures"]["1"]["retry_at"]) + 1
+        seen = []
+
+        def search(*a, **k):
+            seen.append(bot._index_unindexed_progress()["unindexed"])
+            raise bot.MusicBrainzUnavailable("still down")
+
+        with self.patched(_auto_index_refresh=lambda *a: None, mbz_search_artists=search):
+            self.assertEqual(bot._auto_index_tick(state, later, self.USER), "failed")
+        self.assertEqual(seen, [0])
+        self.assertEqual(bot._index_unindexed_progress()["unindexed"], 0)
+
+    def test_progress_rides_the_push_and_is_throttled(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        posts = []
+
+        def post(url, json=None, headers=None, timeout=None):
+            posts.append(json)
+            return types.SimpleNamespace(status_code=200)
+
+        p1 = {"unindexed": 10, "total": 12, "current": "Ay"}
+        p2 = {"unindexed": 9, "total": 12, "current": "Bee"}
+        p3 = {"unindexed": 8, "total": 12, "current": "Cee"}
+        state = {"acked": None, "attempted_at": None}
+        with patch.object(bot.requests, "post", post), \
+                patch.object(bot, "HUB_NOTIFY_URL", "http://hub.test"), \
+                patch.object(bot, "HUB_NOTIFY_TOKEN", "tok"):
+            tick = lambda st, t, head, prog: bot._index_push_tick(
+                st, t, head, bot._index_push_post, prog)
+            state = tick(state, 0.0, (5, "e"), p1)
+            self.assertEqual(posts, [{"seq": 5, "epoch": "e", "progress": p1}])
+            # The head is unchanged: two changes inside 5 s send one progress.
+            state = tick(state, 3.0, (5, "e"), p2)
+            state = tick(state, 4.9, (5, "e"), p3)
+            self.assertEqual(len(posts), 1)
+            state = tick(state, 5.1, (5, "e"), p3)
+            self.assertEqual(posts[-1], {"seq": 5, "epoch": "e", "progress": p3})
+            # Nothing changed: nothing sent.
+            state = tick(state, 60.0, (5, "e"), p3)
+            self.assertEqual(len(posts), 2)
+            # A head change still goes at the head's own cadence, with the
+            # progress as it is.
+            state = tick(state, 62.0, (6, "e"), p3)
+            self.assertEqual(posts[-1], {"seq": 6, "epoch": "e", "progress": p3})
+            # No progress (LB_BOT_AUTO_INDEX=0): the body is as it always was.
+            state = tick(state, 70.0, (7, "e"), None)
+            self.assertEqual(posts[-1], {"seq": 7, "epoch": "e"})
+        self.assertEqual(len(posts), 4)
+
+    # ── Scan now ────────────────────────────────────────────────────────────
+
+    def _library(self, *artists):
+        return self.patched(_nd_artist_index=lambda force=False: [dict(a) for a in artists],
+                            _default_web_user=lambda: self.USER)
+
+    def test_scan_by_nd_id_without_mbid_resolves_then_scans(self):
+        started, scans, searched = [], [], []
+
+        def task_run(kind, label, target, total=0, **extra):
+            started.append(target)
+            return "task-1"
+
+        def search(name, limit=8, strict=False, once=False):
+            searched.append((name, strict))
+            return [{"mbid": "mb-kino", "name": "Kino"}]
+
+        with self._library(self.nd("nd-7", "Kino")), \
+                self.patched(_task_run=task_run, mbz_search_artists=search,
+                             _artist_discography_task=lambda tid, mbid, name, user, nd_id="",
+                             skip_library=False: scans.append((tid, mbid, name, nd_id))):
+            res = self.client.post("/api/artist/discography", json={"nd_id": "nd-7"})
+            self.assertEqual((res.status_code, res.get_json()),
+                             (200, {"ok": True, "task_id": "task-1"}))
+            # Resolved on the task's thread, not the request's.
+            self.assertEqual(searched, [])
+            started[0]("task-1")
+        self.assertEqual(searched, [("Kino", True)])
+        self.assertEqual(scans, [("task-1", "mb-kino", "Kino", "nd-7")])
+
+    def test_scan_by_nd_id_uses_a_tag_mbid_without_a_search(self):
+        scans = []
+        with self._library(self.nd("nd-7", "Kino", "mb-tag")), \
+                self.patched(_task_run=lambda kind, label, target, **k: target("t") or "t",
+                             mbz_search_artists=lambda *a, **k: self.fail("searched"),
+                             _artist_discography_task=lambda tid, mbid, *a, **k:
+                             scans.append(mbid)):
+            res = self.client.post("/api/artist/discography", json={"nd_id": "nd-7"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(scans, ["mb-tag"])
+
+    def test_scan_by_nd_id_unresolvable_marks_unresolved(self):
+        finished = {}
+
+        def finish(task_id, summary="", error="", **extra):
+            finished[task_id] = (summary, error, extra)
+
+        with self._library(self.nd("nd-7", "Nobody Knows")), \
+                self.patched(_task_run=lambda kind, label, target, **k: target("t") or "t",
+                             _task_finish=finish,
+                             _notify_hub_library_change=lambda *a, **k: None,
+                             mbz_search_artists=lambda *a, **k: []):
+            res = self.client.post("/api/artist/discography", json={"nd_id": "nd-7"})
+        self.assertEqual(res.status_code, 200)
+        view = bot._artist_discography_read_view("", "nd-7")
+        self.assertEqual((view["indexed"], view["unresolved"], view["releases"]),
+                         (True, True, []))
+        self.assertEqual(view["scan"]["state"], "done")
+        self.assertEqual(finished["t"][1], "")
+        # An outage is not "no match": nothing is written, the scan failed.
+        def down(*a, **k):
+            raise bot.MusicBrainzUnavailable("MusicBrainz did not answer (HTTP 503)")
+
+        with self._library(self.nd("nd-8", "Later")), \
+                self.patched(_task_run=lambda kind, label, target, **k: target("u") or "u",
+                             _task_finish=finish,
+                             _notify_hub_library_change=lambda *a, **k: None,
+                             mbz_search_artists=down):
+            self.client.post("/api/artist/discography", json={"nd_id": "nd-8"})
+        view = bot._artist_discography_read_view("", "nd-8")
+        self.assertFalse(view["indexed"])
+        self.assertEqual(view["scan"]["state"], "failed")
+        self.assertTrue(finished["u"][1])
+
+    def test_a_non_admin_cannot_match_an_artist_manually(self):
+        """Review S#2: a `user`-role Rescan keeps to the MBIDs the artist
+        already carries; a foreign `mbid`, a client `name` and `external`
+        are an admin's "Match manually"."""
+        scans, searched = [], []
+
+        def search(name, limit=8, strict=False, once=False):
+            searched.append(name)
+            return [{"mbid": "mb-kino", "name": "Kino"}]
+
+        def scan(tid, mbid, name, u, nd_id="", skip_library=False):
+            # A stub scan leaves no running entry behind.
+            scans.append((mbid, name, nd_id, skip_library))
+            bot._artist_scans.clear()
+            bot._artist_scan_pending.clear()
+
+        user = _web_app(as_role="user").test_client()
+        sync = dict(_task_run=lambda kind, label, target, **k: target("t") or "t",
+                    _artist_discography_task=scan, mbz_search_artists=search)
+        with self._library(self.nd("nd-7", "Kino")), self.patched(**sync):
+            res = user.post("/api/artist/discography", json={
+                "nd_id": "nd-7", "mbid": "mb-foreign", "name": "Someone Else",
+                "external": True})
+            self.assertEqual(res.status_code, 200)
+            # Resolved as Scan now would: Navidrome's name, never the body's.
+            self.assertEqual(searched, ["Kino"])
+            self.assertEqual(scans, [("mb-kino", "Kino", "nd-7", False)])
+            # The MBID its stored row was scanned under is the artist's own.
+            bot._index_store_artist({"artist_mbid": "mb-old", "artist_name": "Kino",
+                                     "releases": []}, nd_artist_id="nd-7")
+            scans.clear()
+            user.post("/api/artist/discography", json={"nd_id": "nd-7", "mbid": "mb-old",
+                                                       "name": "Someone Else"})
+            self.assertEqual(scans, [("mb-old", "Kino", "nd-7", False)])
+            # An admin still matches manually.
+            scans.clear()
+            self.client.post("/api/artist/discography", json={
+                "nd_id": "nd-7", "mbid": "mb-foreign", "name": "Someone Else"})
+            self.assertEqual(scans, [("mb-foreign", "Someone Else", "nd-7", False)])
+        # A tag and an override are the artist's own too; `mb:` pages as before.
+        scans.clear()
+        with self._library(self.nd("nd-8", "Tagged", "mb-tag")), self.patched(**sync), \
+                patch.object(bot, "_artist_overrides",
+                             lambda: {"nd-9": {"mbid": "mb-ovr"}}):
+            user.post("/api/artist/discography", json={"nd_id": "nd-8", "mbid": "mb-tag"})
+            user.post("/api/artist/discography", json={"nd_id": "nd-9", "mbid": "mb-tag"})
+            user.post("/api/artist/discography", json={"nd_id": "mb:mb-ext", "mbid": "mb-ext",
+                                                       "name": "Ext", "external": True})
+        self.assertEqual([m for m, *_ in scans], ["mb-tag", "mb-ovr", "mb-ext"])
+        # Writing one release under a named artist is an admin's.
+        self.assertEqual(user.post("/api/artist/release",
+                                   json={"rgid": "rg-1", "nd_id": "nd-7",
+                                         "mbid": "mb-foreign"}).status_code, 403)
+
+    def test_scan_now_prefers_navidromes_name(self):
+        searched = []
+        with self._library(self.nd("nd-7", "Kino")), \
+                self.patched(_task_run=lambda kind, label, target, **k: target("t") or "t",
+                             mbz_search_artists=lambda name, *a, **k:
+                             searched.append(name) or [{"mbid": "mb-kino"}],
+                             _artist_discography_task=lambda *a, **k: None):
+            self.client.post("/api/artist/discography", json={"nd_id": "nd-7", "name": "Other"})
+        self.assertEqual(searched, ["Kino"])
+
+    def test_a_scan_reads_running_right_after_the_post(self):
+        """Lane H review: the POST answers with the task id at once, and the
+        task's thread writes `running` only after its first step; a poll in
+        between read "no scan" (and the hub cached it)."""
+        release, entered = threading.Event(), threading.Event()
+
+        def scan(task_id, mbid, name, user, nd_id="", skip_library=False):
+            entered.set()
+            release.wait(10)
+            bot._task_finish(task_id, "done")
+
+        # An earlier scan of this artist, finished: a Rescan must not read it.
+        bot._artist_scan_set("mb-kino", "nd-7", state="done", task_id="old",
+                             started_at=1.0, finished_at=2.0)
+        with self._library(self.nd("nd-7", "Kino", "mb-kino")), \
+                self.patched(_artist_discography_task=scan,
+                             _artist_scan_task=lambda mbid, name, nd_id, user, skip_library=False:
+                             bot._task_create("artist-discography", "Scan")):
+            # The task is created and never started here: the thread has
+            # written nothing when the GET comes.
+            res = self.client.post("/api/artist/discography",
+                                   json={"nd_id": "nd-7", "mbid": "mb-kino"}).get_json()
+            task_id = res["task_id"]
+            for query in ("mbid=mb-kino", "nd_id=nd-7", "mbid=mb-kino&nd_id=nd-7"):
+                got = self.client.get(f"/api/artist/discography?{query}").get_json()["scan"]
+                self.assertEqual((got["state"], got["taskId"], got["done"], got["total"]),
+                                 ("running", task_id, 0, 0), query)
+            # A second tap still gets the same task.
+            again = self.client.post("/api/artist/discography",
+                                     json={"nd_id": "nd-7", "mbid": "mb-kino"}).get_json()
+            self.assertEqual(again["task_id"], task_id)
+            # Once the task has ended, the entries speak again.
+            bot._task_finish(task_id, "done")
+            got = self.client.get("/api/artist/discography?mbid=mb-kino").get_json()["scan"]
+            self.assertEqual((got["state"], got["taskId"]), ("done", "old"))
+        # The real thread, blocked at its first step: still "running".
+        bot._artist_scans.clear()
+        with self._library(self.nd("nd-8", "Later")), \
+                self.patched(_artist_discography_task=scan):
+            try:
+                res = self.client.post("/api/artist/discography",
+                                       json={"nd_id": "mb:mb-later", "mbid": "mb-later"}).get_json()
+                self.assertTrue(entered.wait(5))
+                got = self.client.get("/api/artist/discography?mbid=mb-later").get_json()
+                self.assertEqual((got["scan"]["state"], got["scan"]["taskId"]),
+                                 ("running", res["task_id"]))
+            finally:
+                release.set()
+
+    def test_second_scan_request_returns_the_running_task(self):
+        release = threading.Event()
+        scans = []
+
+        def scan(task_id, mbid, name, user, nd_id="", skip_library=False):
+            scans.append(task_id)
+            release.wait(10)
+
+        with self._library(self.nd("nd-7", "Kino")), \
+                self.patched(_artist_discography_task=scan,
+                             mbz_search_artists=lambda *a, **k: [{"mbid": "mb-kino"}]):
+            try:
+                first = self.client.post("/api/artist/discography",
+                                         json={"nd_id": "nd-7"}).get_json()
+                second = self.client.post("/api/artist/discography",
+                                          json={"nd_id": "nd-7"}).get_json()
+                # The same artist from a page that knows its MBID: still one scan.
+                third = self.client.post("/api/artist/discography",
+                                         json={"nd_id": "nd-7", "mbid": "mb-kino"}).get_json()
+            finally:
+                release.set()
+            deadline = time.time() + 5
+            while bot._task_snapshot(first["task_id"])["status"] == "running" \
+                    and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertTrue(first["task_id"])
+        self.assertNotIn("running", first)
+        self.assertEqual(second, {"ok": True, "task_id": first["task_id"], "running": True})
+        self.assertEqual(third, second)
+        self.assertEqual(len(scans), 1)
+
+    def test_worker_scan_is_visible_on_the_discography_route(self):
+        seen = []
+
+        def discog(mbid, name, *a, progress=None, **k):
+            progress(3, 8, name, "Some album")
+            seen.append(bot._artist_discography_read_view("", "2").get("scan"))
+            return self.discog(mbid, name)
+
+        state = self.state_with([self.nd("2", "Bee", "mb-2")])
+        with self.patched(build_artist_discography=discog, _auto_index_refresh=lambda *a: None):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "indexed")
+        (during,) = seen
+        self.assertEqual((during["state"], during["done"], during["total"]), ("running", 3, 8))
+        after = bot._artist_discography_read_view("mb-2", "2")["scan"]
+        self.assertEqual(after["state"], "done")
+        # Scan now while the worker scans that artist: no second scan.
+        bot._artist_scan_set("mb-2", "2", state="running", task_id=bot.AUTO_INDEX_SCAN_TASK,
+                             started_at=time.time())
+        with self._library(self.nd("2", "Bee", "mb-2")), \
+                self.patched(_artist_scan_task=lambda *a, **k: self.fail("a second scan")):
+            res = self.client.post("/api/artist/discography", json={"nd_id": "2"}).get_json()
+        self.assertEqual(res, {"ok": True, "task_id": bot.AUTO_INDEX_SCAN_TASK, "running": True})
+
+    def test_worker_scan_is_visible_by_mbid_alone(self):
+        """Review S#6: a page asking `?mbid=X` alone sees the worker's scan
+        of a tagged artist, while it runs and after."""
+        seen = []
+
+        def discog(mbid, name, *a, progress=None, **k):
+            progress(2, 5, name, "Some album")
+            seen.append(self.client.get("/api/artist/discography?mbid=mb-2")
+                        .get_json().get("scan"))
+            return self.discog(mbid, name)
+
+        state = self.state_with([self.nd("2", "Bee", "mb-2")])
+        with self.patched(build_artist_discography=discog, _auto_index_refresh=lambda *a: None):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "indexed")
+        (during,) = seen
+        self.assertEqual((during or {}).get("state"), "running")
+        self.assertEqual((during["done"], during["total"]), (2, 5))
+        after = self.client.get("/api/artist/discography?mbid=mb-2").get_json()["scan"]
+        self.assertEqual(after["state"], "done")
+
+    def test_worker_scan_of_a_covered_artist_leaves_the_holders_entry(self):
+        bot._index_store_artist({"artist_mbid": "mb-x", "artist_name": "Holder",
+                                 "releases": []}, nd_artist_id="9")
+        state = self.state_with([self.nd("9", "Holder", "mb-x"), self.nd("3", "Alias")])
+        with self.patched(build_artist_discography=lambda *a, **k: self.fail("scanned"),
+                          mbz_search_artists=lambda *a, **k: [{"mbid": "mb-x"}],
+                          _auto_index_refresh=lambda *a: None):
+            self.assertEqual(bot._auto_index_tick(state, self.now, self.USER), "covered")
+        self.assertIsNone(bot._artist_scan_get("mb-x", ""))
+        self.assertEqual(bot._artist_scan_get("", "3")["state"], "done")
+
+    def test_the_worker_leaves_an_artist_a_page_is_scanning(self):
+        bot._artist_scan_set("mb-2", "2", state="running", task_id="task-9",
+                             started_at=time.time())
+        state = self.state_with([self.nd("2", "Bee", "mb-2"), self.nd("3", "Cee", "mb-3")])
+        scanned = []
+        with self.patched(build_artist_discography=lambda mbid, name, *a, **k:
+                          scanned.append(mbid) or self.discog(mbid, name),
+                          _auto_index_refresh=lambda *a: None):
+            bot._auto_index_tick(state, self.now, self.USER)
+        self.assertEqual(scanned, ["mb-3"])
+
+    def test_scan_state_expires_after_restart(self):
+        """A scan whose thread died with the process it ran in: its entry is
+        not updated again, and after 10 minutes it reads as no scan, so a
+        page stops waiting and Scan now starts a new one."""
+        bot._artist_scans["nd:7"] = {"state": "running", "task_id": "t-old",
+                                     "started_at": 1.0, "updated_at": time.time() - 601}
+        self.assertIsNone(bot._artist_scan_get("", "7"))
+        self.assertNotIn("scan", bot._artist_discography_read_view("", "7"))
+        bot._artist_scans["nd:7"]["updated_at"] = time.time() - 30
+        self.assertEqual(bot._artist_scan_get("", "7")["state"], "running")
+        bot._artist_scans["nd:7"]["updated_at"] = time.time() - 601
+        with self._library(self.nd("7", "Seven", "mb-7")), \
+                self.patched(_artist_resolve_scan_task=lambda *a, **k: "t-new"):
+            res = self.client.post("/api/artist/discography", json={"nd_id": "7"}).get_json()
+        self.assertEqual(res, {"ok": True, "task_id": "t-new"})
+
+    def test_unresolved_flag(self):
+        bot._index_store_unresolved_artist("Nobody", "7")
+        bot._index_store_artist({"artist_mbid": "mb-8", "artist_name": "Quiet",
+                                 "releases": []}, nd_artist_id="8")
+        self.assertIs(bot._artist_discography_read_view("", "7")["unresolved"], True)
+        self.assertIs(bot._artist_discography_read_view("mb-8", "8")["unresolved"], False)
+        self.assertEqual(bot._artist_discography_read_view("mb-8", "8")["releases"], [])
+        # Not indexed: no key, which reads as false (an older lb-bot's answer).
+        self.assertNotIn("unresolved", bot._artist_discography_read_view("", "9"))
+        # Any scan carries counts, 0 when unknown.
+        bot._artist_scan_set("", "7", state="done", task_id="t", started_at=1.0,
+                             finished_at=2.0)
+        scan = bot._artist_discography_read_view("", "7")["scan"]
+        self.assertEqual((scan["done"], scan["total"]), (0, 0))
+
+
+
+class FindItTests(unittest.TestCase):
+    """Worbus P1 task S4: Find-it links on album meta. MusicBrainz's
+    release-level url-rels for the group's releases, confirmed links first,
+    then a search link for each of the six search services it confirms
+    nothing for."""
+
+    RG = {"title": "OK Computer", "artist-credit": [{"name": "Radiohead"}],
+          "relations": [], "first-release-date": "1997-05-21"}
+
+    def setUp(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        bot._wiki_cache.clear()
+        self.addCleanup(bot._wiki_cache.clear)
+        self.asked = []
+
+    def mbz(self, releases=None, rg=None, browse_fails=False):
+        def fake(path, params=None, **kw):
+            self.asked.append((path, dict(params or {})))
+            if path.startswith("release-group/"):
+                return dict(rg or self.RG)
+            if path == "release":
+                if browse_fails:
+                    return {}
+                return {"release-count": len(releases or []), "releases": releases or []}
+            return {}
+        return fake
+
+    @staticmethod
+    def rel(kind, url):
+        return {"type": kind, "url": {"resource": url}}
+
+    def album(self, rgid="rg-1", **kw):
+        with patch("listenbrainz_bot.mbz_get", side_effect=self.mbz(**kw)), \
+                patch("listenbrainz_bot._wiki_get", return_value={}), \
+                patch.object(bot, "mbz_resolve_album", lambda rgid: {"release_mbid": "r1"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return bot.meta_for_album(rgid)
+
+    SEARCH = ["bandcamp", "qobuz", "apple-music", "spotify", "deezer", "youtube-music"]
+
+    def test_find_it_confirmed_from_release_rels(self):
+        releases = [
+            {"id": "r1", "relations": [
+                self.rel("streaming", "https://open.spotify.com/album/abc"),
+                self.rel("purchase for download", "https://www.qobuz.com/album/ok/xyz"),
+                self.rel("discogs", "https://www.discogs.com/release/1"),   # not a Find-it type
+            ]},
+            {"id": "r2", "relations": [
+                self.rel("free streaming", "https://open.spotify.com/album/def"),  # 2nd spotify
+                self.rel("streaming", "https://listen.tidal.com/album/9"),
+                self.rel("purchase for mail-order", "https://www.amazon.co.uk/dp/B0"),
+            ]},
+        ]
+        meta = self.album(releases=releases)
+        confirmed = [l for l in meta["findIt"] if l["kind"] == "confirmed"]
+        self.assertEqual([(l["service"], l["url"]) for l in confirmed], [
+            ("qobuz", "https://www.qobuz.com/album/ok/xyz"),
+            ("spotify", "https://open.spotify.com/album/abc"),
+            ("tidal", "https://listen.tidal.com/album/9"),
+            ("amazon", "https://www.amazon.co.uk/dp/B0")])
+        # One browse of the group's releases, with their url-rels.
+        (browse,) = [p for path, p in self.asked if path == "release"]
+        self.assertEqual(browse, {"release-group": "rg-1", "inc": "url-rels", "limit": "100"})
+        # The existing `links` key is unchanged.
+        self.assertEqual(meta["links"], [])
+
+    def test_find_it_search_fallback_fills_missing_services(self):
+        meta = self.album(releases=[{"id": "r1", "relations": [
+            self.rel("streaming", "https://open.spotify.com/album/abc"),
+            self.rel("purchase for download", "https://radiohead.bandcamp.com/album/ok")]}])
+        rows = meta["findIt"]
+        self.assertEqual([l["kind"] for l in rows], ["confirmed"] * 2 + ["search"] * 4,
+                         "confirmed first")
+        self.assertEqual([l["service"] for l in rows if l["kind"] == "search"],
+                         ["qobuz", "apple-music", "deezer", "youtube-music"])
+        for l in rows:
+            self.assertEqual(sorted(l), ["kind", "service", "url"])
+            self.assertTrue(l["url"].startswith("https://"))
+        # No release links at all: exactly the six searches.
+        meta = self.album("rg-2", releases=[])
+        self.assertEqual([(l["service"], l["kind"]) for l in meta["findIt"]],
+                         [(s, "search") for s in self.SEARCH])
+        self.assertEqual(set(bot._FIND_IT_SEARCH), set(self.SEARCH))
+
+    def test_find_it_on_an_old_cached_payload(self):
+        old = {"rgid": "rg-1", "title": "OK Computer", "artist": "Radiohead",
+               "summary": "cached summary", "links": [], "credits": [], "releaseMbid": "r1"}
+        bot._meta_cache_write("album", "rg-1", old, True)
+        with bot._index_lock:
+            before = bot._index_db().execute(
+                "SELECT fetched_at FROM meta WHERE kind='album' AND mbid='rg-1'").fetchone()[0]
+        meta = self.album(releases=[{"id": "r1", "relations": [
+            self.rel("streaming", "https://www.deezer.com/album/1")]}])
+        # The rest came from the cache: only the release browse was asked.
+        self.assertEqual([path for path, _ in self.asked], ["release"])
+        self.assertEqual(meta["summary"], "cached summary")
+        self.assertEqual(meta["findIt"][0], {"service": "deezer", "kind": "confirmed",
+                                             "url": "https://www.deezer.com/album/1"})
+        # Merged into the stored payload, which keeps its age.
+        self.asked.clear()
+        again = self.album(releases=[])
+        self.assertEqual(self.asked, [])
+        self.assertEqual(again["findIt"], meta["findIt"])
+        with bot._index_lock:
+            after = bot._index_db().execute(
+                "SELECT fetched_at FROM meta WHERE kind='album' AND mbid='rg-1'").fetchone()[0]
+        self.assertEqual(before, after)
+
+    def test_find_it_urls_quote_artist_and_title(self):
+        for artist, title in (("AC/DC", "Back in Black"), ("Sigur Rós", "( )"),
+                              ("Simon & Garfunkel", "Bookends?")):
+            rg = dict(self.RG, title=title, **{"artist-credit": [{"name": artist}]})
+            with self.subTest(artist=artist):
+                rows = self.album(f"rg-{artist}", releases=[], rg=rg)["findIt"]
+                self.assertEqual(len(rows), 6)
+                quoted = urllib.parse.quote(f"{artist} {title}", safe="")
+                for row in rows:
+                    url = row["url"]
+                    self.assertIn(quoted, url)
+                    for raw in (" ", "AC/DC", "&G", "ó", "Bookends?"):
+                        self.assertNotIn(raw, url)
+
+    def test_find_it_absent_when_mb_fails_and_nothing_cached(self):
+        meta = self.album(releases=None, browse_fails=True)
+        self.assertNotIn("findIt", meta)
+        # The release group itself unreadable: no names to search with either.
+        with patch("listenbrainz_bot.mbz_get", return_value={}), \
+                patch("listenbrainz_bot._wiki_get", return_value={}), \
+                patch.object(bot, "mbz_resolve_album", lambda rgid: {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            meta = bot.meta_for_album("rg-2")
+        self.assertNotIn("findIt", meta)
+        # A browse that raises is the same.
+        def boom(path, params=None, **kw):
+            if path == "release":
+                raise RuntimeError("MusicBrainz is having a bad afternoon")
+            return self.mbz()(path, params, **kw)
+        with patch("listenbrainz_bot.mbz_get", side_effect=boom), \
+                patch("listenbrainz_bot._wiki_get", return_value={}), \
+                patch.object(bot, "mbz_resolve_album", lambda rgid: {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            meta = bot.meta_for_album("rg-3")
+        self.assertNotIn("findIt", meta)
+
+
+
+class WebLoginTests(unittest.TestCase):
+    """Worbus P1 task S5: lb-bot's web UI behind the Navidrome login. Any
+    Navidrome user signs in with their own username and password; only
+    Navidrome admins get the routes that change files; the hub's token is an
+    admin service caller; every route is tagged."""
+
+    PASSWORD = "correct horse battery staple"
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.dict(bot._web_sessions, {}, clear=True))
+        stack.enter_context(patch.dict(bot._login_failures, {}, clear=True))
+        stack.enter_context(patch.object(bot, "NAVIDROME_URL", "http://nd.test"))
+        self.calls = []
+        self.users = {"alice": (self.PASSWORD, False), "root": (self.PASSWORD, True)}
+        self.nd_down = False
+        stack.enter_context(patch.object(bot, "_http", types.SimpleNamespace(get=self._nd)))
+
+    def _nd(self, url, params=None, timeout=None, **kw):
+        """Navidrome's Subsonic API for `ping` and `getUser`, checking the
+        salted token the way Navidrome does."""
+        import hashlib
+        self.calls.append((url, dict(params or {})))
+        if self.nd_down:
+            raise ConnectionError("Navidrome is down")
+        params = params or {}
+        self.assertNotIn("p", params, "the password itself is never sent")
+        # Navidrome finds the account without regard to case and answers the
+        # name it has stored (`canonical`), not the string that was typed.
+        canonical = next((n for n in self.users
+                          if n.lower() == str(params.get("u") or "").lower()), None)
+        known = self.users.get(canonical)
+        ok = bool(known) and params.get("t") == hashlib.md5(
+            (known[0] + params.get("s", "")).encode()).hexdigest()
+        if not ok:
+            body = {"status": "failed", "error": {"code": 40, "message": "Wrong username or password"}}
+        elif url.endswith("/rest/ping"):
+            body = {"status": "ok"}
+        elif url.endswith("/rest/getUser"):
+            self.assertEqual(params.get("username"), params.get("u"))
+            body = {"status": "ok", "user": {"username": canonical, "adminRole": known[1]}}
+        else:
+            raise AssertionError(url)
+        return types.SimpleNamespace(status_code=200, ok=True,
+                                     json=lambda: {"subsonic-response": body})
+
+    def client(self, role="anon"):
+        return _web_app(as_role=role).test_client()
+
+    def sign_in(self, client, username="alice", password=None):
+        return client.post("/api/session", json={
+            "username": username, "password": self.PASSWORD if password is None else password})
+
+    # ── the table ───────────────────────────────────────────────────────────
+
+    def test_every_route_is_tagged(self):
+        app = _web_app()
+        keys = {f"{m} {r.rule}" for r in app.url_map.iter_rules()
+                for m in r.methods - {"HEAD", "OPTIONS"}}
+        self.assertEqual(sorted(keys - set(bot._ROUTE_ACCESS)), [], "untagged routes")
+        self.assertEqual(sorted(set(bot._ROUTE_ACCESS) - keys), [], "tags of no route")
+        self.assertEqual(set(bot._ROUTE_ACCESS.values()), {"open", "user", "admin"})
+        opened = sorted(k for k, v in bot._ROUTE_ACCESS.items() if v == "open")
+        self.assertEqual(opened, sorted([
+            "GET /api/health", "POST /api/session", "GET /api/session",
+            "DELETE /api/session", "GET /", "GET /assets/<path:filename>",
+            "GET /<path:path>"]))
+        # Everything that changes files or settings is admin, never user.
+        for key in ("POST /api/library/delete-file", "POST /api/groups/<group_id>/retag",
+                    "POST /api/artist/override", "POST /api/artist/merge",
+                    "POST /api/album/override", "POST /api/library-index/build",
+                    "POST /api/playlists/scan", "PUT /api/prefs", "GET /api/settings",
+                    "GET /api/logs", "GET /api/system/status", "GET /api/diagnostics",
+                    "POST /api/album/download", "POST /api/gaps/<group_id>/fetch",
+                    "POST /api/place-folder", "POST /api/groups/<group_id>/hide"):
+            self.assertEqual(bot._ROUTE_ACCESS[key], "admin", key)
+        for key in ("GET /api/artists", "GET /api/artist/discography",
+                    "POST /api/artist/discography", "GET /api/wishlist",
+                    "POST /api/wishlist", "POST /api/wishlist/remove", "GET /api/gaps",
+                    "GET /api/meta/album", "GET /api/deezer/chart", "GET /api/summary"):
+            self.assertEqual(bot._ROUTE_ACCESS[key], "user", key)
+
+    def test_an_untagged_route_is_admin_only(self):
+        app = _web_app(as_role="user")
+
+        @app.get("/api/_untagged")
+        def untagged():
+            return {"ok": True}
+
+        res = app.test_client().get("/api/_untagged")
+        self.assertEqual((res.status_code, res.get_json()), (403, {"code": "admin_only"}))
+
+    # ── signing in ──────────────────────────────────────────────────────────
+
+    def test_signin_with_navidrome_credentials(self):
+        c = self.client()
+        self.assertEqual(c.get("/api/session").status_code, 401)
+        res = self.sign_in(c)
+        self.assertEqual((res.status_code, res.get_json()),
+                         (200, {"user": "alice", "admin": False, "primary": False}))
+        self.assertEqual([url for url, _ in self.calls],
+                         ["http://nd.test/rest/ping", "http://nd.test/rest/getUser"])
+        self.assertEqual(c.get("/api/session").get_json(),
+                         {"user": "alice", "admin": False, "primary": False})
+        # A Navidrome admin is an admin here.
+        other = self.client()
+        self.assertEqual(self.sign_in(other, "root").get_json(),
+                         {"user": "root", "admin": True, "primary": False})
+        # Signing out ends the session.
+        self.assertEqual(c.delete("/api/session").status_code, 200)
+        self.assertEqual(c.get("/api/session").status_code, 401)
+        self.assertEqual(other.get("/api/session").status_code, 200)
+
+    def test_bad_credentials_401_and_rate_limit_429(self):
+        c = self.client()
+        for _ in range(5):
+            res = self.sign_in(c, password="wrong")
+            self.assertEqual((res.status_code, res.get_json()), (401, {"code": "bad_credentials"}))
+        asked = len(self.calls)
+        res = self.sign_in(c)     # even the right password, inside the window
+        self.assertEqual((res.status_code, res.get_json()), (429, {"code": "too_many_attempts"}))
+        self.assertEqual(len(self.calls), asked, "Navidrome is not asked while limited")
+        # Another username from the same address is its own count.
+        self.assertEqual(self.sign_in(c, "root").status_code, 200)
+        # Ten minutes on, the count has gone.
+        later = time.time() + 601
+        with patch.object(bot.time, "time", lambda: later):
+            self.assertEqual(self.sign_in(c).status_code, 200)
+        # An unknown user, an empty body and a missing password are bad credentials too.
+        self.assertEqual(self.sign_in(c, "mallory").status_code, 401)
+        self.assertEqual(c.post("/api/session", json={}).status_code, 401)
+        # Navidrome not answering is not a wrong password.
+        self.nd_down = True
+        res = self.sign_in(self.client(), "root")
+        self.assertEqual((res.status_code, res.get_json()["code"]), (503, "navidrome_unavailable"))
+        self.assertEqual(bot._login_failures.get(("127.0.0.1", "root"), []), [])
+
+    def test_concurrent_wrong_passwords_reach_navidrome_at_most_five_times(self):
+        """Review S#1: the check and the count are one step, so a burst of
+        concurrent attempts cannot all pass the check before any is counted."""
+        asked = []
+        lock = threading.Lock()
+
+        def slow_check(username, password):
+            with lock:
+                asked.append(username)
+            time.sleep(0.3)
+            return None
+
+        n = 20
+        barrier = threading.Barrier(n)
+        codes = []
+        app = _web_app()
+
+        def attempt():
+            c = app.test_client()
+            barrier.wait()
+            res = self.sign_in(c, password="wrong")
+            with lock:
+                codes.append(res.status_code)
+
+        with patch.object(bot, "_nd_check_login", slow_check):
+            threads = [threading.Thread(target=attempt) for _ in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertLessEqual(len(asked), bot.LOGIN_FAIL_MAX)
+        self.assertEqual(sorted(codes), [401] * len(asked) + [429] * (n - len(asked)))
+        # Navidrome not answering gives its attempt back, even mid-burst.
+        bot._login_failures.clear()
+        self.nd_down = True
+        for _ in range(8):
+            self.assertEqual(self.sign_in(self.client()).status_code, 503)
+        self.nd_down = False
+        self.assertEqual(self.sign_in(self.client()).status_code, 200)
+
+    def test_one_user_cannot_push_everyone_else_out(self):
+        other = self.client()
+        self.assertEqual(self.sign_in(other, "root").status_code, 200)
+        clients = [self.client() for _ in range(bot.SESSIONS_PER_USER_MAX + 5)]
+        with patch.object(bot, "SESSIONS_MAX", bot.SESSIONS_PER_USER_MAX + 2):
+            for c in clients:
+                self.assertEqual(self.sign_in(c).status_code, 200)
+        # root's one session survives a flood of alice's sign-ins.
+        self.assertEqual(other.get("/api/session").get_json()["user"], "root")
+        alive = [c.get("/api/session").status_code for c in clients]
+        self.assertEqual(alive, [401] * 5 + [200] * bot.SESSIONS_PER_USER_MAX)
+        self.assertEqual(sum(1 for v in bot._web_sessions.values() if v["user"] == "alice"),
+                         bot.SESSIONS_PER_USER_MAX)
+
+    def test_non_admin_reads_and_wishlist_ok_admin_routes_403(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        scratch_index(self, os.path.join(td, "index.db"))
+        c = self.client("user")
+        with patch.object(bot, "_summary_view", lambda: {"ok": True}):
+            self.assertEqual(c.get("/api/summary").status_code, 200)
+        self.assertEqual(c.get("/api/wishlist").status_code, 200)
+        self.assertEqual(c.post("/api/wishlist", json={"rgid": "rg-1"}).status_code, 200)
+        self.assertEqual(c.post("/api/wishlist/remove", json={"rgid": "rg-1"}).status_code, 200)
+        self.assertEqual(c.get("/api/artist/discography?nd_id=7").get_json(), {"indexed": False})
+        with patch.object(bot, "_artist_rescan_view", lambda data, admin=True: ({"ok": True, "task_id": "t"}, 200)):
+            self.assertEqual(c.post("/api/artist/discography", json={"nd_id": "7"}).status_code, 200)
+        for method, path in (("GET", "/api/logs"), ("GET", "/api/settings"),
+                             ("GET", "/api/system/status"), ("POST", "/api/groups/g1/hide"),
+                             ("POST", "/api/library/delete-file"), ("PUT", "/api/prefs"),
+                             ("POST", "/api/artist/override"), ("POST", "/api/library-index/build"),
+                             ("POST", "/api/album/download")):
+            res = c.open(path, method=method, json={})
+            self.assertEqual((res.status_code, res.get_json()), (403, {"code": "admin_only"}),
+                             f"{method} {path}")
+        # Signed out: every route but the open ones says sign in.
+        anon = self.client()
+        for method, path in (("GET", "/api/summary"), ("GET", "/api/wishlist"),
+                             ("GET", "/api/logs"), ("POST", "/api/wishlist")):
+            res = anon.open(path, method=method, json={})
+            self.assertEqual((res.status_code, res.get_json()), (401, {"code": "signin_required"}))
+
+    def test_fills_hide_peer_names_from_non_admins(self):
+        """Review S#3: who a fill came from is an admin's (and the hub's)."""
+        album = {"releaseMbid": "rel-1", "state": "downloading", "source": "peer-a",
+                 "pickedSource": "peer-b", "done": 1}
+        gap = {"groupId": "g1", "tracks": [{"title": "T", "username": "peer-c",
+                                             "manualPick": {"peer": "peer-d", "filename": "f"}}]}
+        fills = {"albums": {"rel-1": album}, "gaps": {"g1": gap}, "serverTime": 1.0}
+        with patch.object(bot, "_album_fill_view", lambda mbid, include_files=True: dict(album)), \
+                patch.object(bot, "_fills_view", lambda mbids, gids: json.loads(json.dumps(fills))):
+            for role in ("user", "admin"):
+                c = self.client(role)
+                one = c.get("/api/album/status?release_mbid=rel-1").get_json()
+                many = c.get("/api/fills?release_mbids=rel-1&group_ids=g1").get_json()
+                text = json.dumps([one, many])
+                if role == "user":
+                    for peer in ("peer-a", "peer-b", "peer-c", "peer-d"):
+                        self.assertNotIn(peer, text)
+                    self.assertEqual(one, {"releaseMbid": "rel-1", "state": "downloading",
+                                           "done": 1})
+                    self.assertEqual(many["gaps"]["g1"]["tracks"][0]["manualPick"],
+                                     {"filename": "f"})
+                else:
+                    self.assertEqual(one, album)
+                    self.assertEqual(many, fills)
+            with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+                res = self.client().get("/api/album/status?release_mbid=rel-1",
+                                        headers={"Authorization": "Bearer hub-secret-token"})
+            self.assertEqual(res.get_json()["source"], "peer-a")
+
+    def test_hub_token_is_admin(self):
+        c = self.client()
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                patch.object(bot, "_settings_cards", lambda *a, **k: {"cards": []}), \
+                patch.object(bot, "_diagnostics_cached", lambda *a, **k: []):
+            ok = c.get("/api/settings", headers={"Authorization": "Bearer hub-secret-token"})
+            self.assertEqual(ok.status_code, 200)
+            for header in ("Bearer wrong", "Bearer ", "hub-secret-token", "Basic hub-secret-token"):
+                res = c.get("/api/settings", headers={"Authorization": header})
+                self.assertEqual(res.status_code, 401, header)
+        # No token configured: no bearer is ever an admin.
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", ""):
+            self.assertEqual(c.get("/api/settings", headers={"Authorization": "Bearer "})
+                             .status_code, 401)
+
+    # ── Worbus P2 S1: the acting user comes from the hub ────────────────────
+
+    HUB = {"Authorization": "Bearer hub-secret-token"}
+
+    def hub(self, user=None, admin=None, primary=None):
+        """The headers the hub sends: its bearer, then (for a signed-in
+        caller) the three identity headers."""
+        headers = dict(self.HUB)
+        for name, value in (("X-Worbus-User", user), ("X-Worbus-Admin", admin),
+                            ("X-Worbus-Primary", primary)):
+            if value is not None:
+                headers[name] = value
+        return headers
+
+    def test_hub_headers_set_the_acting_user(self):
+        c = self.client()
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            for admin, primary in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
+                res = c.get("/api/session", headers=self.hub("bob", admin, primary))
+                self.assertEqual(res.get_json(), {"user": "bob", "admin": admin == "1",
+                                                  "primary": primary == "1"})
+            # Only the exact string "1" is a yes; anything else, or no header, is a no.
+            for odd in ("true", "yes", "01", "2", "", " ", "0"):
+                res = c.get("/api/session", headers=self.hub("bob", odd, odd))
+                self.assertEqual(res.get_json(), {"user": "bob", "admin": False,
+                                                  "primary": False}, repr(odd))
+            res = c.get("/api/session", headers=self.hub("bob"))
+            self.assertEqual(res.get_json(), {"user": "bob", "admin": False, "primary": False})
+            # A name Navidrome keeps in non-ASCII reaches lb-bot as the UTF-8 bytes
+            # the WSGI layer shows as latin-1; it is read back as the name.
+            raw = "Zoë".encode("utf-8").decode("latin-1")
+            res = c.get("/api/session", headers=self.hub(raw, "0", "0"))
+            self.assertEqual(res.get_json()["user"], "Zoë")
+            # A blank name is not "no headers": it is the least-privileged caller.
+            res = c.get("/api/session", headers=self.hub("  ", "1", "1"))
+            self.assertEqual(res.get_json(), {"user": "", "admin": False, "primary": False})
+
+    def test_hub_headers_without_bearer_are_ignored(self):
+        c = self.client()
+        every = {"X-Worbus-User": "mallory", "X-Worbus-Admin": "1", "X-Worbus-Primary": "1"}
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"):
+            for extra in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "Bearer "},
+                          {"Authorization": "hub-secret-token"},
+                          {"Authorization": "Basic hub-secret-token"}):
+                res = c.get("/api/session", headers={**every, **extra})
+                self.assertEqual((res.status_code, res.get_json()),
+                                 (401, {"code": "signin_required"}), str(extra))
+                res = c.get("/api/settings", headers={**every, **extra})
+                self.assertEqual(res.status_code, 401, str(extra))
+            # A signed-in cookie user does not become anyone else by sending them.
+            signed = self.client("user")
+            res = signed.get("/api/session", headers=every)
+            self.assertEqual(res.get_json(), {"user": "test-user", "admin": False,
+                                              "primary": False})
+            self.assertEqual(signed.get("/api/settings", headers=every).status_code, 403)
+        # No token configured on this lb-bot: the headers are never believed.
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", ""):
+            res = c.get("/api/session", headers={**every, "Authorization": "Bearer "})
+            self.assertEqual(res.status_code, 401)
+
+    def test_no_headers_is_todays_admin(self):
+        """An older hub (or a legacy shared-token client through this one) sends
+        the bearer and nothing else: the admin it always was."""
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                patch.object(bot, "_settings_cards", lambda *a, **k: {"cards": []}), \
+                patch.object(bot, "_diagnostics_cached", lambda *a, **k: []):
+            c = self.client()
+            res = c.get("/api/session", headers=self.HUB)
+            self.assertEqual(res.get_json(), {"user": "hub", "admin": True, "primary": True})
+            self.assertEqual(c.get("/api/settings", headers=self.HUB).status_code, 200)
+
+    def test_non_admin_through_hub_gets_admin_only(self):
+        c = self.client()
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                patch.object(bot, "_settings_cards", lambda *a, **k: {"cards": []}), \
+                patch.object(bot, "_diagnostics_cached", lambda *a, **k: []):
+            res = c.get("/api/settings", headers=self.hub("bob", "0", "0"))
+            self.assertEqual((res.status_code, res.get_json()), (403, {"code": "admin_only"}))
+            # A user route is still open to them, and an admin bob gets the admin route.
+            self.assertEqual(c.get("/api/wishlist", headers=self.hub("bob", "0", "0"))
+                             .status_code, 200)
+            self.assertEqual(c.get("/api/settings", headers=self.hub("bob", "1", "0"))
+                             .status_code, 200)
+
+    def test_cookie_session_stores_canonical_name(self):
+        """Signing in as `OWNER` when Navidrome's account is `owner` makes the
+        session `owner`, and a session of `owner` is the primary user whatever
+        case NAVIDROME_USER is written in."""
+        self.users["owner"] = (self.PASSWORD, True)
+        with patch.object(bot, "USERS", [{"navidrome_user": "Owner"}]):
+            c = self.client()
+            res = self.sign_in(c, "OWNER")
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.get_json(), {"user": "owner", "admin": True, "primary": True})
+            self.assertEqual({v["user"] for v in bot._web_sessions.values()}, {"owner"})
+            self.assertEqual(c.get("/api/session").get_json()["user"], "owner")
+            # The same account typed two ways is one user's sessions, not two.
+            self.sign_in(self.client(), "Owner")
+            self.assertEqual({v["user"] for v in bot._web_sessions.values()}, {"owner"})
+        # A getUser answer with no name (an unusual server) keeps what was typed.
+        real = self._nd
+
+        def nameless(url, params=None, **kw):
+            res = real(url, params, **kw)
+            body = res.json()["subsonic-response"]
+            if url.endswith("/rest/getUser"):
+                body["user"].pop("username")
+            return types.SimpleNamespace(status_code=200, ok=True,
+                                         json=lambda: {"subsonic-response": body})
+
+        with patch.object(bot, "_http", types.SimpleNamespace(get=nameless)):
+            res = self.sign_in(self.client(), "alice")
+        self.assertEqual(res.get_json()["user"], "alice")
+
+    def test_session_answer_has_primary(self):
+        self.users["owner"] = (self.PASSWORD, True)
+        with patch.object(bot, "USERS", [{"navidrome_user": "owner"}]):
+            mine, theirs = self.client(), self.client()
+            self.assertEqual(self.sign_in(mine, "owner").get_json(),
+                             {"user": "owner", "admin": True, "primary": True})
+            self.assertEqual(self.sign_in(theirs, "alice").get_json(),
+                             {"user": "alice", "admin": False, "primary": False})
+            self.assertEqual(mine.get("/api/session").get_json(),
+                             {"user": "owner", "admin": True, "primary": True})
+            self.assertEqual(theirs.get("/api/session").get_json(),
+                             {"user": "alice", "admin": False, "primary": False})
+        # Where no primary user is configured, nobody on the web UI is it.
+        with patch.object(bot, "USERS", [{"navidrome_user": ""}]):
+            self.assertFalse(mine.get("/api/session").get_json()["primary"])
+        with patch.object(bot, "USERS", []):
+            self.assertFalse(mine.get("/api/session").get_json()["primary"])
+
+    def test_health_has_identity(self):
+        with patch.object(bot, "_index_read_head", lambda conn: (3, "ep")), \
+                patch.object(bot, "_index_db", lambda: None), \
+                patch.object(bot, "_index_read_hwm", lambda: {"epoch": "ep", "hwm": 2}):
+            body = self.client().get("/api/health").get_json()
+        self.assertEqual(body["identity"], 1)
+
+    def test_every_api_answer_says_it_honours_the_acting_user(self):
+        """R17: the hub reads `X-Worbus-Identity: 1` off any answer, so a rollback
+        to an older lb-bot (which has no such header) is noticed on the next
+        call, not after a stale probe. It rides every /api/ answer, refusals
+        and the error handler's 500 included."""
+        app = _web_app(as_role="anon")
+
+        @app.get("/api/_boom")
+        def boom():
+            raise RuntimeError("boom")
+
+        c = app.test_client()
+        admin = self.hub("root", "1", "1")
+        user = self.hub("bob", "0", "0")
+        not_primary = self.hub("bob", "1", "0")
+        with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                patch.object(bot, "_index_read_head", lambda conn: (3, "ep")), \
+                patch.object(bot, "_index_db", lambda: None), \
+                patch.object(bot, "_index_read_hwm", lambda: {"epoch": "ep", "hwm": 2}), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            answers = {
+                "200 health": (c.get("/api/health"), 200),
+                "200 session": (c.get("/api/session", headers=admin), 200),
+                "401 signin_required": (c.get("/api/session"), 401),
+                "403 admin_only": (c.get("/api/settings", headers=user), 403),
+                "403 primary_only": (c.get("/api/listening/status", headers=not_primary), 403),
+                "404": (c.get("/api/no-such-route", headers=admin), 404),
+                "500 error handler": (c.get("/api/_boom", headers=admin), 500),
+            }
+        for label, (res, status) in answers.items():
+            self.assertEqual(res.status_code, status, label)
+            self.assertEqual(res.headers.get("X-Worbus-Identity"), "1", label)
+        self.assertEqual(answers["403 admin_only"][0].get_json(), {"code": "admin_only"})
+        self.assertEqual(answers["403 primary_only"][0].get_json(), {"code": "primary_only"})
+
+    def test_the_identity_header_is_only_on_api_answers(self):
+        """Not the SPA's pages or assets: they are not the hub's business."""
+        c = self.client()
+        for path in ("/", "/assets/none.js", "/some/spa/route"):
+            res = c.get(path)
+            self.assertNotIn("X-Worbus-Identity", res.headers, path)
+
+    def test_headers_never_logged(self):
+        """The identity headers are read and forgotten: none of their values is
+        printed, logged or put in the request-log line, not even for a refusal."""
+        import logging
+        secrets_seen = ("zq-user-7731", "zq-flag-4410")
+        headers = self.hub(secrets_seen[0], secrets_seen[1], secrets_seen[1])
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger()
+        before = (logger.level, logging.getLogger("werkzeug").level)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("werkzeug").setLevel(logging.DEBUG)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with patch.object(bot, "HUB_NOTIFY_TOKEN", "hub-secret-token"), \
+                    patch.object(bot, "_settings_cards", lambda *a, **k: {"cards": []}), \
+                    patch.object(bot, "_diagnostics_cached", lambda *a, **k: []), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                c = self.client()
+                for path in ("/api/session", "/api/settings", "/api/wishlist",
+                             "/api/no-such-route"):
+                    c.get(path, headers=headers)
+                c.post("/api/wishlist", json={"rgid": "rg-1"}, headers=headers)
+                # And through a real server, whose request-log line is werkzeug's.
+                from werkzeug.serving import make_server
+                import urllib.request
+                server = make_server("127.0.0.1", 0, _web_app(), threaded=True)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/session", headers=headers)
+                    urllib.request.urlopen(req, timeout=10).read()
+                finally:
+                    server.shutdown()
+                    thread.join(10)
+                    server.server_close()
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(before[0])
+            logging.getLogger("werkzeug").setLevel(before[1])
+        logged = stream.getvalue()
+        self.assertIn("/api/session", logged, "the request-log line was not captured")
+        ring = json.dumps(bot._log_ring_merged(), default=str)
+        for text in (out.getvalue(), err.getvalue(), logged, ring):
+            for value in secrets_seen:
+                self.assertNotIn(value, text)
+
+    def test_health_open_and_minimal(self):
+        with patch.object(bot, "_index_read_head", lambda conn: (3, "ep")), \
+                patch.object(bot, "_index_db", lambda: None), \
+                patch.object(bot, "_index_read_hwm", lambda: {"epoch": "ep", "hwm": 2}), \
+                patch.object(bot, "USERS", [{"navidrome_user": "nd", "navidrome_password": "pw-value"}]), \
+                patch.object(bot, "HUB_NOTIFY_URL", ""), \
+                patch.dict(os.environ, {"NAVIDROME_URL": "http://nd.test"}), \
+                patch.object(bot, "HUB_NOTIFY_TOKEN", "tok-value"):
+            res = self.client().get("/api/health")
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertEqual(sorted(body),
+                         ["build", "downloads", "epoch", "headSeq", "identity",
+                          "missingConfig", "ok"])
+        self.assertEqual(body["missingConfig"], ["LB_BOT_HUB_URL"])
+        text = res.get_data(as_text=True)
+        for value in ("pw-value", "tok-value", "/config", "/music", "nd.test"):
+            self.assertNotIn(value, text)
+
+    def test_cookie_flags(self):
+        res = self.sign_in(self.client())
+        (cookie,) = [v for k, v in res.headers.items() if k == "Set-Cookie"]
+        parts = [p.strip() for p in cookie.split(";")]
+        self.assertTrue(parts[0].startswith("lb_session="))
+        self.assertGreater(len(parts[0]), len("lb_session=") + 30)
+        lower = {p.lower() for p in parts}
+        self.assertIn("httponly", lower)
+        self.assertIn("samesite=strict", lower)
+        self.assertIn("path=/", lower)
+        self.assertIn(f"max-age={30 * 86400}", lower)
+        out = self.client().delete("/api/session")
+        (cleared,) = [v for k, v in out.headers.items() if k == "Set-Cookie"]
+        self.assertIn("lb_session=;", cleared)
+
+    def test_password_never_logged(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.sign_in(self.client())
+            self.sign_in(self.client(), password=self.PASSWORD + "x")
+            self.nd_down = True
+            self.sign_in(self.client(), "root")
+        for text in (out.getvalue(), err.getvalue(), repr(bot._web_sessions),
+                     repr(bot._login_failures)):
+            self.assertNotIn(self.PASSWORD, text)
+
+    def test_session_expires(self):
+        c = self.client()
+        self.assertEqual(self.sign_in(c).status_code, 200)
+        later = time.time() + bot.SESSION_TTL_SECS + 1
+        with patch.object(bot.time, "time", lambda: later):
+            self.assertEqual(c.get("/api/session").status_code, 401)
+            self.assertEqual(c.get("/api/wishlist").get_json(), {"code": "signin_required"})
+        # And it is gone, not just refused.
+        self.assertEqual(bot._web_sessions, {})
+
+
+# ── B-297: a new cover reaches the songs too ─────────────────────────────────
+#
+# Navidrome 0.64.2 serves a song's picture from the picture inside its file
+# first, and falls back to the album's only for a file with none (measured on
+# the stand-in, RESULTS-lbbot-embedded-cover-task1-2026-10-31). A cover change
+# therefore replaces the front picture inside every file of the album that
+# has a picture, and keeps what it replaced for the undo.
+
+def _fake_jpeg(tag: str, width=300, height=300) -> bytes:
+    """A JPEG as far as anything here reads one: its start, a frame header
+    with a size, and `tag` so that two images are two."""
+    import struct
+    sof = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
+    note = tag.encode()
+    return (b"\xff\xd8\xff\xe0" + struct.pack(">H", 2 + 5) + b"JFIF\0" + sof
+            + b"\xff\xfe" + struct.pack(">H", 2 + len(note)) + note + b"\xff\xd9")
+
+
+def _pic(kind=3, tag="red", **fields):
+    """One picture as the helpers below write it: its type, its bytes, and
+    the fields a FLAC picture block (or an ID3 `APIC`) carries."""
+    out = {"type": kind, "data": _fake_jpeg(tag), "mime": "image/jpeg", "desc": "",
+           "width": 300, "height": 300, "depth": 24, "colors": 0, "encoding": 3}
+    out.update(fields)
+    return out
+
+
+def _flac_with_pictures(path, pictures, frames=b""):
+    """A FLAC file holding `pictures`, in that order, and `frames` as its
+    audio — bytes no decoder would play, which is all a check that the audio
+    was not touched needs."""
+    from mutagen.flac import FLAC, Picture
+    _tiny_flac(path, tags={"title": os.path.basename(path), "album": "Album"})
+    if frames:
+        with open(path, "ab") as fh:
+            fh.write(frames)
+    audio = FLAC(path)
+    for spec in pictures:
+        picture = Picture()
+        for name in ("type", "mime", "desc", "width", "height", "depth", "colors", "data"):
+            setattr(picture, name, spec[name])
+        audio.add_picture(picture)
+    audio.save()
+    return path
+
+
+def _mp3_with_pictures(path, pictures, version=4):
+    import mutagen.id3 as id3
+    _tiny_mp3(path, version=version, TIT2="A song", TALB="Album")
+    tag = id3.ID3(path)
+    for spec in pictures:
+        tag.add(id3.APIC(encoding=spec["encoding"], mime=spec["mime"], type=spec["type"],
+                         desc=spec["desc"], data=spec["data"]))
+    tag.save(path, v2_version=version)
+    return path
+
+
+def _opus_with_pictures(path, pictures):
+    import base64
+    from mutagen.flac import Picture
+    from mutagen.oggopus import OggOpus
+    _tiny_opus(path, tags={"title": "A song"})
+    audio = OggOpus(path)
+    blocks = []
+    for spec in pictures:
+        picture = Picture()
+        for name in ("type", "mime", "desc", "width", "height", "depth", "colors", "data"):
+            setattr(picture, name, spec[name])
+        blocks.append(base64.b64encode(picture.write()).decode("ascii"))
+    audio["metadata_block_picture"] = blocks
+    audio.save()
+    return path
+
+
+def _pictures_of(path):
+    """Every picture inside a file as stored, read with mutagen alone: FLAC
+    and Opus in their order, `(type, mime, desc, width, height, depth,
+    colours, sha256)`; an MP3's `APIC` frames as `(type, mime, desc,
+    encoding, sha256)`, sorted (mutagen writes ID3 frames in an order of its
+    own)."""
+    import base64
+    import hashlib
+    sha = lambda data: hashlib.sha256(data).hexdigest()
+    if path.endswith(".mp3"):
+        from mutagen.id3 import ID3
+        return sorted((int(f.type), f.mime, f.desc, int(f.encoding), sha(f.data))
+                      for f in ID3(path).getall("APIC"))
+    from mutagen.flac import FLAC, Picture
+    if path.endswith(".flac"):
+        pictures = FLAC(path).pictures
+    else:
+        from mutagen.oggopus import OggOpus
+        pictures = [Picture(base64.b64decode(v))
+                    for v in OggOpus(path).get("metadata_block_picture") or []]
+    return [(int(p.type), p.mime, p.desc, p.width, p.height, p.depth, p.colors, sha(p.data))
+            for p in pictures]
+
+
+def _sha_of(data) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_sha(path) -> str:
+    with open(path, "rb") as fh:
+        return _sha_of(fh.read())
+
+
+# `_album_cover_restore` as the build before B-297 has it (12b1c7f, verbatim): what an Undo
+# runs after a rollback. It moves every entry of `cover-backups/<id>/` into the album folder.
+BASE_ALBUM_COVER_RESTORE = 'def _album_cover_restore(override_id: str, folder: str, own: str) -> list:\n    """Undo `_album_cover_write`: delete the cover it wrote (`own`) and put\n    back what it moved out. Returns why each kept image that was **not** put\n    back was not — `[]` when the undo is whole.\n\n    **A kept image is the only copy of a cover that was the user\'s, and it\n    is never deleted here.** One that cannot be put back — the folder has an\n    image by its name now, or the move failed — stays kept, and the backup\n    folder is removed only once it is empty.\n\n    **Returning means lb-bot\'s own cover is out of the folder**, whatever\n    became of the kept ones: the caller then forgets `cover_file`, so that a\n    later undo cannot take a `cover.jpg` the user has put there since for\n    lb-bot\'s. **Raising OSError means it is not**, and nothing else was\n    touched: the album\'s folder is not there (renamed, or its mount down), or\n    the cover could not be removed. The caller keeps `cover_file` then, and\n    the undo can be asked for again."""\n    backup = _cover_backup_dir(override_id)\n    kept = sorted(os.listdir(backup)) if os.path.isdir(backup) else []\n    if not own and not kept:\n        _rmdir_if_empty(backup)\n        return []\n    if not (folder and _path_in_library(folder) and os.path.isdir(folder)):\n        raise OSError("the album\'s folder is no longer there")\n    if own and os.path.isfile(os.path.join(folder, own)):\n        os.remove(os.path.join(folder, own))\n    left = []\n    for name in kept:\n        dest = os.path.join(folder, name)\n        if os.path.exists(dest):\n            left.append(_ALBUM_COVER_COLLISION)\n            continue\n        try:\n            shutil.move(os.path.join(backup, name), dest)\n        except OSError as e:\n            left.append(f"the earlier cover could not be put back ({_os_error_text(e)}); "\n                        f"lb-bot still keeps it — undo again")\n    _touch(folder)\n    _rmdir_if_empty(backup)\n    return left\n'
+
+
+def _base_album_cover_restore():
+    """The rolled-back build's `_album_cover_restore`, run in this module's namespace."""
+    namespace = dict(vars(bot))
+    exec(BASE_ALBUM_COVER_RESTORE, namespace)
+    return namespace["_album_cover_restore"]
+
+
+class EmbeddedPictureTests(unittest.TestCase):
+    """`_embedded_pictures`, `_picture_replace`, `_picture_snapshot` and
+    `_picture_restore`: rule 2 of the plan, per format, written as copy →
+    check → replace."""
+
+    NEW = _fake_jpeg("the new cover", 1200, 1200)
+
+    def setUp(self):
+        import shutil
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def new_front(self, **fields):
+        out = ((3, "image/jpeg", "", 1200, 1200, 24, 0, _sha_of(self.NEW)))
+        return out
+
+    def leftovers(self):
+        return sorted(n for n in os.listdir(self.tmp)
+                      if not n.endswith((".flac", ".mp3", ".opus", ".m4a")))
+
+    # ── which picture is replaced (rule 2) ──────────────────────────────────
+
+    def test_a_flac_front_is_replaced_where_it_was_and_the_rest_stay(self):
+        path = _flac_with_pictures(self.path("a.flac"), [
+            _pic(4, "back", desc="Back"), _pic(3, "old front"), _pic(0, "other", desc="x")])
+        before = _pictures_of(path)
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        after = _pictures_of(path)
+        self.assertEqual(after, [before[0], self.new_front(), before[2]])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_every_front_goes_and_the_new_one_takes_the_first_ones_place(self):
+        path = _flac_with_pictures(self.path("a.flac"), [
+            _pic(3, "red"), _pic(4, "back"), _pic(3, "blue")])
+        before = _pictures_of(path)
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        self.assertEqual(_pictures_of(path), [self.new_front(), before[1]])
+
+    def test_a_file_with_only_a_type_0_or_a_back_cover_gets_a_front_appended(self):
+        # Navidrome shows the first picture of any type when there is no
+        # front — a back cover included — and a front wherever it sits.
+        for kind in (0, 4):
+            path = _flac_with_pictures(self.path(f"t{kind}.flac"), [_pic(kind, "only")])
+            before = _pictures_of(path)
+            self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+            self.assertEqual(_pictures_of(path), before + [self.new_front()], kind)
+
+    def test_a_file_with_no_picture_is_not_touched(self):
+        path = _flac_with_pictures(self.path("none.flac"), [])
+        os.utime(path, (1_000_000_000, 1_000_000_000))
+        sha, ino = _file_sha(path), os.stat(path).st_ino
+        self.assertEqual(bot._embedded_pictures(path)[2], [])
+        self.assertTrue(bot._picture_replace(path, self.NEW, "image/jpeg"))   # a reason
+        self.assertEqual((_file_sha(path), os.stat(path).st_ino, os.stat(path).st_mtime),
+                         (sha, ino, 1_000_000_000))
+
+    def test_an_mp3_keeps_its_id3_version_and_its_other_pictures(self):
+        for version in (3, 4):
+            path = _mp3_with_pictures(self.path(f"v{version}.mp3"), [
+                _pic(3, "old", encoding=0), _pic(4, "back", desc="Back", encoding=1)],
+                version=version)
+            self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+            from mutagen.id3 import ID3
+            self.assertEqual(ID3(path).version[:2], (2, version))
+            self.assertEqual(_pictures_of(path), sorted([
+                (3, "image/jpeg", "", 0, _sha_of(self.NEW)),
+                (4, "image/jpeg", "Back", 1, _sha_of(_fake_jpeg("back")))]))
+
+    def test_an_opus_picture_is_replaced_in_its_order(self):
+        path = _opus_with_pictures(self.path("a.opus"), [_pic(0, "zero"), _pic(3, "old")])
+        before = _pictures_of(path)
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        self.assertEqual(_pictures_of(path), [before[0], self.new_front()])
+
+    def v23_mp3_with_everything(self, name, v1=True, version=3):
+        """A v2.3 MP3 as an older tagger leaves one — TYER, TDAT, TORY, TSIZ,
+        IPLS, frames v2.4 has other names for — with a front, a back, and
+        an ID3v1 tag at the end that does not say what the v2 tag says."""
+        import mutagen.id3 as id3
+        path = self.path(name)
+        with open(path, "wb") as fh:
+            fh.write((b"\xff\xfb\x90\x00" + b"\0" * 413) * 8)
+        tag = id3.ID3()
+        tag.add(id3.TIT2(encoding=1, text=["Song"]))
+        tag.add(id3.TPE1(encoding=1, text=["Artist A", "Artist B"]))
+        tag.add(id3.TYER(encoding=1, text=["1999"]))
+        tag.add(id3.TDAT(encoding=1, text=["0503"]))
+        tag.add(id3.TORY(encoding=1, text=["1998"]))
+        tag.add(id3.TSIZ(encoding=1, text=["12345"]))
+        tag.add(id3.IPLS(encoding=1, people=[["producer", "Bob"]]))
+        tag.add(id3.APIC(encoding=0, mime="image/jpeg", type=3, desc="",
+                         data=_fake_jpeg("old")))
+        tag.add(id3.APIC(encoding=1, mime="image/jpeg", type=4, desc="Back",
+                         data=_fake_jpeg("back")))
+        if version == 3:
+            tag.update_to_v23()
+        tag.save(path, v2_version=version, v23_sep=None)
+        if v1:
+            with open(path, "ab") as fh:
+                fh.write(b"TAG" + b"Old v1 title".ljust(30, b"\0") + b"v1 artist".ljust(30, b"\0")
+                         + b"v1 album".ljust(30, b"\0") + b"1990" + b"\0" * 30 + bytes([17]))
+        return path
+
+    @staticmethod
+    def id3_as_stored(path):
+        """The tag as stored, untranslated: its version, every frame but the
+        pictures, and the ID3v1 tag's bytes."""
+        from mutagen.id3 import ID3
+        tag = ID3(path, translate=False)
+        with open(path, "rb") as fh:
+            tail = fh.read()[-128:]
+        return (tag.version[:2],
+                {k: repr(f) for k, f in sorted(tag.items()) if not k.startswith("APIC")},
+                tail if tail[:3] == b"TAG" else None)
+
+    def test_an_mp3_keeps_every_other_frame_and_its_id3v1_tag_through_replace_and_restore(self):
+        for name, version in (("v23.mp3", 3), ("v24.mp3", 4)):
+            path = self.v23_mp3_with_everything(name, version=version)
+            before, pictures = self.id3_as_stored(path), _pictures_of(path)
+            self.assertIsNotNone(before[2])
+            if version == 3:
+                self.assertTrue({"TYER", "TDAT", "TORY", "TSIZ", "IPLS"} <= set(before[1]))
+            fmt, ver, found = bot._embedded_pictures(path)
+            snapshot, images = bot._picture_snapshot(fmt, ver, found)
+            self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+            self.assertEqual(self.id3_as_stored(path), before, name)
+            self.assertEqual(self.fronts_of_mp3(path), [_sha_of(self.NEW)])
+            self.assertEqual(bot._picture_restore(path, snapshot, images), "")
+            self.assertEqual(self.id3_as_stored(path), before, name)
+            self.assertEqual(_pictures_of(path), pictures, name)
+
+    def test_an_mp3_with_no_id3v1_tag_is_not_given_one(self):
+        path = self.v23_mp3_with_everything("plain.mp3", v1=False)
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        self.assertIsNone(self.id3_as_stored(path)[2])
+
+    @staticmethod
+    def fronts_of_mp3(path):
+        return [p[-1] for p in _pictures_of(path) if p[0] == 3]
+
+    # ── written safely (rule 6) ─────────────────────────────────────────────
+
+    def test_the_audio_is_untouched_and_the_file_is_the_same_file_with_a_new_mtime(self):
+        frames = os.urandom(200_000)
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")], frames=frames)
+        os.chmod(path, 0o640)
+        os.utime(path, (1_000_000_000, 1_000_000_000))
+        from mutagen.flac import FLAC
+        info = FLAC(path).info
+        md5, samples, ino = info.md5_signature, info.total_samples, os.stat(path).st_ino
+        # Bigger than the padding: mutagen would move the audio in place.
+        big = self.NEW + b"\0" * 50_000
+        self.assertEqual(bot._picture_replace(path, big, "image/jpeg"), "")
+        info = FLAC(path).info
+        self.assertEqual((info.md5_signature, info.total_samples), (md5, samples))
+        with open(path, "rb") as fh:
+            self.assertTrue(fh.read().endswith(frames))
+        st = os.stat(path)
+        # Written in place, never renamed onto: on Unraid's user share a new
+        # file may land on another disk than the one it replaces.
+        self.assertEqual(st.st_ino, ino)
+        self.assertEqual(st.st_mode & 0o7777, 0o640)
+        # Navidrome ignores a change whose mtime was put back (Task 1).
+        self.assertGreater(st.st_mtime, 1_000_000_000 + 1000)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_hard_linked_file_is_written_in_place(self):
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")])
+        twin = self.path("twin.flac")
+        os.link(path, twin)
+        ino = os.stat(path).st_ino
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        self.assertEqual(os.stat(path).st_ino, ino)
+        self.assertEqual(os.stat(twin).st_ino, ino, "the link is not split")
+        self.assertEqual(_pictures_of(twin), [self.new_front()])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_check_that_fails_leaves_the_file_as_it_was(self):
+        frames = os.urandom(50_000)
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")], frames=frames)
+        sha, ino = _file_sha(path), os.stat(path).st_ino
+        real = bot._picture_write
+
+        def truncating(target, fmt, version, pictures):
+            real(target, fmt, version, pictures)
+            with open(target, "r+b") as fh:          # the copy loses its last bytes
+                fh.truncate(os.path.getsize(target) - 10)
+
+        with patch.object(bot, "_picture_write", truncating):
+            reason = bot._picture_replace(path, self.NEW, "image/jpeg")
+        self.assertIn("audio", reason)
+        self.assertEqual((_file_sha(path), os.stat(path).st_ino), (sha, ino))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_check_that_fails_after_the_file_itself_was_written_puts_its_bytes_back(self):
+        frames = os.urandom(50_000)
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")], frames=frames)
+        sha, ino = _file_sha(path), os.stat(path).st_ino
+        real = bot._picture_write
+
+        def truncating_the_file_itself(target, fmt, version, pictures):
+            real(target, fmt, version, pictures)
+            if target == path:              # the rehearsal on a copy passes
+                with open(target, "r+b") as fh:
+                    fh.truncate(os.path.getsize(target) - 10)
+
+        with patch.object(bot, "_picture_write", truncating_the_file_itself):
+            reason = bot._picture_replace(path, self.NEW, "image/jpeg")
+        self.assertIn("audio", reason)
+        self.assertEqual((_file_sha(path), os.stat(path).st_ino), (sha, ino))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_link_is_written_through_when_its_file_is_in_the_library_and_not_otherwise(self):
+        lib, outside = os.path.join(self.tmp, "music"), os.path.join(self.tmp, "elsewhere")
+        os.makedirs(lib)
+        os.makedirs(outside)
+        inside_target = _flac_with_pictures(os.path.join(lib, "real.flac"), [_pic(3, "old")])
+        outside_target = _flac_with_pictures(os.path.join(outside, "far.flac"), [_pic(3, "old")])
+        near, far = os.path.join(lib, "near.flac"), os.path.join(lib, "far.flac")
+        os.symlink(inside_target, near)
+        os.symlink(outside_target, far)
+        sha = _file_sha(outside_target)
+        with patch.object(bot, "MUSIC_LIBRARY_PATH", lib):
+            self.assertEqual(bot._picture_replace(near, self.NEW, "image/jpeg"), "")
+            self.assertIn("outside the music folder",
+                          bot._picture_replace(far, self.NEW, "image/jpeg"))
+        self.assertTrue(os.path.islink(near))
+        self.assertEqual(_pictures_of(inside_target), [self.new_front()])
+        self.assertEqual(_file_sha(outside_target), sha)
+        self.assertEqual(sorted(n for n in os.listdir(lib) if n.startswith(".")), [])
+
+    def test_the_copies_are_not_named_as_audio(self):
+        for name in (bot._picture_part_path(self.path("01 - a.flac")),
+                     bot._picture_try_path(self.path("01 - a.flac")),
+                     bot._picture_copying_path(self.path("01 - a.flac"))):
+            name = os.path.basename(name)
+            self.assertTrue(name.startswith("."))
+            self.assertNotIn(bot._file_ext(name), bot._AUDIO_FILE_EXTS)
+
+    # ── what a stop half way leaves, and the next run over the folder ───────
+
+    def test_a_file_left_half_written_is_put_back_from_its_copy(self):
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")],
+                                   frames=os.urandom(50_000))
+        sha, ino = _file_sha(path), os.stat(path).st_ino
+        import shutil
+        shutil.copyfile(path, bot._picture_part_path(path))
+        with open(path, "r+b") as fh:           # the write stopped half way
+            fh.truncate(os.path.getsize(path) // 2)
+        bot._picture_leftovers_recover([self.tmp])
+        self.assertEqual((_file_sha(path), os.stat(path).st_ino), (sha, ino))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_file_whose_write_had_finished_keeps_it_and_its_copy_goes(self):
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")],
+                                   frames=os.urandom(50_000))
+        import shutil
+        shutil.copyfile(path, bot._picture_part_path(path))
+        bot._picture_write(path, "flac", 0, [{**_pic(3), "data": self.NEW}])
+        written = _file_sha(path)
+        bot._picture_leftovers_recover([self.tmp])
+        self.assertEqual((_file_sha(path), self.leftovers()), (written, []))
+
+    def test_a_copy_cut_short_or_a_rehearsal_is_simply_removed(self):
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")])
+        sha = _file_sha(path)
+        for leftover in (bot._picture_copying_path(path), bot._picture_try_path(path)):
+            with open(leftover, "wb") as fh:
+                fh.write(b"half a copy")
+        bot._picture_leftovers_recover([self.tmp])
+        self.assertEqual((_file_sha(path), self.leftovers()), (sha, []))
+
+    def test_a_copy_whose_file_is_gone_is_left_where_it_is(self):
+        path = _flac_with_pictures(self.path("a.flac"), [_pic(3, "old")])
+        import shutil
+        shutil.copyfile(path, bot._picture_part_path(path))
+        os.remove(path)
+        bot._picture_leftovers_recover([self.tmp])
+        self.assertFalse(os.path.exists(path), "a song somebody removed is not brought back")
+        self.assertTrue(os.path.exists(bot._picture_part_path(path)))
+
+    def test_a_file_that_cannot_be_read_is_a_reason_and_is_not_touched(self):
+        path = self.path("broken.flac")
+        with open(path, "wb") as fh:
+            fh.write(b"not a flac at all")
+        with self.assertRaises(Exception):
+            bot._embedded_pictures(path)
+        self.assertTrue(bot._picture_replace(path, self.NEW, "image/jpeg"))
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), b"not a flac at all")
+
+    # ── what is kept, and put back exactly ──────────────────────────────────
+
+    def restore_round_trip(self, path):
+        before = _pictures_of(path)
+        fmt, version, pictures = bot._embedded_pictures(path)
+        snapshot, images = bot._picture_snapshot(fmt, version, pictures)
+        self.assertEqual(json.loads(json.dumps(snapshot)), snapshot, "it is stored as JSON")
+        self.assertEqual(bot._picture_replace(path, self.NEW, "image/jpeg"), "")
+        self.assertNotEqual(_pictures_of(path), before)
+        self.assertEqual(bot._picture_restore(path, snapshot, images), "")
+        self.assertEqual(_pictures_of(path), before)
+        return snapshot
+
+    def test_a_flac_gets_back_every_field_of_every_picture_in_its_order(self):
+        path = _flac_with_pictures(self.path("a.flac"), [
+            _pic(4, "back", desc="Back side", width=640, height=480, depth=32, colors=0),
+            _pic(3, "red", desc="Front", width=500, height=501, depth=24, colors=0),
+            _pic(0, "zero", mime="image/png", desc="", width=1, height=2, depth=8, colors=256),
+            _pic(3, "blue", desc="second front", width=10, height=10, depth=24, colors=0)])
+        snapshot = self.restore_round_trip(path)
+        self.assertEqual([p["position"] for p in snapshot["removed"]], [1, 3])
+        self.assertNotIn("data", json.dumps(snapshot))
+
+    def test_an_mp3_gets_back_its_frames_and_their_encodings(self):
+        for version in (3, 4):
+            path = _mp3_with_pictures(self.path(f"v{version}.mp3"), [
+                _pic(3, "front", desc="Front", encoding=1 if version == 3 else 3),
+                _pic(4, "back", desc="Back", encoding=0)], version=version)
+            self.restore_round_trip(path)
+
+    def test_an_opus_gets_back_its_pictures(self):
+        path = _opus_with_pictures(self.path("a.opus"), [
+            _pic(3, "front", desc="F", width=7, height=8), _pic(4, "back")])
+        self.restore_round_trip(path)
+
+
+
+class PictureChangesTests(unittest.TestCase):
+    """`picture_changes` and its two loops: `_picture_changes_apply` (keep
+    everything, durably, then write) and `_picture_changes_put_back` (the
+    undo's rules)."""
+
+    A = _fake_jpeg("cover A", 1200, 1200)
+    B = _fake_jpeg("cover B", 500, 500)
+
+    def setUp(self):
+        review = isolated_review()
+        self.td = review.__enter__()
+        self.addCleanup(review.__exit__, None, None, None)
+        self.lib = os.path.join(self.td, "music")
+        self.folder = os.path.join(self.lib, "Artist", "Album")
+        os.makedirs(self.folder)
+        patcher = patch.object(bot, "MUSIC_LIBRARY_PATH", self.lib)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.progress = []
+
+    def flac(self, name, pictures, frames=b""):
+        return _flac_with_pictures(os.path.join(self.folder, name), pictures, frames=frames)
+
+    def files(self, *paths):
+        return [(p, {"title": os.path.basename(p)}) for p in paths]
+
+    def apply(self, paths, image, batch="ov1"):
+        plan = bot._picture_changes_plan(self.files(*paths))
+        return plan, bot._picture_changes_apply(
+            batch, plan, image, "image/jpeg",
+            lambda done, failures: self.progress.append((done, len(failures))))
+
+    def put_back(self, batch="ov1"):
+        return bot._picture_changes_put_back(batch, lambda done, failures: None)
+
+    def rows(self, batch="ov1"):
+        with bot._index_lock:
+            return [dict(r) for r in bot._index_db().execute(
+                "SELECT * FROM picture_changes WHERE batch_id = ? ORDER BY path", (batch,))]
+
+    def backups(self, batch="ov1"):
+        folder = bot._picture_backup_dir(batch)
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test_first_write_wins_across_two_cover_changes_and_the_undo_goes_back_past_both(self):
+        one = self.flac("1.flac", [_pic(4, "back"), _pic(3, "red")])
+        two = self.flac("2.flac", [_pic(3, "red")])          # the same picture: kept once
+        before = {p: _pictures_of(p) for p in (one, two)}
+        _plan, (done, failures, written) = self.apply([one, two], self.A)
+        self.assertEqual((done, failures, sorted(written)), (2, [], sorted([one, two])))
+        self.assertEqual(self.backups(), [_sha_of(_fake_jpeg("red"))])
+        first = {r["path"]: json.loads(r["before"]) for r in self.rows()}
+        self.assertEqual({r["wrote_sha"] for r in self.rows()}, {_sha_of(self.A)})
+        _plan, (done, failures, _written) = self.apply([one, two], self.B)
+        self.assertEqual((done, failures), (2, []))
+        # The second change kept nothing new: what was there before the first.
+        self.assertEqual({r["path"]: json.loads(r["before"])["snapshot"] for r in self.rows()},
+                         {p: b["snapshot"] for p, b in first.items()})
+        self.assertEqual({r["wrote_sha"] for r in self.rows()}, {_sha_of(self.B)})
+        self.assertEqual(_pictures_of(two)[0][-1], _sha_of(self.B))
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, failures, sorted(restored), given_up),
+                         (2, [], sorted([one, two]), 0))
+        self.assertEqual({p: _pictures_of(p) for p in (one, two)}, before)
+        self.assertEqual((self.rows(), self.backups()), ([], []))
+
+    def test_the_pictures_taken_out_of_the_files_are_kept_apart_from_the_folder_covers(self):
+        # A rolled-back build's undo moves everything in `cover-backups/<id>/`
+        # into the album folder: nothing of the songs' pictures may be there.
+        path = self.flac("1.flac", [_pic(3, "red")])
+        self.apply([path], self.A)
+        pictures, covers = bot._picture_backup_dir("ov1"), bot._cover_backup_dir("ov1")
+        self.assertEqual(os.listdir(pictures), [_sha_of(_fake_jpeg("red"))])
+        self.assertNotEqual(os.path.commonpath([pictures, covers]), covers)
+        self.assertFalse(os.path.exists(covers))
+
+    def test_every_snapshot_and_image_is_on_disk_before_the_first_file_is_written(self):
+        paths = [self.flac(f"{n}.flac", [_pic(3, f"old {n}")]) for n in range(3)]
+        seen = []
+        real = bot._picture_replace
+
+        def watching(path, image, mime):
+            if not seen:
+                seen.append((len(self.rows()), len(self.backups())))
+            return real(path, image, mime)
+
+        with patch.object(bot, "_picture_replace", watching):
+            self.apply(paths, self.A)
+        self.assertEqual(seen, [(3, 3)])
+
+    def test_nothing_is_written_when_the_snapshots_cannot_be_kept(self):
+        path = self.flac("1.flac", [_pic(3, "old")])
+        sha = _file_sha(path)
+        plan = bot._picture_changes_plan(self.files(path))
+        with patch.object(bot, "_index_commit_durably",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.Error):
+                bot._picture_changes_apply("ov1", plan, self.A, "image/jpeg", lambda *a: None)
+        self.assertEqual(_file_sha(path), sha)
+
+    def test_which_files_are_written_skipped_or_failed(self):
+        flac = self.flac("1.flac", [_pic(3, "old")])
+        bare = self.flac("2.flac", [])
+        mp3 = _mp3_with_pictures(os.path.join(self.folder, "3.mp3"), [_pic(0, "zero")])
+        import mutagen.mp4
+        m4a = os.path.join(self.folder, "4.m4a")
+        broken = os.path.join(self.folder, "5.flac")
+        with open(broken, "wb") as fh:
+            fh.write(b"not audio")
+        with patch.object(bot, "_file_has_picture",
+                          lambda p: True if p.endswith(".m4a") else bot._file_has_picture(p)):
+            plan = bot._picture_changes_plan(self.files(flac, bare, mp3, m4a, broken))
+        self.assertEqual(sorted(w[0] for w in plan["writes"]), sorted([flac, mp3]))
+        self.assertEqual(plan["skipped"], 1)
+        reasons = {f["title"]: f["reason"] for f in plan["failures"]}
+        self.assertEqual(sorted(reasons), ["4.m4a", "5.flac"])
+        self.assertEqual(reasons["4.m4a"], "the cover inside this file was not changed: lb-bot "
+                                           "cannot write the pictures of a .m4a file, so it "
+                                           "was left as it is")
+        self.assertTrue(reasons["5.flac"].startswith("the cover inside this file was not "
+                                                     "changed: it could not be read"))
+        self.assertNotIn(self.td, json.dumps(plan["failures"]))
+
+    def test_an_m4a_or_a_wav_with_a_picture_is_a_failure_and_stays_byte_identical(self):
+        import mutagen.id3 as id3
+        wav = os.path.join(self.folder, "6.wav")
+        import struct
+        with open(wav, "wb") as fh:                 # a WAVE with no samples
+            fmt = struct.pack("<HHIIHH", 1, 2, 44100, 44100 * 4, 4, 16)
+            body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + b"\0" * 4
+            fh.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+        from mutagen.wave import WAVE
+        audio = WAVE(wav)
+        audio.add_tags()
+        audio.tags.add(id3.APIC(encoding=0, mime="image/jpeg", type=3, desc="",
+                                data=_fake_jpeg("wav")))
+        audio.save()
+        sha = _file_sha(wav)
+        self.assertIs(bot._file_has_picture(wav), True)
+        _plan, (done, failures, written) = self.apply([wav], self.A)
+        self.assertEqual((done, written, [f["title"] for f in failures]), (0, [], ["6.wav"]))
+        self.assertIn("cannot write the pictures of a .wav file", failures[0]["reason"])
+        self.assertEqual((_file_sha(wav), self.rows()), (sha, []))
+
+    def test_a_file_whose_write_fails_and_is_as_it_was_loses_its_snapshot(self):
+        one = self.flac("1.flac", [_pic(3, "old")])
+        two = self.flac("2.flac", [_pic(3, "old two")])
+        real = bot._picture_replace
+        with patch.object(bot, "_picture_replace",
+                          lambda p, i, m: "Permission denied" if p == two else real(p, i, m)):
+            _plan, (done, failures, written) = self.apply([one, two], self.A)
+        self.assertEqual((done, written), (1, [one]))
+        self.assertEqual(failures, [{"title": "2.flac", "reason": "the cover inside this file "
+                                                                  "was not changed: Permission "
+                                                                  "denied"}])
+        self.assertEqual([r["path"] for r in self.rows()], [one])
+        self.assertEqual(self.backups(), [_sha_of(_fake_jpeg("old"))])
+        self.assertEqual(self.progress[-1], (1, 1))
+
+    def test_a_file_already_as_wanted_is_not_written_and_keeps_no_snapshot(self):
+        path = self.flac("1.flac", [_pic(4, "back"), {**_pic(3), "data": self.A}])
+        sha = _file_sha(path)
+        _plan, (done, failures, written) = self.apply([path], self.A)
+        self.assertEqual((done, failures, written, self.rows()), (1, [], [], []))
+        self.assertEqual(_file_sha(path), sha)
+
+    def test_a_picture_changed_since_is_kept_and_said_then_given_up_on_at_the_second_press(self):
+        path = self.flac("1.flac", [_pic(3, "red")])
+        self.apply([path], self.A)
+        # Somebody's tagger puts another cover in meanwhile.
+        bot._picture_rewrite(path, "flac", 0, [_pic(3, "green")])
+        green = _file_sha(path)
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, restored, given_up), (0, [], 0))
+        self.assertEqual([f["title"] for f in failures], ["1.flac"])
+        self.assertIn("changed since", failures[0]["reason"])
+        self.assertIn("stays in lb-bot's keeping", failures[0]["reason"])
+        self.assertNotIn(self.td, failures[0]["reason"])
+        self.assertEqual((_file_sha(path), len(self.rows()), len(self.backups())), (green, 1, 1))
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, failures, restored, given_up), (0, [], [], 1))
+        self.assertEqual((_file_sha(path), self.rows()), (green, []))
+        # The picture that was in the file is still in lb-bot's keeping: it may
+        # be the only copy of it there is.
+        red = _sha_of(_fake_jpeg("red"))
+        self.assertEqual(self.backups(), [f"given-up-{red}.jpg"])
+        with open(os.path.join(bot._picture_backup_dir("ov1"), f"given-up-{red}.jpg"), "rb") as fh:
+            self.assertEqual(fh.read(), _fake_jpeg("red"))
+        # Deleting the row leaves it there too.
+        bot._album_override_delete("ov1")
+        self.assertEqual(self.backups(), [f"given-up-{red}.jpg"])
+
+    def test_a_file_not_found_is_kept_by_the_first_undo_and_given_up_by_the_second(self):
+        path = self.flac("1.flac", [_pic(3, "red")])
+        self.apply([path], self.A)
+        os.remove(path)
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, given_up, len(failures), len(self.rows())), (0, 0, 1, 1))
+        self.assertIn("not found", failures[0]["reason"])
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, failures, given_up, self.rows()), (0, [], 1, []))
+        self.assertEqual(self.backups(), [f"given-up-{_sha_of(_fake_jpeg('red'))}.jpg"])
+
+    def test_a_missing_backup_image_is_said_and_the_row_stays(self):
+        path = self.flac("1.flac", [_pic(3, "red")])
+        self.apply([path], self.A)
+        for name in self.backups():
+            os.remove(os.path.join(bot._picture_backup_dir("ov1"), name))
+        sha = _file_sha(path)
+        done, failures, restored, _given_up = self.put_back()
+        self.assertEqual((done, restored, len(failures), len(self.rows())), (0, [], 1, 1))
+        self.assertIn("no longer has the picture", failures[0]["reason"])
+        self.assertEqual(_file_sha(path), sha)
+
+    def test_a_snapshot_in_a_form_this_build_does_not_know_is_kept_and_unreadable_json_dropped(self):
+        one = self.flac("1.flac", [_pic(3, "red")])
+        two = self.flac("2.flac", [_pic(3, "blue")])
+        self.apply([one, two], self.A)
+        with bot._index_lock:
+            conn = bot._index_db()
+            with conn:
+                conn.execute("UPDATE picture_changes SET before = ? WHERE path = ?",
+                             (json.dumps({"title": "1.flac", "snapshot": {"format": "jxl-box"}}),
+                              one))
+                conn.execute("UPDATE picture_changes SET before = '{not json' WHERE path = ?",
+                             (two,))
+        done, failures, restored, _given_up = self.put_back()
+        self.assertEqual(done, 0)
+        self.assertEqual(sorted(f["title"] for f in failures), ["1.flac", "A file"])
+        self.assertEqual([r["path"] for r in self.rows()], [one])
+
+    def test_the_images_of_a_row_in_a_form_this_build_does_not_know_are_never_pruned(self):
+        one = self.flac("1.flac", [_pic(3, "red")])
+        two = self.flac("2.flac", [_pic(3, "blue")])
+        self.apply([one, two], self.A)
+        red, blue = _sha_of(_fake_jpeg("red")), _sha_of(_fake_jpeg("blue"))
+        with bot._index_lock:
+            conn = bot._index_db()
+            with conn:
+                # A newer build's row: another shape, the image named somewhere else.
+                conn.execute("UPDATE picture_changes SET before = ? WHERE path = ?",
+                             (json.dumps({"title": "1.flac", "snapshot": {
+                                 "format": "jxl-box", "pictures": [{"hash": {"sha256": red}}]}}),
+                              one))
+        done, failures, restored, _given_up = self.put_back()
+        self.assertEqual((done, restored), (1, [two]))
+        self.assertEqual(self.backups(), [red])
+        self.assertNotIn(blue, self.backups())
+
+    def test_after_a_stop_half_way_the_undo_restores_what_was_written_and_drops_the_rest(self):
+        paths = [self.flac(f"{n}.flac", [_pic(3, f"old {n}")]) for n in range(3)]
+        before = {p: _pictures_of(p) for p in paths}
+        real, calls = bot._picture_replace, []
+
+        def dies_at_the_second(path, image, mime):
+            calls.append(path)
+            if len(calls) == 2:
+                raise SystemExit("the container stopped")
+            return real(path, image, mime)
+
+        with patch.object(bot, "_picture_replace", dies_at_the_second):
+            with self.assertRaises(SystemExit):
+                self.apply(paths, self.A)
+        with open(bot._picture_copying_path(paths[1]), "wb") as fh:
+            fh.write(b"half a copy")                # what a stop leaves beside a file
+        self.assertEqual(len(self.rows()), 3)
+        done, failures, restored, given_up = self.put_back()
+        self.assertEqual((done, failures, restored, given_up), (3, [], [paths[0]], 0))
+        self.assertEqual({p: _pictures_of(p) for p in paths}, before)
+        self.assertEqual((self.rows(), self.backups()), ([], []))
+        self.assertFalse(os.path.exists(bot._picture_copying_path(paths[1])))
+
+
+
+class AlbumCoverEmbedTests(_OverridableAlbum, unittest.TestCase):
+    """A cover change also replaces the front picture inside each of the
+    album's files that has one (B-297) — in the background, under the
+    album's job — and the override's undo puts every replaced picture back."""
+
+    URL = "https://coverartarchive.org/release/" + PLAIN + "/111.jpg"
+    NEW = _fake_jpeg("the new cover", 1200, 1200)
+
+    def setUp(self):
+        super().setUp()
+        self.images[self.URL] = (self.NEW, "jpg")
+        self.backups = os.path.join(os.path.dirname(bot.LIBRARY_INDEX_FILE), "cover-backups")
+        # Songs 1-10 carry the old CD scan as their front; song 11 a type-0
+        # picture only; song 12 none (it shows the folder cover already).
+        for n in range(1, 11):
+            self.add_pictures(self.song(n), [_pic(4, "back of the box", desc="Back"),
+                                             _pic(3, "old CD scan")] if n == 1
+                              else [_pic(3, "old CD scan")])
+        self.add_pictures(self.song(11), [_pic(0, "a sticker")])
+        self.nd.index()
+        self.old_id = self.nd.only()["id"]
+        self.before = {n: _pictures_of(self.song(n)) for n in range(1, 13)}
+        self.bare = _file_sha(self.song(12))
+
+    @staticmethod
+    def add_pictures(path, pictures):
+        from mutagen.flac import FLAC, Picture
+        audio = FLAC(path)
+        for spec in pictures:
+            picture = Picture()
+            for name in ("type", "mime", "desc", "width", "height", "depth", "colors", "data"):
+                setattr(picture, name, spec[name])
+            audio.add_picture(picture)
+        audio.save()
+
+    def fronts(self, n):
+        return [p[-1] for p in _pictures_of(self.song(n)) if p[0] == 3]
+
+    def cover(self, url=None):
+        return bot._album_cover_view({"album_id": self.old_id,
+                                      "cover_url": self.URL if url is None else url})
+
+    def picture_rows(self):
+        with bot._index_lock:
+            return [dict(r) for r in bot._index_db().execute(
+                "SELECT * FROM picture_changes ORDER BY path")]
+
+    # ── the route ───────────────────────────────────────────────────────────
+
+    def test_the_route_answers_before_any_file_is_written_and_holds_the_album_meanwhile(self):
+        started = []
+        with patch.object(bot, "_task_run",
+                          lambda kind, label, target, **k: started.append((kind, target)) or "t"):
+            payload, status = self.cover()
+        self.assertEqual((status, payload), (200, {"ok": True, "id": payload.get("id")}))
+        self.assertTrue(payload["id"])
+        # The folder cover is written; no song has been touched, no scan asked.
+        with open(os.path.join(self.folder, "cover.jpg"), "rb") as fh:
+            self.assertEqual(fh.read(), self.NEW)
+        self.assertEqual({n: _pictures_of(self.song(n)) for n in range(1, 13)}, self.before)
+        self.assertEqual((self.nd.scans, self.notified), (0, []))
+        self.assertEqual([kind for kind, _ in started], ["album-cover"])
+        # The row is what the build before this one left — the songs are no
+        # state of it — and a marker clients never see says the songs are
+        # being written, on disk before the answer.
+        row = self.row(payload["id"])
+        self.assertEqual((row["state"], row["done"], row["total"]), ("applied", 0, 0))
+        self.assertGreater(bot._album_override_row(payload["id"])["embedding"], 0)
+        # While the songs are written, the album is the job's.
+        again, status = self.cover()
+        self.assertEqual((status, again.get("code")), (409, "in_progress"), again)
+        undo, status = bot._album_override_remove_view({"id": payload["id"]})
+        self.assertEqual((status, undo.get("code")), (409, "in_progress"), undo)
+        self.assertTrue(bot._album_override_running_for({self.old_id}))
+        started[0][1]("t")                          # the task runs
+        self.assertEqual(self.fronts(2), [_sha_of(self.NEW)])
+        self.assertEqual(bot._album_override_row(payload["id"])["embedding"], 0)
+        self.assertFalse(bot._album_override_running_for({self.old_id}))
+        self.assertEqual(self.cover()[1], 200)
+
+    def test_every_song_with_a_picture_gets_the_new_front_and_the_others_are_left(self):
+        payload, status = self.cover()
+        self.assertEqual(status, 200, payload)
+        new = (3, "image/jpeg", "", 1200, 1200, 24, 0, _sha_of(self.NEW))
+        self.assertEqual(_pictures_of(self.song(1)), [self.before[1][0], new])
+        for n in range(2, 11):
+            self.assertEqual(_pictures_of(self.song(n)), [new], n)
+        self.assertEqual(_pictures_of(self.song(11)), self.before[11] + [new])
+        self.assertEqual(_file_sha(self.song(12)), self.bare)
+        row = self.row(payload["id"])
+        self.assertEqual((row["state"], row["done"], row["total"], row["failures"]),
+                         ("applied", 0, 0, []))
+        self.assertEqual(len(self.picture_rows()), 11)
+        # One kept image for the ten songs that shared it; none for song 11.
+        self.assertEqual(os.listdir(bot._picture_backup_dir(payload["id"])),
+                         [_sha_of(_fake_jpeg("old CD scan"))])
+        self.assertEqual(self.nd.scans, 1)
+        self.assertEqual([(m, k["event"]) for m, k in self.notified],
+                         [(LONERISM, "albumIndexed")])
+        self.assertNotIn(self.tmp, json.dumps(self.row(payload["id"])))
+
+    def test_one_scan_after_the_last_write_then_the_announce(self):
+        events = []
+        real_replace, real_scan = bot._picture_replace, self.nd.scan
+
+        def replace(path, image, mime):
+            events.append("write")
+            return real_replace(path, image, mime)
+
+        def scan(*a, **k):
+            events.append("scan")
+            return real_scan(*a, **k)
+
+        with patch.object(bot, "_picture_replace", replace), \
+             patch.object(bot, "nd_start_scan", scan), \
+             patch.object(bot, "_notify_hub_library_change",
+                          lambda *a, **k: events.append("announce")):
+            self.assertEqual(self.cover()[1], 200)
+        self.assertEqual(events, ["write"] * 11 + ["scan", "announce"])
+
+    def test_a_song_that_fails_is_named_by_its_title_and_the_rest_go_on(self):
+        third = self.song(3)
+        real = bot._picture_replace
+        with patch.object(bot, "_picture_replace",
+                          lambda p, i, m: "Permission denied" if p == third else real(p, i, m)):
+            payload, status = self.cover()
+        self.assertEqual(status, 200)
+        row = self.row(payload["id"])
+        title = next(s["title"] for s in self.nd.only()["song"] if s["path"] == third)
+        self.assertEqual((row["state"], row["done"], row["total"]), ("applied", 0, 0))
+        self.assertEqual(row["failures"], [{
+            "title": title,
+            "reason": "the cover inside this file was not changed: Permission denied"}])
+        self.assertEqual(_pictures_of(third), self.before[3])
+        self.assertNotIn(self.tmp, json.dumps(row))
+        self.assertNotIn(".flac", json.dumps(row))
+
+    def test_a_wav_with_a_picture_is_a_failure_row_and_stays_byte_identical(self):
+        import struct
+        import mutagen.id3 as id3
+        from mutagen.wave import WAVE
+        wav = os.path.join(self.folder, "13 - a bonus.wav")
+        with open(wav, "wb") as fh:
+            fmt = struct.pack("<HHIIHH", 1, 2, 44100, 44100 * 4, 4, 16)
+            body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + b"\0" * 4
+            fh.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+        audio = WAVE(wav)
+        audio.add_tags()
+        audio.tags.add(id3.APIC(encoding=0, mime="image/jpeg", type=3, desc="",
+                                data=_fake_jpeg("wav")))
+        audio.save()
+        sha = _file_sha(wav)
+        # Navidrome lists it with the album.
+        self.nd.albums[self.old_id]["song"].append({
+            "id": "s-wav", "title": "A Bonus", "track": 13, "discNumber": 1, "duration": 200,
+            "path": wav, "albumId": self.old_id, "artistId": "ar1"})
+        payload, status = self.cover()
+        self.assertEqual(status, 200, payload)
+        row = self.row(payload["id"])
+        self.assertEqual((row["done"], row["total"]), (0, 0))
+        self.assertEqual(row["failures"], [{
+            "title": "A Bonus",
+            "reason": "the cover inside this file was not changed: lb-bot cannot write the "
+                      "pictures of a .wav file, so it was left as it is"}])
+        self.assertEqual(_file_sha(wav), sha)
+
+    # ── what is embedded (rule 3) ───────────────────────────────────────────
+
+    def test_an_image_over_the_embed_cap_is_put_in_as_the_archives_smaller_version(self):
+        big = _fake_jpeg("a big original") + b"\0" * (bot.EMBEDDED_COVER_MAX_BYTES + 1)
+        rendition_1200 = _fake_jpeg("1200 px") + b"\0" * (bot.EMBEDDED_COVER_MAX_BYTES + 1)
+        rendition_500 = _fake_jpeg("500 px", 500, 500)
+        self.images[self.URL] = (big, "jpg")
+        self.images[self.URL[:-len(".jpg")] + "-1200.jpg"] = (rendition_1200, "jpg")
+        self.images[self.URL[:-len(".jpg")] + "-500.jpg"] = (rendition_500, "jpg")
+        payload, status = self.cover()
+        self.assertEqual(status, 200, payload)
+        with open(os.path.join(self.folder, "cover.jpg"), "rb") as fh:
+            self.assertEqual(fh.read(), big, "the folder cover is the image as fetched")
+        self.assertEqual(self.fronts(2), [_sha_of(rendition_500)])
+        self.assertEqual(self.row(payload["id"])["failures"], [])
+
+    def test_with_no_version_small_enough_nothing_is_embedded_and_the_row_says_why(self):
+        big = _fake_jpeg("a big original") + b"\0" * (bot.EMBEDDED_COVER_MAX_BYTES + 1)
+        self.images[self.URL] = (big, "jpg")          # and no smaller versions to be had
+        payload, status = self.cover()
+        self.assertEqual(status, 200, payload)
+        with open(os.path.join(self.folder, "cover.jpg"), "rb") as fh:
+            self.assertEqual(fh.read(), big)
+        self.assertEqual({n: _pictures_of(self.song(n)) for n in range(1, 13)}, self.before)
+        row = self.row(payload["id"])
+        self.assertEqual([f["title"] for f in row["failures"]], ["Cover image"])
+        self.assertTrue(row["failures"][0]["reason"].startswith(
+            "the cover inside the songs was not changed:"), row["failures"])
+        self.assertEqual((row["state"], self.picture_rows()), ("applied", []))
+
+    # ── an apply with a cover ───────────────────────────────────────────────
+
+    def test_an_apply_with_a_cover_writes_tags_then_pictures_with_one_scan(self):
+        payload, status = self.apply(cover_url=self.URL)
+        self.assertEqual(status, 200, payload)
+        row = self.row(payload["id"])
+        # The tags' count, as before this build: the pictures are no part of it.
+        self.assertEqual((row["state"], row["done"], row["total"], row["failures"]),
+                         ("applied", 12, 12, []))
+        self.assertEqual(self.fronts(5), [_sha_of(self.NEW)])
+        self.assertEqual(self.tags()[5]["musicbrainz_albumid"], [PLAIN])
+        self.assertEqual(self.nd.scans, 1)
+
+
+    # ── the undo ────────────────────────────────────────────────────────────
+
+    def undo(self, override_id):
+        payload, status = bot._album_override_remove_view({"id": override_id})
+        self.assertEqual(status, 200, payload)
+        return payload
+
+    def everything(self):
+        return {n: _pictures_of(self.song(n)) for n in range(1, 13)}
+
+    def test_the_undo_puts_every_picture_back_exactly_and_the_folder_cover_goes(self):
+        payload, _ = self.cover()
+        self.assertNotEqual(self.everything(), self.before)
+        self.undo(payload["id"])
+        self.assertEqual(self.everything(), self.before)
+        self.assertEqual(_file_sha(self.song(12)), self.bare)
+        # Nothing of lb-bot's keeping went into the album's folder.
+        self.assertEqual(sorted(n for n in os.listdir(self.folder) if not n.endswith(".flac")),
+                         [])
+        self.assertEqual((self.rows(), self.picture_rows()), ([], []))
+        self.assertFalse(os.path.exists(os.path.join(self.backups, payload["id"])))
+
+    def test_an_undo_after_an_edition_change_and_a_cover_change_restores_tags_and_pictures(self):
+        tags = self.tags()
+        override_id = self.applied()
+        new_id = self.row(override_id)["albumId"]
+        self.assertTrue(new_id)
+        payload, status = bot._album_cover_view({"album_id": new_id, "cover_url": self.URL})
+        self.assertEqual((status, payload["id"]), (200, override_id))
+        self.assertEqual(self.fronts(4), [_sha_of(self.NEW)])
+        self.undo(override_id)
+        self.assertEqual(self.tags(), tags)
+        self.assertEqual(self.everything(), self.before)
+        self.assertEqual((self.rows(), self.snapshots(), self.picture_rows()), ([], [], []))
+
+    def test_a_second_cover_change_keeps_the_first_snapshot_and_the_undo_goes_past_both(self):
+        other = "https://coverartarchive.org/release/" + PLAIN + "/222.jpg"
+        second = _fake_jpeg("a second choice", 500, 500)
+        self.images[other] = (second, "jpg")
+        first, _ = self.cover()
+        again, status = self.cover(other)
+        self.assertEqual((status, again["id"]), (200, first["id"]))
+        self.assertEqual(self.fronts(7), [_sha_of(second)])
+        self.assertEqual({r["wrote_sha"] for r in self.picture_rows()}, {_sha_of(second)})
+        self.undo(first["id"])
+        self.assertEqual(self.everything(), self.before)
+
+    def test_a_restart_during_the_embedding_leaves_the_row_failed_and_the_undo_finishes_it(self):
+        real, calls = bot._picture_replace, []
+
+        def stops_at_the_fourth(path, image, mime):
+            calls.append(path)
+            if len(calls) == 4:
+                raise SystemExit("the container stopped")
+            return real(path, image, mime)
+
+        started = []
+        with patch.object(bot, "_picture_replace", stops_at_the_fourth), \
+             patch.object(bot, "_task_run",
+                          lambda kind, label, target, **k: started.append(target) or "t"):
+            self.assertEqual(self.cover()[1], 200)
+            # The task's thread, when the process is stopped under it.
+            with self.assertRaises(SystemExit):
+                started[0]("t")
+        (row,) = self.rows()
+        self.assertEqual((row["state"], row["embedding"] > 0), ("applied", True))
+        self.assertFalse(bot._album_override_running_for({self.old_id}), "the album let go")
+        # What startup does: the row keeps its state and says what happened.
+        bot._mark_interrupted_jobs()
+        after = self.row(row["id"])
+        self.assertEqual(after["state"], "applied")
+        self.assertEqual(after["failures"], [{"title": "Cover image",
+                                              "reason": bot._COVER_INSIDE_INTERRUPTED}])
+        self.assertEqual(bot._album_override_row(row["id"])["embedding"], 0)
+        self.assertEqual(sum(1 for n in range(1, 13) if self.fronts(n) == [_sha_of(self.NEW)]), 3)
+        self.undo(row["id"])
+        self.assertEqual(self.everything(), self.before)
+        self.assertEqual((self.rows(), self.picture_rows()), ([], []))
+
+    def test_a_picture_changed_since_is_left_and_named_and_the_rest_are_restored(self):
+        payload, _ = self.cover()
+        bot._picture_rewrite(self.song(2), "flac", 0, [_pic(3, "somebody else's")])
+        theirs = _pictures_of(self.song(2))
+        self.undo(payload["id"])
+        row = self.row(payload["id"])
+        title = next(s["title"] for s in self.nd.only()["song"] if s["path"] == self.song(2))
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual([f["title"] for f in row["failures"]], [title])
+        self.assertIn("changed since", row["failures"][0]["reason"])
+        self.assertEqual(_pictures_of(self.song(2)), theirs)
+        self.assertEqual({n: p for n, p in self.everything().items() if n != 2},
+                         {n: p for n, p in self.before.items() if n != 2})
+        # The second press gives up on that file, and the row can go.
+        self.undo(payload["id"])
+        self.assertEqual((self.rows(), self.picture_rows()), ([], []))
+        self.assertEqual(_pictures_of(self.song(2)), theirs)
+
+    def test_the_undo_counts_the_files_whose_pictures_it_puts_back(self):
+        payload, _ = self.cover()
+        reachable, total, there = bot._album_override_reach(payload["id"],
+                                                            bot._album_override_row(payload["id"]))
+        self.assertEqual((reachable, total, there), (11, 11, True))
+        answer = []
+        with patch.object(bot, "_task_run",
+                          lambda kind, label, target, **k: answer.append(target) or "t"):
+            self.undo(payload["id"])
+        self.assertEqual((self.row(payload["id"])["state"], self.row(payload["id"])["total"]),
+                         ("removing", 11))
+        answer[0]("t")
+        self.assertEqual(self.rows(), [])
+
+    def test_an_undo_with_the_albums_folder_gone_starts_nothing_and_keeps_everything(self):
+        import shutil
+        payload, _ = self.cover()
+        moved = self.folder + " (moved)"
+        shutil.move(self.folder, moved)
+        answer, status = bot._album_override_remove_view({"id": payload["id"]})
+        self.assertEqual((status, answer.get("code")), (409, "files_unreachable"), answer)
+        self.assertEqual(len(self.picture_rows()), 11)
+        shutil.move(moved, self.folder)
+        self.undo(payload["id"])
+        self.assertEqual(self.everything(), self.before)
+
+
+    def folder_with_its_own_picture(self):
+        with open(os.path.join(self.folder, "folder.jpg"), "wb") as fh:
+            fh.write(b"the user's own folder picture")
+        return sorted(os.listdir(self.folder))
+
+    def test_a_rolled_back_lb_bots_undo_puts_nothing_of_the_songs_pictures_into_the_folder(self):
+        before = self.folder_with_its_own_picture()
+        payload, _ = self.cover()
+        row = bot._album_override_row(payload["id"])
+        # What the build before B-297 does on Undo: tags (none here), then this.
+        left = _base_album_cover_restore()(payload["id"], row["folder"], row["cover_file"])
+        self.assertEqual(left, [])
+        self.assertEqual(sorted(os.listdir(self.folder)), before)
+        with open(os.path.join(self.folder, "folder.jpg"), "rb") as fh:
+            self.assertEqual(fh.read(), b"the user's own folder picture")
+        # The songs keep lb-bot's picture; what was in them is still kept.
+        self.assertEqual(self.fronts(3), [_sha_of(self.NEW)])
+        self.assertEqual(os.listdir(bot._picture_backup_dir(payload["id"])),
+                         [_sha_of(_fake_jpeg("old CD scan"))])
+
+    def test_a_partial_undo_leaves_the_album_folder_holding_what_it_held(self):
+        before = self.folder_with_its_own_picture()
+        payload, _ = self.cover()
+        bot._picture_rewrite(self.song(2), "flac", 0, [_pic(3, "somebody else's")])
+        self.undo(payload["id"])
+        self.assertEqual(self.row(payload["id"])["state"], "failed")
+        self.assertEqual(sorted(os.listdir(self.folder)), before)
+
+
+    # ── the wire is the build before this one's (review 1) ──────────────────
+
+    def test_a_cover_change_on_an_applied_row_leaves_its_state_and_count_as_they_were(self):
+        override_id = self.applied()
+        before = self.row(override_id)
+        self.assertEqual((before["state"], before["done"], before["total"]), ("applied", 12, 12))
+        payload, status = bot._album_cover_view({"album_id": before["albumId"],
+                                                 "cover_url": self.URL})
+        self.assertEqual((status, payload["id"]), (200, override_id))
+        after = self.row(override_id)
+        self.assertEqual((after["state"], after["done"], after["total"], after["failures"]),
+                         ("applied", 12, 12, []))
+        self.assertEqual(self.fronts(6), [_sha_of(self.NEW)])
+
+    def test_a_restart_between_the_answer_and_the_task_is_said_at_startup(self):
+        with patch.object(bot, "_task_run", lambda kind, label, target, **k: "t"):
+            payload, status = self.cover()           # the task never runs
+        self.assertEqual(status, 200)
+        bot._album_override_jobs.clear()             # the process is gone
+        bot._mark_interrupted_jobs()
+        row = self.row(payload["id"])
+        self.assertEqual((row["state"], row["failures"]), ("applied", [{
+            "title": "Cover image", "reason": bot._COVER_INSIDE_INTERRUPTED}]))
+        self.assertNotIn("tags", bot._COVER_INSIDE_INTERRUPTED)
+
+    def test_an_error_while_reading_the_files_still_scans_announces_and_lets_go(self):
+        with patch.object(bot, "_picture_changes_plan", side_effect=RuntimeError("boom")):
+            payload, status = self.cover()
+        self.assertEqual(status, 200)
+        row = self.row(payload["id"])
+        self.assertEqual(row["state"], "applied")
+        self.assertEqual([f["title"] for f in row["failures"]], ["Cover image"])
+        self.assertTrue(row["failures"][0]["reason"].startswith(
+            "the cover inside the songs was not changed"))
+        self.assertEqual((self.nd.scans, len(self.notified)), (1, 1))
+        self.assertEqual(bot._album_override_row(payload["id"])["embedding"], 0)
+        self.assertFalse(bot._album_override_running_for({self.old_id}))
+        self.assertEqual(self.everything(), self.before)
+
+    def test_a_cover_only_row_is_never_told_to_restore_tags(self):
+        payload, _ = self.cover()
+        bot._album_override_write(payload["id"], state="removing")
+        bot._album_overrides_interrupted()
+        (reason,) = [f["reason"] for f in self.row(payload["id"])["failures"]]
+        self.assertNotIn("tags", reason)
+        self.assertIn("cover", reason)
+        bot._album_override_write(payload["id"], state="applied", failures="[]")
+        with patch.object(bot, "_picture_changes_put_back", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                bot._album_override_remove_view({"id": payload["id"]})
+        (reason,) = [f["reason"] for f in self.row(payload["id"])["failures"]]
+        self.assertNotIn("tags", reason)
+        # An apply's row still is.
+        override_id = self.applied(album_id=self.old_id)
+        bot._album_override_write(override_id, state="removing", failures="[]")
+        bot._album_overrides_interrupted()
+        self.assertIn("tags", self.row(override_id)["failures"][0]["reason"])
+
+    def test_an_undo_counts_files_not_records(self):
+        override_id = self.applied()
+        bot._album_cover_view({"album_id": self.row(override_id)["albumId"],
+                               "cover_url": self.URL})
+        written, real = [], bot._album_override_write
+
+        def write(row_id, **fields):
+            if "done" in fields or "total" in fields:
+                written.append((fields.get("done"), fields.get("total")))
+            return real(row_id, **fields)
+
+        with patch.object(bot, "_album_override_write", write):
+            self.undo(override_id)
+        # Twelve files, eleven of them in both tables: twelve, not 23.
+        self.assertEqual(written[0], (0, 12))
+        self.assertEqual(max(d for d, _t in written if d is not None), 12)
+        self.assertEqual(self.everything(), self.before)
+
+
+    def test_a_failure_outside_the_songs_work_still_scans_and_announces(self):
+        real = bot._album_override_write
+
+        def write(row_id, **fields):
+            if fields.get("embedding") == 0:
+                raise sqlite3.OperationalError("database is locked")
+            return real(row_id, **fields)
+
+        with patch.object(bot, "_album_override_write", write):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.cover()
+        self.assertEqual((self.nd.scans, len(self.notified)), (1, 1))
+        self.assertFalse(bot._album_override_running_for({self.old_id}))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 // Settings card may say for each thing /api/summary's `index` block can hold.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { indexProgress, indexHeaderLabel } from './indexProgress.js'
+import { autoScanStep, indexProgress, indexHeaderLabel } from './indexProgress.js'
 
 const fmt = n => String(n)
 const clock = t => `@${t}`
@@ -70,4 +70,11 @@ test('a manual build is the build, whatever the worker last said', () => {
 test('numbers that disagree are clamped, never negative', () => {
   assert.deepEqual(indexProgress({ ...on, total: 5, remaining: 9 }).done, 0)
   assert.deepEqual(indexProgress({ ...on, build: { done: 12, total: 9 } }).done, 9)
+})
+
+test('following the background scan of one artist: only a vanished entry is lost', () => {
+  assert.equal(autoScanStep({ state: 'running', done: 1, total: 4 }), 'running')
+  assert.equal(autoScanStep({ state: 'failed', error: 'MusicBrainz did not answer' }), 'failed')
+  assert.equal(autoScanStep({ state: 'done' }), 'done')
+  for (const gone of [undefined, null, {}]) assert.equal(autoScanStep(gone), 'lost')
 })

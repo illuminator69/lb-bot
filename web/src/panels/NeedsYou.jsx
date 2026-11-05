@@ -70,6 +70,9 @@ function useTaskWatch(taskId, onDone) {
   return task
 }
 
+// lb-bot's own words for a scan it will not run (NO_LISTENBRAINZ_USER there).
+const NO_LISTENBRAINZ_USER = 'No ListenBrainz user is set, so there are no playlists to scan; set LISTENBRAINZ_USER and restart lb-bot to scan yours.'
+
 // Start a scan from here — where its results land.
 function ScanMenu({ scanTask, onStarted }) {
   const { action, pushToast } = useApp()
@@ -79,6 +82,9 @@ function ScanMenu({ scanTask, onStarted }) {
   useEffect(() => { api('/api/system/status').then(setStatus).catch(() => {}) }, [])
   const spotifyReady = !!status?.spotify?.configured
   const playlists = status?.listenbrainz?.playlists || []
+  // B-304: lb-bot says which ListenBrainz user it scans for; '' is none. Not
+  // known yet (or not read) is not "none": the item stays as it was.
+  const noLbUser = status?.listenbrainz != null && !String(status.listenbrainz.user || '').trim()
 
   async function start(path, body, label) {
     try {
@@ -115,8 +121,9 @@ function ScanMenu({ scanTask, onStarted }) {
             hint="Every album in Navidrome against its MusicBrainz tracklist">
             {scanTask ? 'Library scan (running)' : 'Library scan'}
           </MenuItem>
-          <MenuItem onClick={() => { close(); start('/api/playlists/scan', {}, 'ListenBrainz playlist scan') }}
-            hint={playlists.length ? playlists.join(', ') : 'Your ListenBrainz playlists'}>
+          <MenuItem disabled={noLbUser} onClick={() => { close(); start('/api/playlists/scan', {}, 'ListenBrainz playlist scan') }}
+            hint={noLbUser ? NO_LISTENBRAINZ_USER
+              : playlists.length ? playlists.join(', ') : 'Your ListenBrainz playlists'}>
             ListenBrainz playlists
           </MenuItem>
           <MenuItem disabled={!spotifyReady} onClick={() => { close(); setSpotifyOpen(true) }}
@@ -710,7 +717,7 @@ function IdentifyAction({ unidentified, identify }) {
 const ARTISTS_SHOWN = 6
 
 function FixTab({ routeId, onOpened }) {
-  const { state, dispatch, action, pushToast } = useApp()
+  const { state, dispatch, action, pushToast, downloadsOn } = useApp()
   const { gaps, fills, transfers, gapDetail } = state
   const narrow = useNarrow()
 
@@ -919,15 +926,18 @@ function FixTab({ routeId, onOpened }) {
     <div className={`two${open ? ' open' : ''}`}>
       <div className="list" role="listbox" aria-label="Things to fix">
         {nothing && !unlisted && !waiting && (
-          <p className="empty">Nothing needs a decision. Failed fills, folders to file, unmatched artists and artists under two names show up here.</p>
+          <p className="empty">{downloadsOn
+            ? 'Nothing needs a decision. Failed fills, folders to file, unmatched artists and artists under two names show up here.'
+            : 'Nothing needs a decision. Unmatched artists and artists under two names show up here.'}</p>
         )}
-        {lists.failed.length > 0 && (
+        {/* The download groups exist only where the server downloads (Worbus P1). */}
+        {downloadsOn && lists.failed.length > 0 && (
           <>
             <Grp n={groups.failed.length}>Failed or stuck</Grp>
             <div className="rows">{lists.failed.map(row)}</div>
           </>
         )}
-        {(lists.folders.length > 0 || transfers.identify?.running) && (
+        {downloadsOn && (lists.folders.length > 0 || transfers.identify?.running) && (
           <>
             <Grp n={groups.folders.length}
               right={<IdentifyAction unidentified={transfers.counts?.unidentified ?? 0} identify={transfers.identify} />}>
@@ -971,16 +981,20 @@ function FixTab({ routeId, onOpened }) {
               onClick={pressed ? undefined : () => overrides.read({ asked: true })}>Try again</button>
           </p>
         )}
-        <Grp n={leftovers ? leftovers.length : ''}
-          right={<button className="link" disabled={leftLoading} aria-busy={leftLoading} onClick={loadLeftovers}>
-            {leftovers ? 'Check again' : 'Check'}
-          </button>}>
-          Left on disk
-        </Grp>
-        {leftError ? <p className="bad text-caption">Couldn’t list them: {leftError}.</p>
-          : leftovers === null ? <p className="muted text-caption">Folders already filed or dismissed whose files are still in the downloads folder.</p>
-          : !leftovers.length ? <p className="muted text-caption">Nothing left behind in the downloads folder.</p>
-          : <div className="rows">{lists.left.map(row)}</div>}
+        {downloadsOn && (
+          <>
+            <Grp n={leftovers ? leftovers.length : ''}
+              right={<button className="link" disabled={leftLoading} aria-busy={leftLoading} onClick={loadLeftovers}>
+                {leftovers ? 'Check again' : 'Check'}
+              </button>}>
+              Left on disk
+            </Grp>
+            {leftError ? <p className="bad text-caption">Couldn’t list them: {leftError}.</p>
+              : leftovers === null ? <p className="muted text-caption">Folders already filed or dismissed whose files are still in the downloads folder.</p>
+              : !leftovers.length ? <p className="muted text-caption">Nothing left behind in the downloads folder.</p>
+              : <div className="rows">{lists.left.map(row)}</div>}
+          </>
+        )}
       </div>
       <div className="detail swap" key={sel?.key || 'none'}>
         {!sel ? (

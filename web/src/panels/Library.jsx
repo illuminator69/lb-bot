@@ -1,18 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useApp, navigate, goGap } from '../App.jsx'
+import { useApp, navigate, goAlbum, goGap } from '../App.jsx'
 import { api, post } from '../lib/api.js'
 import Cover from '../components/Cover.jsx'
 import { DuplicateFileSet, TrashPanel } from '../components/Duplicates.jsx'
 import Page, { Grp, Pick, Seg } from '../components/Page.jsx'
 import { ArtistIndex } from './Artist.jsx'
-import { Pager, StatusChip } from '../components/ui.jsx'
+import { ago, fmtDuration, Pager, StatusChip } from '../components/ui.jsx'
 
 // Library is what you have: your artists (each opens their whole discography,
-// owned or not), your albums as a list, and cleanup.
-const TABS = ['artists', 'albums', 'cleanup']
+// owned or not), your albums as a list, the wishlist (what you want; its own
+// place since Worbus P1, whether or not the server downloads), and cleanup
+// (an admin's: it changes files).
+const TABS = ['artists', 'albums', 'wishlist', 'cleanup']
 
-function LibraryFrame({ tab, bar, action, children }) {
-  const { state } = useApp()
+function LibraryFrame({ tab, bar, action, sub: subLine, children }) {
+  const { state, isAdmin } = useApp()
   // The summary: it refreshes on every poll of every screen, while the album
   // list's own totals move only on the Albums tab.
   const totals = state.summary?.library || state.library?.libraryTotals
@@ -22,9 +24,11 @@ function LibraryFrame({ tab, bar, action, children }) {
     totals?.albums ? `${totals.albums.toLocaleString()} albums` : null,
     totals?.albums ? `${(totals.withGaps || 0).toLocaleString()} with gaps` : null,
   ].filter(Boolean).join(' · ')
+  const wished = state.wishlist?.total ?? state.wishlist?.wishlist?.length
   return (
-    <Page title="Library" sub={sub} action={action}
-      tabs={[['artists', 'Artists', artists ?? null], ['albums', 'Albums', totals?.albums ?? null], ['cleanup', 'Cleanup']]}
+    <Page title="Library" sub={subLine ?? sub} action={action}
+      tabs={[['artists', 'Artists', artists ?? null], ['albums', 'Albums', totals?.albums ?? null],
+        ['wishlist', 'Wishlist', wished || null], ...(isAdmin ? [['cleanup', 'Cleanup']] : [])]}
       tab={tab} onTab={k => navigate('library', k)} bar={bar}>
       {children}
     </Page>
@@ -44,7 +48,7 @@ const LIB_SORTS = [
 ]
 
 function AlbumsView() {
-  const { state, dispatch, action, pushToast } = useApp()
+  const { state, dispatch, action, pushToast, isAdmin, canDownload } = useApp()
   const { library, libFilter, libSearch, libSort } = state
 
   // Debounced: committing every keystroke fired one /api/library per character.
@@ -58,9 +62,10 @@ function AlbumsView() {
   const setFilter = f => dispatch({ type: 'SET_LIB_FILTER', filter: f || 'all' })
   const inSplit = SPLIT.some(([k]) => k === libFilter)
 
-  // One verb per state.
+  // One verb per state. Each is an admin's, and getting an album's tracks is
+  // only offered where the server downloads (Worbus P1).
   function rowAction(row) {
-    if (!row.groupId) return null
+    if (!row.groupId || !isAdmin) return null
     if (row.status === 'complete') {
       return (
         <button className="sm quiet" title="Recompute which tracks are missing"
@@ -74,6 +79,7 @@ function AlbumsView() {
     if (row.status === 'failed') {
       return <button className="sm" onClick={() => navigate('needs', 'fix', `gap:${row.groupId}`)}>Fix</button>
     }
+    if (!canDownload) return null
     return (
       <button className="sm" onClick={() => goGap(row.groupId)}>
         {row.status === 'downloading' ? 'View' : 'Find sources'}
@@ -305,10 +311,76 @@ function CleanupView() {
   )
 }
 
+// ── Wishlist ─────────────────────────────────────────────────────────────────
+// Albums you want. With downloading on, lb-bot searches for them again on a
+// slow schedule (each row says how it went); with it off it is a plain list,
+// and its words say only that: no searches, no attempts, no "not searched yet".
+const caaCover = rgid => rgid ? `https://coverartarchive.org/release-group/${rgid}/front-250` : null
+
+function WishlistView() {
+  const { state, pushToast, scheduleRefresh, downloadsOn, canDownload } = useApp()
+  const data = state.wishlist
+  const [busy, setBusy] = useState('')
+  const rows = data?.wishlist || []
+  async function remove(r) {
+    setBusy(r.rgid)
+    try {
+      await post('/api/wishlist/remove', { rgid: r.rgid })
+      pushToast(`Removed ${r.title} from the wishlist`)
+      scheduleRefresh(300)
+    } catch (e) {
+      pushToast(`Could not remove: ${e.message}`, 'error')
+    } finally { setBusy('') }
+  }
+  const every = data?.intervalSeconds ? fmtDuration(data.intervalSeconds) : '6 h'
+  const cooldown = data?.cooldownSeconds ? fmtDuration(data.cooldownSeconds) : '12 h'
+  const sub = downloadsOn
+    ? 'Albums you want, searched for again on a slow schedule'
+    : 'Albums you want. Worbus looks for them once downloading is set up'
+  return (
+    <LibraryFrame tab="wishlist" sub={sub}>
+      {data === null ? <p className="muted">Loading the wishlist…</p> : !rows.length ? (
+        <p className="empty">
+          {downloadsOn
+            ? `The wishlist is empty. Albums nobody was sharing go here, and lb-bot searches for one of them every ${every}.`
+            : 'The wishlist is empty. Add albums you want from an album page or from New releases.'}
+        </p>
+      ) : (
+        <>
+          <div className="rows arrive">
+            {rows.map(r => (
+              <div key={r.rgid} className="row stack">
+                <Cover url={caaCover(r.rgid)} name={r.title || '?'} size={40} />
+                <div className="grow">
+                  <button className="link plain t clip block max-w-full" onClick={() => goAlbum(r.rgid)}>{r.title || r.rgid}</button>
+                  <div className="s clip">
+                    {r.artist}{' · added '}{ago(r.addedAt)} ago
+                    {downloadsOn && (r.lastTriedAt ? ` · searched ${ago(r.lastTriedAt)} ago` : ' · not searched yet')}
+                    {downloadsOn && r.attempts ? ` · ${r.attempts} search${r.attempts === 1 ? '' : 'es'}` : ''}
+                  </div>
+                  {downloadsOn && r.lastReason && <div className="s clip">{r.lastReason}</div>}
+                </div>
+                {canDownload && <button className="sm" onClick={() => goAlbum(r.rgid, true)}>Find sources</button>}
+                <button className="sm quiet" disabled={busy === r.rgid} onClick={() => remove(r)}>Remove</button>
+              </div>
+            ))}
+          </div>
+          <p className="muted mt-3" style={{ maxWidth: '70ch' }}>
+            {downloadsOn
+              ? `lb-bot searches for one of these every ${every}, and for each at most every ${cooldown}. When one lands it leaves the list on its own. Add albums from an album page, from New releases, or from a failed request under Needs you.`
+              : 'Add albums from an album page or from New releases. Once downloading is set up on this server, Worbus looks for each of them, and one that lands leaves the list on its own.'}
+          </p>
+        </>
+      )}
+    </LibraryFrame>
+  )
+}
+
 export default function Library() {
-  const { state } = useApp()
+  const { state, isAdmin } = useApp()
   const tab = TABS.includes(state.routeParams[0]) ? state.routeParams[0] : 'artists'
   if (tab === 'albums') return <AlbumsView />
-  if (tab === 'cleanup') return <CleanupView />
+  if (tab === 'wishlist') return <WishlistView />
+  if (tab === 'cleanup' && isAdmin) return <CleanupView />
   return <ArtistIndex frame={({ bar, children }) => <LibraryFrame tab="artists" bar={bar}>{children}</LibraryFrame>} />
 }

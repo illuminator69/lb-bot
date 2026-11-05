@@ -3,7 +3,9 @@ import { useApp, navigate } from '../App.jsx'
 import { SECTIONS, navigateSection, rootSection, isSection } from '../lib/router.js'
 import { fillProgress, toFixCount, trackedProgress } from '../lib/needs.js'
 import { indexProgress, indexHeaderLabel } from '../lib/indexProgress.js'
+import { sectionsFor } from '../lib/access.js'
 import { Roll } from './Page.jsx'
+import { UPDATED_TEXT, createBuildWatch, readBuild } from '../lib/buildWatch.js'
 
 // Connection status, in its one fixed place. It is a button: the honest job of
 // a status that has gone stale is to let you force the resync it is
@@ -83,7 +85,7 @@ function Tray({ summary }) {
 // shown and the long one is the button's title; a label that still does not
 // fit is clipped, never wrapped. It opens System › Status, where the same
 // numbers have their rows.
-function IndexAtWork({ index }) {
+function IndexAtWork({ index, linked = true }) {
   const p = indexProgress(index)
   const label = indexHeaderLabel(p, Date.now() / 1000)
   if (!label) return null
@@ -93,13 +95,30 @@ function IndexAtWork({ index }) {
     long,
     p.current ? `Scanning ${p.current}` : '',
     p.kind === 'outage' ? `${n(p.done)} of ${n(p.total)} artists are up to date` : '',
-    'Open System',
+    linked ? 'Open System' : '',
   ].filter(Boolean).join(' · ')
-  return (
-    <button className="tray" title={title} aria-label={title} onClick={() => navigateSection('system', 'status')}>
+  const body = (
+    <>
       <span className={`clip ${p.kind === 'outage' ? 'warn' : 'muted'}`}>{short}</span>
       <span className="meter"><i style={{ width: `${Math.max(2, Math.min(100, p.pct))}%` }} /></span>
-    </button>
+    </>
+  )
+  // System is an admin's page: for anyone else the box says what it says and
+  // opens nothing.
+  return linked
+    ? <button className="tray" title={title} aria-label={title} onClick={() => navigateSection('system', 'status')}>{body}</button>
+    : <div className="tray" role="status" title={title} aria-label={title}>{body}</div>
+}
+
+// Who is signed in (Worbus P1: the Navidrome login), and the way out.
+function SignedIn({ session, onSignOut }) {
+  return (
+    <div className="flex min-w-0 items-center gap-2 px-2">
+      <span className="muted clip grow text-caption" title={session.admin ? `${session.user} · admin` : session.user}>
+        {session.user}
+      </span>
+      <button className="sm quiet" onClick={onSignOut}>Sign out</button>
+    </div>
   )
 }
 
@@ -117,14 +136,48 @@ function SideSearch() {
   )
 }
 
+// The build lb-bot served this page with: lb-bot writes it into index.html
+// (`<meta name="lb-bot-build">`). None on the Vite dev server or from an older
+// lb-bot, and then the watch takes its first answer instead.
+function servedBuild() {
+  return readBuild({ build: document.querySelector('meta[name="lb-bot-build"]')?.getAttribute('content') })
+}
+
+// B-095: whether lb-bot has been upgraded under this tab (`lib/buildWatch.js`).
+// Compared with the build the page was served with, on arrival, then on focus
+// and when the tab is shown again, at most once a minute. Never reloads.
+function useUpgraded() {
+  const [updated, setUpdated] = useState(false)
+  useEffect(() => {
+    const watch = createBuildWatch({
+      baseline: servedBuild(),
+      read: async signal => {
+        const res = await fetch('/api/health', { cache: 'no-store', signal })
+        return res.ok ? readBuild(await res.json()) : null
+      },
+      onUpdated: () => setUpdated(true),
+    })
+    const look = () => { if (document.visibilityState !== 'hidden') watch.check() }
+    watch.check()
+    window.addEventListener('focus', look)
+    document.addEventListener('visibilitychange', look)
+    return () => {
+      window.removeEventListener('focus', look)
+      document.removeEventListener('visibilitychange', look)
+    }
+  }, [])
+  return updated
+}
+
 export default function Shell({ children }) {
-  const { state, refresh } = useApp()
+  const { state, refresh, session, isAdmin, downloadsOn, signOut } = useApp()
   const { tab, summary, lastSyncAt, pollError, navKind } = state
   // An artist or album page keeps the section it was opened from lit.
   const lit = isSection(tab) ? tab : (rootSection() || { artist: 'library', album: 'library', place: 'needs' }[tab] || null)
   const fix = toFixCount(state)
   const moving = (summary?.transfers?.active || 0) + (summary?.transfers?.queued || 0)
   const counts = { needs: fix, activity: moving }
+  const upgraded = useUpgraded()
 
   return (
     <div className="app">
@@ -132,7 +185,7 @@ export default function Shell({ children }) {
         <div className="brand">lb-bot</div>
         <SideSearch />
         <nav className="nav" aria-label="Main">
-          {SECTIONS.map(([k, label]) => (
+          {sectionsFor(SECTIONS, { admin: isAdmin, downloads: downloadsOn }).map(([k, label]) => (
             <button key={k} aria-current={lit === k ? 'page' : undefined} onClick={() => navigateSection(k)}>
               {label}
               {counts[k] ? (
@@ -145,10 +198,12 @@ export default function Shell({ children }) {
           ))}
         </nav>
         <div className="side-foot">
-          <Tray summary={summary} />
-          <IndexAtWork index={summary?.index} />
+          {/* Downloads, an admin's, on a server that downloads. */}
+          {isAdmin && downloadsOn && <Tray summary={summary} />}
+          <IndexAtWork index={summary?.index} linked={isAdmin} />
           <Connection lastSyncAt={lastSyncAt} error={pollError} onRefresh={refresh} />
           <button className="sm quiet text-left" onClick={() => navigateSection('system', 'appearance')}>Appearance</button>
+          {session && <SignedIn session={session} onSignOut={signOut} />}
         </div>
       </aside>
       <section className="main" data-anim={navKind || ''}>
@@ -157,16 +212,32 @@ export default function Shell({ children }) {
             down a banner's height in one frame, and back in one. While it
             shuts it says what it last said (`Roll` keeps it). The wrapper is
             what the arrival animations leave alone (`.banner-fold` in
-            index.css: they select `.main`'s direct children). */}
+            index.css: they select `.main`'s direct children). Each live
+            region is on the page, empty, before its text arrives — `Roll`
+            mounts what it holds only while open, and a region inserted
+            with its text already in it is not announced by every screen
+            reader. */}
         <div className="banner-fold">
-          <Roll open={!!pollError}>
-            <div className="banner" role="status" aria-live="polite">
-              <span className="st bad font-semibold">Can’t reach lb-bot</span>
-              <span className="muted">{pollError}</span>
-              <span className="spacer" />
-              <button className="sm" onClick={() => refresh({ force: true })}>Retry now</button>
-            </div>
-          </Roll>
+          <div role="status" aria-live="polite">
+            <Roll open={!!pollError}>
+              <div className="banner">
+                <span className="st bad font-semibold">Can’t reach lb-bot</span>
+                <span className="muted">{pollError}</span>
+                <span className="spacer" />
+                <button className="sm" onClick={() => refresh({ force: true })}>Retry now</button>
+              </div>
+            </Roll>
+          </div>
+          {/* Folds open like the one above, and only on a press reloads. */}
+          <div role="status" aria-live="polite">
+            <Roll open={upgraded}>
+              <div className="banner note">
+                <span>{UPDATED_TEXT}</span>
+                <span className="spacer" />
+                <button className="target" onClick={() => window.location.reload()}>Reload</button>
+              </div>
+            </Roll>
+          </div>
         </div>
         {children}
       </section>

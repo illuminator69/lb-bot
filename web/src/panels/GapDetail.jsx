@@ -82,14 +82,16 @@ const TRACK_STATE = {
 // and the two escape hatches for when the matcher got it wrong: pick a file out
 // of a specific source, and place-anyway.
 function TrackRow({ track: t, detail, sources, expandSource }) {
-  const { action, pushToast, requestConfirm } = useApp()
+  const { action, pushToast, requestConfirm, canDownload } = useApp()
   const [picking, setPicking] = useState(false)
   const [srcIdx, setSrcIdx] = useState(sources[0]?.id ?? 0)
   const [listing, setListing] = useState(null)
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const present = t.state === 'present'
-  const canPick = !present && t.index != null && sources.length > 0
+  // Picking a file and placing one are an admin's, where the server downloads
+  // (Worbus P1); the row's state and words stay for everyone.
+  const canPick = canDownload && !present && t.index != null && sources.length > 0
 
   async function loadSource(id) {
     setSrcIdx(id)
@@ -160,7 +162,7 @@ function TrackRow({ track: t, detail, sources, expandSource }) {
         </div>
         {/* A loose track's download has no release on record to be filed
             under; the server names its folder so the user can pick one. */}
-        {t.placeFolder && (
+        {canDownload && t.placeFolder && (
           <button className="sm" onClick={() => goPlace(t.placeFolder, '', 'pick', t.placeFile)}>Pick the release</button>
         )}
         {canPick && (
@@ -169,7 +171,7 @@ function TrackRow({ track: t, detail, sources, expandSource }) {
             {picking ? 'Close' : 'Pick a file'}
           </button>
         )}
-        {t.canForcePlace && (
+        {canDownload && t.canForcePlace && (
           <button className="sm" disabled={busy} aria-busy={busy} onClick={placeAnyway}>Place anyway</button>
         )}
         {t.duration ? <span className="num muted hide-sm">{fmtClock(t.duration)}</span> : null}
@@ -289,7 +291,7 @@ export function GapTracks({ detail, reference }) {
  *   hidden  the queue's list says this album is hidden
  */
 export function GapFoot({ detail, bare = false, hidden = false, onHide }) {
-  const { action, pushToast } = useApp()
+  const { action, pushToast, isAdmin, canDownload } = useApp()
   const id = detail.id
   const [busy, setBusy] = useState(false)
   const [rescanning, setRescanning] = useState(false)
@@ -327,14 +329,18 @@ export function GapFoot({ detail, bare = false, hidden = false, onHide }) {
     }
   }, [id, pushToast])
 
+  // Every one of these is an admin's (Worbus P1): a non-admin's album page
+  // has none of them, and no empty row where they were.
+  if (!isAdmin) return null
   return (
     <>
       <div className="acts mt-4">
         {!bare && detail.artistId && (
           <button onClick={() => goArtist(detail.artistId)}>Open artist</button>
         )}
-        {/* A loose group has no release to reconcile against (Q-020). */}
-        {!detail.loose && !stalled && (
+        {/* A loose group has no release to reconcile against (Q-020). Its
+            files are downloads: not offered where the server has none. */}
+        {canDownload && !detail.loose && !stalled && (
           <button disabled={busy} onClick={reconcile}
             title="Match files already in the downloads folder against these tracks">
             Reconcile downloaded files
@@ -384,7 +390,7 @@ const rescanSaid = r => (r.foundOnDisk
  *   autoFind  start the source search on arrival if none has run
  */
 export default function GapDetail({ row, detail, transfers, pager, onHide, onDetail, bare = false, flowOnly = false, autoFind = false }) {
-  const { action, pushToast } = useApp()
+  const { action, pushToast, canDownload } = useApp()
   const g = detail || row
   const [busy, setBusy] = useState(false)
   const [finding, setFinding] = useState(false)
@@ -633,7 +639,7 @@ export default function GapDetail({ row, detail, transfers, pager, onHide, onDet
   // one has already left results or something is in flight.
   const autoRef = useRef(false)
   useEffect(() => {
-    if (!autoFind || autoRef.current || !detail) return
+    if (!canDownload || !autoFind || autoRef.current || !detail) return
     autoRef.current = true
     if (!totalSources && !searching && status !== 'downloading' && status !== 'complete' && !detail.stalledPlacement) {
       findSources()
@@ -711,7 +717,10 @@ export default function GapDetail({ row, detail, transfers, pager, onHide, onDet
         </p>
       )}
 
-      {err && !downloading && !complete && (
+      {/* What follows, up to the tracks, is getting the missing tracks: an
+          admin's, where the server downloads (Worbus P1). Without it the
+          album says what is missing and nothing else. */}
+      {canDownload && err && !downloading && !complete && (
         <div className="why bad">
           <div className="font-semibold">{stalled ? `Stuck. ${err.reason}` : err.reason}</div>
           {err.detail ? <div className="mt-0.5">{err.detail}</div> : null}
@@ -768,7 +777,7 @@ export default function GapDetail({ row, detail, transfers, pager, onHide, onDet
         </div>
       )}
 
-      <div className="next">
+      {canDownload && <div className="next">
         <Grp>Next step<span className="note">{hint}</span></Grp>
         <Roll open={showActs}>
           <div style={{ paddingTop: 10 }}>
@@ -797,11 +806,11 @@ export default function GapDetail({ row, detail, transfers, pager, onHide, onDet
             {detail && <Mp3Fallback detail={detail} busy={busy} onToggle={setAllowMp3} />}
           </div>
         </Roll>
-      </div>
+      </div>}
 
       {!detail && <p className="muted mt-4">Loading album detail…</p>}
 
-      <Roll open={!!detail && downloading}>
+      <Roll open={canDownload && !!detail && downloading}>
         <Grp>Source<span className="note">
           {asking ? 'asking the peer' : mine.length ? 'downloading' : inFlight ? 'queued with the peer' : 'filing into the album'}
         </span></Grp>
@@ -844,7 +853,7 @@ export default function GapDetail({ row, detail, transfers, pager, onHide, onDet
       </Roll>
 
       <div ref={sourcesRef}>
-        <Roll open={showSources}>
+        <Roll open={canDownload && showSources}>
           <Grp n={totalSources} right={<SourceFilters value={srcFilters} onChange={setSrcFilters} />}>
             Sources<span className="note">ranked by <button className="link plain underline"
               onClick={() => navigate('system', 'sources')}>your preferences</button></span>

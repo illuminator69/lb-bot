@@ -102,6 +102,7 @@ const skeletonRows = n => (
 )
 
 function TextResults({ q }) {
+  const { canDownload } = useApp()
   const [owned, setOwned] = useState(null)
   const [artists, setArtists] = useState(null)
   // Why the MusicBrainz artist search has no rows, when it failed: an empty
@@ -184,8 +185,8 @@ function TextResults({ q }) {
                   <div className="s clip">{[c.artist, c.year, c.primary_type && c.primary_type.toLowerCase() !== 'album' ? c.primary_type : null].filter(Boolean).join(' · ')}</div>
                 </div>
                 <span className={`st ${c.releaseOwned ? 'ok' : ''}`}>{c.releaseOwned ? 'In library' : 'Not in library'}</span>
-                {c.releaseOwned
-                  ? <button className="sm" onClick={() => goAlbum(c.rgid)}>View</button>
+                {c.releaseOwned || !canDownload
+                  ? <button className="sm" onClick={() => goAlbum(c.rgid)}>{c.releaseOwned ? 'View' : 'Open'}</button>
                   : <button className="sm" onClick={() => goAlbum(c.rgid, true)}>Find sources</button>}
               </div>
             ))}

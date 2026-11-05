@@ -1,10 +1,12 @@
 # lb-bot
 
 A self-hosted **music-library gap-filler**. It scans a Navidrome library for
-missing tracks and incomplete albums, acquires the missing audio from Soulseek
-(via slskd), and places it back into the library — correctly tagged, no retagging
-of what's already there. It runs as a single long-lived Python process exposing
-**both a Telegram bot and a React web UI**.
+missing tracks and incomplete albums and, when slskd is configured, acquires the
+missing audio from Soulseek and places it back into the library — correctly tagged,
+no retagging of what's already there. Without slskd it still indexes discographies,
+keeps a wishlist and links to where an album can be found. It runs as a single
+long-lived Python process exposing **a React web UI behind a Navidrome login**, and
+optionally a Telegram bot.
 
 It also has a **second front end you don't run yourself**: through
 [navi-connect](https://github.com/illuminator69/navi-connect), lb-bot's
@@ -72,7 +74,8 @@ A prebuilt image is published to GHCR on every push to `main`, and
 `docker-compose.yml` pulls from there:
 
 ```bash
-cp .env.example .env     # then edit — Telegram token, Navidrome, slskd, MusicBrainz contact
+cp .env.example .env     # then edit — Navidrome, the hub's address and token, MusicBrainz contact
+                         # (slskd, ListenBrainz and Telegram are optional)
 docker compose pull && docker compose up -d
 ```
 

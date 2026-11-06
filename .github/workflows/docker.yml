@@ -3,6 +3,8 @@ name: docker
 on:
   push:
     branches: [main]
+    # A release tag (`v0.4.0`) also tags the image with that version.
+    tags: ['v*']
   workflow_dispatch:
 
 env:
@@ -32,6 +34,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,format=short
+            type=raw,value=${{ github.ref_name }},enable=${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
 
       - uses: docker/build-push-action@v6
         with:

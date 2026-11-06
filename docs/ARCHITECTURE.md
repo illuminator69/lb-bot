@@ -10,10 +10,9 @@ by function and constant, never by line.
 
 ## Architecture at a glance
 
-One module, `listenbrainz_bot.py` (about 35,000 lines), and one process running three
-things concurrently:
+One module, `listenbrainz_bot.py` (about 37,000 lines), and one process running two
+things concurrently (a third, the Telegram bot, was removed in Worbus 0.4):
 
-- **Telegram bot** — `python-telegram-bot`, command and inline-button driven.
 - **Flask web UI + JSON API** — port `8899`, serving a prebuilt React SPA and a large
   `/api/*` surface.
 - **Background workers** — a scan at start and one a week, the download poller, the
@@ -411,8 +410,9 @@ on another thread long after that scope has exited. An unknown value is a `400`.
 **A group whose transfers all vanished is finalized, not left hanging.** The poller's
 sweep finalizes a group with nothing left in `pending_downloads` after
 `ALBUM_GROUP_ORPHAN_GRACE`, skipping groups mid-failover, and ledger rows that can make
-no further progress are failed with a reason (`_sweep_album_fill_zombies`). Nothing in
-placement hinges on there being a Telegram chat to narrate to.
+no further progress are failed with a reason (`_sweep_album_fill_zombies`). An album
+group is created whenever a download has an owner (B-331: it once also wanted a
+Telegram chat id, so a web download on a server with no Telegram was never finalized).
 
 ### Background work must be visible and must not strand an album
 

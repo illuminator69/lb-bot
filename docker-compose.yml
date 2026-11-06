@@ -15,8 +15,7 @@ services:
       LB_BOT_STATE: /config/lb_bot_state.json
       LB_BOT_REVIEW_FILE: /config/missing_album_review.json
 
-      # ── Web UI ───────────────────────────────────────────────────────────────
-      LB_BOT_WEB: "1"
+      # ── Web UI (always on) ──────────────────────────────────────────────────
       LB_BOT_WEB_HOST: 0.0.0.0
       LB_BOT_WEB_PORT: "8899"
 
@@ -38,8 +37,6 @@ services:
       # ── Credentials and integration (from .env — see .env.example) ────────
       # `${VAR:-}` rather than `${VAR}` so an unset optional var is simply empty
       # instead of emitting a compose warning on every command.
-      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN:-}"
-      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
       NAVIDROME_URL: "${NAVIDROME_URL:-}"
       NAVIDROME_USER: "${NAVIDROME_USER:-}"
       NAVIDROME_PASSWORD: "${NAVIDROME_PASSWORD:-}"

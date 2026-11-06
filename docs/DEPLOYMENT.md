@@ -21,7 +21,7 @@ To build locally instead, comment the `image:` line in the compose file and
 uncomment `build: .`.
 
 **What is in the image.** Two stages: `node:22-slim` builds the web UI (`npm ci`,
-`npm run build`), then `python:3.11-slim` gets `libchromaprint-tools`, the Python
+`npm run build`), then `python:3.12-slim` gets `libchromaprint-tools`, the Python
 requirements, `listenbrainz_bot.py` and the built `web/dist`. It runs
 `python -u listenbrainz_bot.py` and exposes `8899`. There is no init system: the
 process is PID 1.
@@ -47,8 +47,11 @@ at import (`LB_BOT_UMASK`).
 
 **What `/config` holds:**
 
-- `lb_bot_state.json` — transfers in flight, the fill ledger. It embeds the Telegram
-  token and chat id: treat it as a secret.
+- `lb_bot_state.json` — transfers in flight, the fill ledger, the import records. A
+  file written before Worbus 0.4 embeds the Telegram token and chat id: treat it as a
+  secret. Since 0.4 lb-bot re-owns those records to the web user on start and writes
+  no token back (each record keeps an empty `chat_id`, which the release before 0.4
+  reads after a rollback).
 - `library_index.db` (with its `-wal` and `-shm`) — the catalogue, the review, your
   overrides and what they changed, the wishlist; and `library_index.db.hwm.json` beside
   it. **Restoring a backup: restore the database and leave the current `.hwm.json` in
@@ -138,7 +141,6 @@ value itself.
 | `SLSKD_API_KEY` (empty) | from `.env` | Optional. slskd UI → Options → API Keys. **Downloading is on only when this is set** (read once at start); without it lb-bot makes no slskd call and every download route answers 409 `downloads_off` |
 | `LISTENBRAINZ_USER` (empty) | from `.env` | Optional. Whose playlists are scanned and whose listens are mirrored; unset, no playlist scan runs. Through navi-connect, listening history is shown to the hub's primary user only |
 | `MBZ_CONTACT` (empty) | from `.env` | Contact email the MusicBrainz API terms require |
-| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` (empty) | from `.env` | The Telegram bot. Optional if you only use the web UI |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` (empty) | from `.env` | Optional: Spotify playlist import, and resolving a pasted Spotify link |
 | `LASTFM_API_KEY` (empty) | from `.env` | Optional: cross-checks the similar-artists lookup. Without it the ListenBrainz half runs alone |
 | `ACOUSTID_API_KEY` (empty) | from `.env` | Optional: with it a downloaded file is fingerprinted before it is placed — a different song under the right name is refused, another recording of the same track is placed and said. Without it nothing is checked and nothing is refused on that ground |
@@ -161,7 +163,6 @@ value itself.
 
 | Variable (default) | Compose | |
 |---|---|---|
-| `LB_BOT_WEB` (`1`) | fixed | `0` runs the Telegram bot alone — and with it none of the workers the web side starts: no background indexing, no listens mirror, no index feed for a hub |
 | `LB_BOT_WEB_HOST` (`0.0.0.0`), `LB_BOT_WEB_PORT` (`8899`) | fixed |  |
 
 **Optional checks and background work** — none is needed to run, and none is listed in
@@ -191,29 +192,33 @@ the reference compose file.
 | `DOWNLOAD_POLL_ACTIVE_INT` (`5`) | seconds | How often slskd's transfers are read while a download is running |
 | `LB_BOT_REVIEW_FLUSH_INT` (`2.0`) | seconds | The longest a change to the review waits before it is written to disk |
 
+**Removed in Worbus 0.4:** `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID` (either one set logs
+one line at start — "Telegram was removed in Worbus 0.4; this setting is ignored" — and
+never its value), and `LB_BOT_WEB` (`0` meant "Telegram alone"; the web UI always runs
+now, and a `0` is ignored with a line).
+
 **Multi-user:** the `USERS` list near the top of `listenbrainz_bot.py` holds one entry
-per user — Telegram token and chat, Navidrome login, ListenBrainz user, and which
+per user — Navidrome login, ListenBrainz user, and which
 playlists to pull (`playlist_sources`; Weekly Exploration and Weekly Jams by default).
 The first entry is the one the environment variables fill; more are added in the
 source.
 
 ---
 
-## Telegram commands
+## What replaced the Telegram commands (Worbus 0.4)
 
-| Command | Action |
+The Telegram bot is gone. What only it did went to the web page or was dropped on
+purpose:
+
+| Telegram | Now |
 |---|---|
-| `/start`, `/help` | Help text |
-| `/scan` | Scan your playlists now for missing tracks |
-| `/status` | Active downloads and album progress |
-| `/pending` | Albums in progress or needing review |
-| `/diag` | What the bot can reach |
-| `/album <Artist - Album>` | Download a whole album by name |
-| `/search <Artist - Title>` | Manual Soulseek search with per-file and per-album download buttons |
-| `/spplaylist <url>` | Import a public Spotify playlist |
-| `/checkalbums` | Find incomplete albums in the library |
-| `/beets` | List the download folders that hold audio and offer to file each into the library. The name is from when beets did the filing; lb-bot's own placement does it now, and nothing runs beets |
-| `/rescan` | Trigger a Navidrome quick scan (`/rescan full` for a full one) |
+| The Tuesday playlist scan's results as a message | Needs you › Gaps to fill, found by the playlist scan |
+| A failed import's card (Retry, Re-import, Pin MBID & retry, Pick release, Import as-is, Choose cover, Re-download) | Needs you › To fix › **Imports that need you**: Retry, Pin release & retry, Import as-is and Open album (the album page has its cover and its re-download). `/lb/attention` counts them (`counts.imports`) and both apps link to `#/needs/imports` |
+| `/status`, `/pending` | Activity and Needs you |
+| `/search`, `/album` | The web page's search and album pages |
+| `/spplaylist` | Needs you › Scan › Spotify playlist |
+| `/diag` | System › Status |
+| "Download all", `/beets` "Import ALL", `/rescan full`, `/checkalbums`, the pings | Dropped: the web page fetches gap by gap and files one folder at a time; a full rescan is Navidrome's own button; the apps show the same states when opened |
 
 A scan runs at start (throttled, so a restart loop does not repeat it) and every
 Tuesday at 09:00, container time.

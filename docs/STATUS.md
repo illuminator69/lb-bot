@@ -11,7 +11,8 @@ design behind each item is in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 lb-bot scans a Navidrome library for missing tracks and missing albums, finds them on
 Soulseek through slskd, and places them into the library tagged from MusicBrainz, with
-Navidrome as the check that they arrived. It has a Telegram bot and a web UI, and through
+Navidrome as the check that they arrived. It has a web UI (its Telegram bot was removed
+in Worbus 0.4), and through
 a [navi-connect](https://github.com/illuminator69/navi-connect) hub the same surface
 appears inside the music players. Around that loop it lets the user correct what the
 library says — which MusicBrainz artist an artist is, which release an album is (with a
@@ -135,6 +136,7 @@ a live stack:
 - The web UI has no login; it is meant for a private network.
 - The listens mirror reads ListenBrainz only, and stores the first artist of a listen:
   a collaboration counts for its lead artist.
-- With `LB_BOT_WEB=0` the background indexer, the listens mirror and the index feed do
-  not run.
+- Worbus 0.4: Telegram is gone; a failed import is listed under Needs you › Imports that
+  need you and counted in `/lb/attention` (`counts.imports`). Checked by the suite and on
+  a scratch lb-bot on the sandbox VM; not yet on a live stack.
 - Line numbers quoted in older notes drift; navigate by function name.

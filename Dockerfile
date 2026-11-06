@@ -7,7 +7,7 @@ COPY web/ ./
 RUN npm run build
 
 # ── Stage 2: Python runtime ───────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.12-slim
 WORKDIR /app
 # fpcalc (Chromaprint) — the fingerprinter behind the AcoustID placement check.
 # A few MB, and pyacoustid shells out to it, so pip alone is not enough.

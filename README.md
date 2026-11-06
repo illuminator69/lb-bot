@@ -5,8 +5,9 @@ missing tracks and incomplete albums and, when slskd is configured, acquires the
 missing audio from Soulseek and places it back into the library — correctly tagged,
 no retagging of what's already there. Without slskd it still indexes discographies,
 keeps a wishlist and links to where an album can be found. It runs as a single
-long-lived Python process exposing **a React web UI behind a Navidrome login**, and
-optionally a Telegram bot.
+long-lived Python process exposing **a React web UI behind a Navidrome login**. (Its
+Telegram bot was removed in Worbus 0.4: a failed import is listed on the web page,
+under Needs you, and the apps link there.)
 
 It also has a **second front end you don't run yourself**: through
 [navi-connect](https://github.com/illuminator69/navi-connect), lb-bot's
@@ -75,22 +76,21 @@ A prebuilt image is published to GHCR on every push to `main`, and
 
 ```bash
 cp .env.example .env     # then edit — Navidrome, the hub's address and token, MusicBrainz contact
-                         # (slskd, ListenBrainz and Telegram are optional)
+                         # (slskd and ListenBrainz are optional)
 docker compose pull && docker compose up -d
 ```
 
 The web UI is on **:8899**. Three mounts have to be writable by the container's uid,
 including the downloads directory — placement unlinks the source file after copying.
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the mounts, every environment variable,
-the Telegram commands, the one-time `chown` that fixes "attempt to write a readonly
-database", and the one Navidrome setting ("Report Real Path" for lb-bot's player)
+the one-time `chown` that fixes "attempt to write a readonly database", and the one Navidrome setting ("Report Real Path" for lb-bot's player)
 without which retagging an album, changing its cover or merging two artist names is
 refused.
 
 To run it directly instead:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt       # Python 3.12, the image's
 cd web && npm ci && npm run build     # or `npm run dev` for HMR
 python listenbrainz_bot.py            # bot + web UI on :8899
 ```
@@ -102,7 +102,7 @@ python listenbrainz_bot.py            # bot + web UI on :8899
 | | |
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | What the process is doing: the three concurrent halves, the state files and index schema, the systems it talks to, the `/api/*` surface, the overrides and the listens mirror, and how acquisition and placement actually work. |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, mounts and ownership, what Navidrome must be set to, every environment variable, local development, Telegram commands. |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, mounts and ownership, what Navidrome must be set to, every environment variable, local development, what replaced the Telegram commands. |
 | [`CLAUDE.md`](CLAUDE.md) | The long-form design notes: every rule with its reason, written as the work was done, oldest sections kept as history. Where it and the architecture page disagree about the present, the architecture page is the current one. **Read the relevant section before touching acquisition or placement.** |
 | [`docs/STATUS.md`](docs/STATUS.md) | How far to trust each part: what has been confirmed on a live stack, what is built and not confirmed, and the known limits. |
 

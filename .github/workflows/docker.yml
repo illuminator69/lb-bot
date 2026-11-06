@@ -3,7 +3,8 @@ name: docker
 on:
   push:
     branches: [main]
-    # A release tag (`v0.4.0`) also tags the image with that version.
+    # A release tag (`v0.4.0`) also tags the image with that version, without
+    # the `v` (`lb-bot:0.4.0`, as worbus-server.yml tags `worbus-server:0.4.0`).
     tags: ['v*']
   workflow_dispatch:
 
@@ -31,10 +32,12 @@ jobs:
         id: meta
         with:
           images: ${{ env.IMAGE }}
+          # `latest` moves on a push to main (what the NAS pulls) and on a
+          # release tag; never on a pre-release tag (one with a `-`, v0.4.1-rc1).
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref_type != 'tag' || !contains(github.ref_name, '-') }}
+            type=semver,pattern={{version}}
             type=sha,format=short
-            type=raw,value=${{ github.ref_name }},enable=${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
 
       - uses: docker/build-push-action@v6
         with:

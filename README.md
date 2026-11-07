@@ -16,7 +16,7 @@ albums you're missing show up on the artist page next to the ones you own, and a
 download is reviewed and started from there. The two apps,
 [Worbus for Android](https://github.com/illuminator69/worbus-android) and
 [Worbus for desktop](https://github.com/illuminator69/worbus-desktop), also carry lb-bot's
-Needs attention, Source history and listening pages. If that's what you came for, the
+Needs attention (admin account), activity (called Source history in Worbus for Android) and listening pages. If that's what you came for, the
 [Worbus install guide](https://github.com/illuminator69/worbus/blob/main/INSTALL.md)
 is the place to start; it covers both halves. Worbus is not affiliated with Navidrome.
 

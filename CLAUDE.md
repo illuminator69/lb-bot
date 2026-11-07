@@ -49,7 +49,10 @@ a fresh clone gets a `deploy.sh` that answers "Permission denied". Adding an exe
 A single-file Python bot (`listenbrainz_bot.py`, ~37k lines) that fills gaps in a
 self-hosted music library. It exposes a Flask web UI (port 8899) and the routes the
 Worbus hub proxies; the Telegram bot it also had was removed in Worbus 0.4 (§ Telegram,
-removed in Worbus 0.4). It talks to:
+removed in Worbus 0.4). Its clients are **the Worbus apps**: from Worbus 0.5 (project 5) Navic is **Worbus for
+Android** (`app.worbus.android`) and Feishin is **Worbus for desktop** (`app.worbus.desktop`); older sections of this
+file and the dated notes say Navic and Feishin, and mean those two. lb-bot itself keeps its name, and its public repo
+(`illuminator69/lb-bot`) is not renamed. It talks to:
 
 - **Navidrome** — music server, Subsonic API. `http://navidrome:4533`.
   This is the source of truth for what's in the library and the success oracle

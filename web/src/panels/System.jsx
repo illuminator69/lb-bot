@@ -418,7 +418,7 @@ function Status() {
               <IndexBuild progress={progress} />
               <KV label="Hub push" st={hub.configured ? (hub.persistFailing ? 'Fail' : 'On') : 'Off'}
                 note={hub.configured ? `${hub.url} · index head ${hub.headSeq ?? '—'}${hub.ackedSeq != null ? `, hub has ${hub.ackedSeq}` : ''}` : null}>
-                {!hub.configured ? 'LB_BOT_HUB_URL and _TOKEN are not set, so the Feishin and Navic clients get no live updates.'
+                {!hub.configured ? 'LB_BOT_HUB_URL and _TOKEN are not set, so the Worbus apps get no live updates.'
                   : hub.persistFailing ? <span className="bad">Can’t write the high-water mark. /config is not writable.</span>
                   : hub.attemptedAt ? `last push ${ago(hub.attemptedAt)} ago` : 'no push yet'}
               </KV>

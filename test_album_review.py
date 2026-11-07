@@ -19,20 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 requests_stub = types.SimpleNamespace(get=lambda *a, **k: None, post=lambda *a, **k: None,
                                       delete=lambda *a, **k: None)
-telegram_stub = types.ModuleType("telegram")
-telegram_stub.InlineKeyboardButton = object
-telegram_stub.InlineKeyboardMarkup = object
-telegram_stub.Update = object
-telegram_ext_stub = types.ModuleType("telegram.ext")
-telegram_ext_stub.Application = types.SimpleNamespace(builder=lambda: None)
-telegram_ext_stub.CallbackQueryHandler = object
-telegram_ext_stub.CommandHandler = object
-telegram_ext_stub.MessageHandler = object
-telegram_ext_stub.ContextTypes = types.SimpleNamespace(DEFAULT_TYPE=object)
-telegram_ext_stub.filters = types.SimpleNamespace(COMMAND=object())
 sys.modules.setdefault("requests", requests_stub)
-sys.modules.setdefault("telegram", telegram_stub)
-sys.modules.setdefault("telegram.ext", telegram_ext_stub)
 
 import listenbrainz_bot as bot
 
@@ -1865,7 +1852,6 @@ class AlbumReviewTests(unittest.TestCase):
 
     def test_recovery_record_marks_downloaded_not_imported(self):
         old_albums = bot._albums.copy()
-        old_uid = bot._uid_to_token.copy()
         try:
             bot._albums.clear()
             recid = bot._record_import_recovery(
@@ -1878,8 +1864,6 @@ class AlbumReviewTests(unittest.TestCase):
         finally:
             bot._albums.clear()
             bot._albums.update(old_albums)
-            bot._uid_to_token.clear()
-            bot._uid_to_token.update(old_uid)
 
     def test_atomic_json_write_survives_concurrent_writers(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2251,10 +2235,9 @@ class AlbumReviewTests(unittest.TestCase):
         bot.pending_album_groups["ag1"]["local_dirs"] = {"/downloads/Album": 3}
         bot.pending_album_groups["ag1"]["cancelled"] = True
         with patch.object(bot, "_deterministic_album_import",
-                          lambda *a, **k: self.fail("a cancelled group must not be placed")), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+                          lambda *a, **k: self.fail("a cancelled group must not be placed")):
             bot._album_fill_set("rel1", "cancelled")
-            asyncio.run(bot._finalize_group(None, "ag1"))
+            asyncio.run(bot._finalize_group("ag1"))
         self.assertNotIn("ag1", bot.pending_album_groups)
         self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
 
@@ -2271,15 +2254,13 @@ class AlbumReviewTests(unittest.TestCase):
                           lambda force=False: [{"_username": "slowpeer",
                                                "filename": "Album\\01.flac",
                                                "state": "Completed, Succeeded"}]), \
-                patch.object(bot, "_tg_send", sends), \
                 patch.object(bot, "_transfer_local_path",
                              lambda f, asked=0: "/downloads/Album/01.flac"), \
                 patch.object(bot, "_mutagen_write_tags",
                              lambda *a, **k: self.fail("must not tag a cancelled album's file")), \
                 patch.object(bot, "_nd_scan_after_import",
                              lambda *a, **k: self.fail("must not scan for it either")):
-            app = type("App", (), {"bot": AsyncMock()})()
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
         self.assertEqual(bot.pending_downloads, {})
         sends.assert_not_called()
 
@@ -2303,9 +2284,8 @@ class AlbumReviewTests(unittest.TestCase):
             return True
 
         with patch.object(bot, "slskd_expand_directory", lambda u, fd, ref: fd["files"]), \
-                patch.object(bot, "slskd_enqueue", enqueue_then_cancel), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
-            asyncio.run(bot._switch_album_source(None, "ag1"))
+                patch.object(bot, "slskd_enqueue", enqueue_then_cancel):
+            asyncio.run(bot._switch_album_source("ag1"))
         self.assertEqual(enqueued, ["a.flac"])
         self.assertNotIn("ag1", bot.pending_album_groups)
         self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
@@ -2314,14 +2294,12 @@ class AlbumReviewTests(unittest.TestCase):
         """One poll of the `_group()` fixture's three files, in `states`."""
         listing = [{"_username": "slowpeer", "filename": f"Album\\0{n}.flac", "state": st}
                    for n, st in zip((1, 2, 3), states)]
-        app = type("App", (), {"bot": AsyncMock()})()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(bot, "slskd_get_all_downloads",
                                              lambda force=False: listing))
-            stack.enter_context(patch.object(bot, "_tg_send", new_callable=AsyncMock))
             for name, value in patches.items():
                 stack.enter_context(patch.object(bot, name, value))
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
 
     def test_the_poller_skips_a_finished_file_whose_transfer_was_let_go_of(self):
         """Fix round 1 (M3): a rescan that drops a row lets go of its transfer
@@ -2382,7 +2360,7 @@ class AlbumReviewTests(unittest.TestCase):
         ag = bot.pending_album_groups["ag1"]
         ag["alt_sources"] = [{"username": "peer2", "files": [{"filename": "a.flac"}]}]
 
-        async def switch(_bot, ag_id):
+        async def switch(ag_id):
             ag["source_user"] = "peer2"
 
         self._poll_once_with(["Completed, Errored", "InProgress", "InProgress"],
@@ -2408,9 +2386,8 @@ class AlbumReviewTests(unittest.TestCase):
 
         with patch.object(bot, "slskd_expand_directory", expand_then_cancel), \
                 patch.object(bot, "slskd_enqueue",
-                             lambda *a, **k: self.fail("must not enqueue after a cancel")), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
-            asyncio.run(bot._switch_album_source(None, "ag1"))
+                             lambda *a, **k: self.fail("must not enqueue after a cancel")):
+            asyncio.run(bot._switch_album_source("ag1"))
         self.assertNotIn("ag1", bot.pending_album_groups)
         self.assertEqual(bot._album_fill_view("rel1")["state"], "cancelled")
 
@@ -2443,9 +2420,8 @@ class AlbumReviewTests(unittest.TestCase):
         with patch.object(bot, "slskd_expand_directory", lambda u, fd, ref: fd["files"]), \
                 patch.object(bot, "slskd_enqueue",
                              off_loop("enqueue", lambda username, f: username == "peer3")), \
-                patch.object(bot, "_abandon_group_downloads", off_loop("abandon")), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
-            asyncio.run(bot._switch_album_source(None, "ag1"))
+                patch.object(bot, "_abandon_group_downloads", off_loop("abandon")):
+            asyncio.run(bot._switch_album_source("ag1"))
         # The switch's own abandon, peer2 refusing, its abandon, peer3 accepting.
         self.assertEqual(calls, ["abandon", "enqueue", "abandon", "enqueue"])
         self.assertEqual(on_loop, [])
@@ -2722,12 +2698,9 @@ class AlbumReviewTests(unittest.TestCase):
         self.assertTrue(view["mp3WouldHelp"])
 
     def _poll_once(self, downloads):
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: downloads), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock), \
-                patch.object(bot, "_update_group_progress", new_callable=AsyncMock), \
                 patch.object(bot, "_transfer_local_path", lambda f, asked=0: ""):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
 
     def test_cancel_of_one_file_in_slskd_loses_that_file_and_keeps_the_album(self):
         """A user-cancelled transfer used to be failed over to another peer — the
@@ -2784,10 +2757,8 @@ class AlbumReviewTests(unittest.TestCase):
         self._isolated_transfers(forbid_auto_retry=False)
         self._group(completed=0)
         bot._album_fill_set("rel1", "queued")
-        with patch.object(bot, "InlineKeyboardButton", lambda *a, **k: None), \
-                patch.object(bot, "InlineKeyboardMarkup", lambda *a, **k: None):
-            self._poll_once([{"_username": "slowpeer", "filename": "Album\\01.flac",
-                              "state": "Completed, Rejected"}])
+        self._poll_once([{"_username": "slowpeer", "filename": "Album\\01.flac",
+                          "state": "Completed, Rejected"}])
         view = bot._album_fill_view("rel1")
         self.assertEqual((view["state"], view["failureKind"], view["retryable"]),
                          ("failed", "transfer_failed", True))
@@ -3034,9 +3005,11 @@ class AlbumReviewTests(unittest.TestCase):
             bot._save_state()
             bot.pending_album_groups.clear()
             bot._load_state()
+            # (With the fields an older release reads, written on save.)
             self.assertEqual(bot.pending_album_groups["ag-asked"],
                              {"label": "Album", "total": 5, "completed": 0, "failed": 0,
-                              "source_user": "peer"})
+                              "source_user": "peer", "token": "web", "chat_id": "",
+                              "progress_msg_id": None})
 
     def test_fill_ledger_prunes_only_aged_out_terminal_rows(self):
         """A stale `verified` is history; an interrupted transfer is not, however
@@ -5737,12 +5710,8 @@ class AlbumSearchPassTests(unittest.TestCase):
               "retry_query": "", "completed": 0, "failed": 0}
         bot.pending_album_groups[ag_id] = ag
         try:
-            from unittest.mock import MagicMock
-            with patch.object(bot, "_tg_send", new=AsyncMock()), \
-                 patch.object(bot, "InlineKeyboardButton", MagicMock()), \
-                 patch.object(bot, "InlineKeyboardMarkup", MagicMock()), \
-                 patch.object(bot, "slskd_expand_directory") as expand:
-                asyncio.run(bot._switch_album_source_inner(None, ag_id, ag))
+            with patch.object(bot, "slskd_expand_directory") as expand:
+                asyncio.run(bot._switch_album_source_inner(ag_id, ag))
             expand.assert_not_called()
             self.assertNotIn(ag_id, bot.pending_album_groups)
         finally:
@@ -9922,6 +9891,194 @@ class GapsHiddenViewTests(unittest.TestCase):
         self.assertEqual(v["counts"]["hidden"], 1)
 
 
+class LogTeeRedactionTests(unittest.TestCase):
+    """Worbus P4 fix round (ruling R19): every line lb-bot writes to stdout or
+    stderr goes through the shared redaction rule v2 in `_LogTee.write`, so the
+    container's log carries no Subsonic login, key, token or password."""
+
+    # The round's contract, `redaction-vectors.json` (27 cases), verbatim:
+    # (name, input, output). Navic, Feishin and the Worbus launcher hold the same.
+    VECTORS = [
+        ('subsonic_params',
+         'GET https://nd.example.org/rest/stream?u=bob&t=abc123&s=def456&v=1.16.1&c=navic&id=tr-1',
+         'GET https://nd.example.org/rest/stream?u=[removed]&t=[removed]&s=[removed]&v=1.16.1&c=navic&id=tr-1'),
+        ('subsonic_p_enc',
+         'cover https://nd.example.org/rest/getCoverArt?id=al-9&p=enc:7365637265743132&u=alice&size=300',
+         'cover https://nd.example.org/rest/getCoverArt?id=al-9&p=[removed]&u=[removed]&size=300'),
+        ('bearer_header',
+         'Authorization: Bearer eyJhbGciOi.payload.sig',
+         'Authorization: [removed]'),
+        ('bearer_header_lower',
+         'authorization: bearer eyJhbGciOi.payload.sig',
+         'authorization: [removed]'),
+        ('bearer_bare_upper',
+         '-> request with BEARER zzz999 attached',
+         '-> request with BEARER [removed] attached'),
+        ('bearer_json_header',
+         '{"headers":{"Authorization":"Bearer abc.def"}}',
+         '{"headers":{"Authorization":"[removed]"}}'),
+        ('json_password',
+         '{"username":"bob","password":"hunter2"}',
+         '{"username":"bob","password":"[removed]"}'),
+        ('json_password_escaped_quote',
+         '{"password":"a\\"b","x":1}',
+         '{"password":"[removed]","x":1}'),
+        ('json_device_secret',
+         '{"deviceId":"d-1","deviceSecret":"ds-1234","name":"Pixel"}',
+         '{"deviceId":"d-1","deviceSecret":"[removed]","name":"Pixel"}'),
+        ('json_token',
+         'hello {"t":"hello","token":"tok-abc","device":"d-1"}',
+         'hello {"t":"hello","token":"[removed]","device":"d-1"}'),
+        ('json_nested_secret',
+         '{"hubAuth":{"deviceId":"d1","secret":"s3cr3t"}}',
+         '{"hubAuth":{"deviceId":"d1","secret":"[removed]"}}'),
+        ('json_spaced',
+         '{ "apiKey" : "k-123" }',
+         '{ "apiKey" : "[removed]" }'),
+        ('kv_apikey',
+         'audiomuse apiKey=sk-123 ok',
+         'audiomuse apiKey=[removed] ok'),
+        ('kv_env_style',
+         'SLSKD_API_KEY=abc HUB_TOKEN=tok2 HUB_NAME=home',
+         'SLSKD_API_KEY=[removed] HUB_TOKEN=[removed] HUB_NAME=home'),
+        ('kv_colon',
+         'HubManager: token: abc123',
+         'HubManager: token: [removed]'),
+        ('kv_quoted',
+         'password="hunter 2" next',
+         'password="[removed]" next'),
+        ('query_apikey',
+         'GET http://am.local:8000/api/x?apiKey=abc&q=1',
+         'GET http://am.local:8000/api/x?apiKey=[removed]&q=1'),
+        ('url_inside_json',
+         '{"url":"https://nd.example.org/rest/stream?u=bob&t=abc&s=def&id=1"}',
+         '{"url":"https://nd.example.org/rest/stream?u=[removed]&t=[removed]&s=[removed]&id=1"}'),
+        ('url_inside_escaped_json',
+         'payload={\\"src\\":\\"https://nd/rest/stream?id=1&t=abc&s=def\\"}',
+         'payload={\\"src\\":\\"https://nd/rest/stream?id=1&t=[removed]&s=[removed]\\"}'),
+        ('json_escaped_password',
+         'body="{\\"user\\":\\"bob\\",\\"password\\":\\"hunter2\\"}"',
+         'body="{\\"user\\":\\"bob\\",\\"password\\":\\"[removed]\\"}"'),
+        ('json_escaped_token_spaced',
+         'frame {\\"t\\":\\"hello\\", \\"token\\" : \\"tok-9\\"}',
+         'frame {\\"t\\":\\"hello\\", \\"token\\" : \\"[removed]\\"}'),
+        ('url_userinfo',
+         'fetch https://bob:hunter2@nd.example.org/rest/ping',
+         'fetch https://[removed]@nd.example.org/rest/ping'),
+        ('plain_ping',
+         'GET /rest/ping?v=1.16.1&c=navic ok',
+         'GET /rest/ping?v=1.16.1&c=navic ok'),
+        ('plain_player',
+         'Player: track changed to 3 of 12 (id=tr-1)',
+         'Player: track changed to 3 of 12 (id=tr-1)'),
+        ('plain_words',
+         'Pressed the key 5 times; token refresh scheduled',
+         'Pressed the key 5 times; token refresh scheduled'),
+        ('plain_json',
+         '{"t":"progress","positionMs":1200,"index":3}',
+         '{"t":"progress","positionMs":1200,"index":3}'),
+        ('plain_url',
+         'https://hub.example.org:4790/hub/info?format=json',
+         'https://hub.example.org:4790/hub/info?format=json'),
+    ]
+
+    def test_the_shared_rule_v2_gives_every_vector_its_output(self):
+        self.assertEqual(len(self.VECTORS), 27)
+        for name, given, expected in self.VECTORS:
+            with self.subTest(name):
+                self.assertEqual(bot._redact_log_rule(given), expected)
+                # and the line the tee writes is the same (no Telegram shape in them)
+                self.assertEqual(bot._redact_log_line(given), expected)
+
+    def test_a_navidrome_connection_error_reaches_stdout_without_u_t_s(self):
+        """What `requests` raises when Navidrome does not answer names the whole
+        URL, `u`/`t`/`s` included; nd_get_all_albums prints it."""
+        # The suite stubs `requests`; the message is built as urllib3 words it.
+        class ConnectionError(Exception):
+            pass
+        seen = {}
+
+        def refuse(url, params=None, **kw):
+            seen.update(params)
+            path = (urllib.parse.urlsplit(url).path + "?"
+                    + urllib.parse.urlencode(params))
+            raise ConnectionError(
+                "HTTPConnectionPool(host='navidrome', port=4533): Max retries "
+                f"exceeded with url: {path} (Caused by NewConnectionError("
+                "'<urllib3.connection.HTTPConnection object>: Failed to establish "
+                "a new connection: [Errno 111] Connection refused'))")
+
+        sink = io.StringIO()
+        tee = bot._LogTee(sink)
+        with patch.object(bot._http, "get", side_effect=refuse), \
+                patch.object(bot, "_stdout_events", []) as ring, \
+                patch.object(sys, "stdout", tee):
+            bot.nd_get_all_albums("planted-owner", "planted-password")
+            msgs = [e["msg"] for e in ring]
+        out = sink.getvalue()
+        self.assertIn("nd_get_all_albums error:", out)
+        self.assertIn("/rest/getAlbumList2?u=[removed]&t=[removed]&s=[removed]&v=1.16.1", out)
+        for value in ("planted-owner", seen["t"], seen["s"], "planted-password"):
+            self.assertNotIn(value, out)
+            self.assertFalse(any(value in m for m in msgs), msgs)
+
+    def test_the_lastfm_key_and_a_telegram_token_are_removed(self):
+        sink = io.StringIO()
+        tee = bot._LogTee(sink)
+        with patch.object(bot, "_stdout_events", []):
+            tee.write("  similar artists: lastfm lookup failed: 403 Client Error: "
+                      "Forbidden for url: https://ws.audioscrobbler.com/2.0/?method="
+                      "artist.getsimilar&artist=X&api_key=plantedlastfmkey99&format=json\n")
+            tee.write("  old error: POST https://api.telegram.org/"
+                      "bot123456789:AAplantedTelegramSecretValue0001/sendMessage\n")
+        out = sink.getvalue()
+        self.assertIn("api_key=[removed]&format=json", out)
+        self.assertNotIn("plantedlastfmkey99", out)
+        self.assertNotIn("AAplantedTelegramSecretValue0001", out)
+        self.assertNotIn("123456789:", out)
+
+    def test_lb_bots_own_start_up_lines_keep_their_words(self):
+        """The rule takes the word after a sensitive name and a colon for its
+        value; lb-bot's own lines are worded so it has nothing to take."""
+        for env in ({"TELEGRAM_TOKEN": "x"}, {"TELEGRAM_CHAT_ID": "y"},
+                    {"TELEGRAM_TOKEN": "x", "TELEGRAM_CHAT_ID": "y"}):
+            (line,) = bot._retired_setting_lines(env)
+            self.assertIn(bot.TELEGRAM_REMOVED, line)
+            self.assertEqual(bot._redact_log_line(line), line)
+        line = f"  migration {bot._TITLE_KEY_STALE_MIGRATION} — skipped (x); will try again"
+        self.assertEqual(bot._redact_log_line(line), line)
+        self.assertIn(f'print(f"  migration {{_TITLE_KEY_STALE_MIGRATION}} — skipped',
+                      inspect.getsource(bot))
+
+    def test_a_secret_split_across_two_writes_is_one_line_to_the_rule(self):
+        sink = io.StringIO()
+        tee = bot._LogTee(sink)
+        with patch.object(bot, "_stdout_events", []):
+            print("hub token:", "plantedhubtoken7", file=tee)
+        self.assertEqual(sink.getvalue(), "hub token: [removed]\n")
+
+    def test_a_partial_line_is_written_redacted_at_flush(self):
+        sink = io.StringIO()
+        tee = bot._LogTee(sink)
+        with patch.object(bot, "_stdout_events", []):
+            tee.write("GET /rest/ping?u=owner&p=enc:736563726574")
+            self.assertEqual(sink.getvalue(), "")
+            tee.flush()
+        self.assertEqual(sink.getvalue(), "GET /rest/ping?u=[removed]&p=[removed]")
+
+    def test_a_long_adversarial_line_is_fast(self):
+        """The reference's regexes are quadratic on long dotted or dashed runs
+        (16 KB of `ab-` took 0.1 s); the port is linear."""
+        for line in ("ab-" * 350_000, "a." * 500_000, "key-" * 250_000,
+                     '"' + "key" * 330_000, "a://" * 250_000):
+            sink = io.StringIO()
+            tee = bot._LogTee(sink)
+            start = time.perf_counter()
+            with patch.object(bot, "_stdout_events", []):
+                tee.write(line + "\n")
+            self.assertLess(time.perf_counter() - start, 3.0, line[:8])
+            self.assertEqual(len(sink.getvalue()), len(line) + 1)
+
 class LogTeeTests(unittest.TestCase):
     def test_complete_lines_reach_the_ring_and_web_echo_does_not(self):
         sink = io.StringIO()
@@ -10264,7 +10421,6 @@ def _web_app(as_role: str = "admin"):
             pass
 
     with patch.object(flask, "Flask", _Recording), \
-            patch.object(bot, "WEB_UI_ENABLED", True), \
             patch.object(bot.threading, "Thread", _NoThread):
         bot.start_web_dashboard()
     app = apps[0]
@@ -11093,11 +11249,9 @@ class LooseTrackPlacementTests(unittest.TestCase):
             "release_mbid": self.RELEASE, "artist": "Artist", "album": "Album",
             "review_group_id": "album1", "match_mode": "auto"}
         with patch.object(bot, "_audio_signature", sig), \
-                patch.object(bot, "_save_state", lambda *a, **k: None), \
-                patch.object(bot, "_album_action_markup", lambda *a, **k: None), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+                patch.object(bot, "_save_state", lambda *a, **k: None):
             bot._album_fill_set(self.RELEASE, "downloading")
-            asyncio.run(bot._finalize_group(None, "ag1"))
+            asyncio.run(bot._finalize_group("ag1"))
         self.assertEqual(bot._album_fill_get(self.RELEASE)["state"], "failed")
         self._assert_each_row_says_its_own_refusal(self._album1_tracks())
 
@@ -11436,21 +11590,23 @@ class LooseTrackPlacementTests(unittest.TestCase):
             "album_group_id": None, "review_group_id": "loose1",
             "review_track_index": 0, "track": copy}
         written = []
-        app = type("App", (), {"bot": AsyncMock()})()
+        out = io.StringIO()
         with patch.object(bot, "slskd_get_all_downloads",
                           lambda force=False: [{"_username": "peer",
                                                "filename": "Music\\01 - One.flac",
                                                "state": "Completed, Succeeded"}]), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock) as tg, \
+                contextlib.redirect_stdout(out), \
                 patch.object(bot, "_save_state", lambda *a, **k: None), \
                 patch.object(bot, "_transfer_local_path", lambda f, asked=0: self.file), \
                 patch.object(bot, "_audio_file_tags",
                              tags if callable(tags) else (lambda path: dict(tags))), \
                 patch.object(bot, "_mutagen_write_tags",
                              lambda path, t: written.append((path, t)) or True):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
-        # _tg_send(bot, chat_id, text): what Telegram was told.
-        self.telegram = [c.args[2] for c in tg.call_args_list]
+            asyncio.run(bot._poll_downloads_once())
+        # What the poller logged of the file's outcome (Telegram was told the
+        # same, until Worbus 0.4).
+        self.told = [line for line in out.getvalue().splitlines()
+                     if "downloaded file " in line]
         return written
 
     def test_embedded_release_tag_files_the_loose_track(self):
@@ -11809,9 +11965,9 @@ class LooseTrackPlacementTests(unittest.TestCase):
 
         with patch.object(bot, "_link_loose_track_placements", boom):
             self._finish_download({"musicbrainz_albumid": self.RELEASE, "title": "One"})
-        self.assertEqual(len(self.telegram), 1)
-        self.assertNotIn("filed under", self.telegram[0])
-        self.assertIn("failed", self.telegram[0])
+        self.assertEqual(len(self.told), 1)
+        self.assertNotIn("filed under", self.told[0])
+        self.assertIn("failed", self.told[0])
         # Q-026: the row says why and carries the miss stamp — and, the file
         # having moved, it no longer points at a path with nothing there.
         self.assertFalse(os.path.exists(self.file))
@@ -11856,8 +12012,8 @@ class LooseTrackPlacementTests(unittest.TestCase):
         self.assertIn("is a track of Artist – Album", row["download_error"])
         self.assertTrue(row.get("placement_missed_at"))
         self.assertEqual(self.verified, [])
-        self.assertEqual(len(self.telegram), 1)
-        self.assertNotIn("extra track", self.telegram[0])
+        self.assertEqual(len(self.told), 1)
+        self.assertNotIn("extra track", self.told[0])
 
 
 class RescanKeepsLiveTransfersTests(unittest.TestCase):
@@ -12736,11 +12892,9 @@ class RescanKeepsLiveTransfersTests(unittest.TestCase):
                              lambda filename, asked=0: resolve(filename)), \
                 patch.object(bot, "_remember_download_origin", lambda *a, **k: None), \
                 patch.object(bot, "_push_fill_progress", lambda *a, **k: None), \
-                patch.object(bot, "_update_group_progress", new_callable=AsyncMock), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock), \
                 patch.object(bot, "_save_state", lambda *a, **k: None), \
                 patch.object(bot, "_sweep_album_fill_zombies", lambda *a, **k: 0):
-            asyncio.run(bot._poll_downloads_once({}))
+            asyncio.run(bot._poll_downloads_once())
 
     def test_the_pollers_downloaded_lands_on_the_row_a_rescan_moved(self):
         """The poller reads the transfer's index, then awaits
@@ -17058,7 +17212,6 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
                 ("_nd_scan_after_import", lambda token: self.scans.append(token) or True),
                 ("_push_gap", self.pushed.append),
                 ("_start_placement_verification", self.verified.append),
-                ("_album_action_markup", lambda *a, **k: None),
                 # The automatic retry is a whole-album download on a thread.
                 ("_schedule_album_fill_retry",
                  lambda mbid, prior, **k: self.retries.append(mbid)),
@@ -17135,16 +17288,17 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
 
     def _poll(self, *finished, state="Completed, Succeeded"):
         """One poll in which these (peer, file name) transfers read finished.
-        Returns what Telegram was told."""
+        Returns what the poller logged of each file's outcome (what Telegram
+        was told, until Worbus 0.4)."""
         listing = [{"_username": peer, "filename": f"Music\\{name}",
                     "state": state} for peer, name in finished]
-        app = type("App", (), {"bot": AsyncMock()})()
+        out = io.StringIO()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock) as tg, \
+                contextlib.redirect_stdout(out), \
                 patch.object(bot, "_transfer_local_path",
                              lambda f, asked=0: self.paths.get(f.rsplit("\\", 1)[-1])):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
-        return [c.args[2] for c in tg.call_args_list]
+            asyncio.run(bot._poll_downloads_once())
+        return [line for line in out.getvalue().splitlines() if "downloaded file " in line]
 
     def _placed_files(self):
         return sorted(os.listdir(self.dest)) if os.path.isdir(self.dest) else []
@@ -17174,7 +17328,7 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
         self.assertEqual(self.scans, ["tok"])
         self.assertIn("g1", self.pushed)
         self.assertEqual(len(told), 1)
-        self.assertIn("Placed into Band – Record", told[0])
+        self.assertIn("placed into Band – Record", told[0])
         self.assertNotIn("completed", told[0])
         # The gaps nobody fetched are still gaps.
         self.assertEqual(self._row("Three")["decision"], "pending")
@@ -17187,7 +17341,7 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
         told = self._poll(("second", "02 - Two.flac"))
         self.assertEqual(self._row("Two")["decision"], "placed")
         self.assertEqual(self._placed_files(), ["02 - Two.flac"])
-        self.assertIn("Placed into", told[0])
+        self.assertIn("placed into", told[0])
         # Only its own row is judged by this import.
         self.assertEqual(self._row("Four")["download_error"], "placement failed: x")
         self.assertEqual(self._row("Three")["decision"], "placed")
@@ -18011,7 +18165,7 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
         self.assertEqual(answered, [0])
         self.assertEqual(self._row("Two")["decision"], "placed")
         self.assertEqual((self._placed_files(), self.verified), (["02 - Two.flac"], ["g1"]))
-        self.assertIn("Placed into", told[0])
+        self.assertIn("placed into", told[0])
 
     def test_two_placements_of_one_group_take_turns_and_another_group_does_not_wait(self):
         # What the helper's one process-wide lock used to do, per group now.
@@ -18075,14 +18229,13 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
                 release.wait(5)
             return real(mbid, *a, **k)
 
-        with patch.object(bot, "mbz_release_tracks", tracks), \
-                patch.object(bot, "_tg_send", new_callable=AsyncMock):
+        with patch.object(bot, "mbz_release_tracks", tracks):
             helper = threading.Thread(target=bot._place_group_downloads,
                                       args=("g1", "", [stranded]), name="helper")
             helper.start()
             self.assertTrue(entered.wait(5))
             finalize = threading.Thread(
-                target=lambda: asyncio.run(bot._finalize_group(None, "ag1")),
+                target=lambda: asyncio.run(bot._finalize_group("ag1")),
                 name="finalize")
             finalize.start()
             time.sleep(0.2)
@@ -18390,18 +18543,14 @@ class ReviewLinkedSinglesPlacedTests(unittest.TestCase):
         if not review_group_id:
             bot.pending_downloads[("first", "Music\\03 - Three.flac")].update(
                 review_group_id="", review_track_index=None)
-        saved = dict(bot._pending_album)
-        self.addCleanup(lambda: (bot._pending_album.clear(), bot._pending_album.update(saved)))
         with contextlib.ExitStack() as stack:
-            for name, value in (("InlineKeyboardButton", lambda *a, **k: None),
-                                ("InlineKeyboardMarkup", lambda *a, **k: None),
-                                ("_abandon_group_downloads", lambda ag_id: 0),
+            for name, value in (("_abandon_group_downloads", lambda ag_id: 0),
                                 ("slskd_expand_directory", lambda u, fd, ref: fd["files"]),
                                 ("slskd_enqueue", lambda *a, **k: False)):
                 stack.enter_context(patch.object(bot, name, value))
             if how == "nothing downloaded":
                 bot.pending_downloads.clear()
-                asyncio.run(bot._finalize_group(None, "ag1"))
+                asyncio.run(bot._finalize_group("ag1"))
             elif how == "its source failed before any track arrived":
                 self._poll(("first", "03 - Three.flac"), state="Completed, Rejected")
             elif how == "every ranked source failed":
@@ -19159,7 +19308,7 @@ class PlacementClaimCensusTests(unittest.TestCase):
         "_finalize_taken_group": "_finalize_group",
     }
     # Passes no group id: nothing to own.
-    NO_GROUP = {"_reimport_worker", "_beets_worker"}
+    NO_GROUP = {"_import_record_as_is"}
     # Says nobody is looking at this import (`unattended=True`, ruling C4a):
     # the album group's finalize, and no route a person starts.
     UNATTENDED = {"_finalize_taken_group"}
@@ -20948,9 +21097,7 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
                 ("_notify_hub_library_change", lambda *a, **k: told.append("hub")),
                 ("_start_album_fill_verification", lambda *a, **k: told.append("verify")),
                 ("_album_fill_schedule_retry", lambda *a, **k: told.append("retry")),
-                ("_album_action_markup", lambda *a, **k: None),
                 ("_library_artist_spelling", lambda mbid, artist: artist),
-                ("_tg_send", AsyncMock()),
                 ("_save_state", lambda *a, **k: None),
                 # (The finalize looks again for a finished transfer's file for
                 # a few seconds — ruling E2. Not five of them per test.)
@@ -20972,7 +21119,7 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
             "ts": time.time(), "release_mbid": release, "target_release_mbid": release,
             "artist": artist, "album": album, "source_user": "peer",
             "review_group_id": "", "match_mode": "auto", **group}
-        asyncio.run(bot._finalize_group(None, "ag1"))
+        asyncio.run(bot._finalize_group("ag1"))
         return bot._album_fill_view(release)
 
     # ── C4 counts against what the fill wanted (ruling D4, the re-review's
@@ -21190,7 +21337,7 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
             "ts": time.time(), "release_mbid": AFTER_EP_2, "target_release_mbid": AFTER_EP_2,
             "artist": "After", "album": "After EP 2", "source_user": "peer",
             "review_group_id": "", "match_mode": "auto"}
-        asyncio.run(bot._finalize_group(None, "ag1"))
+        asyncio.run(bot._finalize_group("ag1"))
         self.assertEqual(len(self.in_library()), len(right) + len(earlier))
 
     def test_a_fill_whose_files_are_gone_imports_nothing_else(self):
@@ -21251,13 +21398,11 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
         replaced."""
         listing = [{"_username": "peer", "filename": self.remote(name),
                     "state": "Completed, Succeeded"} for name in names]
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing), \
-                patch.object(bot, "_update_group_progress", new_callable=AsyncMock), \
                 patch.object(bot, "_push_fill_progress", lambda *a, **k: None), \
                 patch.object(bot, "_sweep_album_fill_zombies", lambda *a, **k: 0), \
                 contextlib.redirect_stdout(io.StringIO()):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
         return bot._album_fill_view(AFTER_EP_2)
 
     def lay_there_before(self, paths: list, seconds=3600) -> list:
@@ -21367,8 +21512,8 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
         view = self.land(*self.NAMES)
         self.assertEqual((view["state"], bot._album_fill_get(AFTER_EP_2).get("moved")),
                          ("placed", 5), view)
-        said = "\n".join(str(call.args[2]) for call in bot._tg_send.call_args_list)
-        self.assertIn("1 downloaded file(s) were not found where slskd downloads to", said)
+        self.assertIn("1 downloaded file(s) were not found where slskd downloads to",
+                      view.get("reason", ""))
         self.assertEqual(self.in_downloads(), self.NAMES)
 
     def test_a_row_whose_file_did_not_arrive_says_so(self):
@@ -21479,9 +21624,6 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
                       view["reason"])
         self.assertEqual(bot._album_fill_get(AFTER_EP_2).get("moved"), 5)
         self.assertEqual(self.in_library(), self.NAMES[:5])
-        said = "\n".join(str(call.args[2]) for call in bot._tg_send.call_args_list)
-        self.assertIn("5/6 files downloaded, 1 failed", said)
-        self.assertIn("1 downloaded file(s) were not found where slskd downloads to", said)
         del group
 
     def test_a_gaps_row_whose_file_never_appears_is_still_wanted(self):
@@ -21750,26 +21892,19 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
 
     # ── "Import as-is" files a folder as what it is (ruling C5) ─────────────
 
-    def refused_fill(self, identity) -> tuple:
+    def refused_fill(self, identity) -> str:
         """OVERWERK's six, refused by the finalize of After EP 2's fill, and
-        the record that leaves — the message with "📥 Import as-is" on it.
-        `identity` is what identifying the folder answers. Returns the record
-        id and the list Telegram's messages are appended to."""
+        the record that leaves — the row Needs you's imports list offers
+        "Import as-is" on. `identity` is what identifying the folder answers.
+        Returns the record id."""
         self.finalize_rig()
         self.release = None             # each release its own tracklist, below
         releases = {AFTER_EP_2: _release_of(AFTER_EP_2, "After EP 2", AFTER_EP_2_TRACKS),
                     "rel-overwerk": _release_of("rel-overwerk", "After Hours EP",
                                                 OVERWERK_AFTER_HOURS)}
-        sent = []
-
-        async def tell(_bot, chat, text, **k):
-            sent.append(text)
-
         for name, value in (
                 ("mbz_release_tracks", lambda mbid: bot._release_tracks_from(releases[mbid])),
-                ("_identity_for_path", lambda path: dict(identity)),
-                ("_album_action_markup", lambda recid, status: None),
-                ("_tg_send", tell)):
+                ("_identity_for_path", lambda path: dict(identity))):
             patcher = patch.object(bot, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -21779,22 +21914,23 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
         ((recid, record),) = bot._albums.items()
         self.assertEqual((record["artist"], record["album"], record["release_mbid"]),
                          ("After", "After EP 2", AFTER_EP_2))
-        return recid, sent
+        return recid
 
     def test_import_as_is_files_the_folder_as_the_release_it_is(self):
         # It took the release from the folder's identity and the artist and
         # album from the fill's record: OVERWERK's six in After/After EP 2/,
         # album "After EP 2", album artist "After", OVERWERK's release id.
-        recid, sent = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
-                                         "album": "After Hours EP"})
-        asyncio.run(bot._reimport_worker(None, recid, autotag=False, mbid=AFTER_EP_2))
+        recid = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
+                                   "album": "After Hours EP"})
+        result = bot._import_record_as_is(recid)
         self.assertEqual(sorted(os.listdir(self.lib)), ["OVERWERK"])
         placed = self.placed("OVERWERK", "After Hours EP")
         self.assertEqual(len(placed), 6)
         tags = placed["01 - Daybreak.flac"]
         self.assertEqual((tags["album"], tags["albumartist"], tags["musicbrainz_albumid"]),
                          (["After Hours EP"], ["OVERWERK"], ["rel-overwerk"]))
-        self.assertIn("After Hours EP", sent[-1])
+        self.assertEqual((result["ok"], result["dest"], result["moved"]),
+                         (True, "After Hours EP", 6), result)
         self.assertEqual(bot._albums[recid]["status"], "imported")
 
     def test_import_as_is_of_a_folder_nobody_can_name_files_nothing(self):
@@ -21803,48 +21939,52 @@ class PlacementRefusesWhatIsNotTheAlbumTests(_PlacedOnDisk, unittest.TestCase):
             with self.subTest(identity=identity):
                 self.start_over()
                 bot._albums.clear()
-                recid, sent = self.refused_fill(identity)
+                recid = self.refused_fill(identity)
                 before = self.in_downloads()
-                asyncio.run(bot._reimport_worker(None, recid, autotag=False, mbid=AFTER_EP_2))
+                result = bot._import_record_as_is(recid)
                 self.assertEqual(self.in_library(), [])
                 self.assertEqual(self.in_downloads(), before)
-                self.assertIn("could not tell which release", sent[-1])
+                self.assertFalse(result["ok"])
+                self.assertIn("could not tell which release", result["error"])
                 self.assertEqual(bot._albums[recid]["status"], "failed")
 
     def test_import_as_is_of_a_folder_whose_artist_nobody_can_name_files_nothing(self):
         # (D7b.) The identity names a release and no artist. The import then
         # asked MusicBrainz for the credit, fail-soft — and with MusicBrainz
         # silent filed the six under `Unknown Artist/Unknown Album`.
-        recid, sent = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "",
-                                         "album": "", "confidence": "possible"})
+        recid = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "",
+                                   "album": "", "confidence": "possible"})
         before = self.in_downloads()
         with patch.object(bot, "mbz_get", lambda *a, **k: {}):
-            asyncio.run(bot._reimport_worker(None, recid, autotag=False, mbid=AFTER_EP_2))
+            result = bot._import_record_as_is(recid)
         self.assertEqual(self.in_library(), [])
         self.assertEqual(os.listdir(self.lib), [])
         self.assertEqual(self.in_downloads(), before)
-        self.assertIn("could not tell whose release", sent[-1])
+        self.assertIn("could not tell whose release", result["error"])
         self.assertEqual(bot._albums[recid]["status"], "failed")
 
     def test_after_import_as_is_the_record_names_what_the_folder_was_filed_as(self):
         # (D7b.) The record kept the fill's artist, album and release and
-        # read `imported`: a later Adjust or cover on that message was for
-        # After EP 2, which holds none of these files.
-        recid, _sent = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
-                                          "album": "After Hours EP"})
-        asyncio.run(bot._reimport_worker(None, recid, autotag=False, mbid=AFTER_EP_2))
+        # read `imported`: a later action on that record was for After EP 2,
+        # which holds none of these files.
+        recid = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
+                                   "album": "After Hours EP"})
+        bot._import_record_as_is(recid)
         record = bot._albums[recid]
         self.assertEqual((record["status"], record["artist"], record["album"],
                           record["release_mbid"]),
                          ("imported", "OVERWERK", "After Hours EP", "rel-overwerk"))
 
-    def test_re_import_asks_for_the_fills_release_again_and_is_refused_again(self):
-        # Unchanged: the same release, the same answer.
-        recid, sent = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
-                                         "album": "After Hours EP"})
-        asyncio.run(bot._reimport_worker(None, recid, autotag=True, mbid=AFTER_EP_2))
+    def test_retry_asks_for_the_fills_release_again_and_is_refused_again(self):
+        # Unchanged: the same release, the same answer — now through the
+        # imports list's Retry (it was Telegram's Re-import).
+        recid = self.refused_fill({"release_mbid": "rel-overwerk", "artist": "OVERWERK",
+                                   "album": "After Hours EP"})
+        r = _web_app().test_client().post(f"/api/imports/{recid}/retry", json={})
+        self.assertEqual(r.status_code, 200, r.get_json())
         self.assertEqual(self.in_library(), [])
-        self.assertIn("After – After EP 2", sent[-1])
+        self.assertFalse(r.get_json()["ok"])
+        self.assertIn("After – After EP 2", r.get_json()["import_result"]["error"])
 
     def test_a_whole_album_fill_sharing_one_title_is_not_placed_either(self):
         # (C4.) One coincidental title used to be one foreign file in the
@@ -22379,14 +22519,13 @@ class UnattendedNeedsAlbumEvidenceTests(unittest.TestCase):
         bot.pending_album_groups[ag_id] = ag
         self.addCleanup(bot.pending_album_groups.pop, ag_id, None)
         asked, queued = [], []
-        with patch.object(bot, "_tg_send", new=AsyncMock()), \
-                patch.object(bot, "slskd_expand_directory",
+        with patch.object(bot, "slskd_expand_directory",
                              lambda user, fd, ref: asked.append(user) or list(fd["files"])), \
                 patch.object(bot, "slskd_enqueue",
                              lambda user, f, **k: queued.append(user) or True), \
                 patch.object(bot, "_album_fill_set", lambda *a, **k: True), \
                 patch.object(bot, "_save_state", lambda *a, **k: None):
-            asyncio.run(bot._switch_album_source_inner(None, ag_id, ag))
+            asyncio.run(bot._switch_album_source_inner(ag_id, ag))
         self.assertEqual((asked, queued), (["peer-good"], ["peer-good"]))
         # What the source that failed had landed is not the new one's to
         # import (ruling C1): the group's own files start over with it.
@@ -22872,43 +23011,6 @@ class UnattendedNeedsAlbumEvidenceTests(unittest.TestCase):
         self.assertNotIn("albumEvidence", bot._source_view(summary))
         self.assertTrue(bot._source_recommendable(summary))
 
-    def test_telegrams_album_prompt_and_its_auto_pick_read_their_list_as_an_albums(self):
-        # The two Telegram readers of an album list: the prompt's caution
-        # and `_auto_enqueue_album`'s choice and alternates. A list from
-        # before album evidence is an album search's there, read by its name.
-        named = self.kept_by_an_older_build("m/Tame Impala/Currents", True, ["01 - x.flac"])
-        other = self.kept_by_an_older_build("m/Tame Impala/Lonerism", False, ["01 - x.flac"])
-        other["username"], named["username"] = "peer-other", "peer-named"
-        group = {"artist": "Tame Impala", "album": "Currents", "release_mbid": "rel-13"}
-        said, queued = [], []
-
-        async def tell(_bot, chat, text, **k):
-            said.append(text)
-
-        saved = (dict(bot.pending_approvals), dict(bot._uid_to_token))
-
-        def restore():
-            for live, old in zip((bot.pending_approvals, bot._uid_to_token), saved):
-                live.clear()
-                live.update(old)
-
-        self.addCleanup(restore)
-        with patch.object(bot, "_tg_send", tell), \
-                patch.object(bot, "InlineKeyboardButton", lambda *a, **k: None), \
-                patch.object(bot, "InlineKeyboardMarkup", lambda *a, **k: None), \
-                patch.object(bot, "slskd_expand_directory", lambda user, fd, ref: list(fd["files"])), \
-                patch.object(bot, "slskd_enqueue_folder",
-                             lambda user, files, **k: queued.append((user, k)) or (1, 1, "")):
-            asyncio.run(bot._send_album_prompt(None, "chat", "tok", "Tame Impala - Currents",
-                                               group, [other, named]))
-            asyncio.run(bot._auto_enqueue_album(None, "chat", "tok", "Tame Impala - Currents",
-                                                [other, named], release_mbid="rel-13"))
-        lines = said[0].splitlines()
-        self.assertIn("(may be another album) Lonerism", lines[2])
-        self.assertNotIn("may be another album", lines[4])
-        ((user, kwargs),) = queued
-        self.assertEqual((user, kwargs["alt_sources"]), ("peer-named", []))
-
     def test_the_stall_failover_walks_a_track_searchs_alternates(self):
         # An album group with no release — Telegram's /search album download,
         # a Loose-tracks fetch — in flight across the deploy: its alternates
@@ -22922,13 +23024,12 @@ class UnattendedNeedsAlbumEvidenceTests(unittest.TestCase):
         bot.pending_album_groups[ag_id] = ag
         self.addCleanup(bot.pending_album_groups.pop, ag_id, None)
         asked = []
-        with patch.object(bot, "_tg_send", new=AsyncMock()), \
-                patch.object(bot, "slskd_expand_directory",
+        with patch.object(bot, "slskd_expand_directory",
                              lambda user, fd, ref: asked.append(user) or list(fd["files"])), \
                 patch.object(bot, "slskd_enqueue", lambda user, f, **k: True), \
                 patch.object(bot, "_album_fill_set", lambda *a, **k: True), \
                 patch.object(bot, "_save_state", lambda *a, **k: None):
-            asyncio.run(bot._switch_album_source_inner(None, ag_id, ag))
+            asyncio.run(bot._switch_album_source_inner(ag_id, ag))
         self.assertEqual(asked, ["peer-b"])
 
     def test_the_stall_failover_reads_an_older_builds_alternates_by_their_name(self):
@@ -22947,13 +23048,12 @@ class UnattendedNeedsAlbumEvidenceTests(unittest.TestCase):
         bot.pending_album_groups[ag_id] = ag
         self.addCleanup(bot.pending_album_groups.pop, ag_id, None)
         asked = []
-        with patch.object(bot, "_tg_send", new=AsyncMock()), \
-                patch.object(bot, "slskd_expand_directory",
+        with patch.object(bot, "slskd_expand_directory",
                              lambda user, fd, ref: asked.append(user) or list(fd["files"])), \
                 patch.object(bot, "slskd_enqueue", lambda user, f, **k: True), \
                 patch.object(bot, "_album_fill_set", lambda *a, **k: True), \
                 patch.object(bot, "_save_state", lambda *a, **k: None):
-            asyncio.run(bot._switch_album_source_inner(None, ag_id, ag))
+            asyncio.run(bot._switch_album_source_inner(ag_id, ag))
         self.assertEqual(asked, ["peer-named"])
 
     def test_recommended_needs_both_kinds_of_evidence(self):
@@ -24108,8 +24208,6 @@ class LibrarySpellingForWholeAlbumsTests(unittest.TestCase):
                  lambda mbid, result, **k: verified.append(k.get("artist"))),
                 ("_start_placement_verification", lambda gid: verified.append(gid)),
                 ("_push_gap", lambda gid: None),
-                ("_album_action_markup", lambda *a, **k: None),
-                ("_tg_send", AsyncMock()),
                 ("_save_state", lambda *a, **k: None)):
             patcher = patch.object(bot, name, value)
             patcher.start()
@@ -24132,7 +24230,7 @@ class LibrarySpellingForWholeAlbumsTests(unittest.TestCase):
             "ts": time.time(), "release_mbid": "rel-1", "target_release_mbid": "rel-1",
             "artist": "Belle and Sebastian", "album": "Record", "source_user": "peer",
             "review_group_id": review_group_id, "match_mode": "auto"}
-        asyncio.run(bot._finalize_group(None, "ag1"))
+        asyncio.run(bot._finalize_group("ag1"))
         artists = os.listdir(lib)
         tags = _flac_tags(os.path.join(lib, artists[0], "Record", "01 - One.flac"))
         return artists, tags, verified
@@ -24803,8 +24901,6 @@ class LibrarySpellingForEveryGrouplessPlacementTests(unittest.TestCase):
                 ("_nd_scan_after_import", lambda *a, **k: False),
                 ("_push_gap", lambda *a, **k: None),
                 ("_start_placement_verification", lambda *a, **k: None),
-                ("_album_action_markup", lambda *a, **k: None),
-                ("_tg_send", AsyncMock()),
                 ("_save_state", lambda *a, **k: None),
                 ("_task_run", lambda kind, label, target, **k: target("t1") or "t1")):
             patcher = patch.object(bot, name, value)
@@ -24849,11 +24945,6 @@ class LibrarySpellingForEveryGrouplessPlacementTests(unittest.TestCase):
         self.assert_filed_under_the_librarys_name()
         # The answer says where it went.
         self.assertEqual(r.get_json()["import_result"]["artist"], "Belle & Sebastian")
-
-    def test_the_telegram_re_import(self):
-        self.record()
-        asyncio.run(bot._reimport_worker(None, "rec1", True, self.RELEASE))
-        self.assert_filed_under_the_librarys_name()
 
     def test_a_placement_for_an_album_gap_keeps_the_groups_artist(self):
         # The same folder, placed for a review group: its artist is the
@@ -32080,7 +32171,7 @@ class RefusedFilePollerTests(unittest.TestCase):
             self.asked.append((username, f["filename"]))
             return True
 
-        async def finalize(_bot, ag_id):
+        async def finalize(ag_id):
             ag = bot.pending_album_groups.pop(ag_id)
             self.finalized.append((ag["completed"], ag["failed"],
                                    sorted(os.path.basename(p) for p in ag["local_files"])))
@@ -32097,12 +32188,7 @@ class RefusedFilePollerTests(unittest.TestCase):
                 ("_finalize_group", finalize),
                 ("_transfer_local_path",
                  lambda remote, asked_at=0.0: "/downloads/After EP/" + remote.rsplit("\\", 1)[-1]),
-                ("_remember_download_origin", lambda *a, **k: None),
-                ("_tg_send", AsyncMock()),
-                ("_send_album_prompt", AsyncMock()),
-                ("_update_group_progress", AsyncMock()),
-                ("InlineKeyboardButton", lambda *a, **k: None),
-                ("InlineKeyboardMarkup", lambda *a, **k: None)):
+                ("_remember_download_origin", lambda *a, **k: None)):
             patcher = patch.object(bot, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -32140,10 +32226,9 @@ class RefusedFilePollerTests(unittest.TestCase):
         """One poll in which slskd lists `(name, state)`, in that order."""
         listing = [{"_username": row[2] if len(row) > 2 else peer,
                     "filename": self.remote(row[0]), "state": row[1]} for row in rows]
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing), \
                 contextlib.redirect_stdout(io.StringIO()):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
 
     def start_over(self):
         for table in (bot.pending_album_groups, bot.pending_downloads, bot._album_fill_status):
@@ -32411,9 +32496,7 @@ class _AfterEpDownloads:
                 ("_default_web_user", lambda *a, **k: {"telegram_token": "t", "chat_id": 1}),
                 ("_save_state", lambda *a, **k: None),
                 ("_push_fill", lambda *a, **k: None),
-                ("_slskd_cancel", lambda *a, **k: True),
-                ("_tg_send", AsyncMock()),
-                ("_update_group_progress", AsyncMock())):
+                ("_slskd_cancel", lambda *a, **k: True)):
             patcher = patch.object(bot, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -32456,9 +32539,8 @@ class _AfterEpDownloads:
         refused: the source has given the group nothing, and it is switched."""
         listing = [{"_username": user, "filename": name, "state": REFUSED}
                    for user, name in list(bot.pending_downloads) if user == peer]
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing):
-            asyncio.run(bot._poll_downloads_once({"t": app}))
+            asyncio.run(bot._poll_downloads_once())
 
     def alternate(self, names, peer="alt1", leaf="After EP [FLAC]") -> dict:
         """Give the fill a next source: listed with one file, holding `names`."""
@@ -32559,7 +32641,7 @@ class WholeAlbumAsksForTheReleaseTests(_AfterEpDownloads, unittest.TestCase):
     def switch_to(self, names) -> dict:
         ag = self.alternate(names)
         ((ag_id, _ag),) = bot.pending_album_groups.items()
-        asyncio.run(bot._switch_album_source(None, ag_id))
+        asyncio.run(bot._switch_album_source(ag_id))
         return ag
 
     def test_a_switch_asks_the_next_source_for_the_releases_tracks(self):
@@ -32797,7 +32879,7 @@ class PollerWakesForANewDownloadTests(unittest.TestCase):
                 register.done = True
                 register()
 
-        async def poll(token_to_app):
+        async def poll():
             polled.append(clock[0])
             if len(polled) >= polls:
                 raise self._Stop()
@@ -32805,7 +32887,7 @@ class PollerWakesForANewDownloadTests(unittest.TestCase):
         with patch.object(bot.asyncio, "sleep", sleep), \
                 patch.object(bot, "_poll_downloads_once", poll):
             with self.assertRaises(self._Stop):
-                asyncio.run(bot.poll_downloads_loop([]))
+                asyncio.run(bot.poll_downloads_loop())
         return polled, slept
 
     def test_a_download_registered_while_idle_is_polled_within_the_active_interval(self):
@@ -33119,9 +33201,8 @@ class DownloadAllTests(_AfterEpDownloads, unittest.TestCase):
         listing = [{"_username": user, "filename": name,
                     "state": REFUSED if "EP 2" in name.rsplit("\\", 1)[-1] else "InProgress"}
                    for user, name in list(bot.pending_downloads)]
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing):
-            asyncio.run(bot._poll_downloads_once({"t": app}))
+            asyncio.run(bot._poll_downloads_once())
         self.assertEqual((ag["source_user"], ag["failed"], ag["total"], ag["all_files"]),
                          ("firstpeer", 6, 11, True))
         self.assertEqual(self.names_asked("alt1"), [])
@@ -33262,12 +33343,8 @@ class GroupStillBeingAskedForTests(_PlacedOnDisk, unittest.TestCase):
                  lambda u, f, *a, **k: self.cancelled.append((u, f.rsplit("\\", 1)[-1])) or True),
                 ("_slskd_fetch_all_downloads", lambda: []),
                 ("_abandon_transfers_async", lambda entries: bot._abandon_transfers(entries)),
-                ("_update_group_progress", AsyncMock()),
                 ("_push_fill_progress", lambda *a, **k: None),
-                ("_sweep_album_fill_zombies", lambda *a, **k: 0),
-                ("_send_album_prompt", AsyncMock()),
-                ("InlineKeyboardButton", lambda *a, **k: None),
-                ("InlineKeyboardMarkup", lambda *a, **k: None)):
+                ("_sweep_album_fill_zombies", lambda *a, **k: 0)):
             patcher = patch.object(bot, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -33321,9 +33398,8 @@ class GroupStillBeingAskedForTests(_PlacedOnDisk, unittest.TestCase):
         """One poll in which slskd lists `(peer, name, state)`, in that order."""
         listing = [{"_username": peer, "filename": f"{self.source(peer)['raw_folder']}\\{name}",
                     "state": state} for peer, name, state in rows]
-        app = type("App", (), {"bot": AsyncMock()})()
         with patch.object(bot, "slskd_get_all_downloads", lambda force=False: listing):
-            asyncio.run(bot._poll_downloads_once({"tok": app}))
+            asyncio.run(bot._poll_downloads_once())
         return bot._album_fill_view(AFTER_EP_2)
 
     def arrive(self, *names):
@@ -35230,7 +35306,8 @@ class AttentionActivityTests(unittest.TestCase):
         groups, status, folders = self._standard()
         view, gap_counts = self._attention(groups, status, folders)
         self.assertEqual(view["counts"], {"failedGaps": 3, "failedRequests": 1, "folders": 16,
-                                          "foldersUnidentified": 12, "picks": 14})
+                                          "foldersUnidentified": 12, "picks": 14,
+                                          "imports": bot._open_imports_count()})
         self.assertEqual(view["counts"]["failedGaps"], gap_counts["failed"])
         self.assertEqual(view["counts"]["failedRequests"], bot._album_fill_counts()["failed"])
         self.assertEqual(view["counts"]["foldersUnidentified"], bot._unidentified_count(folders))
@@ -35655,13 +35732,16 @@ class AttentionActivityProductionShapeTests(unittest.TestCase):
         ("a root outside the mounts", "cannot read /home/ilya/secrets/key.txt", ("/home", "ilya")),
         ("a Windows path", "no file at C:\\Users\\bob\\Music\\x.flac", ("C:", "Users", "bob")),
         ("a UNC path", "no file at \\\\nas\\share\\x", ("nas", "share")),
-        ("the Telegram token", f"bot said {SECRET_TOKEN} is wrong", (SECRET_TOKEN, "TELEGRAM")),
+        # Read by its shape since Worbus 0.4: nothing holds the value any more.
+        ("a Telegram token", f"bot said {SECRET_TOKEN} is wrong", (SECRET_TOKEN, "TELEGRAM")),
+        ("a real-shaped Telegram token",
+         "https://api.telegram.org/bot7012345678:AAHf9xQ-Z0rT_bDk2aWmQe4vYp8sLc3NuJ0/getMe",
+         ("AAHf9xQ-Z0rT_bDk2aWmQe4vYp8sLc3NuJ0", "7012345678")),
         ("the slskd key", f"slskd refused key {SLSKD_KEY}", (SLSKD_KEY,)),
     )
 
     def _secrets(self):
         for patcher in (patch.object(bot, "SLSKD_API_KEY", self.SLSKD_KEY),
-                        patch.object(bot, "USERS", [{"telegram_token": self.SECRET_TOKEN}]),
                         patch.object(bot, "SLSKD_DOWNLOAD_DIR", "/downloads"),
                         patch.object(bot, "MUSIC_LIBRARY_PATH", "/music")):
             patcher.start()
@@ -35850,7 +35930,7 @@ class AttentionActivityProductionShapeTests(unittest.TestCase):
         release = group["canonical_mbid"]
         # The finalize records what it placed in `_albums` (and its token):
         # put both back, other tests read them whole.
-        for live in (bot._albums, bot._uid_to_token):
+        for live in (bot._albums,):
             self.addCleanup(lambda live=live, old=dict(live): (live.clear(), live.update(old)))
         bot.pending_album_groups["ag1"] = {
             "label": f"{group['artist']} - {group['album']}", "total": 2,
@@ -35875,14 +35955,12 @@ class AttentionActivityProductionShapeTests(unittest.TestCase):
             "_notify_hub_library_change": lambda *a, **k: None,
             "_record_import_recovery": lambda *a, **k: "rec-1",
             "_stamp_early_placement_failure": lambda *a, **k: None,
-            "_album_action_markup": lambda *a, **k: None,
-            "_tg_send": AsyncMock(),
         }
         with contextlib.ExitStack() as stack:
             for name, value in stubs.items():
                 stack.enter_context(patch.object(bot, name, value))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            asyncio.run(bot._finalize_group(None, "ag1"))
+            asyncio.run(bot._finalize_group("ag1"))
         return release
 
     def test_a_gap_fill_row_is_named_at_its_first_write_by_each_path(self):
@@ -36266,9 +36344,9 @@ class RealPathAdviceTests(unittest.TestCase):
 
 
 class NoTelegramTests(unittest.TestCase):
-    """Worbus P1 task S1: lb-bot starts and runs with no Telegram. An empty
-    `TELEGRAM_TOKEN` used to raise `InvalidToken` at `Application.builder()`
-    in `main()`, before the web UI and every worker started."""
+    """Worbus P1 task S1: lb-bot runs with only Navidrome and the hub
+    configured. (The Telegram half these tests once kept out of the way was
+    removed in Worbus 0.4: `TelegramRemovedTests`.)"""
 
     SECRET_TOKEN = "123456:TELEGRAM-token-secret"
 
@@ -36280,165 +36358,6 @@ class NoTelegramTests(unittest.TestCase):
                 "navidrome_user": nd_user, "navidrome_password": nd_pass,
                 "listenbrainz_user": lbz,
                 "playlist_sources": {"weekly-jams": "Weekly Jams"}}
-
-    def test_main_starts_web_and_workers_with_no_telegram_token(self):
-        started = []
-
-        def loop(name):
-            async def _loop(*a, **k):
-                started.append(name)
-            return _loop
-
-        real_sleep = asyncio.sleep
-
-        async def sleep(seconds):
-            if seconds == 3600:
-                # main()'s idle wait: give the tasks it created a turn first.
-                await real_sleep(0)
-                raise self._Stop()
-            await real_sleep(0)
-
-        def no_builder():
-            raise AssertionError("no Telegram app may be built without a token")
-
-        noop = lambda *a, **k: None
-        out = io.StringIO()
-        with patch.object(bot, "USERS", [self._user(token="")]), \
-                patch.object(bot, "WEB_UI_ENABLED", False), \
-                patch.object(bot, "start_web_dashboard",
-                             lambda: started.append("dashboard")), \
-                patch.object(bot, "_playlist_scan_loop", loop("playlist-scan")), \
-                patch.object(bot, "poll_downloads_loop", loop("poll")), \
-                patch.object(bot, "state_flush_loop", loop("flush")), \
-                patch.object(bot, "housekeeping_loop", loop("housekeeping")), \
-                patch.object(bot.Application, "builder", no_builder), \
-                patch.object(bot, "_TELEGRAM_APPS", ["unset"]), \
-                patch.object(bot, "_APPS", ["unset"]), \
-                patch.object(bot, "_TELEGRAM_STARTED", None), \
-                patch.object(bot.asyncio, "sleep", sleep), \
-                patch.object(bot.threading, "Thread"), \
-                patch.multiple(bot, _sweep_orphaned_state_tmp_files=noop,
-                               _load_state=noop, _load_review_state=noop,
-                               _hide_retired_repair_groups=noop,
-                               _recheck_old_recording_refusals=noop,
-                               _resume_placement_verification=noop,
-                               _load_prefs=noop, _mark_interrupted_jobs=noop,
-                               _flush_all_state=noop), \
-                contextlib.redirect_stdout(out):
-            with self.assertRaises(self._Stop):
-                asyncio.run(bot.main())
-            self.assertEqual((bot._TELEGRAM_APPS, bot._APPS), ([], []))
-            self.assertTrue(bot._TELEGRAM_STARTED.is_set())
-        self.assertEqual(sorted(started), sorted(
-            ["dashboard", "playlist-scan", "poll", "flush", "housekeeping"]))
-        self.assertIn("required settings", out.getvalue())
-
-    def test_main_starts_the_web_ui_before_any_telegram_app(self):
-        src = inspect.getsource(bot.main)
-        built = src.index("_build_telegram_apps(")
-        for first in ("start_web_dashboard()", "_playlist_scan_loop()",
-                      "poll_downloads_loop()", "state_flush_loop()",
-                      "housekeeping_loop()"):
-            self.assertLess(src.index(first), built, first)
-        self.assertNotIn("Application.builder()", src)
-
-    def _fake_application(self, fail_for=()):
-        made = []
-
-        class _App:
-            def __init__(self, token):
-                self.token = token
-                self.bot = types.SimpleNamespace(
-                    token=token, set_my_commands=AsyncMock())
-                self.updater = types.SimpleNamespace(start_polling=AsyncMock())
-                self.initialize = AsyncMock()
-                self.start = AsyncMock()
-                self.stop = AsyncMock()
-                self.shutdown = AsyncMock()
-                self.running = False
-
-            def add_error_handler(self, *a):
-                pass
-
-            def add_handler(self, *a):
-                pass
-
-        class _Builder:
-            def token(self, token):
-                self._token = token
-                return self
-
-            def build(self):
-                if self._token in fail_for:
-                    raise RuntimeError(f"The token `{self._token}` was rejected")
-                app = _App(self._token)
-                made.append(app)
-                return app
-
-        return types.SimpleNamespace(builder=lambda: _Builder()), made
-
-    def _telegram_parts(self):
-        """The handler classes are bare `object` stubs in this file."""
-        part = lambda *a, **k: None
-        return patch.multiple(bot, CallbackQueryHandler=part, CommandHandler=part,
-                              MessageHandler=part,
-                              Update=types.SimpleNamespace(ALL_TYPES=None))
-
-    def test_a_telegram_build_failure_skips_that_user_only(self):
-        bad, good = self._user(token=self.SECRET_TOKEN), self._user(token="999:good")
-        fake, made = self._fake_application(fail_for=(self.SECRET_TOKEN,))
-        out = io.StringIO()
-        with patch.object(bot, "Application", fake), self._telegram_parts(), \
-                patch.object(bot, "USERS", [bad, good]), \
-                contextlib.redirect_stdout(out):
-            pairs = asyncio.run(bot._build_telegram_apps([bad, good]))
-        self.assertEqual([(u is good, app.token) for u, app in pairs],
-                         [(True, "999:good")])
-        made[0].updater.start_polling.assert_awaited()
-        log = out.getvalue()
-        self.assertEqual(log.count("could not start"), 1, log)
-        self.assertNotIn(self.SECRET_TOKEN, log)
-        self.assertNotIn("TELEGRAM-token-secret", log)
-
-    def test_a_polling_failure_also_skips_only_that_user(self):
-        user = self._user(token=self.SECRET_TOKEN)
-        fake, made = self._fake_application()
-        out = io.StringIO()
-
-        async def run():
-            # The failure comes after initialise and start: the half-started
-            # app is stopped, not left running.
-            orig = fake.builder
-
-            def builder():
-                b = orig()
-                real_build = b.build
-
-                def build():
-                    app = real_build()
-                    app.updater.start_polling = AsyncMock(
-                        side_effect=RuntimeError(f"bad {self.SECRET_TOKEN}"))
-                    return app
-                b.build = build
-                return b
-            fake.builder = builder
-            return await bot._build_telegram_apps([user])
-
-        with patch.object(bot, "Application", fake), self._telegram_parts(), \
-                patch.object(bot, "USERS", [user]), \
-                contextlib.redirect_stdout(out):
-            pairs = asyncio.run(run())
-        self.assertEqual(pairs, [])
-        made[0].shutdown.assert_awaited()
-        self.assertNotIn(self.SECRET_TOKEN, out.getvalue())
-
-    def test_users_without_a_token_get_no_app_and_no_log_line(self):
-        fake, made = self._fake_application()
-        out = io.StringIO()
-        with patch.object(bot, "Application", fake), contextlib.redirect_stdout(out):
-            pairs = asyncio.run(bot._build_telegram_apps([self._user(token="  ")]))
-        self.assertEqual((pairs, made), ([], []))
-        self.assertNotIn("could not start", out.getvalue())
 
     def test_web_started_download_owner_is_the_web_key_not_a_token(self):
         self.assertEqual(bot._web_user_key(), "web")
@@ -36474,26 +36393,11 @@ class NoTelegramTests(unittest.TestCase):
         self.assertNotIn('token=user.get("telegram_token"', src)
         self.assertNotIn('token=_default_web_user().get("telegram_token"', src)
 
-    def test_the_web_key_resolves_to_the_web_user_and_its_telegram_app(self):
-        user = self._user(token=self.SECRET_TOKEN)
-        app = types.SimpleNamespace(bot="the-bot")
+    def test_the_web_key_resolves_to_the_web_user(self):
+        user = self._user()
         with patch.object(bot, "USERS", [user]):
             self.assertIs(bot._user_for_token("web"), user)
-            table = bot._token_to_app([(user, app)])
-        # The owner's setup keeps its completion messages for web-started work.
-        self.assertIs(table["web"], app)
-        self.assertIs(table[self.SECRET_TOKEN], app)
-        with patch.object(bot, "USERS", [self._user(token="")]):
-            self.assertEqual(bot._token_to_app([]), {})
             self.assertEqual(bot._user_for_token("web")["navidrome_user"], "nd")
-
-    def test_telegram_status_still_lists_web_started_work(self):
-        user = self._user(token=self.SECRET_TOKEN)
-        with patch.object(bot, "USERS", [user]):
-            self.assertTrue(bot._token_owns("web", self.SECRET_TOKEN))
-            self.assertTrue(bot._token_owns(self.SECRET_TOKEN, self.SECRET_TOKEN))
-            self.assertFalse(bot._token_owns("web", "other:token"))
-            self.assertFalse(bot._token_owns("web", ""))
 
     def test_retag_rescans_navidrome_without_a_token(self):
         group = {"canonical_album_id": "canon", "canonical_mbid": "rel1",
@@ -36512,7 +36416,7 @@ class NoTelegramTests(unittest.TestCase):
         self.assertEqual(scans, [("nd", "nd-pass")])
 
     def _run_scan_loop(self, users, missing):
-        calls = {"scanned": [], "sent": [], "landed": []}
+        calls = {"scanned": [], "landed": []}
 
         async def sleep(seconds):
             raise self._Stop()
@@ -36521,15 +36425,10 @@ class NoTelegramTests(unittest.TestCase):
             calls["scanned"].append(user["listenbrainz_user"])
             return list(missing)
 
-        async def send(app, user, tracks):
-            calls["sent"].append(user["listenbrainz_user"])
-
         with patch.object(bot, "USERS", users), \
                 patch.object(bot, "RUN_SCAN_ON_START", True), \
-                patch.object(bot, "_TELEGRAM_APPS", []), \
                 patch.object(bot, "_last_scan_ts", {}), \
                 patch.object(bot, "scan_user", scan), \
-                patch.object(bot, "send_missing_tracks", send), \
                 patch.object(bot, "_land_playlist_scan",
                              lambda user, tracks, progress=None:
                              calls["landed"].append((user["listenbrainz_user"], len(tracks)))), \
@@ -36540,12 +36439,11 @@ class NoTelegramTests(unittest.TestCase):
                 asyncio.run(bot._playlist_scan_loop())
         return calls
 
-    def test_playlist_scan_runs_without_telegram(self):
+    def test_playlist_scan_lands_in_the_review(self):
         track = {"artist": "A", "title": "T", "mbid": "", "playlist": "Weekly Jams"}
         calls = self._run_scan_loop(
             [self._user(token="", lbz="me"), self._user(token="", lbz="")], [track])
         self.assertEqual(calls["scanned"], ["me"])
-        self.assertEqual(calls["sent"], [])
         self.assertEqual(calls["landed"], [("me", 1)])
 
     def test_playlist_scan_with_no_listenbrainz_user_scans_nothing(self):
@@ -36601,6 +36499,563 @@ class NoTelegramTests(unittest.TestCase):
 
 
 
+class TelegramRemovedTests(unittest.TestCase):
+    """Worbus P4 task S1: Telegram is cut from lb-bot (design §6.5). The
+    module never imports `telegram`; a `TELEGRAM_*` setting left in an env
+    file is read once, for one line saying it is ignored; `LB_BOT_WEB=0`
+    ("Telegram alone") no longer turns the web dashboard off; the playlist
+    scan always lands in the review."""
+
+    SECRET_TOKEN = "123456:TELEGRAM-token-secret"
+    SECRET_CHAT = "4242424242"
+    REMOVED = "Telegram was removed in Worbus 0.4; this setting is ignored"
+
+    class _Stop(BaseException):
+        """Ends `main()`'s endless sleep from inside."""
+
+    def _user(self, lbz=""):
+        return {"navidrome_user": "nd", "navidrome_password": "nd-pass",
+                "listenbrainz_user": lbz,
+                "playlist_sources": {"weekly-jams": "Weekly Jams"}}
+
+    def _run_main(self, env, real_dashboard=False):
+        """`main()` up to its idle wait, under `env`. Returns (stdout, the
+        names of the threads it asked for, what it started)."""
+        started, threads = [], []
+
+        def loop(name):
+            async def _loop(*a, **k):
+                started.append(name)
+            return _loop
+
+        real_sleep = asyncio.sleep
+
+        async def sleep(seconds):
+            if seconds == 3600:
+                await real_sleep(0)
+                raise self._Stop()
+            await real_sleep(0)
+
+        class _Thread:
+            def __init__(self, *a, name="", **k):
+                threads.append(name)
+
+            def start(self):
+                pass
+
+        noop = lambda *a, **k: None
+        out = io.StringIO()
+        dashboard = (contextlib.nullcontext() if real_dashboard else
+                     patch.object(bot, "start_web_dashboard",
+                                  lambda: started.append("dashboard")))
+        with patch.dict(os.environ, env), \
+                patch.object(bot, "USERS", [self._user()]), \
+                dashboard, \
+                patch.object(bot, "_install_log_tee", noop), \
+                patch.object(bot, "_playlist_scan_loop", loop("playlist-scan")), \
+                patch.object(bot, "poll_downloads_loop", loop("poll")), \
+                patch.object(bot, "state_flush_loop", loop("flush")), \
+                patch.object(bot, "housekeeping_loop", loop("housekeeping")), \
+                patch.object(bot.asyncio, "sleep", sleep), \
+                patch.object(bot.threading, "Thread", _Thread), \
+                patch.multiple(bot, _sweep_orphaned_state_tmp_files=noop,
+                               _load_state=noop, _load_review_state=noop,
+                               _hide_retired_repair_groups=noop,
+                               _recheck_old_recording_refusals=noop,
+                               _resume_placement_verification=noop,
+                               _load_prefs=noop, _mark_interrupted_jobs=noop,
+                               _flush_all_state=noop), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(self._Stop):
+                asyncio.run(bot.main())
+        return out.getvalue(), threads, started
+
+    def test_module_does_not_import_telegram(self):
+        self.assertNotIn("telegram", sys.modules)
+        self.assertNotIn("telegram.ext", sys.modules)
+        src = inspect.getsource(bot)
+        self.assertNotIn("from telegram", src)
+        self.assertNotIn("import telegram", src)
+        for gone in ("_tg_send", "callback_handler", "BOT_COMMANDS", "HELP_TEXT",
+                     "_build_telegram_apps", "_telegram_app_for", "_token_to_app",
+                     "_telegram_apps_settled", "on_telegram_error",
+                     "unknown_command", "_dlall_worker", "_beets_worker",
+                     "_set_cover_worker", "_reimport_worker"):
+            self.assertFalse(hasattr(bot, gone), gone)
+        with open(os.path.join(os.path.dirname(os.path.abspath(bot.__file__)),
+                               "requirements.txt"), encoding="utf-8") as fh:
+            self.assertNotIn("python-telegram-bot", fh.read())
+
+    def test_telegram_env_ignored_with_one_line(self):
+        log, _threads, started = self._run_main(
+            {"TELEGRAM_TOKEN": self.SECRET_TOKEN, "TELEGRAM_CHAT_ID": self.SECRET_CHAT})
+        lines = [l for l in log.splitlines() if self.REMOVED in l]
+        self.assertEqual(len(lines), 1, log)
+        self.assertIn("TELEGRAM_TOKEN", lines[0])
+        self.assertIn("TELEGRAM_CHAT_ID", lines[0])
+        for value in (self.SECRET_TOKEN, "TELEGRAM-token-secret", self.SECRET_CHAT):
+            self.assertNotIn(value, log)
+        # Everything else starts as it does with no Telegram setting at all.
+        self.assertEqual(sorted(started), sorted(
+            ["dashboard", "playlist-scan", "poll", "flush", "housekeeping"]))
+        # With neither set, no line.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")}
+        with patch.dict(os.environ, env, clear=True):
+            log, _threads, _started = self._run_main({})
+        self.assertNotIn(self.REMOVED, log)
+        # A blank value is no setting either.
+        log, _threads, _started = self._run_main({"TELEGRAM_TOKEN": " ",
+                                                  "TELEGRAM_CHAT_ID": ""})
+        self.assertNotIn(self.REMOVED, log)
+
+    def test_lb_bot_web_zero_ignored(self):
+        log, threads, started = self._run_main({"LB_BOT_WEB": "0"}, real_dashboard=True)
+        # The real dashboard ran: its server thread was asked for.
+        self.assertIn("album-review-web", threads)
+        lines = [l for l in log.splitlines() if "LB_BOT_WEB" in l]
+        self.assertEqual(len(lines), 1, log)
+        self.assertIn("ignored", lines[0])
+        self.assertFalse(hasattr(bot, "WEB_UI_ENABLED"))
+        log, threads, _started = self._run_main({"LB_BOT_WEB": "1"}, real_dashboard=True)
+        self.assertIn("album-review-web", threads)
+        self.assertNotIn("LB_BOT_WEB", log)
+
+    def test_scheduled_scan_lands_in_review(self):
+        user = self._user(lbz="me")
+        user.update(telegram_token=self.SECRET_TOKEN, chat_id=self.SECRET_CHAT)
+        track = {"artist": "A", "title": "T", "mbid": "", "playlist": "Weekly Jams"}
+        landed, sent = [], []
+
+        async def send(app, u, tracks):
+            sent.append(tracks)
+
+        app = types.SimpleNamespace(bot=types.SimpleNamespace(token=self.SECRET_TOKEN))
+        for missing in ([track], []):
+            landed.clear()
+            with patch.object(bot, "USERS", [user]), \
+                    patch.object(bot, "_TELEGRAM_APPS", [(user, app)], create=True), \
+                    patch.object(bot, "send_missing_tracks", send, create=True), \
+                    patch.object(bot, "_last_scan_ts", {}), \
+                    patch.object(bot, "scan_user", lambda u: list(missing)), \
+                    patch.object(bot, "_land_playlist_scan",
+                                 lambda u, tracks, progress=None:
+                                 landed.append((u["listenbrainz_user"], list(tracks)))), \
+                    patch.object(bot, "_save_state", lambda: None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                asyncio.run(bot.scheduled_scan(force=True))
+            self.assertEqual(landed, [("me", missing)])
+        self.assertEqual(sent, [])
+        src = inspect.getsource(bot.scheduled_scan)
+        self.assertNotIn("send_missing_tracks", src)
+        self.assertNotIn("_token_to_app", src)
+
+
+class TelegramStateMigrationTests(unittest.TestCase):
+    """Worbus P4 task S2 (design §6.5, "The data"): a state file written while
+    Telegram ran loads re-owned to the web key with its button stores
+    dropped; a saved record keeps the fields an older release's poller reads
+    (`info["token"]`, `info["chat_id"]`, `ag["token"]`), so a rollback runs;
+    and an album group is created whenever there is an owner (B-331)."""
+
+    OWNER = "123:abc"
+    CHAT = "42"
+    BUTTON_STORES = ("_pending_beets", "_pending_checkdl", "_pending_dlall",
+                     "_pending_album", "_pending_pick", "pending_approvals",
+                     "pending_retries", "manual_search_results",
+                     "missing_by_playlist", "_uid_to_token", "_uid_to_playlist")
+    BUTTON_KEYS = ("pending_beets", "pending_checkdl", "pending_dlall", "pending_album",
+                   "pending_pick", "pending_approvals", "pending_retries",
+                   "manual_search_results", "missing_by_playlist", "uid_to_token",
+                   "uid_to_playlist")
+    UID_TS = {"ag40": 1700000000.0, "rec41": 1700000001.0}
+
+    def setUp(self):
+        td = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, td, True)
+        live = [bot.pending_downloads, bot.pending_album_groups, bot._albums, bot._uid_ts,
+                *(getattr(bot, n) for n in self.BUTTON_STORES if hasattr(bot, n))]
+        saved = [dict(d) for d in live]
+        old = (bot.STATE_FILE, bot.MBZ_CACHE_FILE, bot._uid_counter, bot._retired_repair_jobs)
+
+        def restore():
+            for d, was in zip(live, saved):
+                d.clear()
+                d.update(was)
+            (bot.STATE_FILE, bot.MBZ_CACHE_FILE, bot._uid_counter,
+             bot._retired_repair_jobs) = old
+
+        self.addCleanup(restore)
+        for d in live:
+            d.clear()
+        bot.STATE_FILE = os.path.join(td, "state.json")
+        bot.MBZ_CACHE_FILE = os.path.join(td, "mbz_cache.json")
+        self.user = {"navidrome_user": "nd", "navidrome_password": "nd-pass",
+                     "listenbrainz_user": "", "playlist_sources": {}}
+        patcher = patch.object(bot, "USERS", [self.user])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _legacy_state(self) -> dict:
+        track = {"artist": "A", "title": "One", "mbid": "rec-1"}
+        return {
+            "uid_counter": 41,
+            "uid_ts": dict(self.UID_TS),
+            "uid_to_token": {"p1": self.OWNER, "a1": self.OWNER},
+            "uid_to_playlist": {"p1": "Weekly Jams"},
+            "missing_by_playlist": {self.OWNER: {"Weekly Jams": [track]}},
+            "pending_approvals": {self.OWNER: {"a1": {"username": "peer", "track": track}}},
+            "pending_retries": {self.OWNER: {"r1": track}},
+            "manual_search_results": {self.OWNER: {"s1": [{"username": "peer"}]}},
+            "pending_beets": {"b1": {"chat_id": self.CHAT, "folders": []}},
+            "pending_checkdl": {"c1": {"token": self.OWNER, "chat_id": self.CHAT}},
+            "pending_dlall": {"d1": {"token": self.OWNER, "chat_id": self.CHAT}},
+            "pending_album": {"al1": {"token": self.OWNER, "chat_id": self.CHAT}},
+            "pending_pick": {"pk1": {"recid": "rec41", "kind": "release"}},
+            "pending_album_groups": {"ag40": {
+                "label": "A - B", "token": self.OWNER, "chat_id": self.CHAT,
+                "total": 2, "completed": 0, "failed": 0, "ts": time.time(),
+                "release_mbid": "rel-1", "local_dirs": {}, "local_files": [],
+                "progress_msg_id": 777, "alt_sources": [], "source_user": "peer",
+                "artist": "A", "album": "B", "missing_tracks": [],
+                "review_group_id": "", "match_mode": "auto"}},
+            "albums": {"rec41": {
+                "token": self.OWNER, "chat_id": self.CHAT, "label": "A - B",
+                "artist": "A", "album": "B", "release_mbid": "rel-1", "rgid": "",
+                "album_dir": "/downloads/A - B", "status": "failed", "ts": time.time()}},
+            "pending_downloads": [[["peer", "A - B\\01 - One.flac"], {
+                "track": track, "token": self.OWNER, "chat_id": self.CHAT,
+                "candidates": [], "album_group_id": "ag40", "review_group_id": "",
+                "review_track_index": None, "queued_at": time.time()}]],
+        }
+
+    def _load(self, state=None):
+        with open(bot.STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(state or self._legacy_state(), fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            bot._load_state()
+
+    def _saved(self) -> dict:
+        bot._save_state()
+        with open(bot.STATE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_legacy_token_owner_reowned_to_web(self):
+        self._load()
+        records = [*bot.pending_downloads.values(), *bot.pending_album_groups.values(),
+                   *bot._albums.values()]
+        self.assertEqual(len(records), 3)
+        self.assertEqual({r["token"] for r in records}, {"web"})
+        self.assertNotIn(self.OWNER, json.dumps(records))
+        self.assertIs(bot._user_for_token("web"), self.user)
+        # The post-placement Navidrome scan still finds its user.
+        scans = []
+        with patch.object(bot, "nd_start_scan", lambda u, p: scans.append((u, p)) or True):
+            self.assertTrue(bot._nd_scan_after_import(bot._albums["rec41"]["token"]))
+        self.assertEqual(scans, [("nd", "nd-pass")])
+        # And the module's own user record carries no Telegram field.
+        line = next(l for l in inspect.getsource(bot).splitlines() if l.startswith("USERS = "))
+        src = inspect.getsource(bot)
+        users_block = src[src.index(line):src.index("\n]\n", src.index(line))]
+        self.assertNotIn("telegram_token", users_block)
+        self.assertNotIn("TELEGRAM_CHAT_ID", users_block)
+
+    def test_button_stores_dropped_on_load(self):
+        self._load()
+        for name in self.BUTTON_STORES:
+            self.assertFalse(getattr(bot, name, None), name)
+        self.assertEqual(bot._uid_counter, 41)
+        self.assertEqual(bot._uid_ts, self.UID_TS)
+        saved = self._saved()
+        for key in self.BUTTON_KEYS:
+            self.assertNotIn(key, saved)
+        self.assertEqual((saved["uid_counter"], saved["uid_ts"]), (41, self.UID_TS))
+
+    def test_saved_records_keep_rollback_fields(self):
+        self._load()
+        # A group and a transfer this build made, without the fields at all.
+        bot.pending_album_groups["ag42"] = {"label": "C - D", "token": "web", "total": 1,
+                                            "completed": 0, "failed": 0, "ts": time.time()}
+        bot.pending_downloads[("peer", "C - D\\01.flac")] = {"track": None, "token": "web",
+                                                             "album_group_id": "ag42"}
+        saved = self._saved()
+        downloads = [info for _key, info in saved["pending_downloads"]]
+        groups = list(saved["pending_album_groups"].values())
+        self.assertEqual((len(downloads), len(groups)), (2, 2))
+        for info in downloads:
+            self.assertEqual((info["token"], info["chat_id"]), ("web", ""), info)
+        for ag in groups:
+            self.assertEqual((ag["token"], ag["chat_id"]), ("web", ""), ag)
+            self.assertIn("progress_msg_id", ag)
+            self.assertIsNone(ag["progress_msg_id"])
+        # What an older release's poller reads, directly, on every tick.
+        for info in downloads:
+            info["token"], info["chat_id"]
+        for ag in groups:
+            ag["token"], ag["chat_id"]
+        # The live records are what this build keeps; nothing else changed.
+        self.assertNotIn("chat_id", bot.pending_album_groups["ag42"])
+
+    def test_album_group_created_without_chat_id(self):
+        """B-331: the group was created only when a chat id existed, so with
+        no Telegram a web album download queued its files with no group: no
+        finalize, nothing placed."""
+        files = [{"filename": f"@@peer\\Music\\A\\B\\0{n} - T{n}.flac", "size": 1}
+                 for n in (1, 2)]
+        queued = []
+        with patch.object(bot, "slskd_enqueue",
+                          lambda user, f, **k: queued.append((user, f["filename"], k)) or True), \
+                patch.object(bot, "_downloads_on", lambda: True):
+            ok, total, ag_id = bot.slskd_enqueue_folder(
+                "peer", files, token="web", chat_id="", label="A - B",
+                release_mbid="rel-1", artist="A", album="B")
+        self.assertEqual((ok, total), (2, 2))
+        self.assertTrue(ag_id)
+        self.assertIn(ag_id, bot.pending_album_groups)
+        ag = bot.pending_album_groups[ag_id]
+        self.assertEqual((ag["token"], ag["chat_id"]), ("web", ""))
+        self.assertEqual({k["album_group_id"] for _u, _f, k in queued}, {ag_id})
+        # Its files land, and its finalize places them.
+        folder = "/downloads/A/B"
+        ag.update(completed=2, local_dirs={folder: 2},
+                  local_files=[f"{folder}/01 - T1.flac", f"{folder}/02 - T2.flac"])
+        imported, told = [], []
+        fill = bot._album_fill_status.copy()
+        self.addCleanup(lambda: (bot._album_fill_status.clear(),
+                                 bot._album_fill_status.update(fill)))
+        bot._album_fill_set("rel-1", "downloading", artist="A", album="B")
+
+        def place(dirs, release, artist, album, group_id="", **k):
+            imported.append((list(dirs), release, artist, album, group_id))
+            return {"ok": True, "moved": 2, "dest_folder": "/music/A/B",
+                    "artist": "A", "album": "B", "per_file": []}
+
+        with patch.object(bot, "_deterministic_album_import", place), \
+                patch.object(bot, "_finalize_import_selection",
+                             lambda dirs, gid, files: (dirs, None)), \
+                patch.object(bot, "_note_folder_imported", lambda d: None), \
+                patch.object(bot, "_nd_scan_after_import",
+                             lambda token: told.append(("scan", token)) or True), \
+                patch.object(bot, "rgid_from_release", lambda mbid: "rg-1"), \
+                patch.object(bot, "_index_mark_release_present",
+                             lambda **k: told.append("present") or True), \
+                patch.object(bot, "_index_artist_key_for_rgid", lambda *a, **k: ""), \
+                patch.object(bot, "_notify_hub_library_change",
+                             lambda *a, **k: told.append("hub")), \
+                patch.object(bot, "_start_album_fill_verification",
+                             lambda *a, **k: told.append("verify")), \
+                patch.object(bot, "_save_state", lambda *a, **k: None), \
+                patch.object(bot, "FINALIZE_FILE_WAIT_SECS", 0.05), \
+                contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(bot._finalize_group(ag_id))
+        self.assertEqual(imported, [([folder], "rel-1", "A", "B", "")])
+        self.assertNotIn(ag_id, bot.pending_album_groups)
+        self.assertEqual(bot._album_fill_view("rel-1")["state"], "placed")
+        self.assertEqual(told, [("scan", "web"), "present", "hub", "verify"])
+
+
+class ImportsNeedYouTests(unittest.TestCase):
+    """Worbus P4 task S3 (design §6.5 #4): the imports lb-bot could not finish
+    filing — the card Telegram sent with Retry, Pin MBID & retry and Import
+    as-is — are listed on the web page (Needs you › Imports that need you)
+    and counted in `/lb/attention`'s `counts.imports`, the number both
+    clients add to their to-fix number and link to `#/needs/imports` for."""
+
+    SECRET_DIR = "/downloads/PeerSecretShare/OVERWERK - After Hours EP"
+    SECRET_TOKEN = "123456:TELEGRAM-token-secret"
+
+    def setUp(self):
+        records = {
+            "rec1": {"token": "web", "chat_id": "", "label": "OVERWERK - After Hours EP",
+                     "artist": "OVERWERK", "album": "After Hours EP", "release_mbid": "rel-1",
+                     "rgid": "rg-1", "album_dir": self.SECRET_DIR, "status": "needs_review",
+                     "import_state": "downloaded_not_imported", "review_group_id": "",
+                     "ts": 100.0, "updated_at": 300.0,
+                     "error": f"none of the 6 file(s) in {self.SECRET_DIR} is a track"},
+            "rec2": {"token": self.SECRET_TOKEN, "chat_id": "42", "label": "After - After EP 2",
+                     "artist": "After", "album": "After EP 2", "release_mbid": "rel-2",
+                     "rgid": "", "album_dir": "/downloads/After EP 2", "status": "failed",
+                     "import_state": "downloaded_not_imported", "review_group_id": "g2",
+                     "ts": 200.0},
+            "rec3": {"token": "web", "chat_id": "", "label": "Placed - Fine",
+                     "artist": "Placed", "album": "Fine", "release_mbid": "rel-3",
+                     "album_dir": "/downloads/Fine", "status": "imported",
+                     "import_state": "imported", "ts": 400.0},
+        }
+        for patcher in (patch.dict(bot._albums, records, clear=True),
+                        patch.object(bot, "_save_state", lambda *a, **k: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        ledger = dict(bot._album_fill_status)
+        self.addCleanup(lambda: (bot._album_fill_status.clear(),
+                                 bot._album_fill_status.update(ledger)))
+        with bot._album_fill_lock:
+            bot._album_fill_status.clear()
+
+    def _attention(self):
+        with patch.object(bot, "_review_list_snapshot", lambda: {"groups": []}), \
+                patch.object(bot, "_needs_placement_view", lambda include_filed=False: []):
+            return bot._attention_view()
+
+    def test_attention_counts_imports(self):
+        counts = self._attention()["counts"]
+        self.assertEqual(counts["imports"], 2)
+        self.assertIsInstance(counts["imports"], int)
+        bot._albums["rec2"]["status"] = "imported"
+        self.assertEqual(self._attention()["counts"]["imports"], 1)
+        bot._albums.clear()
+        self.assertEqual(self._attention()["counts"]["imports"], 0)
+
+    def test_imports_attention_route_lists_only_open(self):
+        client = _web_app().test_client()
+        with patch.object(bot, "_review_list_snapshot",
+                          lambda: {"groups": [{"id": "g2", "canonical_album_id": "nd-2",
+                                               "rgid": "rg-2"}]}):
+            res = client.get("/api/imports/attention")
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        body = res.get_json()
+        self.assertEqual([i["recid"] for i in body["items"]], ["rec1", "rec2"])
+        keys = {"recid", "artist", "album", "status", "releaseMbid", "rgid", "albumId",
+                "reason", "updatedAt"}
+        for item in body["items"]:
+            self.assertEqual(set(item), keys)
+        first, second = body["items"]
+        self.assertEqual((first["artist"], first["album"], first["status"],
+                          first["releaseMbid"], first["rgid"], first["updatedAt"]),
+                         ("OVERWERK", "After Hours EP", "needs_review", "rel-1", "rg-1", 300.0))
+        # From its review group when the record has none.
+        self.assertEqual((second["rgid"], second["albumId"], second["updatedAt"]),
+                         ("rg-2", "nd-2", 200.0))
+        self.assertIn("is a track", first["reason"])
+        # (A reason keeps the folder's own name, as `_wire_text` does for
+        # every reason on the wire, and loses the mount it is under.)
+        text = json.dumps(body)
+        for leak in (self.SECRET_DIR, "/downloads", self.SECRET_TOKEN,
+                     '"album_dir"', '"token"', '"chat_id"', '"42"'):
+            self.assertNotIn(leak, text)
+        # Admin only.
+        res = _web_app(as_role="user").test_client().get("/api/imports/attention")
+        self.assertEqual((res.status_code, res.get_json()["code"]), (403, "admin_only"))
+        self.assertEqual(bot._ROUTE_ACCESS["GET /api/imports/attention"], "admin")
+
+    def test_import_as_is_admin_only(self):
+        placed = []
+
+        def as_is(recid):
+            placed.append(recid)
+            bot._albums[recid]["status"] = "imported"
+            return {"ok": True, "status": "imported", "error": "", "moved": 6,
+                    "dest": "After Hours EP"}
+
+        with patch.object(bot, "_import_record_as_is", as_is):
+            res = _web_app(as_role="user").test_client().post("/api/imports/rec1/as-is")
+            self.assertEqual((res.status_code, res.get_json()["code"]), (403, "admin_only"))
+            self.assertEqual(placed, [])
+            client = _web_app().test_client()
+            res = client.post("/api/imports/rec1/as-is")
+            self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+            self.assertEqual(res.get_json(), {"ok": True})
+            self.assertEqual(placed, ["rec1"])
+            items = client.get("/api/imports/attention").get_json()["items"]
+            self.assertEqual([i["recid"] for i in items], ["rec2"])
+            self.assertEqual(client.post("/api/imports/nope/as-is").status_code, 404)
+        self.assertEqual(bot._ROUTE_ACCESS["POST /api/imports/<recid>/as-is"], "admin")
+        # A refusal says why, through the wire redaction, and leaves the row listed.
+        with patch.object(bot, "_import_record_as_is",
+                          lambda recid: {"ok": False, "status": "failed",
+                                         "error": f"Placement failed: nothing in {self.SECRET_DIR}"}):
+            res = client.post("/api/imports/rec2/as-is")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.get_json()["ok"])
+        self.assertIn("Placement failed", res.get_json()["error"])
+        self.assertNotIn("/downloads", res.get_json()["error"])
+
+    def test_import_as_is_refuses_a_record_already_imported(self):
+        """B-334: as-is acts only on a record waiting for somebody (or one
+        dismissed, which Retry may still act on); an imported album is never
+        placed again, and its record is left as it was."""
+        placed = []
+
+        def as_is(recid):
+            placed.append(recid)
+            return {"ok": False, "status": "failed", "error": "Placement failed"}
+
+        client = _web_app().test_client()
+        with patch.object(bot, "_import_record_as_is", as_is):
+            res = client.post("/api/imports/rec3/as-is")
+            self.assertEqual(res.status_code, 409, res.get_data(as_text=True))
+            self.assertEqual(placed, [])
+            self.assertEqual(bot._albums["rec3"]["status"], "imported")
+            bot._albums["rec1"]["status"] = "dismissed"
+            self.assertEqual(client.post("/api/imports/rec1/as-is").status_code, 200)
+            self.assertEqual(placed, ["rec1"])
+
+    def test_a_failed_import_records_why_and_a_retry_renews_it(self):
+        """The list's `reason`: the finalize keeps the placement's error on the
+        record it leaves, and Retry stamps the record again."""
+        with patch.object(bot, "_deterministic_album_import",
+                          lambda *a, **k: {"ok": False, "error": "MusicBrainz is down",
+                                           "moved": 0, "per_file": []}), \
+                patch.object(bot, "_group_placement", lambda gid: contextlib.nullcontext()):
+            before = time.time()
+            res = _web_app().test_client().post("/api/imports/rec1/retry", json={})
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        rec = bot._albums["rec1"]
+        self.assertEqual((rec["status"], rec["error"]), ("failed", "MusicBrainz is down"))
+        self.assertGreaterEqual(rec["updated_at"], before)
+        item = next(i for i in self._items() if i["recid"] == "rec1")
+        self.assertEqual(item["reason"], "MusicBrainz is down")
+
+    def _items(self):
+        with patch.object(bot, "_review_list_snapshot", lambda: {"groups": []}):
+            return _web_app().test_client().get("/api/imports/attention").get_json()["items"]
+
+    def test_dismiss_is_admin_only_and_the_record_leaves_the_list_and_the_count(self):
+        """Ruling R20: an import nobody can file any more (its folder deleted or
+        placed by hand) can be dismissed; it then counts nowhere."""
+        res = _web_app(as_role="user").test_client().post("/api/imports/rec1/dismiss")
+        self.assertEqual((res.status_code, res.get_json()["code"]), (403, "admin_only"))
+        self.assertEqual(bot._albums["rec1"]["status"], "needs_review")
+        self.assertEqual(bot._ROUTE_ACCESS["POST /api/imports/<recid>/dismiss"], "admin")
+        client = _web_app().test_client()
+        before = time.time()
+        res = client.post("/api/imports/rec1/dismiss")
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        self.assertEqual(res.get_json(), {"ok": True})
+        self.assertEqual([i["recid"] for i in self._items()], ["rec2"])
+        self.assertEqual(self._attention()["counts"]["imports"], 1)
+        self.assertEqual(bot._open_imports_count(), 1)
+        rec = bot._albums["rec1"]
+        self.assertEqual(rec["status"], "dismissed")
+        self.assertGreaterEqual(rec["dismissed_at"], before)
+        # Nothing else about the record changes: the folder is not touched.
+        self.assertEqual((rec["album_dir"], rec["import_state"], rec["release_mbid"]),
+                         (self.SECRET_DIR, "downloaded_not_imported", "rel-1"))
+        # A second press is a no-op; a filed one is not waiting; an unknown one is 404.
+        self.assertEqual(client.post("/api/imports/rec1/dismiss").status_code, 200)
+        self.assertEqual(client.post("/api/imports/rec3/dismiss").status_code, 409)
+        self.assertEqual(bot._albums["rec3"]["status"], "imported")
+        self.assertEqual(client.post("/api/imports/nope/dismiss").status_code, 404)
+        # The failed one too, and the count reaches 0.
+        self.assertEqual(client.post("/api/imports/rec2/dismiss").status_code, 200)
+        self.assertEqual(self._attention()["counts"]["imports"], 0)
+        self.assertEqual(self._items(), [])
+
+    def test_a_dismissed_record_is_out_of_the_downloads_review_too(self):
+        """The downloads view lists records by the same three statuses the
+        release before 0.4 reads (`needs_review`, `needs_match`, `failed`): a
+        dismissed record is in neither, which is what makes it inert there."""
+        self.assertTrue(bot._dismiss_import_record(bot._albums["rec2"]))
+        self.assertNotIn(bot.IMPORT_DISMISSED, bot.IMPORT_STATUSES_NEEDING_YOU)
+        self.assertIn('if r.get("status") in ("needs_review", "needs_match", "failed")]',
+                      inspect.getsource(bot))
+
+    def test_the_summary_counts_them_too(self):
+        self.assertEqual(bot._open_imports_count(), 2)
+        self.assertIn('"imports": {"open": _open_imports_count()}',
+                      inspect.getsource(bot._summary_view))
+
+
 class DownloadsModeTests(unittest.TestCase):
     """Worbus P1 task S2: downloading is a mode, off without an slskd API key.
     With it off lb-bot makes no slskd call at all, and every route that would
@@ -36639,6 +37094,7 @@ class DownloadsModeTests(unittest.TestCase):
         "POST /api/imports/<recid>/retry",
         "POST /api/imports/<recid>/remove-stale-and-retry",
         "POST /api/imports/<recid>/merge-retry",
+        "POST /api/imports/<recid>/as-is",
         "POST /api/groups/<group_id>/downloads/<download_id>/match-selected",
         "POST /api/groups/<group_id>/downloads/<download_id>/match",
         "POST /api/groups/<group_id>/download",
@@ -36713,6 +37169,10 @@ class DownloadsModeTests(unittest.TestCase):
         "POST /api/gaps/<group_id>/allow-mp3",
         "GET /api/gaps/<group_id>/duplicate-files",
         "POST /api/gaps/<group_id>/rescan",
+        "GET /api/imports/attention",
+        # Dismiss touches no file and asks slskd nothing (ruling R20): a server
+        # whose downloading was turned off can still clear its count.
+        "POST /api/imports/<recid>/dismiss",
         "GET /api/groups/<group_id>/downloads/<download_id>/match",
         "POST /api/groups/<group_id>/downloads/<download_id>/match-preview",
         "POST /api/groups/<group_id>/match-mode",
@@ -36756,45 +37216,6 @@ class DownloadsModeTests(unittest.TestCase):
         "_settings_cards",
     }
     SLSKD_URL_DISPLAY_ONLY = {"_settings_cards"}
-
-    def test_telegram_says_downloading_is_off(self):
-        """Review S#12: `/album`, `/search` and the download buttons say
-        downloading is not set up, instead of "nothing found"."""
-        said = []
-
-        async def reply(text, **k):
-            said.append(text)
-
-        def update(data=None):
-            q = types.SimpleNamespace(
-                data=data, message=types.SimpleNamespace(chat_id=1),
-                answer=lambda *a, **k: asyncio.sleep(0),
-                edit_message_text=lambda text, **k: reply(text))
-            return types.SimpleNamespace(
-                message=types.SimpleNamespace(reply_text=reply),
-                effective_chat=types.SimpleNamespace(id=1), callback_query=q)
-
-        ctx = types.SimpleNamespace(args=["Kino", "-", "Gruppa", "krovi"], bot=None)
-        searched = []
-        errors = types.ModuleType("telegram.error")
-        for name in ("TelegramError", "BadRequest", "TimedOut", "NetworkError"):
-            setattr(errors, name, type(name, (Exception,), {}))
-        with patch.dict(sys.modules, {"telegram.error": errors}), \
-                patch.object(sys.modules["telegram"], "error", errors, create=True), \
-                patch.object(bot, "DOWNLOADS_ON", False), \
-                patch.object(bot, "_resolve_token", lambda c: "tok"), \
-                patch.object(bot, "mbz_search_release_groups",
-                             lambda *a, **k: searched.append(a) or []), \
-                patch.object(bot, "_do_search_and_render",
-                             lambda *a, **k: searched.append(a) or asyncio.sleep(0)), \
-                contextlib.redirect_stdout(io.StringIO()):
-            asyncio.run(bot.album_command(update(), ctx))
-            asyncio.run(bot.search_command(update(), ctx))
-            for data in ("dlall|p1", "DLA|p1", "ALD|x", "AP|a|0", "DA|s|0", "ARETRY|x"):
-                asyncio.run(bot.callback_handler(update(data), ctx))
-        off = bot.DOWNLOADS_OFF_BODY["error"]
-        self.assertEqual(said, [off] * 8)
-        self.assertEqual(searched, [])
 
     def test_every_slskd_request_site_is_guarded(self):
         """Review S#11: a new use of SLSKD_URL outside the guarded functions
@@ -36907,7 +37328,7 @@ class DownloadsModeTests(unittest.TestCase):
             for key, rule in sorted(self._decorated().items()):
                 client.open(self._url(rule), method=key.split(" ", 1)[0], json={})
             # The poller, once.
-            asyncio.run(bot._poll_downloads_once({}))
+            asyncio.run(bot._poll_downloads_once())
             # The wishlist sweep, once: it neither searches nor reads the list.
             with patch.object(bot.time, "sleep", sleep), \
                     patch.object(bot, "_wishlist_due",

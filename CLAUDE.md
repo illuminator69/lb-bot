@@ -8,11 +8,11 @@ gap-fill pipeline.
 The repo moved off the Windows box; it now lives at
 `/home/ilya/Documents/navi-connect+lb-bot/Lb-bot-missing`, a sibling of `navi-connect/` and
 `navi-connect-publish/lb-bot/` (the publish clone). Node and pip are dnf-installed system-wide;
-**this project's Python deps are not** — they live in `.venv`, because Fedora's
-`python3-telegram-bot` is 22.8 against our pinned 21.10:
+**this project's Python deps are not** — they live in `.venv` (the pins in `requirements.txt`; the image's Python
+is 3.12 since Worbus 0.4, so make the venv with 3.12):
 
 ```bash
-.venv/bin/python listenbrainz_bot.py            # deps from requirements.txt, Python 3.14
+.venv/bin/python listenbrainz_bot.py            # deps from requirements.txt, Python 3.12 (the image's)
 .venv/bin/python -m unittest test_album_review  # suite; see the baseline below
 cd web && npm ci && npm run build               # SPA → web/dist (system Node 24, npm not pnpm)
 
@@ -46,9 +46,10 @@ a fresh clone gets a `deploy.sh` that answers "Permission denied". Adding an exe
 
 ## What this is
 
-A single-file Python bot (`listenbrainz_bot.py`, ~10.3k lines) that fills gaps in a
-self-hosted music library. It exposes a Telegram bot **and** a Flask web UI
-(port 8899). It talks to:
+A single-file Python bot (`listenbrainz_bot.py`, ~37k lines) that fills gaps in a
+self-hosted music library. It exposes a Flask web UI (port 8899) and the routes the
+Worbus hub proxies; the Telegram bot it also had was removed in Worbus 0.4 (§ Telegram,
+removed in Worbus 0.4). It talks to:
 
 - **Navidrome** — music server, Subsonic API. `http://navidrome:4533`.
   This is the source of truth for what's in the library and the success oracle
@@ -93,8 +94,9 @@ host once: `chown -R 99:100 /mnt/user/appdata/lb-bot` (and `/mnt/user/Music` if
 placement into pre-existing album folders fails).
 
 The required set for a stranger's server is `NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD`,
-`LB_BOT_HUB_URL` and `LB_BOT_HUB_TOKEN` (§ A stranger's server). `TELEGRAM_TOKEN` and `SLSKD_API_KEY` are
-optional: no token, no Telegram; no key, downloading is off.
+`LB_BOT_HUB_URL` and `LB_BOT_HUB_TOKEN` (§ A stranger's server). `SLSKD_API_KEY` is optional: no key,
+downloading is off. `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` and `LB_BOT_WEB=0` are ignored with one line each
+(§ Telegram, removed in Worbus 0.4).
 
 New environment variables, all optional and all degrading to "feature off"
 rather than to an error:
@@ -108,38 +110,32 @@ rather than to an error:
 | `LB_BOT_WISHLIST_COOLDOWN` | `43200` (12 h) | how long before one wishlist row is re-searched |
 | `LB_BOT_SOURCE_FAILOVER_DEADLINE` | `45` | wall-clock ceiling on the fetch route's walk down the ranked source list |
 | `LB_BOT_LISTENS_SYNC` | `1` (on) | the listens mirror (§ The listens mirror). `0`: the `listens-sync` worker does not start, `status.state` reads `off` and `artistPlays` is 0, whatever `LISTENBRAINZ_USER` says. What is already in `listens.db` is left there, and the summary routes still read it. The switch for a first live run |
-| `LB_BOT_AUTO_INDEX` | `1` (on) | the background auto-index worker (`_auto_index_worker`): scans Navidrome artists with no, stub or stale index rows, yielding every MusicBrainz request to interactive callers. `0` turns it off without a rebuild. Like `index-push`, it only exists when the web UI does (`LB_BOT_WEB`, see § The index change feed) |
+| `LB_BOT_AUTO_INDEX` | `1` (on) | the background auto-index worker (`_auto_index_worker`): scans Navidrome artists with no, stub or stale index rows, yielding every MusicBrainz request to interactive callers. `0` turns it off without a rebuild. Like `index-push`, it is started by `start_web_dashboard()` (see § The index change feed) |
 
 Deezer needs no configuration at all — the browse API is open.
 
 `LB_BOT_UMASK` (default `002` in compose) is applied by the bot itself via
-`os.umask()` at import. The image is `python:3.11-slim` with a bare `python`
+`os.umask()` at import. The image is `python:3.12-slim` (since Worbus 0.4; the suite runs on 3.12) with a bare `python`
 CMD — there is no s6/linuxserver init, so a bare `UMASK` var would do nothing.
 
 ### A stranger's server — Worbus P1 (2026-10-28)
 
-lb-bot runs with only Navidrome and the hub configured: no Telegram, no slskd. The pieces, each with its tests in
-`test_album_review.py` (`NoTelegramTests`, `DownloadsModeTests`, `IndexProgressScanNowTests`, `FindItTests`,
-`WebLoginTests`):
+lb-bot runs with only Navidrome and the hub configured: no slskd (and, since Worbus 0.4, no Telegram at all). The
+pieces, each with its tests in `test_album_review.py` (`NoTelegramTests`, `DownloadsModeTests`,
+`IndexProgressScanNowTests`, `FindItTests`, `WebLoginTests`):
 
 - **Required env** (`_missing_required_config()`, names only, never values): `NAVIDROME_URL`, `NAVIDROME_USER`,
   `NAVIDROME_PASSWORD`, `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN`. `main()` logs them in one line ("required settings
   missing: …" or "all present"), and `/api/health` carries them as `missingConfig`. `NAVIDROME_URL` is judged by
   `os.environ` (the module value has a default, so it was never empty). `HUB_NOTIFY_TOKEN` is read stripped.
-- **Start-up order.** `main()` starts the web dashboard and the four loops (`_playlist_scan_loop`,
-  `poll_downloads_loop`, `state_flush_loop`, `housekeeping_loop`) **first**, then `_build_telegram_apps(USERS)`: one
-  app per user with a non-empty token; a build, initialise or start-polling failure is logged once (the exception's
-  type and a redacted message, never the token) and that user is skipped. Before this an empty `TELEGRAM_TOKEN` raised
-  `InvalidToken` at the builder and the container crash-looped. `_TELEGRAM_APPS` holds the `(user, app)` pairs,
-  `_TELEGRAM_STARTED` is set once they are final.
-- **The web user's key.** Web-started (and hub-started) state is owned by `_web_user_key()` = `"web"`, never the
-  Telegram token: `_user_for_token("web")` is the default web user, `_token_to_app()` maps `"web"` to that user's app
-  (so the owner keeps completion messages), `_token_owns()` lets `/status` and `/pending` list it. The retag's
-  Navidrome rescan no longer needs a token.
+- **Start-up.** `main()` starts the web dashboard and the four loops (`_playlist_scan_loop`,
+  `poll_downloads_loop`, `state_flush_loop`, `housekeeping_loop`), then idles. (Until Worbus 0.4 it then started a
+  Telegram app per user with a token.)
+- **The web user's key.** Web-started (and hub-started) state is owned by `_web_user_key()` = `"web"`, never a
+  credential: `_user_for_token("web")` is the default web user. The retag's Navidrome rescan needs no token.
 - **The playlist scan** (`_playlist_scan_loop`, was `tuesday_scheduler`) runs for each user with a
-  `listenbrainz_user`, independent of Telegram, and returns at once when there is none. Results go to Telegram when
-  that user has an app (as before), else into the review's playlist origin (`_land_playlist_scan`, what the web UI's
-  "Scan playlists" does).
+  `listenbrainz_user`, and returns at once when there is none. Results land in the review's playlist origin
+  (`_land_playlist_scan`, what the web UI's "Scan playlists" does) — the only path since Worbus 0.4.
 - **Downloading is a mode.** `DOWNLOADS_ON` = `SLSKD_API_KEY.strip()` non-empty, read once at import; `_downloads_on()`
   reads it at call time. Off: `slskd_run_search`, `slskd_search_probe`, `slskd_enqueue`, `slskd_expand_directory`,
   `slskd_get_all_downloads`, `_slskd_fetch_all_downloads`, `_slskd_cancel` and the diagnostics' slskd probe answer
@@ -228,7 +224,95 @@ lb-bot runs with only Navidrome and the hub configured: no Telegram, no slskd. T
   for an admin, Match manually. A library artist with no MBID is scanned by its Navidrome id (no client-side name
   lookup any more); a worker-held scan (`task_id: "auto-index"`) is followed on the discography route.
 
+### Telegram, removed in Worbus 0.4 (2026-11-06)
+
+Ruled obsolete on 2026-11-02 (backlog I-058); cut in Worbus project 4, task S1 (design §6.5). The module never
+imports `telegram`, and `python-telegram-bot` (and `httpx`, which only it needed) left `requirements.txt`. Gone: the
+13 command handlers, `callback_handler`, `unknown_command`, `on_telegram_error`, `BOT_COMMANDS`, `HELP_TEXT`,
+`_tg_send` and every call, the `_dlall`/`_beets`/`_reimport`/`_set_cover` Telegram workers, the album prompt and
+card, the approval/retry/duplicate prompts, the button markups, `_telegram_app_for`, `_build_telegram_apps`,
+`_token_to_app`, `_token_owns`, `_resolve_token`, `_telegram_apps_settled`, `_update_group_progress` (the editable
+progress line) and the housekeeping sweep of button state (`housekeeping_loop` now only forgets old `_uid_ts`
+entries); with them the helpers only they called (`find_incomplete_albums`, `slskd_search_and_pick`, `slskd_pick`,
+`caa_list_front_images`, `nd_find_duplicate`, `_progress_bar`, `_format_info`).
+
+- **What only Telegram did, and where it went** (design §6.5's table, the owner's ruling of 2026-11-06): the
+  scheduled playlist scan always lands in Needs you's playlist origin (`scheduled_scan` → `_land_playlist_scan`);
+  "Download all", `/beets` "Import ALL", a full rescan and free-text search from a phone, and the pings are
+  dropped; the failed-imports card's actions live on the web page (task S3, below) — Retry and Pin release & retry
+  are the `/api/imports/<id>/*retry` routes, **Import as-is** is `_import_record_as_is` (the logic of
+  `_reimport_worker(autotag=False)`, now a plain function on the caller's thread) behind `POST
+  /api/imports/<id>/as-is`, Choose cover and Re-download are the album page's own.
+- **What the poller and the finalize said to the chat** they now log (`downloaded file <label>: …`, `<label>:
+  source failed — trying @peer`, `every source failed to queue`); the fill ledger and the review rows carry the
+  same outcomes for every client, as they already did. `_finalize_group(ag_id)`, `_finalize_taken_group(ag)`,
+  `_switch_album_source(ag_id)`, `_switch_album_source_inner(ag_id, ag)`, `_finish_gap_single(info, …)`,
+  `_poll_downloads_once()` and `poll_downloads_loop()` take no `bot` any more. A group whose every source failed is
+  dropped and the poller records `transfer_failed` (retryable) in the ledger; nothing writes a Retry button.
+- **Settings.** `_retired_setting_lines()` is the one reader of `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID`: when either is
+  non-blank `main()` logs `config: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID are set. Telegram was removed in Worbus 0.4; this setting
+  is ignored` (names only, never a value), and `LB_BOT_WEB=0` (it meant "Telegram alone") logs one line that it is
+  ignored. `WEB_UI_ENABLED` is gone: `start_web_dashboard()` and the log tee always run.
+- **The data** (task S2). `USERS[0]` has no `telegram_token` or `chat_id`; `_user_for_token` knows only `"web"`.
+  On load `_reown_legacy_records()` re-owns every pending download, album group and `_albums` record owned by
+  anything but `"web"` (a Telegram token, or the `""` of an older web-only server) to `"web"`, with `chat_id` `""`
+  and a group's `progress_msg_id` `None`, so `_nd_scan_after_import` still finds the user. Telegram's button stores
+  (`uid_to_token`, `uid_to_playlist`, `missing_by_playlist`, `pending_approvals`, `pending_retries`,
+  `manual_search_results`, `pending_beets`, `pending_checkdl`, `pending_dlall`, `pending_album`, `pending_pick`) are
+  no longer globals: not read on load, not written on save. `uid_counter` and `uid_ts` stay (group and record ids
+  share them). **For the rollback, every saved pending download and album group carries `token`, `chat_id` (`""`)
+  and, for a group, `progress_msg_id` (`null`)** (`_with_rollback_fields`, on a copy): the release before 0.4 reads
+  `info["token"]`, `info["chat_id"]` and `ag["token"]` directly on every poll.
+- **B-331 is fixed by the cut:** `slskd_enqueue_folder` creates the album group, and `slskd_enqueue` registers its
+  transfer, whenever there is an owner (`if token:`), no longer only with a chat id too. Before, a web album download
+  on a server with no Telegram queued its files with no group: nothing finalized or placed it.
+- **Redaction.** `_redact_secrets` no longer holds a Telegram token value (nothing reads it); a token in an old
+  reason or error is caught by its shape (`_TELEGRAM_TOKEN_SHAPE`, `[bot]<digits>:<20+ chars>`).
+- **stdout and stderr are redacted too** (fix round, ruling R19): `_LogTee.write` writes a line to the stream
+  only once its `\n` has come, through `_redact_log_line` = the shared rule v2 (`_redact_log_rule`, the same 27
+  vectors as Navic, Feishin and the Worbus launcher — `LogTeeRedactionTests`) and the Telegram shape, mark
+  `[removed]`. It covers every `print(f"... error: {e}")` of a `requests` exception that names a Navidrome URL
+  (`u`/`t`/`s`) or Last.fm's `api_key=`. The port is linear time (a name is one whole run matched once, rule (e)
+  walks back from `://`); a partial line is written at `flush()` or past 64 KiB. The ring keeps
+  `_redact_secrets`. Limit: a credential split across two lines, or a bare value with no name beside it.
+- **Imports that need you** (task S3; the card Telegram sent for an import that failed or wanted a decision). An
+  import record (`_albums`) at `needs_review` or `failed` (`IMPORT_STATUSES_NEEDING_YOU`) needs a person:
+  - `GET /api/imports/attention` (admin) → `{"items": [{recid, artist, album, status, releaseMbid, rgid, albumId,
+    reason, updatedAt}]}`, newest first (`updated_at`, else `ts`), an allowlist (`_imports_attention_view`: never
+    `album_dir`, the owner key or the chat id). `rgid` / `albumId` from the record, else its review group, else
+    (`rgid`) the fill ledger; `reason` is the record's `error` (the finalize keeps the placement's error there; the
+    retry routes and as-is renew it, `_stamp_import_outcome`), else the ledger's, through `_wire_text`.
+  - `POST /api/imports/<id>/as-is` (admin, `@needs_downloads`) → `{"ok": true}` or `{"ok": false, "error"}`
+    (`_wire_text`); 404 for an unknown record.
+  - `POST /api/imports/<id>/dismiss` (admin; ruling R20) → `{"ok": true}`, 404 unknown, 409 for a record not
+    waiting (imported): status `dismissed` (`IMPORT_DISMISSED`, `dismissed_at`), every other field as it was,
+    nothing on disk touched. Out of the list and the count. The release before 0.4 lists records by
+    `needs_review`/`needs_match`/`failed` only and walks none on its own, so a dismissed one is inert there.
+  - **`counts.imports`** on `/api/attention` (so `/lb/attention`) and **`imports.open`** on `/api/summary`: the
+    same number (`_open_imports_count`). The apps add it to their to-fix number and link to
+    `<base>/#/needs/imports`; an older app ignores the key.
+  - **The web page:** `#/needs/imports` (`#/needs/imports/<recid>` for one) opens Needs you › To fix on its
+    "Imports that need you" group (`needsView` in `lib/needs.js`; wide: the first import selected, narrow: the list
+    scrolled to the group). Each row's detail has **Retry**, **Pin release & retry** (the album's releases from
+    `/api/album/releases`, each "Pin and retry" → `/merge-retry {release_mbid}`), **Import as-is** and **Open album**
+    (the album page: its cover and its re-download), and **Dismiss**. A row acted on stays where it was, saying what became of it,
+    until something else is picked. `toFixCount` adds `summary.imports.open` (else the page's own list).
+- **Tests:** `TelegramRemovedTests` (no `telegram` in `sys.modules`, the one ignore line, `LB_BOT_WEB=0` ignored,
+  the scan always lands) and `TelegramStateMigrationTests` (re-owned to `"web"`, button stores dropped, the rollback
+  fields on save, B-331's group created and finalized to placement with no chat id), `ImportsNeedYouTests` (the
+  count, the list route, as-is admin only, the reason) and `web/src/lib/needs.test.mjs` / `router.test.mjs`
+  (`toFixCount` counts imports; `#/needs/imports` opens the imports list). The suite has no Telegram stubs
+  any more; the fixtures that still build records with `token` / `chat_id` are the legacy-state case.
+
 ### Deployment
+
+**Worbus 0.4 (2026-11-06) changes what runs.** This image becomes the base of the umbrella's
+`ghcr.io/illuminator69/worbus-server` (`server/Dockerfile`, `FROM` this image's **pinned digest**), which runs
+lb-bot and the hub in one container under a launcher; data moves to `/data/lb-bot/`. Until the owner's move
+(PLAN-worbus-p4 C2) the NAS still runs `lb-bot-lb-bot-1` as below. **After it, `deploy.sh` is stale:** it targets
+`lb-bot-lb-bot-1`, and a lb-bot release reaches the NAS only through a new `worbus-server` build with the new
+digest pinned. The publish clone's `docker.yml` still moves `latest` on a push to `main`, and also tags `v*`
+releases with their version (`lb-bot:0.4.0`).
 
 The live container is **`lb-bot-lb-bot-1`**, started by Unraid's **Compose Manager**
 plugin from its own project dir on the NAS:
@@ -583,9 +667,8 @@ upstream breaks them silently, which is what the 0.7 cap is saying:
 The comma rule is **Qobuz-only and must stay that way**: album titles contain
 commas all the time, and applying it generally splits a title in half.
 
-There is still **no Telegram plain-text handler** — `/spplaylist` remains the
-only command that takes a link. The route is the deliverable; the paste UI is
-each client's.
+Telegram's `/spplaylist`, the only command that took a link, went with Telegram in
+Worbus 0.4. The route is the deliverable; the paste UI is each client's.
 
 ### Acquisition reliability
 
@@ -1027,7 +1110,7 @@ every row `downloaded`. It lasted until the row was evicted or a restart a day l
   auto-placement, beside the poller's and the startup pass's `_place_group_downloads`
   and the finalize. One context manager, `_group_placement`; an empty id claims
   nothing, so a caller passes whatever id it has ("Pick the release" with no group,
-  an artist-page album, the Telegram re-import workers: none). Three things to know
+  an artist-page album, "Import as-is" (`_import_record_as_is`): none). Three things to know
   before adding a caller:
   - **Never wait for the claim under `_review_lock`.** The placement that holds it
     needs that lock to write its rows. `_place_track_anyway` imports under the lock,
@@ -1188,8 +1271,7 @@ bonus against ~4,000 points of peer metrics. Now:
   album evidence for a folder of an album search, item 11** — and
   `_auto_download_choice` is the first folder
   that passes it: the API download task fails `no_source` (`artist_unverified`
-  or `album_unverified`), Telegram falls through to the picker with a caution,
-  `_source_failover_order(..., folders=)` and `_switch_album_source_inner`
+  or `album_unverified`), `_source_failover_order(..., folders=)` and `_switch_album_source_inner`
   skip every alternate that does not pass. A user's explicit pick (`chosen`,
   `start_is_choice`) is consent — for that one source only.
 - `_folder_name_score` classifies a candidate's extra tokens: packaging/years/
@@ -1335,8 +1417,9 @@ Two hand-picked Currents files and a rescued Innerspeaker track sat in
   on: it can end without importing anything (source failed, every alternate
   refused), and the file would be stranded again. The file is **not** tagged
   in /downloads any more — its own tags are what placement judges it by.
-  Telegram says which of the three happened ("Placed into …", "waiting for its
-  album", "not placed (reason)").
+  The poller logs which of the three happened (`downloaded file <label>: placed
+  into …`, `waiting for its album to finish`, `not placed (reason)`; Telegram was
+  told the same until Worbus 0.4).
 - **`_finalize_group` imports those files, not their folders**
   (`_finalize_import_selection`). Of the album group's own folders
   (`ag["local_dirs"]`) it imports the files its transfers landed
@@ -1477,7 +1560,7 @@ artists for one MusicBrainz id. The numbering had the same residue.
   gap's review group (`_placement_takes_the_librarys_spelling`: no group id, a
   group that is gone, or a Loose-tracks group) — an artist page's whole album,
   "Pick the release", a Loose-tracks row's auto-placement, the Place task, the
-  `/api/imports/<id>/*retry` routes, the Telegram re-import workers. Until the
+  `/api/imports/<id>/*retry` routes, "Import as-is" (`_import_record_as_is`). Until the
   L2 review only the album group's finalize asked, and each of the others could
   still file under MusicBrainz's credit or a peer's `albumartist` tag. A new
   caller of the import gets it without doing anything; do not resolve the name
@@ -1660,8 +1743,8 @@ of which had looked like the feature working:
     that keeps none taking the folder whole. The group is a whole-album
     group in every other respect: no track on its transfers,
     `missing_tracks` empty, the finalize and its rules as they are. Callers:
-    the album download task and the switch — Telegram's album paths and a
-    bare folder download pass no rows and are as they were. **Costs:** a
+    the album download task and the switch — a bare folder download (and
+    Telegram's album paths, removed in Worbus 0.4) pass no rows and are as they were. **Costs:** a
     file of the folder whose name is no track's — a bonus track of another
     edition, a hidden track — is no longer fetched with the album when the
     folder holds the whole release by its exact titles: the fill says how
@@ -1772,10 +1855,9 @@ of which had looked like the feature working:
   a folder of an album search — is the one rule** behind
   `_auto_download_choice`, every `alt_sources` (`_unattended_alternates`),
   `_source_failover_order`, `_switch_album_source_inner`, `_gap_auto_task`,
-  the leftover rescue and the Telegram auto paths. **A track search's folder
-  is nobody's album and passes on artist evidence**, as it always did: a
-  Loose-tracks row, a gap with no release, Telegram's `/search`, the
-  single-track path. **Which search made a folder** (D3,
+  and the leftover rescue (and Telegram's auto paths, until Worbus 0.4). **A
+  track search's folder is nobody's album and passes on artist evidence**, as it
+  always did: a Loose-tracks row, a gap with no release, the single-track path. **Which search made a folder** (D3,
   `_album_evidence_as_read` — the one reading, for the rule and for the row
   a client is shown): its own `album_evidence`; else its `search_kind`,
   which every search stamps now (`"album"` / `"track"`); else, for a list
@@ -1783,7 +1865,7 @@ of which had looked like the feature working:
   — a review group by what its last search was (`source_results.mode`),
   else by what its next would be (`_group_sources_are_album`); a transfer
   group by whether it names a release (`_album_group_holds_album_list`);
-  Telegram's album prompt and the album download hold album lists. Only a
+  the album download holds an album list. Only a
   stamp-less list held for an album is read by its name: `album_match_ok`,
   unless the title has no word of its own (`artist` and `album` are for
   that). **The keys cannot tell**: `_annotate_folder_match` stamps
@@ -1863,11 +1945,12 @@ of which had looked like the feature working:
     `placed`, the release `present`. **The import is told by its caller**
     (`unattended=True`, a parameter — never a guess at who called), and one
     caller says it: the album group's finalize, i.e. the artist page's
-    download, the wishlist, the automatic retry and Telegram's album paths.
+    download, the wishlist, the automatic retry (and Telegram's album paths
+    until Worbus 0.4).
     **A hand route is the user naming the folder and the release** — the
     Place task (`/api/place-folder`, "Pick the release"), the download-match
-    and `/api/imports/<id>/*retry` routes, "Place anyway", Telegram's
-    Re-import, Import as-is and `/beets` — and there each file paired by its
+    and `/api/imports/<id>/*retry` routes, "Place anyway" and "Import as-is"
+    (`_import_record_as_is`) — and there each file paired by its
     recording id or a title is placed as it always was: one track of twelve,
     two of six. (C4 first held them to half the album too, which took away
     the only way a partial folder, or a Loose-tracks row's file, could be
@@ -1875,9 +1958,9 @@ of which had looked like the feature working:
     one places each of its rows that is paired** whoever started it; a hand
     pairing is always placed; an id that names no group is no group.
     **So does a fill that named the tracks it wanted itself** (D4): an
-    album group with `missing_tracks` and no review group — Telegram's fill
-    of an album the library partly has (`group_missing_by_album`,
-    `_dlall_worker`, the album prompt). The finalize hands those rows over
+    album group with `missing_tracks` and no review group — a fill of an
+    album the library partly has (Telegram's `_dlall_worker` and album prompt
+    made them until Worbus 0.4; a group an older build left still can). The finalize hands those rows over
     (`wanted_tracks`); they are the slots the import may fill, and each one
     paired is placed. Rows that name **every** track of the release are a
     whole-album fill and C4 stands (an album the library has none of is
@@ -1989,23 +2072,24 @@ of which had looked like the feature working:
   was not found where slskd downloads to" (retryable); and a fill that
   placed the rest says "N downloaded file(s) were not found where slskd
   downloads to" in its ledger row's `reason` — what the web UI and the
-  clients read — as well as in Telegram. With none found at all the fill
+  clients read. With none found at all the fill
   fails `placement_failed`, "could not be found", not retryable.
   **Known and left:** a single transfer with no album group (a hand pick,
   a rescue) is still looked for once; and two fills at once into one leaf
   with one file name in common, both landed between two polls, take each
   other's file ("the newest").
-- **Telegram's "📥 Import as-is" files a folder as what it is** (C5):
+- **"Import as-is" files a folder as what it is** (C5; Telegram's "📥 Import as-is"
+  until Worbus 0.4, now `_import_record_as_is`):
   artist, album and release all from the folder's own identity
   (`_identity_for_path`), never the artist and album of the fill's record
-  — on the message a refused fill leaves, that record names exactly what
+  — on the record a refused fill leaves, that record names exactly what
   the folder was found not to be, and one tap filed OVERWERK's six as
-  After's. A folder nobody can name is not placed, and the message says so
+  After's. A folder nobody can name is not placed, and the answer says so
   — **nor one whose identity names a release and no artist** (D7b: the
   import then asked MusicBrainz for the credit fail-soft, and with
   MusicBrainz silent filed it under `Unknown Artist/`). After an as-is
-  import the record names what the folder was filed as. "Re-import" is
-  unchanged.
+  import the record names what the folder was filed as. Retry
+  (`/api/imports/<id>/retry`, Telegram's "Re-import") is unchanged.
 - **An album's folder is the album's own** (A4). `_nd_find_album_folder_by`
   asked Navidrome's `search3` for the title, which answers by words, and —
   when no hit carried the release id — kept every hit and took the one with
@@ -2036,7 +2120,7 @@ of which had looked like the feature working:
 - The suite's evidence is four real slskd answers for those two albums, peer
   names replaced, in `test_fixtures/` (gzip; out of the image by
   `.dockerignore`; the tests that read them skip when the folder is absent).
-- Not covered: the Telegram pickers and the Fill-gaps picker keep their own
+- Not covered: the Fill-gaps picker keeps its own
   lists (a gap's `source_results`), and a click there was always for the
   listed folder. A kept list is not persisted. The merge keeps a folder for
   as long as its list is refreshed inside the TTL, with the figures of the
@@ -2503,9 +2587,8 @@ were Settings → Status → Library index.)
 
 `LB_BOT_AUTO_INDEX=0` turns it off (it returns at thread start with one log line;
 also off with no Navidrome login). **`auto-index`, `index-push` and
-`index-backfill-sweep` are started from `start_web_dashboard()`, so with
-`LB_BOT_WEB=0` none of them runs** — a Telegram-only process has no index push and
-no background indexing, whatever `LB_BOT_AUTO_INDEX` says.
+`index-backfill-sweep` are started from `start_web_dashboard()`**, which always
+runs since Worbus 0.4 (`LB_BOT_WEB=0`, "Telegram alone", is ignored with a line).
 
 **The read path is pure SQLite now.** `GET /api/artist/discography` no longer runs
 `_index_backfill_present_album_ids` (it did, per read, against Navidrome's 300 s
@@ -3400,8 +3483,7 @@ is the long form. What binds a future change:
     Undo works on it as usual.
   - **Known and left:** a second cover change on a file whose picture someone
     else changed after the first keeps the first snapshot and loses that
-    intermediate picture; the Telegram cover path (`_set_cover_worker`) writes
-    `cover.jpg` only; an MP3's `APIC` frames come out in mutagen's order, and
+    intermediate picture; an MP3's `APIC` frames come out in mutagen's order, and
     two `APIC` frames with one description get a space added by mutagen; an
     Opus file's legacy `COVERART` comment (the pre-`METADATA_BLOCK_PICTURE`
     way) is neither read nor written, so a file holding only that is
@@ -4250,7 +4332,7 @@ section comment above `LISTENS_PAGE_SIZE` is the long form; what binds a change:
   with a registered `fold()` (Python `casefold`), because SQLite's `lower()` only
   folds ASCII.
 - **One writer.** The `listens-sync` thread (`_listens_sync_worker`, started in
-  `start_web_dashboard()` like the others, so not with `LB_BOT_WEB=0`) is the only
+  `start_web_dashboard()` like the others) is the only
   code that writes rows. `_listens_sync_tick(state, now, user, fetch, wake,
   clock)` is the whole decision with the fetch and the clock passed in, and the
   loop around it (`_listens_sync_worker(clock, fetch, waiter)`) takes its clock,
@@ -4452,14 +4534,15 @@ section comment above `LISTENS_PAGE_SIZE` is the long form; what binds a change:
 Two read-only views the navi-connect hub serves to devices (`/lb/attention`, `/lb/activity`, cached 20 s
 there; navi-connect PROTOCOL §15.6). **Every row is an allowlist** (`_ATTENTION_FOLDER_KEYS` and the literal
 dicts in `_attention_view` / `_activity_view`): never a whole record, never a path, a peer filename, a token or
-a chat id. `/api/downloads` (its review rows carry the Telegram token and chat id) never goes through the hub.
+a chat id. `/api/downloads` (its rows carry the owner key and the legacy `chat_id`) never goes through the hub.
 
 - **`/api/attention`**: `counts` are `/api/summary`'s own numbers by the same rules — `failedGaps` (visible
   groups whose `_gap_status_for_group` is `failed`, as `_gaps_view` counts them), `failedRequests`
   (`_album_fill_counts`' rule: a failed ledger row with a name or a release-group), `folders` and
   `foldersUnidentified` (`_needs_placement_view`, `_unidentified_count`) — plus `picks` (visible groups at
-  `picking`). The to-fix number is the web UI's `needs.js`: `failedGaps + failedRequests + folders`, added up by
-  the client, never sent. `albums`: failed gaps and failed requests, newest first, then the picks, at most 50; a
+  `picking`) and, since Worbus 0.4, `imports` (import records at `needs_review` or `failed`, § Telegram, removed in
+  Worbus 0.4). The to-fix number is the web UI's `needs.js`: `failedGaps + failedRequests + folders + imports`,
+  added up by the client, never sent. `albums`: failed gaps and failed requests, newest first, then the picks, at most 50; a
   request named from its row, else from the group covering its release (`_fill_names_by_release`), else left
   out; a failed gap fill (a failed group AND a failed row under its release) listed once, as the group.
   `folders`: at most 50, without `name`, `path`, `identifyError` (it can quote a path) or `coverUrl` (this

@@ -1,20 +1,19 @@
 """
-ListenBrainz -> slskd Telegram bot
+lb-bot: fills the gaps in a Navidrome library from ListenBrainz, MusicBrainz
+and slskd, behind its own web page (port 8899) and the Worbus hub.
 
 Features:
-- Runs automatically every Tuesday
-- Multi-user support
+- Scans the ListenBrainz playlists every Tuesday into the web page's review
 - MBID-first Navidrome lookup, text-search fallback
 - Album-first download: groups missing tracks by MusicBrainz release,
   searches for full album when enough tracks are missing
 - slskd format filtering (FLAC/Opus), live/compilation scoring, upload-speed ranking
-- Approval prompts for live-only and low-quality results
-- Retry button for not-found and error tracks
-- Download completion polling: auto-retry on failure, beets import on success
+- Download completion polling: failover on failure, deterministic placement on success
 - Duplicate detection before downloading
 - Cross-playlist deduplication
-- /search: manual slskd search with per-file and per-album download buttons
-- /checkalbums: find incomplete albums in Navidrome library via MusicBrainz
+
+The Telegram bot was removed in Worbus 0.4 (design §6.5); a TELEGRAM_* setting
+left in an env file is ignored with one line at start-up.
 """
 
 import re
@@ -46,11 +45,6 @@ import contextlib
 import contextvars
 import functools
 import concurrent.futures
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler,
-    MessageHandler, ContextTypes, filters,
-)
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -151,8 +145,9 @@ _mbz_cache_rev = 0             # bumped on every write into _mbz_cache
 _mbz_cache_saved_rev = -1      # the rev last written to MBZ_CACHE_FILE
 
 # Local web dashboard. The dashboard is intentionally served by the bot process
-# so it can reuse the same Navidrome, slskd, MusicBrainz and beets helpers.
-WEB_UI_ENABLED = os.environ.get("LB_BOT_WEB", "1").lower() not in ("0", "false", "no")
+# so it can reuse the same Navidrome, slskd, MusicBrainz and beets helpers. It
+# always runs: `LB_BOT_WEB=0` ("Telegram alone") went with Telegram in Worbus
+# 0.4 and is ignored with a line (`_retired_setting_lines`).
 WEB_UI_HOST    = os.environ.get("LB_BOT_WEB_HOST", "0.0.0.0")
 WEB_UI_PORT    = int(os.environ.get("LB_BOT_WEB_PORT", "8899"))
 MUSIC_LIBRARY_PATH = os.environ.get("LB_BOT_MUSIC_DIR", "/music")
@@ -284,13 +279,8 @@ _http = _PooledHTTP()
 RUN_SCAN_ON_START = True  # run a scan when the bot boots...
 STARTUP_SCAN_THROTTLE = 6 * 3600  # ...but skip it if a scan ran in the last N seconds
 
-# /album behaviour
-# False → always show a confirmation card (with cover) before downloading.
-# True  → when the album resolves with high confidence, download immediately.
-ALBUM_AUTO_DOWNLOAD = False
-
 # Housekeeping
-UID_TTL          = 24 * 3600   # forget untouched button state after N seconds
+UID_TTL          = 24 * 3600   # forget an id's creation time after N seconds
 ALBUM_GROUP_TTL  = 6 * 3600    # finalize stale album groups after N seconds
 # How long a group with no transfers left in flight is given before it counts as
 # orphaned rather than merely new. Covers the gap between creating the group and
@@ -377,8 +367,6 @@ COMPILATION_RE = re.compile(
 
 USERS = [
     {
-        "telegram_token":     os.environ.get("TELEGRAM_TOKEN", ""),
-        "chat_id":            os.environ.get("TELEGRAM_CHAT_ID", ""),
         "navidrome_user":     os.environ.get("NAVIDROME_USER", ""),
         "navidrome_password": os.environ.get("NAVIDROME_PASSWORD", ""),
         "listenbrainz_user":  os.environ.get("LISTENBRAINZ_USER", ""),
@@ -388,8 +376,6 @@ USERS = [
         },
     },
     # {
-    #     "telegram_token":     "OTHER_TOKEN",
-    #     "chat_id":            "OTHER_CHAT_ID",
     #     "navidrome_user":     "alice",
     #     "navidrome_password": "alicepass",
     #     "listenbrainz_user":  "alice_lbz",
@@ -401,40 +387,27 @@ USERS = [
 # Runtime state
 # ---------------------------------------------------------------------------
 
-missing_by_playlist:  dict = {}  # token -> {playlist_name -> [track]}
-pending_approvals:    dict = {}  # token -> {aid -> {username, file, label, track}}
-pending_retries:      dict = {}  # token -> {rid -> track}
-manual_search_results:dict = {}  # token -> {sid -> [candidate]}
+# The owner of every record below is `token`: `"web"` (`_web_user_key`) since
+# Worbus 0.4. `chat_id` is kept, always "", and `progress_msg_id` (album groups,
+# always None) with it, because an older release's poller reads them directly
+# after a rollback (`_save_state_unlocked`, `_reown_legacy_records`).
 # (username, filename) -> {track, token, chat_id, candidates, album_group_id}
 pending_downloads:    dict = {}
 
 # album_group_id -> {label, token, chat_id, total, completed, failed, ts}
 pending_album_groups: dict = {}
 
-# bid -> {chat_id, folders}  (/beets folder picker)
-_pending_beets:       dict = {}
-# cid -> {token, chat_id, artist, album, tracks}  (/checkalbums download)
-_pending_checkdl:     dict = {}
-# dlid -> {token, chat_id, playlist_name}  (Download-all mode picker)
-_pending_dlall:       dict = {}
-# alid -> resolution {token, chat_id, query, candidates} OR
-#         resolved   {token, chat_id, rgid, release_mbid, title, artist, year, total_tracks}
-_pending_album:       dict = {}
-# recid -> completed-album record for post-import control (Adjust / review)
+# recid -> completed-album record for post-import control (Needs you's imports)
 #   {token, chat_id, label, artist, album, release_mbid, rgid, album_dir, status, ts}
 _albums:              dict = {}
-# pickid -> {recid, kind: 'release'|'art', candidates:[...]}  (Adjust sub-pickers)
-_pending_pick:        dict = {}
 # The retired repair-job pipeline's `repair_jobs` (B-022), exactly as the state
 # file had it, or None when it had none. Nothing reads it; it is only written
 # back unchanged, so the previous release still finds its jobs on a rollback.
 _retired_repair_jobs = None
 
-_uid_to_token   = {}   # uid -> token
-_uid_to_playlist = {}  # uid -> playlist_name
 _uid_ts          = {}  # uid -> created timestamp (for TTL housekeeping)
 
-_imported_folders: set = set()   # absolute paths already imported via /beets
+_imported_folders: set = set()   # absolute paths already placed from /downloads
 _dismissed_folders: set = set()  # download folders hidden from Needs placement
 # Download folders the bot did NOT queue (grabbed through slskd by hand) carry
 # no release MBID, so they have to be identified from their tags/name before
@@ -527,17 +500,8 @@ def _uid(kind: str) -> str:
     _uid_ts[uid] = time.time()
     return uid
 
-def _token_for(uid: str):
-    return _uid_to_token.get(uid)
-
-def _register_playlist(token: str, name: str) -> str:
-    uid = _uid("p")
-    _uid_to_token[uid]    = token
-    _uid_to_playlist[uid] = name
-    return uid
-
 # ---------------------------------------------------------------------------
-# Persistence — best-effort JSON snapshot so buttons survive a restart
+# Persistence — best-effort JSON snapshot so work survives a restart
 # ---------------------------------------------------------------------------
 
 def _atomic_json_write(path: str, snapshot, *, indent=None,
@@ -649,20 +613,12 @@ def _save_state_unlocked() -> None:
     try:
         snapshot = {
             "uid_counter":          _uid_counter,
-            "uid_to_token":         _uid_to_token,
-            "uid_to_playlist":      _uid_to_playlist,
             "uid_ts":               _uid_ts,
-            "missing_by_playlist":  missing_by_playlist,
-            "pending_approvals":    pending_approvals,
-            "pending_retries":      pending_retries,
-            "manual_search_results": manual_search_results,
-            "pending_album_groups": pending_album_groups,
-            "pending_beets":        _pending_beets,
-            "pending_checkdl":      _pending_checkdl,
-            "pending_dlall":        _pending_dlall,
-            "pending_album":        _pending_album,
+            # Each with the fields an older release's poller reads directly
+            # (`_with_rollback_fields`); the live records are left alone.
+            "pending_album_groups": {gid: _with_rollback_fields(ag, group=True)
+                                     for gid, ag in list(pending_album_groups.items())},
             "albums":               _albums,
-            "pending_pick":         _pending_pick,
             "imported_folders":     sorted(_imported_folders),
             "dismissed_folders":    sorted(_dismissed_folders),
             "folder_identity":      _folder_identity,
@@ -677,7 +633,8 @@ def _save_state_unlocked() -> None:
             # forever and _finalize_group with no rgid to flip the index with.
             "album_fill_status":    _album_fill_for_disk(),
             # tuple-keyed dict -> list of [ [username, filename], value ]
-            "pending_downloads":    [[list(k), v] for k, v in pending_downloads.items()],
+            "pending_downloads":    [[list(k), _with_rollback_fields(v)]
+                                     for k, v in list(pending_downloads.items())],
         }
         if _retired_repair_jobs is not None:
             snapshot["repair_jobs"] = _retired_repair_jobs
@@ -726,6 +683,46 @@ def _save_state() -> None:
     with _state_save_lock:
         _save_state_unlocked()
 
+def _with_rollback_fields(record, group: bool = False):
+    """A pending download or album group as it is saved: with `token`,
+    `chat_id` ("") and, for a group, `progress_msg_id` (None), whatever the
+    live record holds. The release before Worbus 0.4 reads `info["token"]`,
+    `info["chat_id"]` and `ag["token"]` directly on every poll, and would fail
+    every tick on a record without them after a rollback (design §6.5). A
+    copy: the live record is not touched."""
+    if not isinstance(record, dict):
+        return record
+    out = dict(record)
+    out["token"] = out.get("token") or _web_user_key()
+    out["chat_id"] = out.get("chat_id") or ""
+    if group:
+        out.setdefault("progress_msg_id", None)
+    return out
+
+def _reown_legacy_records() -> int:
+    """Startup, after `_load_state` read them: every pending download, album
+    group and import record owned by anything but the web key — a Telegram
+    token, or the `""` an older web-only server wrote — is re-owned to
+    `_web_user_key()`, so `_user_for_token` still finds its user and the
+    post-placement Navidrome scan still runs. Its `chat_id` reads "" and a
+    group's `progress_msg_id` None: there is no chat any more. Returns how
+    many were re-owned."""
+    web = _web_user_key()
+    n = 0
+    for table, group in ((pending_downloads, False), (pending_album_groups, True),
+                         (_albums, False)):
+        for record in table.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("token") != web:
+                record["token"] = web
+                n += 1
+            if record.get("chat_id"):
+                record["chat_id"] = ""
+            if group and record.get("progress_msg_id") is not None:
+                record["progress_msg_id"] = None
+    return n
+
 def _load_state() -> None:
     """Restore state from STATE_FILE if present. Safe to call once at startup."""
     global _uid_counter, _mbz_cache_rev, _retired_repair_jobs
@@ -742,25 +739,20 @@ def _load_state() -> None:
         print(f"  state load failed: {e}")
         return
     _uid_counter = s.get("uid_counter", 0)
-    _uid_to_token.update(s.get("uid_to_token", {}))
-    _uid_to_playlist.update(s.get("uid_to_playlist", {}))
     _uid_ts.update(s.get("uid_ts", {}))
-    missing_by_playlist.update(s.get("missing_by_playlist", {}))
-    pending_approvals.update(s.get("pending_approvals", {}))
-    pending_retries.update(s.get("pending_retries", {}))
-    manual_search_results.update(s.get("manual_search_results", {}))
+    # Telegram's button stores (`uid_to_token`, `uid_to_playlist`,
+    # `missing_by_playlist`, `pending_approvals`, `pending_retries`,
+    # `manual_search_results`, `pending_beets`, `pending_checkdl`,
+    # `pending_dlall`, `pending_album`, `pending_pick`) are not read: nothing
+    # presses those buttons since Worbus 0.4, and the next save leaves them
+    # out. `uid_counter` and `uid_ts` stay, since group and record ids share them.
     pending_album_groups.update(s.get("pending_album_groups", {}))
     for ag in pending_album_groups.values():
         # The mark of an enqueue still asking for the group's files is the
         # asker's, and no asker survived the restart (ruling H7).
         if isinstance(ag, dict):
             ag.pop("asking_at", None)
-    _pending_beets.update(s.get("pending_beets", {}))
-    _pending_checkdl.update(s.get("pending_checkdl", {}))
-    _pending_dlall.update(s.get("pending_dlall", {}))
-    _pending_album.update(s.get("pending_album", {}))
     _albums.update(s.get("albums", {}))
-    _pending_pick.update(s.get("pending_pick", {}))
     # Loaded and ignored — carried for the rollback (see _retired_repair_jobs).
     _retired_repair_jobs = s.get("repair_jobs")
     _imported_folders.update(s.get("imported_folders", []))
@@ -783,6 +775,9 @@ def _load_state() -> None:
         print(f"  migrated {len(legacy_mbz)} MB cache entr(ies) out of {STATE_FILE}")
     for k, v in s.get("pending_downloads", []):
         pending_downloads[tuple(k)] = v
+    reowned = _reown_legacy_records()
+    if reowned:
+        print(f"  state: {reowned} record(s) a Telegram user owned re-owned to the web user")
     _album_fill_restore(s.get("album_fill_status", {}))
     print(f"  state restored from {STATE_FILE} "
           f"({len(pending_downloads)} active download(s), "
@@ -882,6 +877,100 @@ def _web_log(message: str, tag: str = "", severity: str = "") -> None:
         _tee_suppress.on = False
     _web_event_append(str(message), tag, severity, src="web")
 
+# The shared redaction rule v2 (Worbus 0.4): what `_LogTee` applies to every line
+# lb-bot writes to stdout/stderr, so the container's log (and a log file an lb-bot
+# outside the container writes) carries no Subsonic login, key, token or password.
+# `requests` prints the whole URL in its exceptions, `?u=…&t=…&s=…` included, and
+# `_lastfm_similar_artists` puts `api_key=` in its query. Navic, Feishin and the
+# Worbus launcher hold the same rule, all tested against the same 27 vectors. Per
+# line, in this order:
+#   a'  a sensitive field inside escaped JSON  \"name\" : \"value\"
+#   a   a quoted JSON field                    "name" : "value"
+#   b   an unquoted field                      name=value, name: value, name="value"
+#   c   a bare bearer                          Bearer <cred>
+#   d   Subsonic query parameters              ?u= &t= &s= &p=
+#   e   userinfo in a URL                      scheme://user:pass@
+# A sensitive name contains (any case) password, secret, token, apikey, key or
+# authorization; the mark is `[removed]`. A credential split across two lines, or a
+# bare value printed with no name beside it, is not caught by a per-line rule.
+#
+# Linear time. The reference spells a name `[name chars]* W [name chars]*`; every
+# place it is used is preceded and followed by a character outside the name class,
+# so a match is always one whole run of name characters that contains W. Spelled
+# that way, a lookahead finds W once and a possessive run takes the rest, instead of
+# trying every split of a long run (quadratic on `key-key-key…` or `a.b.c-…`). Rule
+# (e) as one regex retried the scheme from every word start inside a long dotted or
+# dashed run; here the tail after `://` is found first and the scheme is checked by
+# walking back over its run once. Same matches, same output as the reference.
+_LOG_REDACT_MARK = "[removed]"
+_LOG_REDACT_W = r"(?:password|secret|token|apikey|key|authorization)"
+_LOG_REDACT_NAME = r"(?=[A-Za-z0-9_.\-]*?" + _LOG_REDACT_W + r")[A-Za-z0-9_.\-]++"
+_LOG_REDACT_A2 = re.compile(
+    r'\\"(' + _LOG_REDACT_NAME + r')\\"(\s*:\s*)\\"(?:(?!\\").)*\\"', re.I)
+_LOG_REDACT_A = re.compile(
+    r'"(' + _LOG_REDACT_NAME + r')"(\s*:\s*)"(?:[^"\\]|\\.)*"', re.I)
+_LOG_REDACT_B = re.compile(
+    r'(?<![A-Za-z0-9_.\-"])(' + _LOG_REDACT_NAME + r')(\s*[:=]\s*)'
+    r'(?:"(?:[^"\\]|\\.)*"|(?:(?:bearer|basic)\s+)?[^\s&,;"\']+)', re.I)
+_LOG_REDACT_C = re.compile(r'\b(bearer)\s+[A-Za-z0-9._~+/=\-]+', re.I)
+_LOG_REDACT_D = re.compile(r'([?&])([utsp])=([^&\s"\'\\#<>]+)')
+_LOG_REDACT_E_TAIL = re.compile(r'://[^/\s:@"]++:[^/\s@"]++@')
+_LOG_REDACT_SCHEME = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-")
+_LOG_REDACT_LETTER = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_LOG_REDACT_WORD = re.compile(r"\w")
+
+def _log_redact_userinfo(s: str) -> str:
+    """Rule (e): `scheme://user:pass@` → `scheme://[removed]@`, where the scheme is
+    the reference's `\\b[A-Za-z][A-Za-z0-9+.-]*` — some ASCII letter at a word
+    boundary inside the run before `://`."""
+    out = []
+    last = pos = 0
+    while True:
+        m = _LOG_REDACT_E_TAIL.search(s, pos)
+        if m is None:
+            break
+        i = m.start()
+        j = i
+        while j > last and s[j - 1] in _LOG_REDACT_SCHEME:
+            j -= 1
+        if any(s[k] in _LOG_REDACT_LETTER
+               and (k == 0 or not _LOG_REDACT_WORD.match(s[k - 1]))
+               for k in range(j, i)):
+            out.append(s[last:i] + "://" + _LOG_REDACT_MARK + "@")
+            last = pos = m.end()
+        else:
+            pos = i + 1
+    out.append(s[last:])
+    return "".join(out)
+
+def _log_redact_b(m) -> str:
+    quoted = m.group(0)[len(m.group(1)) + len(m.group(2)):].startswith('"')
+    return m.group(1) + m.group(2) + (
+        f'"{_LOG_REDACT_MARK}"' if quoted else _LOG_REDACT_MARK)
+
+def _redact_log_rule(line: str) -> str:
+    """The shared rule v2, exactly (the vectors' test holds it to that)."""
+    mark = _LOG_REDACT_MARK
+    s = _LOG_REDACT_A2.sub(
+        lambda m: '\\"%s\\"%s\\"%s\\"' % (m.group(1), m.group(2), mark), line)
+    s = _LOG_REDACT_A.sub(lambda m: '"%s"%s"%s"' % (m.group(1), m.group(2), mark), s)
+    s = _LOG_REDACT_B.sub(_log_redact_b, s)
+    s = _LOG_REDACT_C.sub(lambda m: m.group(1) + " " + mark, s)
+    s = _LOG_REDACT_D.sub(lambda m: m.group(1) + m.group(2) + "=" + mark, s)
+    return _log_redact_userinfo(s)
+
+def _redact_log_line(line: str) -> str:
+    """What `_LogTee` writes for one line: the shared rule, then a Telegram bot
+    token by its shape (`bot<id>:<secret>` in a path has no name beside it, so
+    the shared rule does not see it; a state file from before 0.4 can still
+    carry one into an error)."""
+    return _TELEGRAM_TOKEN_SHAPE.sub(_LOG_REDACT_MARK, _redact_log_rule(line))
+
+# A partial line (no "\n" yet) longer than this is written out as it stands, so
+# one thread writing without newlines cannot grow its buffer without bound.
+_LOG_TEE_PARTIAL_MAX = 64 * 1024
+
 class _LogTee:
     """stdout/stderr wrapper that also records each completed line in the web
     log ring.
@@ -889,8 +978,16 @@ class _LogTee:
     The bot reports almost everything through bare `print` — placements, slskd
     failures, scan progress — and none of it reached the web UI, whose Logs view
     therefore showed one line after two days of uptime. Wrapping the streams
-    gets all of it there without touching the few hundred call sites. Writes
-    pass through unchanged; only complete, non-blank lines are recorded.
+    gets all of it there without touching the few hundred call sites. Only
+    complete, non-blank lines are recorded.
+
+    **What reaches the stream is redacted, a whole line at a time** (Worbus 0.4,
+    `_redact_log_line`): a line is written once its "\n" has come, so a secret
+    split across two writes (`print("token:", value)`) is still one line to the
+    rule. The ring keeps its own redaction (`_redact_secrets` in
+    `_web_event_append`). A partial line is written out at `flush()` and when it
+    passes `_LOG_TEE_PARTIAL_MAX`; a thread that ends mid-line takes its partial
+    line with it.
 
     The partial line is buffered **per thread**: `print` is two writes (the
     text, then "\n"), and with one shared buffer another thread's text landed
@@ -903,13 +1000,33 @@ class _LogTee:
         self._local = threading.local()
 
     def write(self, data):
-        n = self._stream.write(data)
+        if not isinstance(data, str):
+            return self._stream.write(data)
+        local = self._local
+        buf = getattr(local, "buf", "") + data
+        *lines, rest = buf.split("\n")
+        overflow = len(rest) > _LOG_TEE_PARTIAL_MAX
+        if overflow:
+            lines.append(rest)  # written as it stands, with no "\n" of its own
+            rest = ""
+        local.buf = rest
+        if lines:
+            out = "\n".join(_LogTee._safe(line) for line in lines)
+            self._stream.write(out if overflow else out + "\n")
+            self._record(lines)
+        return len(data)
+
+    @staticmethod
+    def _safe(line: str) -> str:
         try:
-            local = self._local
-            buf = getattr(local, "buf", "") + data
-            *lines, local.buf = buf.split("\n")
+            return _redact_log_line(line)
+        except Exception:
+            return _LOG_REDACT_MARK  # a line the rule could not read is not written
+
+    def _record(self, lines) -> None:
+        try:
             if getattr(_tee_suppress, "on", False):
-                return n
+                return
             for line in lines:
                 text = _LOG_ANSI_RE.sub("", line).strip()
                 if not text:
@@ -919,9 +1036,14 @@ class _LogTee:
                 _web_event_append(text, src=self._src)
         except Exception:
             pass  # logging must never take the caller down
-        return n
 
     def flush(self):
+        local = self._local
+        rest = getattr(local, "buf", "")
+        if rest:
+            local.buf = ""
+            self._stream.write(_LogTee._safe(rest))
+            self._record([rest])
         self._stream.flush()
 
     def __getattr__(self, name):
@@ -1533,8 +1655,8 @@ def _review_state_for_disk() -> dict:
 def _request_scope():
     """Flask's per-request `g`, or None outside a request.
 
-    Imported lazily: this module is importable (and the Telegram half runs)
-    without the web UI enabled.
+    Imported lazily: this module is importable (the test suite) without
+    Flask's request machinery set up.
     """
     try:
         from flask import g, has_request_context
@@ -5693,21 +5815,6 @@ def _task_run(kind: str, label: str, target, total: int = 0, **extra) -> str:
 def _file_ext(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-_APPS: list = []   # populated in main(); lets command handlers reach every bot
-# (user, Application) pairs: the Telegram apps that started, set by main()
-# after the web UI and the workers are up. Empty with no Telegram configured.
-_TELEGRAM_APPS: list = []
-# Set by main() once `_TELEGRAM_APPS` is final, so the startup playlist scan
-# does not decide "no Telegram" while the apps are still starting.
-_TELEGRAM_STARTED = None
-
-def _progress_bar(done: int, total: int, width: int = 10) -> str:
-    """Render a simple text progress bar like [█████·····]."""
-    if total <= 0:
-        return "[" + "·" * width + "]"
-    filled = int(width * min(done, total) / total)
-    return "[" + "█" * filled + "·" * (width - filled) + "]"
-
 def _folder_quality(files: list) -> str:
     """
     Derive quality string matching Tubifarry's FormatQualityInfo:
@@ -5740,17 +5847,6 @@ def _folder_quality(files: list) -> str:
         return f"{codec} {bitrate}kbps"
     return codec
 
-def _format_info(file: dict) -> str:
-    ext     = _file_ext(file.get("filename", "")).upper() or "?"
-    bitrate = file.get("bitRate") or file.get("bitrate")
-    size_mb = round(file.get("size", 0) / 1024 / 1024, 1)
-    parts   = [ext]
-    if bitrate:
-        parts.append(f"{bitrate} kbps")
-    if size_mb:
-        parts.append(f"{size_mb} MB")
-    return ", ".join(parts)
-
 def _folder(filename: str) -> str:
     f = filename.replace("\\", "/")
     return f.rsplit("/", 1)[0] if "/" in f else ""
@@ -5761,44 +5857,16 @@ def _web_user_key() -> str:
     Per-user state is keyed by the user's Telegram token, which made `""` the
     owner of every web-started download on a server with no Telegram, and put
     the token itself into every row the state file holds. This key is stable,
-    is never a credential, and never goes on the wire; `_user_for_token` and
-    `_token_to_app` resolve it to the default web user and that user's
-    Telegram app, so the owner's setup keeps its completion messages."""
+    is never a credential, and never goes on the wire; `_user_for_token`
+    resolves it to the default web user."""
     return "web"
 
 def _user_for_token(token: str):
+    """The user who owns state stored under `token`: the default web user for
+    `"web"`, the only owner key since Worbus 0.4 (`_reown_legacy_records`)."""
     if token == _web_user_key():
         return _default_web_user() or None
-    return next((u for u in USERS if u["telegram_token"] == token), None)
-
-def _token_owns(stored: str, token: str) -> bool:
-    """Whether state stored under `stored` belongs to the Telegram user
-    `token`: its own rows, and the web user's when that user is this one."""
-    if stored == token:
-        return True
-    return (stored == _web_user_key() and bool(token)
-            and token == (_default_web_user() or {}).get("telegram_token"))
-
-def _token_to_app(pairs: list | None = None) -> dict:
-    """`{owner key: Telegram Application}` for the poller and the scheduled
-    playlist scan: each user's token, plus `_web_user_key()` for the default
-    web user's app. `pairs` defaults to the live `_TELEGRAM_APPS`, which
-    `main()` fills only after the web UI and the workers have started."""
-    pairs = _TELEGRAM_APPS if pairs is None else pairs
-    table = {u.get("telegram_token", ""): app for u, app in pairs
-             if u.get("telegram_token", "")}
-    default_token = (_default_web_user() or {}).get("telegram_token", "")
-    if default_token and default_token in table:
-        table[_web_user_key()] = table[default_token]
-    return table
-
-def _resolve_token(context) -> str:
-    token = next(
-        (u["telegram_token"] for u in USERS
-         if u["telegram_token"].split(":")[0] == str(context.bot.id)),
-        None,
-    )
-    return token or USERS[0]["telegram_token"]
+    return None
 
 # ---------------------------------------------------------------------------
 # MusicBrainz
@@ -6884,8 +6952,8 @@ def _mbid_from_search(artist: str, title: str) -> str:
 # One streaming-service URL in, MusicBrainz ids out, so a client can hand a
 # shared link straight to the acquire path it already has. Until this, the only
 # URL parser in the whole module was `spotify_playlist_id` — a `re.search` for
-# `playlist/<id>` — and the Telegram half had no plain-text message handler at
-# all, so `/spplaylist` was the only way a link could enter the system.
+# `playlist/<id>` — and Telegram's `/spplaylist` (removed in Worbus 0.4) was the
+# only way a link could enter the system.
 #
 # Three tiers of resolution, and `confidence` is on the wire precisely because
 # they are not equally good:
@@ -8019,25 +8087,6 @@ def nd_has_track(track: dict, nd_user: str, nd_pass: str,
             return True
 
     return False
-
-def nd_find_duplicate(track: dict, nd_user: str, nd_pass: str) -> dict | None:
-    """
-    Check if a different recording of this track (same title+artist, different MBID)
-    already exists in Navidrome. Returns the existing song dict if found, else None.
-    """
-    track_mbid = track.get("mbid", "")
-    title      = track.get("title") or ""
-    artist     = track.get("artist") or ""
-    title_q    = title.lower().strip()
-    artist_q   = artist.lower().strip()
-    for song in _nd_search(nd_user, nd_pass, f"{title} {artist}", 10):
-        st        = song.get("title",  "").lower().strip()
-        sa        = song.get("artist", "").lower().strip()
-        song_mbid = song.get("musicBrainzId", "") or ""
-        if st == title_q and (artist_q in sa or sa in artist_q):
-            if track_mbid and song_mbid and track_mbid != song_mbid:
-                return song  # Different version exists in library
-    return None
 
 def nd_track_present(artist: str, title: str, mbid: str,
                      nd_user: str, nd_pass: str, retry: bool = True) -> bool:
@@ -9472,7 +9521,7 @@ def _album_search_context(release_mbid: str) -> tuple:
 
     The self-titled year/track queries and the track-title corroboration
     evidence only work when the caller has these; Fill Gaps always did, the
-    Telegram and API paths never passed them. Costs at most one cached
+    API paths (and Telegram's, removed in Worbus 0.4) never passed them. Costs at most one cached
     `mbz_get` (`mbz_release_full` assembles from the narrower keys when the
     release was already resolved), and answers ("", []) when MusicBrainz is
     down — the search must run degraded, never block or raise.
@@ -15257,8 +15306,7 @@ def _caa_https(url: str) -> str:
 def _caa_fronts(kind: str, mbid: str) -> list:
     """The front images the Cover Art Archive holds for a `release` or a
     `release-group`: `[{thumb, full}]`, `[]` when it holds none. Raises
-    CoverArchiveUnavailable when it did not answer — the fail-soft reader
-    (`caa_list_front_images`) says `[]` for both."""
+    CoverArchiveUnavailable when it did not answer."""
     try:
         r = _http.get(f"https://coverartarchive.org/{kind}/{mbid}", timeout=10)
     except Exception as e:  # noqa: BLE001
@@ -20036,7 +20084,6 @@ def apply_group_retag(group: dict) -> dict:
         "ok": ok_all,
         "output": output[-4000:],
     })
-    # Not gated on a Telegram token: a server with none still rescans.
     if ok_all:
         _nd_scan_after_import(_web_user_key())
     return {"ok": ok_all, "preview": preview, "output": output}
@@ -21492,24 +21539,6 @@ def _debug_album_search_view(artist: str, album: str, year: str = "",
         } for fd in folders],
     }
 
-def slskd_pick(folders: list) -> dict:
-    """
-    Pick the best single file from the best folder.
-    Folders are already sorted by score. Within the best folder,
-    pick the best file by its file-level score tuple.
-    """
-    if not folders:
-        return {"status": "not_found"}
-    best_folder = folders[0]
-    best_file   = min(best_folder["files"], key=lambda f: _score_file(f, best_folder["upload_speed"]) or (99,))
-    file_score  = _score_file(best_file, best_folder["upload_speed"])
-
-    if file_score and file_score[1]:  # is_live
-        return {"status": "live_only", "username": best_folder["username"],
-                "file": best_file, "folder": best_folder}
-    return {"status": "ok", "username": best_folder["username"],
-            "file": best_file, "folder": best_folder}
-
 # Words that say what kind of release a title is, not which one.
 _RELEASE_FORM_WORDS = frozenset(("ep", "lp", "single", "singles"))
 
@@ -21650,8 +21679,8 @@ def _stamp_album_evidence(folders: list, track_titles=None,
 
 # What a search stamps on its folders (`search_kind`): which kind it was. An
 # album search judges its folders against an album (`album_evidence`); a
-# track search — a Loose-tracks row, a gap with no release, Telegram's
-# /search, the single-track path — has no album to judge them against.
+# track search — a Loose-tracks row, a gap with no release, the single-track
+# path — has no album to judge them against.
 SEARCH_KIND_ALBUM = "album"
 SEARCH_KIND_TRACK = "track"
 
@@ -21673,7 +21702,7 @@ def _album_evidence_as_read(fd: dict, artist: str = "", album: str = "",
       with — reading "no `album_evidence` but `album_match_ok`" as "an older
       build's album search" refused every folder of every track search. A
       list held for an album — a gap group with a release, an album fill's
-      alternates, a Telegram album prompt — is an album search's from before
+      alternates — is an album search's from before
       album evidence, and is read by its name: `album_match_ok`, unless the
       title has no word of its own (`_album_own_words`; `artist` and `album`
       are for that). Any other list is a track search's.
@@ -21718,9 +21747,8 @@ def _group_sources_are_album(group: dict) -> bool:
 
 def _album_group_holds_album_list(ag: dict) -> bool:
     """Whether a transfer group's alternates are an album search's: a fill
-    that names the release it is for. One that names none — Telegram's
-    /search album download, a Loose-tracks fetch, a gap with no release —
-    was found by a track search."""
+    that names the release it is for. One that names none — a Loose-tracks
+    fetch, a gap with no release — was found by a track search."""
     ag = ag or {}
     return bool(ag.get("release_mbid") or ag.get("target_release_mbid"))
 
@@ -21786,13 +21814,6 @@ def _no_unattended_source_reason(folders: list, artist: str, album: str) -> tupl
                 "album_unverified")
     return (f"Sources found, but none verifiably by {artist} — pick one manually",
             "artist_unverified")
-
-def slskd_search_and_pick(track: dict) -> dict:
-    query   = f"{track['artist']} {track['title']}"
-    folders = slskd_run_search(query, expected_track_count=1)
-    result  = slskd_pick(folders)
-    result["folders"] = folders
-    return result
 
 MAX_SEARCH_PASSES = 3
 # A pass that found this many folders whose name actually resembles the album
@@ -22047,8 +22068,9 @@ def slskd_enqueue(username: str, file: dict,
         if not r.ok:
             print(f"  slskd enqueue failed ({r.status_code}): {r.text[:200]}")
             return False
-        # Register for polling if context provided
-        if token is not None and chat_id is not None:
+        # Register for polling when it has an owner (B-331: not only when
+        # there is a Telegram chat to tell).
+        if token:
             key = (username, file["filename"])
             entry = {
                 "track":          track,
@@ -22195,12 +22217,15 @@ def slskd_enqueue_folder(username: str, files: list,
         print(f"  no album folder files matched missing tracks for {artist} - {album}")
         return 0, 0, None
     album_group_id = None
-    if token and chat_id:
+    # Whenever there is an owner (B-331): this used to want a Telegram chat id
+    # too, so a web album download with no Telegram queued its files with no
+    # group — nothing finalized it and nothing was placed.
+    if token:
         album_group_id = _uid("ag")
         pending_album_groups[album_group_id] = {
             "label":           label or username,
             "token":           token,
-            "chat_id":         chat_id,
+            "chat_id":         chat_id or "",               # rollback (see above)
             "total":           len(file_pairs),
             "completed":       0,
             "failed":          0,
@@ -22210,7 +22235,7 @@ def slskd_enqueue_folder(username: str, files: list,
             # The files this group's transfers landed: what its finalize
             # imports, of whatever else lies in those folders (ruling C1).
             "local_files":     [],
-            "progress_msg_id": None,                # editable Telegram progress line
+            "progress_msg_id": None,                # read by an older release (rollback)
             "alt_sources":     alt_sources or [],   # remaining folders to try on failure
             "source_user":     username,            # current peer
             "artist":          artist,
@@ -23268,34 +23293,6 @@ def _dir_has_audio(d: str) -> bool:
         pass
     return False
 
-def caa_list_front_images(rgid: str, limit: int = 4) -> list:
-    """
-    Return up to `limit` front-cover candidates for a release-group from the
-    Cover Art Archive: [{thumb, full}]. Empty list if none / on error.
-    """
-    if not rgid:
-        return []
-    try:
-        r = _http.get(f"https://coverartarchive.org/release-group/{rgid}",
-                         timeout=10)
-        if not r.ok:
-            return []
-        out = []
-        for img in r.json().get("images", []):
-            if not img.get("front"):
-                continue
-            thumbs = img.get("thumbnails", {})
-            out.append({
-                "thumb": thumbs.get("250") or thumbs.get("small") or img.get("image", ""),
-                "full":  img.get("image", ""),
-            })
-            if len(out) >= limit:
-                break
-        return out
-    except Exception as e:
-        print(f"  CAA list error: {e}")
-        return []
-
 def rgid_from_release(release_mbid: str) -> str:
     """Resolve a release MBID to its release-group id (cached via mbz_get)."""
     if not release_mbid:
@@ -23634,11 +23631,12 @@ def _retry_file_from_alt_source_inner(ag: dict, ag_id: str, info: dict,
         return username
     return ""
 
-async def _switch_album_source(bot, ag_id: str):
+async def _switch_album_source(ag_id: str):
     """
     The current peer is failing to serve this album (rejected/aborted/etc).
     Abandon it and re-enqueue the whole album from the next candidate source.
-    If no candidates remain, offer the user a Retry button (fresh search).
+    If no candidates remain, the group is dropped; the poller records the
+    failure in the fill ledger, where a client offers a fresh search.
     """
     ag = pending_album_groups.get(ag_id)
     if not ag or ag.get("switching"):
@@ -23649,9 +23647,9 @@ async def _switch_album_source(bot, ag_id: str):
     await asyncio.to_thread(_abandon_group_downloads, ag_id)
 
     with _mp3_fallback(ag.get("allow_mp3")), _quality_preference(ag.get("quality", "")):
-        await _switch_album_source_inner(bot, ag_id, ag)
+        await _switch_album_source_inner(ag_id, ag)
 
-async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
+async def _switch_album_source_inner(ag_id: str, ag: dict):
     """Walk `alt_sources` until one peer accepts the album, or they run out.
 
     Two things here are load-bearing and were not, until this was first wired
@@ -23689,8 +23687,7 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
             # source does not extend to its alternates.
             continue
         username = fd["username"]
-        await _tg_send(bot, ag["chat_id"],
-            f"🔁 Source for {ag['label']} failed — trying @{username}…")
+        print(f"  {ag['label']}: source failed — trying @{username}")
         ref_file = fd["files"][0] if fd["files"] else {}
         full     = await asyncio.to_thread(slskd_expand_directory, username, fd, ref_file)
         if _gone():
@@ -23766,7 +23763,6 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
             await asyncio.to_thread(_abandon_transfers, _detach_group_downloads(ag_id))
             return
         if ok:
-            await _update_group_progress(bot, ag)
             ag["switching"] = False
             return
         # That source enqueued nothing — keep going.
@@ -23774,81 +23770,11 @@ async def _switch_album_source_inner(bot, ag_id: str, ag: dict):
 
     if _gone():
         return
-    # Exhausted every known source — let the user retry a fresh search.
+    # Exhausted every known source: the group goes, and the poller writes the
+    # failure into the fill ledger (`retryable`), where a client offers a
+    # fresh search.
     pending_album_groups.pop(ag_id, None)
-    rid = _uid("aretry")
-    _uid_to_token[rid] = ag["token"]
-    _pending_album[rid] = {
-        "token": ag["token"], "chat_id": ag["chat_id"],
-        "artist": ag.get("artist", ""), "title": ag.get("album", ""),
-        "release_mbid": ag.get("release_mbid", ""), "total_tracks": 0,
-        "query": ag.get("retry_query", ""),
-    }
-    await _tg_send(bot, ag["chat_id"],
-        f"⚠️ Every source for {ag['label']} failed to queue.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔁 Retry (search again)", callback_data=f"ARETRY|{rid}")]]))
-
-async def _update_group_progress(bot, ag: dict):
-    """Edit the album's progress line as files complete (best-effort)."""
-    pmid = ag.get("progress_msg_id")
-    if not pmid:
-        return
-    done = ag["completed"] + ag["failed"]
-    try:
-        await bot.edit_message_text(
-            chat_id=ag["chat_id"], message_id=pmid,
-            text=f"⬇️ Downloading {ag['label']}: {done}/{ag['total']} files "
-                 f"{_progress_bar(done, ag['total'])}")
-    except Exception:
-        pass  # unchanged text / edit too frequent — ignore
-
-def _album_action_markup(recid: str, status: str):
-    """Buttons attached to a finished album, depending on import outcome."""
-    rows = []
-    if status == "needs_review":
-        rows.append([InlineKeyboardButton("📌 Pin MBID & retry", callback_data=f"RIMP|{recid}"),
-                     InlineKeyboardButton("📥 Import as-is",       callback_data=f"IMPAS|{recid}")])
-        rows.append([InlineKeyboardButton("🎯 Pick release",      callback_data=f"PREL|{recid}")])
-    elif status == "failed":
-        rows.append([InlineKeyboardButton("♻️ Re-import",         callback_data=f"RIMP|{recid}"),
-                     InlineKeyboardButton("📥 Import as-is",       callback_data=f"IMPAS|{recid}")])
-    rows.append([InlineKeyboardButton("🎚 Adjust",               callback_data=f"ADJ|{recid}")])
-    return InlineKeyboardMarkup(rows)
-
-def _adjust_menu_markup(recid: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("♻️ Re-import (pinned)", callback_data=f"RIMP|{recid}")],
-        [InlineKeyboardButton("🎯 Pick release",        callback_data=f"PREL|{recid}")],
-        [InlineKeyboardButton("🖼 Choose cover",        callback_data=f"ART|{recid}")],
-        [InlineKeyboardButton("⬇️ Re-download album",   callback_data=f"ADDL|{recid}")],
-    ])
-
-def _render_release_picker(pickid: str, cands: list, label: str, page: int, per: int = 5):
-    """(text, markup) for one page of MusicBrainz release candidates."""
-    import math
-    pages = max(1, math.ceil(len(cands) / per))
-    page  = max(0, min(page, pages - 1))
-    start = page * per
-    chunk = cands[start:start + per]
-    lines = [f"Pick the correct release for {label}  (page {page+1}/{pages}):"]
-    rows  = []
-    for i, c in enumerate(chunk):
-        gidx = start + i
-        yr   = f" ({c['year']})" if c["year"] else ""
-        typ  = f" · {c['primary_type']}" if c.get("primary_type") else ""
-        lines.append(f"{gidx+1}. {c['title']} — {c['artist']}{yr}{typ}")
-        rows.append([InlineKeyboardButton(f"{gidx+1}. {c['title'][:30]}",
-                                          callback_data=f"RPK|{pickid}|{gidx}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"RPGN|{pickid}|{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("More ➡️", callback_data=f"RPGN|{pickid}|{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data=f"RPKC|{pickid}")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    print(f"  {ag['label']}: every source failed to queue")
 
 def _group_missing_slot_keys(group_id: str) -> set:
     """Recording MBIDs and normalized titles of the tracks a group is filling.
@@ -23965,7 +23891,8 @@ def _deterministic_album_import(album_dir, release_mbid: str,
 
     `wanted_tracks` is for a fill with no review group that still says which tracks
     it was for (ruling D4): the rows an album group carries as
-    `missing_tracks` — Telegram's fill of an album the library partly has.
+    `missing_tracks` — a fill of an album the library partly has (Telegram's,
+    until Worbus 0.4).
     They are the slots this import may fill, as a review group's rows are,
     and each one paired is placed. Rows that name every track of the release
     are a whole-album fill, and rows that name none of them say nothing.
@@ -24517,13 +24444,13 @@ def _deterministic_album_import(album_dir, release_mbid: str,
         # fill of a six-track release from a folder sharing one title read
         # `placed`, its release `present`, on that one foreign file.
         # `unattended` is that import: the album group's finalize — the
-        # artist page's download, the wishlist, the automatic retry,
-        # Telegram's album paths. Not a hand route: there a person named the
+        # artist page's download, the wishlist, the automatic retry.
+        # Not a hand route: there a person named the
         # folder and the release, and each file paired by its recording id or
         # a title is placed, as it always was — one track of twelve, two of
         # six. Nor an import for a review group, which says which tracks are
         # wanted — **nor one for a fill that named the tracks it wanted
-        # itself** (ruling D4, `wanted_tracks`): Telegram's fill of the two tracks a
+        # itself** (ruling D4, `wanted_tracks`): a fill of the two tracks a
         # twelve-track album lacks is a gap fill with no review group, and
         # "only 2 of the 12" refused it. And a hand pairing is always placed.
         pairings = []
@@ -25015,7 +24942,7 @@ async def _take_group_for_finalize(ag_id: str) -> dict | None:
                 return ag
         await asyncio.sleep(0.05)
 
-async def _finalize_group(bot, ag_id: str):
+async def _finalize_group(ag_id: str):
     """
     Finalize a completed (or timed-out) album group: import the whole folder
     once in album mode, pinned to the resolved MusicBrainz release, then report.
@@ -25024,7 +24951,7 @@ async def _finalize_group(bot, ag_id: str):
     if not ag:
         return
     try:
-        await _finalize_taken_group(bot, ag)
+        await _finalize_taken_group(ag)
     finally:
         # However it ended — placed, refused, cancelled, or an import that
         # raised: a placement that has stopped must not go on shielding the
@@ -25099,12 +25026,12 @@ async def _look_again_for_landed_files(ag: dict) -> int:
     ag["unfound"] = []
     return len(waiting)
 
-async def _finalize_taken_group(bot, ag: dict):
+async def _finalize_taken_group(ag: dict):
     """`_finalize_group`'s work, on a group it has taken and claimed."""
     label   = ag["label"]
 
-    import_note = ""
     status      = "downloaded"
+    place_error = ""      # why the placement failed, for Needs you's imports list
     album_dir   = ""
     # Remote clients watch this release through /api/album/status; the group is
     # about to be gone from pending_album_groups, so every exit below has to say
@@ -25143,9 +25070,8 @@ async def _finalize_taken_group(bot, ag: dict):
     # Transfers finished and none of their files was found (`lost`; for a
     # group an older build started, `completed` with no folder recorded).
     if (lost or ag["completed"] > 0) and not ag["local_dirs"]:
-        import_note = (
-            f"\n⚠️ Downloaded files could not be located under {SLSKD_DOWNLOAD_DIR}. "
-            "Check the shared downloads volume and place them manually.")
+        print(f"  {label}: downloaded files could not be located under "
+              f"{SLSKD_DOWNLOAD_DIR} — check the shared downloads volume")
         # Not retryable by button: the bytes arrived and the volume mapping is
         # wrong. Re-downloading lands them in the same place nobody can see.
         _album_fill_fail(fill_mbid, "placement_failed",
@@ -25166,9 +25092,6 @@ async def _finalize_taken_group(bot, ag: dict):
             _save_review_state()
             _album_fill_set(fill_mbid, "needs_match", groupId=recid, labels=labels,
                             **counts)
-            await _tg_send(bot, ag["chat_id"],
-                           f"Downloaded {label}. Waiting for web match/import review.",
-                           reply_markup=_album_action_markup(recid, "needs_review"))
             return
         # Claim the row for placement atomically against a concurrent cancel:
         # from here the files are on their way into the library, and the cancel
@@ -25179,7 +25102,6 @@ async def _finalize_taken_group(bot, ag: dict):
             print(f"  {label}: cancelled before placement — files stay in "
                   f"{SLSKD_DOWNLOAD_DIR}")
             return
-        await _tg_send(bot, ag["chat_id"], f"📚 Placing {label} into your library…")
         # Every directory that received a file, busiest first — not just the
         # majority one. A file that failed over to another peer downloads into
         # *that* peer's directory, and importing only the majority directory left
@@ -25219,10 +25141,7 @@ async def _finalize_taken_group(bot, ag: dict):
         if result["ok"]:
             status = "imported"
             await asyncio.to_thread(_note_folder_imported, album_dir)
-            dest_name = os.path.basename(result["dest_folder"])
-            import_note = f"\n📚 Placed {result['moved']} file(s) into {dest_name}."
-            if await asyncio.to_thread(_nd_scan_after_import, ag["token"]):
-                import_note += "\n🔄 Navidrome quick scan triggered."
+            await asyncio.to_thread(_nd_scan_after_import, ag["token"])
             if ag.get("review_group_id"):
                 with _review_lock:
                     group = _find_review_group(ag.get("review_group_id", ""))
@@ -25230,7 +25149,7 @@ async def _finalize_taken_group(bot, ag: dict):
                         _mark_group_tracks_placed(group, result)
                 _save_review_state()
             # (`reason` is where a client reads that the fill is short a
-            # file that was downloaded and not found — not Telegram alone.)
+            # file that was downloaded and not found.)
             _album_fill_set(fill_mbid, "placed", moved=result.get("moved", 0),
                             destFolder=os.path.basename(result.get("dest_folder", "")),
                             reason=lost_note, labels=labels)
@@ -25275,7 +25194,7 @@ async def _finalize_taken_group(bot, ag: dict):
                                                album=ag.get("album", ""))
         else:
             status = "failed"
-            import_note = f"\n⚠️ Placement failed: {result['error']}"
+            place_error = result.get("error", "") or ""
             # `retryable` on the placement result is set for exactly one case:
             # a pinned release whose tracklist MusicBrainz would not return (see
             # _deterministic_album_import). The files are downloaded and waiting;
@@ -25293,35 +25212,25 @@ async def _finalize_taken_group(bot, ag: dict):
                         ag["review_group_id"], one_dir, None,
                         result.get("error", ""), result=result)
 
-    if fails:
-        head = (f"⚠️ Album finished with errors: {label}\n"
-                f"{ag['completed']}/{ag['total']} files downloaded, {fails} failed")
-    else:
-        head = f"✅ Album complete: {label}\n{ag['completed']}/{ag['total']} files"
-    # Transfers that read finished and left no file of their own (rulings D5,
-    # E2). With none found at all, the note above has said it.
-    if lost and ag["local_dirs"]:
-        import_note += f"\n⚠️ {lost_note}."
-    text = head + import_note
-
-    markup = None
     if album_dir:
         recid = _uid("rec")
-        _uid_to_token[recid] = ag["token"]
         _albums[recid] = {
             "token":           ag["token"],
-            "chat_id":         ag["chat_id"],
+            "chat_id":         ag.get("chat_id") or "",
             "label":           label,
             "artist":          ag.get("artist", ""),
             "album":           ag.get("album", ""),
             "release_mbid":    ag.get("release_mbid", ""),
-            "rgid":            "",
+            "rgid":            _album_fill_get(fill_mbid).get("rgid", "") or "",
             "album_dir":       album_dir,
             "status":          status,
             "import_state":    "imported" if status == "imported" else "downloaded_not_imported",
             "review_group_id": ag.get("review_group_id", ""),
             "match_mode":      ag.get("match_mode", "auto"),
             "ts":              time.time(),
+            "updated_at":      time.time(),
+            # What Needs you's imports list says of a failed one (`reason`).
+            "error":           place_error,
         }
         if ag.get("review_group_id") and status != "imported":
             with _review_lock:
@@ -25337,24 +25246,13 @@ async def _finalize_taken_group(bot, ag: dict):
                         "created_at":   time.time(),
                     })
                     group["updated_at"] = time.time()
-        markup = _album_action_markup(recid, status)
         if len(_albums) > 500:
             _albums.pop(next(iter(_albums)), None)
 
-    pmid = ag.get("progress_msg_id")
-    if pmid:
-        try:
-            await bot.edit_message_text(chat_id=ag["chat_id"], message_id=pmid,
-                                        text=text, reply_markup=markup)
-            return
-        except Exception:
-            pass
-    await _tg_send(bot, ag["chat_id"], text, reply_markup=markup)
-
-async def _finish_gap_single(bot, info: dict, local_path: str, label: str,
+async def _finish_gap_single(info: dict, local_path: str, label: str,
                              review_key) -> bool:
     """A finished transfer that names an album gap's row and no album group:
-    see that it is placed, and say what became of it. False when its review
+    see that it is placed, and log what became of it. False when its review
     group is not an album gap — the caller's loose-track path is for that.
 
     - Its album group is still arriving: it waits, and the group's finalize
@@ -25370,16 +25268,15 @@ async def _finish_gap_single(bot, info: dict, local_path: str, label: str,
     with _review_lock:
         if not _is_album_gap_group(_find_review_group(group_id)):
             return False
-    chat_id, token = info.get("chat_id"), info.get("token")
+    token = info.get("token")
     if _album_group_arriving(group_id) is not None:
-        await _tg_send(bot, chat_id,
-                       f"⏳ Downloaded, waiting for its album to finish: {label}")
+        print(f"  downloaded file {label}: waiting for its album to finish")
         return True
     try:
         outcome = await asyncio.to_thread(_place_group_downloads, group_id, token,
                                           [local_path])
     except Exception as e:  # noqa: BLE001 — one file must not end the poll
-        print(f"  {label}: placing the downloaded file failed: {e}")
+        print(f"  {label}: placing the file failed: {e}")
         outcome = {"files": {os.path.normpath(local_path): {
             "placed": False, "reason": f"placement failed ({type(e).__name__})"}}}
         # Still a miss, said as one: without it the row reads as in progress
@@ -25393,14 +25290,12 @@ async def _finish_gap_single(bot, info: dict, local_path: str, label: str,
             print(f"  {label}: could not record the failed placement: {e2}")
     mine = (outcome.get("files") or {}).get(os.path.normpath(local_path))
     if mine and mine["placed"]:
-        text = f"✅ Placed into {outcome.get('album') or 'its album'}: {label}"
-        if outcome.get("scanned"):
-            text += " · 🔄 Navidrome scan triggered"
+        print(f"  downloaded file {label}: placed into {outcome.get('album') or 'its album'}"
+              + (" · Navidrome scan triggered" if outcome.get("scanned") else ""))
     else:
         why = (mine["reason"] if mine else
                outcome.get("note") or "no track of the album is waiting for it")
-        text = f"⚠️ Downloaded but not placed ({why}): {label}"
-    await _tg_send(bot, chat_id, text)
+        print(f"  downloaded file {label}: not placed ({why})")
     return True
 
 async def _wait_for_the_next_poll() -> None:
@@ -25430,23 +25325,21 @@ async def _wait_for_the_next_poll() -> None:
         await asyncio.sleep(nap)
         waited += nap
 
-async def poll_downloads_loop(apps: list | None = None):
+async def poll_downloads_loop():
     """
     Background task: poll slskd transfer statuses.
-    On completion: run beets, send Telegram confirmation.
-    On failure: try next candidate or send retry prompt.
+    On completion: place the files (an album group's once, on finalize).
+    On failure: fail over to the next candidate source.
 
     Matching is resilient: slskd may report a transfer filename that differs
     slightly from what we enqueued (slash/case normalization), so we fall back
     to matching by (username, basename) when the exact key misses. Album groups
     that never reach their total are finalized by a time-based sweep.
     """
-    # `apps`: (user, Application) pairs; None reads the live `_TELEGRAM_APPS`
-    # on every tick, since main() starts this loop before any Telegram app.
     while True:
         await _wait_for_the_next_poll()
         try:
-            await _poll_downloads_once(_token_to_app(apps))
+            await _poll_downloads_once()
         except Exception as e:
             # The poll loop must never die — downloads would stop finalizing.
             import traceback
@@ -25506,7 +25399,7 @@ async def _settle_vanished_transfers(downloads: list) -> None:
               f"cancelling the album fill")
         await asyncio.to_thread(_cancel_album_fill, fill_mbid, "Removed from slskd")
 
-async def _poll_downloads_once(token_to_app: dict):
+async def _poll_downloads_once():
         # Downloading off (Worbus P1 S2): no poller work and no slskd call.
         # Rows a poll would have settled are left as they are.
         if not _downloads_on():
@@ -25591,14 +25484,10 @@ async def _poll_downloads_once(token_to_app: dict):
                         and not any(info.get("album_group_id") == ag_id
                                     for info in pending_downloads.values()))
             if age > ALBUM_GROUP_TTL or orphaned:
-                # A bot-less finalize is fine — _tg_send no-ops on a falsy bot.
-                # Refusing to finalize without a Telegram app was what left
-                # web-started fills dangling until the 6h TTL, on every poll.
-                app = token_to_app.get(ag["token"])
                 print(f"  album group {ag_id} "
                       f"{'has no live transfers' if orphaned else 'timed out'}"
                       f" — finalizing")
-                await _finalize_group(app.bot if app else None, ag_id)
+                await _finalize_group(ag_id)
 
         if not pending_downloads:
             return
@@ -25652,11 +25541,6 @@ async def _poll_downloads_once(token_to_app: dict):
                                         filename=filename)
             label   = (f"{track['artist']} - {track['title']}"
                        if track else key[1].split('/')[-1].split('\\')[-1])
-            app     = token_to_app.get(token)
-            # A token with no Telegram app behind it (a web-only deployment)
-            # used to skip the watchdog and every outcome branch below — the
-            # sweep's own comment already says a bot-less finalize is fine.
-            bot = app.bot if app else None
 
             # Stall watchdog: cancel if no byte progress for too long. slskd will
             # set the state to Cancelled on the next poll, which fires the
@@ -25784,15 +25668,14 @@ async def _poll_downloads_once(token_to_app: dict):
                             "review_group_id": review_gid,
                             "review_track_index": review_idx,
                             "review_key": list(review_key) if review_key else None})
-                    await _update_group_progress(bot, ag)
                     if ag["completed"] + ag["failed"] >= ag["total"]:
-                        await _finalize_group(bot, ag_id)
+                        await _finalize_group(ag_id)
                 else:
                     # An album gap's own file — hand-picked, or rescued from
                     # another peer — is placed into its album, here or by the
                     # album group still arriving.
                     if local_path and review_gid and await _finish_gap_single(
-                            bot, info, local_path, label, review_key):
+                            info, local_path, label, review_key):
                         continue
                     # Loose individual track — tag with mutagen and trigger rescan.
                     #
@@ -25823,7 +25706,7 @@ async def _poll_downloads_once(token_to_app: dict):
                         file_msg = ("filed under its tagged release" if filed == "filed"
                                     else "filed into its tagged release as an extra track")
                         if await asyncio.to_thread(_nd_scan_after_import, token):
-                            file_msg += " · 🔄 Navidrome scan triggered"
+                            file_msg += " · Navidrome scan triggered"
                     elif local_path:
                         info_track = track or {}
                         tag_updates = {k: v for k, v in {
@@ -25836,11 +25719,11 @@ async def _poll_downloads_once(token_to_app: dict):
                         file_msg = ("completed, but filing it under its tagged "
                                     "release failed" if auto_failed else "completed")
                         if await asyncio.to_thread(_nd_scan_after_import, token):
-                            file_msg += " · 🔄 Navidrome scan triggered"
+                            file_msg += " · Navidrome scan triggered"
                     else:
                         file_msg = "completed (file not found on disk)"
                         print(f"  could not locate {filename} under {SLSKD_DOWNLOAD_DIR}")
-                    await _tg_send(bot, chat_id, f"✅ Download {file_msg}: {label}")
+                    print(f"  downloaded file {label}: {file_msg}")
 
             elif _slskd_failed(state):
                 ag_id = info.get("album_group_id")
@@ -25903,9 +25786,8 @@ async def _poll_downloads_once(token_to_app: dict):
                     pending_downloads.pop(key, None)
                     ag["failed"] += 1
                     ag["ts"] = time.time()
-                    await _update_group_progress(bot, ag)
                     if ag["completed"] + ag["failed"] >= ag["total"]:
-                        await _finalize_group(bot, ag_id)
+                        await _finalize_group(ag_id)
                     continue
                 if review_gid:
                     # A transfer of a cancelled fill that fails reads as the
@@ -25944,7 +25826,7 @@ async def _poll_downloads_once(token_to_app: dict):
                     # It is now, before the give-up path below.
                     if (nothing_yet and not ag.get("switching")
                             and ag.get("alt_sources")):
-                        await _switch_album_source(bot, ag_id)
+                        await _switch_album_source(ag_id)
                         switched = (ag_id in pending_album_groups
                                     and not pending_album_groups[ag_id].get("switching"))
                         if switched:
@@ -25969,8 +25851,8 @@ async def _poll_downloads_once(token_to_app: dict):
                                        f"retrying from @{nxt.get('source_user', '?')}")
                             continue
                         # Exhausted. `_switch_album_source` has already abandoned
-                        # the group, popped it and offered the user a fresh
-                        # search — but it records nothing in the fill ledger, and
+                        # the group and popped it — but it records nothing in
+                        # the fill ledger, and
                         # its `switching` flag is still set, so neither branch
                         # below would run. A fill that never reports failure
                         # leaves every client polling `downloading` forever with
@@ -25997,44 +25879,8 @@ async def _poll_downloads_once(token_to_app: dict):
                             f"Source @{username} failed before any track arrived ({state})",
                             retryable=True,
                             review_group_id=ag.get("review_group_id", ""))
-                        alts  = ag.get("alt_sources") or []
-                        label = ag["label"]
-                        # Update the now-stale progress line so it doesn't sit
-                        # there claiming the album is still downloading.
-                        pmid = ag.get("progress_msg_id")
-                        if pmid and bot:
-                            try:
-                                await bot.edit_message_text(
-                                    chat_id=ag["chat_id"], message_id=pmid,
-                                    text=f"❌ Source @{ag.get('source_user','?')} "
-                                         f"failed for {label}.")
-                            except Exception:
-                                pass
-                        if alts:
-                            group = {"release_mbid": ag.get("release_mbid", ""),
-                                     "artist": ag.get("artist", ""),
-                                     "album": ag.get("album", ""),
-                                     "total_tracks": 0,
-                                     "missing_tracks": ag.get("missing_tracks", [])}
-                            await _tg_send(bot, ag["chat_id"],
-                                f"❌ Source for {label} failed to queue. "
-                                f"Pick another source:")
-                            await _send_album_prompt(bot, ag["chat_id"], ag["token"],
-                                                     label, group, alts)
-                        else:
-                            rid = _uid("aretry")
-                            _uid_to_token[rid] = ag["token"]
-                            _pending_album[rid] = {
-                                "token": ag["token"], "chat_id": ag["chat_id"],
-                                "artist": ag.get("artist", ""), "title": ag.get("album", ""),
-                                "release_mbid": ag.get("release_mbid", ""),
-                                "total_tracks": 0, "query": ag.get("retry_query", "")}
-                            await _tg_send(bot, ag["chat_id"],
-                                f"❌ {label} failed to queue and there are no other "
-                                f"sources.",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("🔁 Search again",
-                                                         callback_data=f"ARETRY|{rid}")]]))
+                        print(f"  {ag['label']}: source @{ag.get('source_user', '?')} "
+                              f"failed before any track arrived")
                     else:
                         # The group is otherwise progressing, so the source isn't
                         # globally bad — just bad for this file. Fail this one
@@ -26049,9 +25895,8 @@ async def _poll_downloads_once(token_to_app: dict):
                         else:
                             ag["failed"] += 1
                             ag["ts"] = time.time()
-                            await _update_group_progress(bot, ag)
                             if ag["completed"] + ag["failed"] >= ag["total"]:
-                                await _finalize_group(bot, ag_id)
+                                await _finalize_group(ag_id)
                 else:
                     if info.get("fill_cancelled"):
                         # Its fill was cancelled while it ran, so no other
@@ -26072,93 +25917,17 @@ async def _poll_downloads_once(token_to_app: dict):
                                 slskd_enqueue, next_c["username"], best_file,
                                 track=track, token=token, chat_id=chat_id,
                                 candidates=remaining[1:]):
-                            await _tg_send(bot, chat_id,
-                                f"🔁 Download failed for {label} ({state}) — "
-                                f"retrying with next source…")
+                            print(f"  {label}: download failed ({state}) — "
+                                  f"retrying with the next source")
                         else:
-                            await _tg_send(bot, chat_id,
-                                f"Download failed and retry also failed: {label}")
+                            print(f"  {label}: download failed and the retry "
+                                  f"also failed")
                     else:
-                        await _tg_send(bot, chat_id,
-                            f"❌ Download failed, no more sources: {label} ({state})")
+                        print(f"  {label}: download failed, no more sources ({state})")
 
 # ---------------------------------------------------------------------------
 # Library completeness check (Feature 6)
 # ---------------------------------------------------------------------------
-
-def find_incomplete_albums(nd_user: str, nd_pass: str, progress=None) -> list:
-    """
-    Compare every album in Navidrome against its MusicBrainz tracklist.
-    Returns incomplete albums sorted by completion ratio (least complete first).
-
-    Rather than comparing raw counts (which mis-fires on multi-disc releases,
-    bonus tracks, or a different pressing), we check each MusicBrainz track for
-    presence in the library by title, and record exactly which titles are
-    missing so the result can drive a download.
-    """
-    print("  Fetching all albums from Navidrome...")
-    all_albums = nd_get_all_albums(nd_user, nd_pass)
-    print(f"  Checking {len(all_albums)} albums against MusicBrainz...")
-    incomplete = []
-    candidates = [a for a in all_albums if a.get("musicBrainzId")]
-    buckets = {}
-    for album in candidates:
-        buckets.setdefault(_album_group_key(album), []).append(album)
-    grouped_candidates = list(buckets.values())
-
-    for done, albums in enumerate(grouped_candidates, 1):
-        if progress:
-            try:
-                progress(done, len(grouped_candidates))
-            except Exception:
-                pass
-        records = [_album_record(a, nd_user, nd_pass) for a in albums]
-        records.sort(key=lambda r: (-(int(r.get("songCount") or 0)), r["name"]))
-        album = records[0]
-        mbz_id     = album.get("musicBrainzId", "")
-        artist     = album.get("artist", "")
-        mbz_tracks = mbz_release_tracks(mbz_id)
-        mbz_count  = len(mbz_tracks)
-        if mbz_count == 0:
-            continue
-        # Build a union of present tracks across duplicate/split Navidrome album
-        # rows. This avoids treating two accidental versions as two incomplete
-        # albums and downloading the same missing songs twice.
-        present_titles = set()
-        present_mbids  = set()
-        for rec in records:
-            for song in rec.get("tracks", []):
-                title = (song.get("title") or "").lower().strip()
-                if title:
-                    present_titles.add(title)
-                song_mbid = song.get("musicBrainzId", "") or ""
-                if song_mbid:
-                    present_mbids.add(song_mbid)
-        missing = [
-            {"artist": artist, "title": rt["title"], "mbid": rt["mbid"],
-             "position": rt.get("position", 0), **_row_disc(rt)}
-            for rt in mbz_tracks
-            if not ((rt.get("mbid") and rt.get("mbid") in present_mbids) or
-                    ((rt["title"] or "").lower().strip() in present_titles))
-        ]
-        if missing:
-            incomplete.append({
-                "artist":         artist,
-                "album":          album.get("name", ""),
-                "mbz_id":         mbz_id,
-                "album_ids":      [r["id"] for r in records],
-                "duplicate_count": len(records),
-                "present":        mbz_count - len(missing),
-                "total":          mbz_count,
-                "missing":        len(missing),
-                "missing_tracks": missing,
-            })
-            dup_note = f", {len(records)} local versions" if len(records) > 1 else ""
-            print(f"    Incomplete: {artist} - {album.get('name')} "
-                  f"({mbz_count - len(missing)}/{mbz_count}{dup_note})")
-
-    incomplete.sort(key=lambda x: x["present"] / max(x["total"], 1))
-    return incomplete
 
 # ---------------------------------------------------------------------------
 # Scan
@@ -26262,1321 +26031,158 @@ def scan_user(user: dict) -> list:
     return all_missing
 
 # ---------------------------------------------------------------------------
-# Telegram helpers
+# Import as-is
 # ---------------------------------------------------------------------------
 
-async def _tg_send(bot, chat_id: str, text: str, reply_markup=None, retries: int = 3):
-    """Send a Telegram message with automatic retry on timeout/network errors
-    and flood control. Truncates to Telegram's 4096-char message limit so an
-    oversized text can never make the send fail.
+# The statuses of an import record that need a person: Needs you › Imports
+# that need you lists them, and `/lb/attention` counts them (`counts.imports`).
+IMPORT_STATUSES_NEEDING_YOU = ("needs_review", "failed")
 
-    A falsy `bot` is a no-op, not an error: album groups started from the web UI
-    or a remote client have to be able to finalize on a bot-less path, and
-    placement must never hinge on there being a Telegram chat to narrate it to."""
-    if not bot:
-        return None
-    import telegram.error
-    if len(text) > 4096:
-        text = text[:4093] + "…"
-    for attempt in range(retries):
-        try:
-            return await bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=reply_markup)
-        except telegram.error.RetryAfter as e:
-            # Flood control — wait exactly as long as Telegram asks, then retry.
-            wait = getattr(e, "retry_after", 5) or 5
-            print(f"  Telegram flood control: waiting {wait}s")
-            await asyncio.sleep(wait + 0.5)
-        except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
-            if attempt < retries - 1:
-                print(f"  Telegram send timeout (attempt {attempt+1}/{retries}): {e}")
-                await asyncio.sleep(2 ** attempt)
-            else:
-                print(f"  Telegram send failed after {retries} attempts: {e}")
-        except telegram.error.BadRequest as e:
-            # e.g. malformed markup — log it, don't crash the caller.
-            print(f"  Telegram send rejected: {e}")
-            return None
-    return None
+def _open_import_records() -> list:
+    """`[(recid, record)]` of the import records that need a person, newest
+    first (`updated_at`, else when the record was made)."""
+    rows = [(recid, dict(rec)) for recid, rec in list(_albums.items())
+            if isinstance(rec, dict) and rec.get("status") in IMPORT_STATUSES_NEEDING_YOU]
+    return sorted(rows, key=lambda r: float(r[1].get("updated_at") or r[1].get("ts") or 0),
+                  reverse=True)
 
-async def _send_approval(bot, chat_id, token, label, reason, file, username, track,
-                         candidates: list = None):
-    """`candidates` = remaining folder-level sources to fail over to (excluding
-    the one this file came from)."""
-    aid = _uid("a")
-    pending_approvals.setdefault(token, {})[aid] = {
-        "username": username, "file": file, "label": label, "track": track,
-        "candidates": candidates or [],
-    }
-    _uid_to_token[aid] = token
-    emoji = "🎤" if "live" in reason.lower() else "⚠️"
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(f"{emoji} Approval needed\n"
-              f"Track: {label}\n"
-              f"Reason: {reason}\n"
-              f"Best result: {_format_info(file)}\n"
-              f"Download anyway?"),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Yes", callback_data=f"AY|{aid}"),
-            InlineKeyboardButton("No",  callback_data=f"AN|{aid}"),
-        ]]),
-    )
+# What Dismiss leaves on a record. A status of its own, so the record is out
+# of every list that reads one: `IMPORT_STATUSES_NEEDING_YOU` here, and in the
+# release before 0.4 (the rollback) the downloads view and `/pending`, which
+# list `needs_review` / `needs_match` / `failed` only — nothing there walks the
+# records on its own, so a dismissed one is inert, kept until the 500-record
+# cap evicts it. Every other field stays as it was (`import_state` included):
+# the folder is not touched, and Retry can still act on the record by its id.
+IMPORT_DISMISSED = "dismissed"
 
-async def _send_retry(bot, chat_id, token, label, track, reason):
-    rid = _uid("r")
-    pending_retries.setdefault(token, {})[rid] = track
-    _uid_to_token[rid] = token
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"Not found: {label}\nReason: {reason}",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Retry", callback_data=f"RT|{rid}"),
-            InlineKeyboardButton("Skip",  callback_data=f"SK|{rid}"),
-        ]]),
-    )
-
-async def _send_dup_prompt(bot, chat_id, token, label, track, existing, folders):
-    """`folders` are folder-level search results (best first); pick the best
-    file from the best folder and keep the rest as failover candidates."""
-    did = _uid("d")
-    _uid_to_token[did] = token
-    username, best_file = "", {}
-    if folders:
-        fd        = folders[0]
-        username  = fd["username"]
-        best_file = min(fd["files"],
-                        key=lambda f: _score_file(f, fd.get("upload_speed", 0)) or (99,))
-    pending_approvals.setdefault(token, {})[did] = {
-        "username":   username,
-        "file":       best_file,
-        "label":      label,
-        "track":      track,
-        "candidates": folders[1:] if folders else [],   # failover sources
-    }
-    ext     = existing.get("suffix", "?").upper()
-    bitrate = existing.get("bitRate", "?")
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(f"Duplicate detected: {label}\n"
-              f"Already in library: {ext}, {bitrate} kbps\n"
-              f"New result: {_format_info(best_file) if best_file else '?'}\n"
-              f"Download anyway?"),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Yes", callback_data=f"AY|{did}"),
-            InlineKeyboardButton("No",  callback_data=f"AN|{did}"),
-        ]]),
-    )
-
-# ---------------------------------------------------------------------------
-# Missing tracks message
-# ---------------------------------------------------------------------------
-
-async def send_missing_tracks(app, user: dict, tracks: list):
-    token   = user["telegram_token"]
-    chat_id = user["chat_id"]
-    bot     = app.bot
-
-    grouped = {}
-    for t in tracks:
-        grouped.setdefault(t.get("playlist", "Unknown"), []).append(t)
-
-    missing_by_playlist.setdefault(token, {}).update(grouped)
-
-    for playlist_name, playlist_tracks in grouped.items():
-        pl_uid = _register_playlist(token, playlist_name)
-        header = f"Missing tracks - {playlist_name} ({len(playlist_tracks)} tracks)"
-        chunks, cur, cur_len = [], [header], len(header)
-        for t in playlist_tracks:
-            line = f"- {t['artist']} - {t['title']}"
-            if cur_len + len(line) + 1 > 3900:
-                chunks.append("\n".join(cur))
-                cur, cur_len = [f"{playlist_name} (continued)"], 0
-            cur.append(line)
-            cur_len += len(line) + 1
-        chunks.append("\n".join(cur))
-        kb = [[InlineKeyboardButton(f"Download all ({len(playlist_tracks)})",
-                                    callback_data=f"dlall|{pl_uid}")]]
-        for i, chunk in enumerate(chunks):
-            await bot.send_message(
-                chat_id=chat_id, text=chunk,
-                reply_markup=InlineKeyboardMarkup(kb) if i == len(chunks) - 1 else None,
-            )
-
-# ---------------------------------------------------------------------------
-# Callback handler
-# ---------------------------------------------------------------------------
-
-def _user_nd(token):
-    u = _user_for_token(token)
-    return (u["navidrome_user"], u["navidrome_password"]) if u else ("", "")
-
-async def _edit_or_send(query, context, text, reply_markup=None):
-    """Edit the message the button hangs off; if Telegram refuses the edit
-    (message >48h old, deleted, or not editable) send a new message instead of
-    dying silently."""
-    import telegram.error
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup)
-    except telegram.error.TelegramError as e:
-        print(f"  edit_message_text failed ({e}) — sending a new message instead")
-        chat_id = query.message.chat_id if query.message else None
-        if chat_id is None:
-            raise
-        await context.bot.send_message(chat_id=chat_id, text=text,
-                                       reply_markup=reply_markup)
-
-# The Telegram buttons that search Soulseek or enqueue (review S#12): with
-# downloading off they answer that plainly, instead of running into the
-# guarded slskd functions and reading as "nothing found".
-_TELEGRAM_DOWNLOAD_ACTIONS = frozenset({
-    "AP", "AY", "RT", "DF", "DA", "dlall", "DLA", "DLM", "DLC", "CD",
-    "ALD", "ALM", "ARETRY"})
-
-async def _telegram_downloads_off(update) -> bool:
-    """For `/album` and `/search`: True, after saying so, when downloading is
-    off."""
-    if _downloads_on():
+def _dismiss_import_record(rec: dict) -> bool:
+    """Dismiss an import record that needs a person; a second Dismiss is a
+    no-op that answers True. False for one that is not waiting (imported)."""
+    status = rec.get("status")
+    if status == IMPORT_DISMISSED:
+        return True
+    if status not in IMPORT_STATUSES_NEEDING_YOU:
         return False
-    await update.message.reply_text(DOWNLOADS_OFF_BODY["error"])
+    rec["status"] = IMPORT_DISMISSED
+    rec["dismissed_at"] = rec["updated_at"] = time.time()
     return True
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import telegram.error
-    query  = update.callback_query
-    print(f"  callback: {query.data}", flush=True)
-    try:
-        await query.answer()
-    except telegram.error.BadRequest as e:
-        if "query is too old" in str(e).lower() or "query id is invalid" in str(e).lower():
-            print(f"  Stale callback query ignored: {e}")
-            try:
-                chat_id = query.message.chat_id if query.message else None
-                if chat_id is not None:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="⚠️ That button expired (the bot restarted or too much "
-                             "time passed since it was sent) — please re-run the "
-                             "command that created it (e.g. /scan) to get a fresh one.")
-            except Exception as notify_err:
-                print(f"  Failed to notify about stale callback: {notify_err}")
-            return
-        raise
-    except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
-        # Answering the callback is cosmetic (clears the spinner) — a transient
-        # network failure here must not abort the action itself.
-        print(f"  callback answer() failed ({e}) — continuing with the action")
-    parts  = query.data.split("|")
-    action = parts[0]
-    if action in _TELEGRAM_DOWNLOAD_ACTIONS and not _downloads_on():
-        await _edit_or_send(query, context, DOWNLOADS_OFF_BODY["error"])
-        return
+def _open_imports_count() -> int:
+    """`counts.imports` on `/api/attention`, `imports.open` on `/api/summary`."""
+    return len(_open_import_records())
 
-    # Album pick: user chose a specific folder
-    if action == "AP":
-        aid, idx = parts[1], int(parts[2])
-        token    = _token_for(aid)
-        pending  = pending_approvals.get(token, {}).pop(aid, None)
-        if not pending:
-            await query.edit_message_text("Already handled.")
-            return
-        folders = pending.get("folders", [])
-        if idx >= len(folders):
-            await query.edit_message_text("Result expired.")
-            return
-        fd        = folders[idx]
-        label     = pending["label"]
-        username  = fd["username"]
-        folder    = fd["folder"]
-        chat_id_s = str(query.message.chat_id)
+def _imports_attention_view() -> dict:
+    """`GET /api/imports/attention`: the import records that need a person,
+    newest first, each an allowlist — never the folder's path, the owner key
+    or the legacy chat id. `rgid` and `albumId` come from the record, else from
+    its review group, else (`rgid`) from the fill ledger's row for its release;
+    `reason` is the placement's own error (else the ledger's), through
+    `_wire_text`. A record that names no album is listed under its label."""
+    groups = {g.get("id"): g for g in (_review_list_snapshot().get("groups") or [])
+              if g.get("id")}
+    items = []
+    for recid, rec in _open_import_records():
+        group = groups.get(rec.get("review_group_id") or "") or {}
+        release = rec.get("release_mbid", "") or ""
+        ledger = _album_fill_get(release) if release else {}
+        artist, album = rec.get("artist", "") or "", rec.get("album", "") or ""
+        if not (artist or album):
+            album = os.path.basename(str(rec.get("label", "") or "").rstrip("/\\"))
+        items.append({
+            "recid": recid,
+            "artist": artist,
+            "album": album,
+            "status": rec.get("status", ""),
+            "releaseMbid": release,
+            "rgid": (rec.get("rgid") or group.get("rgid") or ledger.get("rgid") or ""),
+            "albumId": (rec.get("album_id") or group.get("canonical_album_id") or ""),
+            "reason": _wire_text(rec.get("error") or ledger.get("reason") or ""),
+            "updatedAt": float(rec.get("updated_at") or rec.get("ts") or 0),
+        })
+    return {"items": items}
 
-        await query.edit_message_text(
-            f"Expanding directory from @{username}...\n{folder.replace(chr(92), '/').split('/')[-1]}")
+def _stamp_import_outcome(rec: dict, result: dict) -> None:
+    """After a Retry, Pin release & retry or Import as-is: when the record was
+    last acted on, and why the placement failed (gone once it is placed)."""
+    rec["updated_at"] = time.time()
+    if result.get("ok"):
+        rec.pop("error", None)
+    else:
+        rec["error"] = str(result.get("error", "") or "")
 
-        # Expand the directory to get ALL tracks, not just those in the search result
-        ref_file   = fd["files"][0] if fd["files"] else {}
-        full_files = await asyncio.to_thread(
-            slskd_expand_directory, username, fd, ref_file)
+def _import_record_as_is(recid: str) -> dict:
+    """Place a recorded album folder as what the folder itself is: "Import
+    as-is" on Needs you's imports list (`POST /api/imports/<recid>/as-is`).
+    It was Telegram's `IMPAS` button (`_reimport_worker(autotag=False)`) until
+    Worbus 0.4; the logic is unchanged. Runs on the caller's thread: it may ask
+    MusicBrainz and moves files.
 
-        if not full_files:
-            # Fall back to whatever the search returned
-            print(f"  expand_directory returned nothing — falling back to search results")
-            full_files = fd["files"]
-
-        folder_name = fd["folder"].replace(chr(92), "/").split("/")[-1]
-        grp          = pending.get("group") or {}
-        release_mbid = grp.get("release_mbid", "")
-        # What the fill may fail over to unattended: the rest of the list
-        # that has shown it is this artist's album (`_unattended_alternates`).
-        alts         = _unattended_alternates(folders, fd, 6, grp.get("artist", ""),
-                                              grp.get("album", ""), album_list=True)
-        ok, total, ag_id = await asyncio.to_thread(
-            slskd_enqueue_folder,
-            username, full_files, token=token, chat_id=chat_id_s,
-            label=folder_name, release_mbid=release_mbid,
-            alt_sources=alts, artist=grp.get("artist", ""),
-            album=grp.get("album", "") or label,
-            missing_tracks=grp.get("missing_tracks", []))
-        msg = await context.bot.send_message(
-            chat_id=chat_id_s,
-            text=f"⬇️ Downloading {label}: 0/{total} files {_progress_bar(0, total)}\n"
-                 f"from @{username}: {folder_name}")
-        if ag_id and ag_id in pending_album_groups:
-            pending_album_groups[ag_id]["progress_msg_id"] = msg.message_id
-        return
-
-    # Beets: import specific folder
-    if action == "BI":
-        bid, idx = parts[1], int(parts[2])
-        pending  = _pending_beets.pop(bid, None)
-        if not pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        folders = pending["folders"]
-        if idx >= len(folders):
-            await query.edit_message_text("Folder index out of range.")
-            return
-        fd      = folders[idx]
-        chat_id = pending["chat_id"]
-        await query.edit_message_text(f"Queuing beets import for:\n{fd['name']}")
-        asyncio.create_task(_beets_worker(context.bot, chat_id, fd["path"],
-                                          fd["name"], _token_for(bid)))
-        return
-
-    # Beets: import all folders
-    if action == "BA":
-        bid     = parts[1]
-        pending = _pending_beets.pop(bid, None)
-        if not pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        folders = pending["folders"]
-        chat_id = pending["chat_id"]
-        await query.edit_message_text(
-            f"Queuing beets import for all {len(folders)} folder(s)...")
-        for fd in folders:
-            asyncio.create_task(
-                _beets_worker(context.bot, chat_id, fd["path"], fd["name"],
-                              _token_for(bid)))
-        return
-
-    # Beets: cancel
-    if action == "BC":
-        bid = parts[1]
-        _pending_beets.pop(bid, None)
-        await query.edit_message_text("Cancelled.")
-        return
-
-    # Album skip
-    if action == "AS":
-        aid   = parts[1]
-        token = _token_for(aid)
-        pending_approvals.get(token, {}).pop(aid, None)
-        await query.edit_message_text("Album skipped.")
-        return
-
-    # Approval yes
-    if action == "AY":
-        aid     = parts[1]
-        token   = _token_for(aid)
-        pending = pending_approvals.get(token, {}).pop(aid, None)
-        if not pending:
-            await query.edit_message_text("Already handled.")
-            return
-        if not pending.get("username") or not pending.get("file"):
-            await query.edit_message_text(
-                f"No source available anymore for {pending['label']}.")
-            return
-        if await asyncio.to_thread(
-                slskd_enqueue, pending["username"], pending["file"],
-                track=pending.get("track"), token=token,
-                chat_id=str(query.message.chat_id),
-                candidates=pending.get("candidates", [])):
-            await query.edit_message_text(
-                f"Queued: {pending['label']}\n{_format_info(pending['file'])}")
-        else:
-            await query.edit_message_text(f"Enqueue failed: {pending['label']}")
-        return
-
-    # Approval no
-    if action == "AN":
-        aid = parts[1]
-        pending_approvals.get(_token_for(aid), {}).pop(aid, None)
-        await query.edit_message_text("Skipped.")
-        return
-
-    # Retry
-    if action == "RT":
-        rid     = parts[1]
-        token   = _token_for(rid)
-        track   = pending_retries.get(token, {}).pop(rid, None)
-        if not track:
-            await query.edit_message_text("Already handled.")
-            return
-        label   = f"{track['artist']} - {track['title']}"
-        user    = _user_for_token(token)
-        chat_id = user["chat_id"] if user else str(query.message.chat_id)
-        await query.edit_message_text(f"Retrying: {label}")
-        result  = await asyncio.to_thread(slskd_search_and_pick, track)
-        if result["status"] == "ok":
-            if await asyncio.to_thread(
-                    slskd_enqueue, result["username"], result["file"],
-                    track=track, token=token, chat_id=chat_id,
-                    candidates=result.get("folders", [])[1:]):
-                await context.bot.send_message(chat_id=chat_id,
-                    text=f"Retry queued: {label}\n{_format_info(result['file'])}")
-            else:
-                await context.bot.send_message(chat_id=chat_id,
-                    text=f"Retry enqueue failed: {label}")
-        elif result["status"] in ("live_only", "low_quality"):
-            reason = ("Only live recording found" if result["status"] == "live_only"
-                      else "Only low-quality format (no FLAC/Opus)")
-            await _send_approval(context.bot, chat_id, token, label, reason,
-                                 result["file"], result["username"], track,
-                                 candidates=result.get("folders", [])[1:])
-        else:
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"Retry also failed: {label}")
-        return
-
-    # Skip
-    if action == "SK":
-        rid = parts[1]
-        pending_retries.get(_token_for(rid), {}).pop(rid, None)
-        await query.edit_message_text("Skipped.")
-        return
-
-    # Manual search: page navigation
-    if action == "SPG":
-        sid, page       = parts[1], int(parts[2])
-        token           = _token_for(sid)
-        folders, squery = _search_entry(token, sid)
-        if not folders:
-            await query.edit_message_text("Those results expired — run /search again.")
-            return
-        text, markup = _render_search_results(sid, folders, squery, page)
-        try:
-            await query.edit_message_text(text, reply_markup=markup)
-        except Exception:
-            pass
-        return
-
-    # Manual search: download best file from folder
-    if action == "DF":
-        sid, idx    = parts[1], int(parts[2])
-        token       = _token_for(sid)
-        folders, _  = _search_entry(token, sid)
-        if not folders or idx >= len(folders):
-            await query.edit_message_text("Result expired.")
-            return
-        fd        = folders[idx]
-        best_file = min(fd["files"], key=lambda f: _score_file(f, fd["upload_speed"]) or (99,))
-        if await asyncio.to_thread(
-                slskd_enqueue, fd["username"], best_file, token=token,
-                chat_id=str(query.message.chat_id),
-                candidates=[f for j, f in enumerate(folders) if j != idx][:6]):
-            fname = best_file["filename"].replace("\\", "/").split("/")[-1]
-            await context.bot.send_message(chat_id=str(query.message.chat_id),
-                text=f"Queued: {fname}\n{_format_info(best_file)}")
-        else:
-            await context.bot.send_message(chat_id=str(query.message.chat_id),
-                text="Enqueue failed.")
-        return
-
-    # Manual search: download full album folder
-    if action == "DA":
-        sid, idx       = parts[1], int(parts[2])
-        token          = _token_for(sid)
-        folders, squery = _search_entry(token, sid)
-        if not folders or idx >= len(folders):
-            await query.edit_message_text("Result expired.")
-            return
-        fd        = folders[idx]
-        username  = fd["username"]
-        chat_id_s = str(query.message.chat_id)
-
-        await context.bot.send_message(chat_id=chat_id_s,
-            text=f"Expanding directory from @{username}...")
-
-        ref_file   = fd["files"][0] if fd["files"] else {}
-        full_files = await asyncio.to_thread(
-            slskd_expand_directory, username, fd, ref_file)
-        if not full_files:
-            full_files = fd["files"]
-
-        folder_name = fd["folder"].replace(chr(92), "/").split("/")[-1]
-        alt = _unattended_alternates(folders, fd, 6)
-        ok, total, ag_id = await asyncio.to_thread(
-            slskd_enqueue_folder,
-            username, full_files, token=token, chat_id=chat_id_s,
-            label=folder_name, alt_sources=alt, album=folder_name)
-        msg = await context.bot.send_message(chat_id=chat_id_s,
-            text=f"⬇️ Downloading {folder_name}: 0/{total} files {_progress_bar(0, total)}\n"
-                 f"from @{username}")
-        if ag_id and ag_id in pending_album_groups:
-            pending_album_groups[ag_id]["progress_msg_id"] = msg.message_id
-            pending_album_groups[ag_id]["retry_query"]     = squery  # re-search on exhaustion
-        return
-
-    # Download all for a playlist — show an estimate + mode choice first
-    if action == "dlall":
-        pl_uid        = parts[1]
-        token         = _token_for(pl_uid)
-        playlist_name = _uid_to_playlist.get(pl_uid, "")
-        tracks        = missing_by_playlist.get(token, {}).get(playlist_name, [])
-        if not tracks:
-            await _edit_or_send(query, context,
-                "No tracks found (state may have expired). Run /scan again.")
-            return
-        n      = len(tracks)
-        # Rough estimate: MBZ grouping (~1s/track) + ~30s per album search.
-        est_min = max(1, round((n * 1 + n * 0.6 * 30) / 60))
-        dlid = _uid("dl")
-        _uid_to_token[dlid] = token
-        _pending_dlall[dlid] = {"token": token, "playlist_name": playlist_name}
-        await _edit_or_send(query, context,
-            f"Download all — {playlist_name} ({n} tracks)\n"
-            f"Estimated time: ~{est_min} min.\n\n"
-            f"• Auto: pick the best Soulseek source for each album automatically.\n"
-            f"• Choose: prompt you to pick a source per album ({n} taps).\n",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚡ Auto (recommended)", callback_data=f"DLA|{dlid}")],
-                [InlineKeyboardButton("👆 Choose each", callback_data=f"DLM|{dlid}")],
-                [InlineKeyboardButton("Cancel", callback_data=f"DLC|{dlid}")],
-            ]))
-        return
-
-    # Download-all: Auto mode (DLA) or Manual/choose mode (DLM)
-    if action in ("DLA", "DLM"):
-        dlid    = parts[1]
-        token   = _token_for(dlid)
-        pending = _pending_dlall.pop(dlid, None)
-        if not pending:
-            await _edit_or_send(query, context, "Already handled or expired.")
-            return
-        playlist_name = pending["playlist_name"]
-        tracks  = missing_by_playlist.get(token, {}).get(playlist_name, [])
-        if not tracks:
-            await _edit_or_send(query, context, "No tracks found. Run /scan again.")
-            return
-        user    = _user_for_token(token)
-        chat_id = user["chat_id"] if user else str(query.message.chat_id)
-        nd_user, nd_pass = _user_nd(token)
-        auto    = (action == "DLA")
-        await _edit_or_send(query, context,
-            f"Starting {'auto' if auto else 'manual'} download for "
-            f"{len(tracks)} tracks from {playlist_name}...\n"
-            f"Querying MusicBrainz and searching slskd — progress will follow.")
-        asyncio.create_task(_dlall_worker(
-            context.bot, chat_id, token, playlist_name, tracks,
-            nd_user, nd_pass, auto=auto))
-        return
-
-    if action == "DLC":
-        _pending_dlall.pop(parts[1], None)
-        await _edit_or_send(query, context, "Cancelled.")
-        return
-
-    # /checkalbums: download missing tracks for one flagged album
-    if action == "CD":
-        cid     = parts[1]
-        token   = _token_for(cid)
-        pending = _pending_checkdl.pop(cid, None)
-        if not pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        chat_id = pending["chat_id"]
-        tracks  = pending["tracks"]
-        nd_user, nd_pass = _user_nd(token)
-        await query.edit_message_text(
-            f"Downloading {len(tracks)} missing track(s) from "
-            f"{pending['artist']} - {pending['album']} (auto)...")
-        asyncio.create_task(_dlall_worker(
-            context.bot, chat_id, token,
-            f"{pending['artist']} - {pending['album']}", tracks,
-            nd_user, nd_pass, auto=True))
-        return
-
-    # /album: user picked which album they meant (ambiguous resolution)
-    if action == "ALG":
-        rid, idx = parts[1], int(parts[2])
-        token    = _token_for(rid)
-        pending  = _pending_album.pop(rid, None)
-        if not pending or "candidates" not in pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        cands = pending["candidates"]
-        if idx >= len(cands):
-            await query.edit_message_text("Result expired.")
-            return
-        chat_id = pending["chat_id"]
-        c       = cands[idx]
-        await query.edit_message_text(
-            f"📀 {c['title']} — {c['artist']}. Resolving tracklist…")
-        resolved = await asyncio.to_thread(mbz_resolve_album, c["rgid"])
-        if not resolved.get("release_mbid"):
-            await query.edit_message_text(
-                "Couldn't resolve a release for that album. Try a more specific query.")
-            return
-        await _send_album_card(context.bot, chat_id, token, resolved)
-        return
-
-    # /album: download the confirmed album (auto best source, or choose source)
-    if action in ("ALD", "ALM"):
-        aid     = parts[1]
-        token   = _token_for(aid)
-        pending = _pending_album.pop(aid, None)
-        if not pending or "release_mbid" not in pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        chat_id = pending["chat_id"]
-        manual  = (action == "ALM")
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        asyncio.create_task(_album_download_worker(
-            context.bot, chat_id, token, pending["artist"], pending["title"],
-            pending["release_mbid"], pending.get("total_tracks", 0), manual=manual))
-        return
-
-    if action == "ALC":
-        _pending_album.pop(parts[1], None)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    # /album: retry after every source failed to queue (fresh Soulseek search)
-    if action == "ARETRY":
-        rid     = parts[1]
-        token   = _token_for(rid)
-        pending = _pending_album.pop(rid, None)
-        if not pending:
-            await query.edit_message_text("Already handled or expired.")
-            return
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        if pending.get("query"):
-            # Manual /search origin — re-run the exact query with fresh sources.
-            await _do_search_and_render(
-                context.bot, pending["chat_id"], token, pending["query"])
-        else:
-            asyncio.create_task(_album_download_worker(
-                context.bot, pending["chat_id"], token,
-                pending.get("artist", ""), pending.get("title", ""),
-                pending.get("release_mbid", ""), pending.get("total_tracks", 0),
-                manual=False))
-        return
-
-    # ----- Step 3: post-import Adjust / review actions -----
-    if action == "ADJ":
-        recid = parts[1]
-        rec   = _albums.get(recid)
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        try:
-            await query.edit_message_reply_markup(reply_markup=_adjust_menu_markup(recid))
-        except Exception:
-            await context.bot.send_message(
-                chat_id=rec["chat_id"], text=f"Adjust: {rec['label']}",
-                reply_markup=_adjust_menu_markup(recid))
-        return
-
-    if action in ("RIMP", "IMPAS"):
-        recid = parts[1]
-        rec   = _albums.get(recid)
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        autotag = (action == "RIMP")
-        await query.edit_message_text(
-            f"{'Re-importing (pinned)' if autotag else 'Importing as-is'}: {rec['label']}…")
-        asyncio.create_task(_reimport_worker(
-            context.bot, recid, autotag=autotag, mbid=rec.get("release_mbid", "")))
-        return
-
-    if action == "PREL":
-        recid = parts[1]
-        rec   = _albums.get(recid)
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        await query.edit_message_text(f"Searching MusicBrainz for releases of {rec['label']}…")
-        cands = await asyncio.to_thread(
-            mbz_search_release_groups, f"{rec['artist']} {rec['album']}", 15)
-        if not cands:
-            await context.bot.send_message(chat_id=rec["chat_id"],
-                text="No MusicBrainz releases found for that album.",
-                reply_markup=_adjust_menu_markup(recid))
-            return
-        pickid = _uid("pick")
-        _uid_to_token[pickid] = rec["token"]
-        _pending_pick[pickid] = {"recid": recid, "kind": "release",
-                                 "candidates": cands, "label": rec["label"]}
-        text, markup = _render_release_picker(pickid, cands, rec["label"], 0)
-        await context.bot.send_message(chat_id=rec["chat_id"], text=text,
-                                       reply_markup=markup)
-        return
-
-    if action == "RPGN":   # release picker: page nav
-        pickid, page = parts[1], int(parts[2])
-        pend = _pending_pick.get(pickid)
-        if not pend or pend.get("kind") != "release":
-            await query.edit_message_text("That picker expired — open Adjust again.")
-            return
-        text, markup = _render_release_picker(
-            pickid, pend["candidates"], pend.get("label", ""), page)
-        try:
-            await query.edit_message_text(text, reply_markup=markup)
-        except Exception:
-            pass
-        return
-
-    if action == "RPKC":   # release picker: cancel -> back to Adjust menu
-        pickid = parts[1]
-        pend   = _pending_pick.pop(pickid, None)
-        recid  = pend.get("recid") if pend else None
-        if recid and recid in _albums:
-            try:
-                await query.edit_message_text(
-                    f"Adjust: {_albums[recid]['label']}",
-                    reply_markup=_adjust_menu_markup(recid))
-            except Exception:
-                pass
-        else:
-            try:
-                await query.edit_message_text("Cancelled.")
-            except Exception:
-                pass
-        return
-
-    if action == "RPK":
-        pickid, idx = parts[1], int(parts[2])
-        pend = _pending_pick.pop(pickid, None)
-        if not pend or pend.get("kind") != "release":
-            await query.edit_message_text("Already handled or expired.")
-            return
-        rec = _albums.get(pend["recid"])
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        cands = pend["candidates"]
-        if idx >= len(cands):
-            await query.edit_message_text("Result expired.")
-            return
-        await query.edit_message_text(
-            f"Resolving {cands[idx]['title']} and re-importing…")
-        resolved = await asyncio.to_thread(mbz_resolve_album, cands[idx]["rgid"])
-        rec["release_mbid"] = resolved.get("release_mbid", "")
-        rec["rgid"]         = cands[idx]["rgid"]
-        asyncio.create_task(_reimport_worker(
-            context.bot, pend["recid"], autotag=True,
-            mbid=rec["release_mbid"]))
-        return
-
-    if action == "ART":
-        recid = parts[1]
-        rec   = _albums.get(recid)
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        rgid = rec.get("rgid") or await asyncio.to_thread(
-            rgid_from_release, rec.get("release_mbid", ""))
-        rec["rgid"] = rgid
-        images = await asyncio.to_thread(caa_list_front_images, rgid, 4)
-        if not images:
-            await context.bot.send_message(chat_id=rec["chat_id"],
-                text="No cover candidates found on the Cover Art Archive for this album.")
-            return
-        pickid = _uid("pick")
-        _uid_to_token[pickid] = rec["token"]
-        _pending_pick[pickid] = {"recid": recid, "kind": "art", "candidates": images}
-        # Send each candidate as a photo with a Use button.
-        for i, img in enumerate(images):
-            try:
-                await context.bot.send_photo(
-                    chat_id=rec["chat_id"], photo=img["thumb"],
-                    caption=f"Cover option {i+1}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                        f"Use cover {i+1}", callback_data=f"ARTSET|{pickid}|{i}")]]))
-            except Exception:
-                pass
-        return
-
-    if action == "ARTSET":
-        pickid, idx = parts[1], int(parts[2])
-        pend = _pending_pick.pop(pickid, None)
-        if not pend or pend.get("kind") != "art":
-            await query.edit_message_text("Already handled or expired.")
-            return
-        rec = _albums.get(pend["recid"])
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        imgs = pend["candidates"]
-        if idx >= len(imgs):
-            return
-        await context.bot.send_message(chat_id=rec["chat_id"],
-            text=f"Embedding the chosen cover into {rec['label']}…")
-        asyncio.create_task(_set_cover_worker(
-            context.bot, pend["recid"], imgs[idx]["full"]))
-        return
-
-    if action == "ADDL":
-        recid = parts[1]
-        rec   = _albums.get(recid)
-        if not rec:
-            await query.edit_message_text("That album record has expired.")
-            return
-        await query.edit_message_text(f"Re-downloading {rec['label']} (choose source)…")
-        asyncio.create_task(_album_download_worker(
-            context.bot, rec["chat_id"], rec["token"], rec["artist"], rec["album"],
-            rec.get("release_mbid", ""), 0, manual=True))
-        return
-
-    # Unrecognized prefix (stale button from an older version, corrupted data…)
-    # — tell the user instead of silently doing nothing.
-    print(f"  unhandled callback action: {query.data!r}")
-    try:
-        await query.edit_message_text(
-            "This button has expired or is no longer supported — "
-            "run the command again.")
-    except Exception:
-        pass
-
-async def _send_album_prompt(bot, chat_id, token, label, group, folders):
-    """
-    Send a Telegram message showing top album folder results with
-    Download / Skip buttons — one button row per folder result.
-    """
-    aid = _uid("a")
-    _uid_to_token[aid] = token
-    top = folders[:10]
-
-    # Store all folders so the handler can enqueue the chosen one
-    pending_approvals.setdefault(token, {})[aid] = {
-        "type":    "album_pick",
-        "label":   label,
-        "group":   group,
-        "folders": folders,
-    }
-
-    lines = [f"Album results for: {label}\nPick a source or skip:"]
-    buttons = []
-    for i, fd in enumerate(top):
-        folder_name = fd["folder"].replace("\\", "/").split("/")[-1][:60]
-        file_count  = len(fd["files"])
-        speed_mb    = round(fd["upload_speed"] / 1024 / 1024, 1)
-        queue       = fd.get("queue_length", 0)
-        free        = "⚡" if fd.get("has_free_upload_slot") else " "
-        comp        = "(compilation) " if COMPILATION_RE.search(fd["folder"]) else ""
-        live        = "(live) " if LIVE_RE.search(fd["folder"]) else ""
-        unverified  = ("(artist unverified) "
-                       if fd.get("artist_verified", True) is False
-                       else "(may be another album) "
-                       if not _unattended_folder_ok(fd, (group or {}).get("artist", ""),
-                                                    (group or {}).get("album", ""),
-                                                    album_list=True) else "")
-        quality = _folder_quality(fd["files"])
-        lines.append(
-            f"{i+1}. {free}{unverified}{comp}{live}{folder_name}\n"
-            f"   {quality} | {file_count} files | {speed_mb} MB/s"
-            f"{f' | queue: {queue}' if queue else ''} | @{fd['username']}"
-        )
-        buttons.append([
-            InlineKeyboardButton(f"Download #{i+1}", callback_data=f"AP|{aid}|{i}"),
-        ])
-    buttons.append([InlineKeyboardButton("Skip album", callback_data=f"AS|{aid}")])
-
-    text = "\n".join(lines)
-    await _tg_send(bot, chat_id, text, reply_markup=InlineKeyboardMarkup(buttons))
-
-async def _auto_enqueue_album(bot, chat_id, token, label, folders,
-                              release_mbid="", missing_tracks=None):
-    """
-    Pick the best folder for an album, expand it to the full tracklist, and
-    enqueue everything — no user interaction. Returns (ok, total).
-    Sends progress messages and seeds the album's editable progress line.
-    """
-    # Already sorted best-first, the folders an unattended path may take
-    # before the others: the first of those, as the caller checked there is.
-    artist, _, album = label.partition(" - ")
-    fd       = _auto_download_choice(folders, artist, album, album_list=True) or folders[0]
-    username = fd["username"]
-    quality  = _folder_quality(fd["files"])
-    speed_mb = round((fd.get("upload_speed", 0) or 0) / 1024 / 1024, 1)
-    await _tg_send(bot, chat_id,
-        f"📂 Best source for {label}: @{username} "
-        f"({quality}, {speed_mb} MB/s). Expanding folder…")
-
-    ref_file = fd["files"][0] if fd["files"] else {}
-    full     = await asyncio.to_thread(slskd_expand_directory, username, fd, ref_file)
-    if not full:
-        full = fd["files"]
-    folder_name = fd["folder"].replace(chr(92), "/").split("/")[-1]
-    ok, total, ag_id = await asyncio.to_thread(
-        slskd_enqueue_folder,
-        username, full, token=token, chat_id=chat_id,
-        label=folder_name, release_mbid=release_mbid,
-        alt_sources=_unattended_alternates(folders, fd, artist=artist, album=album,
-                                           album_list=True),
-        artist=artist, album=album,
-        missing_tracks=missing_tracks or [])
-    if ok and ag_id:
-        msg = await _tg_send(bot, chat_id,
-            f"⬇️ Downloading {label}: 0/{total} files {_progress_bar(0, total)}")
-        if msg and ag_id in pending_album_groups:
-            pending_album_groups[ag_id]["progress_msg_id"] = msg.message_id
-    return ok, total
-
-async def _send_album_card(bot, chat_id, token, resolved: dict):
-    """Send the album confirmation card (cover + details + action buttons)."""
-    aid = _uid("ald")
-    _uid_to_token[aid]  = token
-    _pending_album[aid] = {"token": token, "chat_id": chat_id, **resolved}
-
-    yr = f" · {resolved['year']}" if resolved.get("year") else ""
-    tt = (f"{resolved['total_tracks']} tracks" if resolved.get("total_tracks")
-          else "tracklist unknown")
-    caption = (f"🎵 {resolved['title']}\n{resolved['artist']}{yr} · {tt}\n\n"
-               f"Download this album?")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Download (best source)", callback_data=f"ALD|{aid}")],
-        [InlineKeyboardButton("👆 Choose source",          callback_data=f"ALM|{aid}")],
-        [InlineKeyboardButton("Cancel",                    callback_data=f"ALC|{aid}")],
-    ])
-    cover = caa_front_url(resolved.get("rgid", ""))
-    try:
-        await bot.send_photo(chat_id=chat_id, photo=cover,
-                             caption=caption, reply_markup=kb)
-    except Exception:
-        # No cover art available / fetch failed — fall back to a text card
-        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=kb)
-
-async def _reimport_worker(bot, recid: str, autotag: bool, mbid: str = ""):
-    """Re-place a recorded album dir into the library using deterministic placement."""
+    Returns `{"ok", "status", "error", "moved", "dest"}`; the record's
+    `status` and `import_state` say the same afterwards."""
     rec = _albums.get(recid)
     if not rec:
-        return
+        return {"ok": False, "status": "", "error": "Import record not found"}
     album_dir = rec.get("album_dir", "")
     if not album_dir:
-        await _tg_send(bot, rec["chat_id"], "No download folder recorded for that album.")
-        return
+        return {"ok": False, "status": rec.get("status", ""),
+                "error": "No download folder recorded for that album."}
+
+    def refused(error: str) -> dict:
+        rec["status"] = "failed"
+        rec["import_state"] = "downloaded_not_imported"
+        _stamp_import_outcome(rec, {"ok": False, "error": error})
+        _save_state()
+        return {"ok": False, "status": "failed", "error": error}
+
     # "Place as-is" used to mean "no release pinned", which placed untagged
     # files under Unknown Artist/Unknown Album. Identify the folder instead so
     # as-is means "don't make me pick", not "don't tag".
-    release_mbid = mbid if autotag else ""
-    artist, album = rec.get("artist", ""), rec.get("album", "")
+    #
+    # **As what the folder is — all of it** (ruling C5). This took the
+    # release from the folder's identity and the artist and album from the
+    # fill's record: on a refused fill ("Placement failed: … none of the 6
+    # file(s) is a track of After – After EP 2"), one tap filed OVERWERK's six
+    # into After/After EP 2/, album artist "After", under OVERWERK's release
+    # id. The record says what was asked for, which is exactly what this
+    # folder was found not to be.
+    ident = _identity_for_path(album_dir)
+    release_mbid = ident.get("release_mbid", "")
     if not release_mbid:
-        # **As what the folder is — all of it** (ruling C5). This took the
-        # release from the folder's identity and the artist and album from
-        # the fill's record: on the message a refused fill leaves ("Placement
-        # failed: … none of the 6 file(s) is a track of After – After EP 2"),
-        # one tap filed OVERWERK's six into After/After EP 2/, album artist
-        # "After", under OVERWERK's release id. The record says what was
-        # asked for, which is exactly what this folder was found not to be.
-        ident = await asyncio.to_thread(_identity_for_path, album_dir)
-        release_mbid = ident.get("release_mbid", "")
-        if not release_mbid:
-            rec["status"] = "failed"
-            rec["import_state"] = "downloaded_not_imported"
-            await _tg_send(
-                bot, rec["chat_id"],
-                f"{rec['label']}\n⚠️ Not placed: lb-bot could not tell which release "
-                f"this folder is, so there is nothing to file it as — pick the "
-                f"release for it in Placement.",
-                reply_markup=_album_action_markup(recid, rec["status"]))
-            await asyncio.to_thread(_save_state)
-            return
-        artist, album = ident.get("artist", ""), ident.get("album", "")
-        if not artist:
-            # **Whose release, or nothing** (ruling D7b). With no artist the
-            # import asks MusicBrainz for the credit, fail-soft, and with
-            # MusicBrainz silent filed the folder under `Unknown Artist/`.
-            rec["status"] = "failed"
-            rec["import_state"] = "downloaded_not_imported"
-            await _tg_send(
-                bot, rec["chat_id"],
-                f"{rec['label']}\n⚠️ Not placed: lb-bot could not tell whose release "
-                f"this folder is, so there is nowhere to file it — pick the release "
-                f"for it in Placement.",
-                reply_markup=_album_action_markup(recid, rec["status"]))
-            await asyncio.to_thread(_save_state)
-            return
-    result = await asyncio.to_thread(
-        _deterministic_album_import, album_dir, release_mbid, artist, album)
+        return refused("Not placed: lb-bot could not tell which release this folder "
+                       "is, so there is nothing to file it as — pick the release for "
+                       "it in Placement.")
+    artist, album = ident.get("artist", ""), ident.get("album", "")
+    if not artist:
+        # **Whose release, or nothing** (ruling D7b). With no artist the
+        # import asks MusicBrainz for the credit, fail-soft, and with
+        # MusicBrainz silent filed the folder under `Unknown Artist/`.
+        return refused("Not placed: lb-bot could not tell whose release this folder "
+                       "is, so there is nowhere to file it — pick the release for it "
+                       "in Placement.")
+    result = _deterministic_album_import(album_dir, release_mbid, artist, album)
     rec["import_state"] = "imported" if result["ok"] else "downloaded_not_imported"
-    if result["ok"]:
-        rec["status"] = "imported"
-        if not autotag:
-            # The record names what the folder was filed as, not what the
-            # fill had asked for (ruling D7b): everything else on this
-            # message — Adjust, a cover — acts on the record.
-            rec["release_mbid"] = release_mbid
-            rec["artist"] = result.get("artist") or artist
-            rec["album"] = result.get("album") or album
-        await asyncio.to_thread(_note_folder_imported, album_dir)
-        dest = os.path.basename(result["dest_folder"])
-        msg = f"📚 Placed {result['moved']} file(s) into {dest}."
-        if await asyncio.to_thread(_nd_scan_after_import, rec["token"]):
-            msg += "\n🔄 Navidrome quick scan triggered."
-    else:
+    _stamp_import_outcome(rec, result)
+    if not result["ok"]:
         rec["status"] = "failed"
-        msg = f"⚠️ Placement failed: {result['error']}"
-    await _tg_send(bot, rec["chat_id"], f"{rec['label']}\n{msg}",
-                   reply_markup=_album_action_markup(recid, rec["status"]))
-    await asyncio.to_thread(_save_state)
-
-async def _set_cover_worker(bot, recid: str, image_url: str):
-    """Download the chosen cover into the album dir and embed it via beets."""
-    rec = _albums.get(recid)
-    if not rec:
-        return
-    album_dir = rec.get("album_dir", "")
-    try:
-        r = await asyncio.to_thread(lambda: _http.get(image_url, timeout=20))
-        if not r.ok:
-            await _tg_send(bot, rec["chat_id"], "Couldn't download that cover image.")
-            return
-        cover_path = os.path.join(album_dir, "cover.jpg")
-        await asyncio.to_thread(lambda: open(cover_path, "wb").write(r.content))
-    except Exception as e:
-        await _tg_send(bot, rec["chat_id"], f"Couldn't save the cover: {e}")
-        return
-    await _tg_send(bot, rec["chat_id"],
-        f"🖼 Saved cover.jpg for {rec['label']}. Navidrome will pick it up on next scan.")
-    await asyncio.to_thread(_save_state)
-
-async def _album_download_worker(bot, chat_id, token, artist, album,
-                                 release_mbid, total_tracks, manual=False):
-    """
-    Search Soulseek for one album and either auto-enqueue the best source or
-    send the source picker. Reuses the step-1 album pipeline, so completion
-    triggers a single MBID-pinned, --flat beets import.
-    """
-    label = f"{artist} - {album}"
-    try:
-        await _tg_send(bot, chat_id, f"🔍 Searching Soulseek for {label}…")
-        folders = await asyncio.to_thread(
-            _search_album_with_context, artist, album, total_tracks,
-            release_mbid)
-        if not folders:
-            await _tg_send(bot, chat_id,
-                f"❌ Couldn't find {label} on Soulseek. "
-                f"Try /search for individual files.")
-            return
-        if not manual and _auto_download_choice(folders, artist, album,
-                                                album_list=True) is None:
-            # Manual-pick-only policy in the medium's native shape: rather
-            # than a dead-end refusal, the same picker the Choose-source
-            # button sends — with the caution said out loud.
-            reason, _token = _no_unattended_source_reason(folders, artist, album)
-            await _tg_send(bot, chat_id,
-                f"⚠️ Found {len(folders)} source(s) for {label}. {reason}:")
-            manual = True
-        if manual:
-            await _tg_send(bot, chat_id, f"📂 Found {len(folders)} source(s) for {label}.")
-            group = {"release_mbid": release_mbid, "artist": artist,
-                     "album": album, "total_tracks": total_tracks,
-                     "missing_tracks": []}
-            await _send_album_prompt(bot, chat_id, token, label, group, folders)
-        else:
-            ok, total = await _auto_enqueue_album(
-                bot, chat_id, token, label, folders, release_mbid=release_mbid)
-            if not ok:
-                await _tg_send(bot, chat_id,
-                    f"⚠️ Couldn't queue {label}. Tap \u201cChoose source\u201d next time, "
-                    f"or use /search.")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        await _tg_send(bot, chat_id, f"Album download error: {e}")
-
-async def _dlall_worker(bot, chat_id, token, playlist_name, tracks,
-                        nd_user, nd_pass, auto: bool = False):
-    """
-    Background task: album grouping + searches without blocking the event loop.
-
-    auto=True  → pick the best source per album automatically (no per-album taps);
-                 only low-confidence individual tracks still prompt.
-    auto=False → send a per-album source picker as before.
-    """
-    try:
-        # Live progress while MusicBrainz grouping runs (one editable message).
-        status_msg = await _tg_send(bot, chat_id,
-            f"Grouping {len(tracks)} tracks by album… {_progress_bar(0, len(tracks))}")
-        loop      = asyncio.get_running_loop()
-        last_edit = [0.0]
-
-        async def _edit_progress(done, total):
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id, message_id=status_msg.message_id,
-                    text=f"Grouping {total} tracks by album… "
-                         f"{_progress_bar(done, total)} {done}/{total}")
-            except Exception:
-                pass  # message unchanged / too-frequent edit — ignore
-
-        def _on_progress(done, total):
-            # Called from the worker thread. Throttle to ~1 edit / 3s.
-            now = time.time()
-            if status_msg is None:
-                return
-            if now - last_edit[0] < 3 and done < total:
-                return
-            last_edit[0] = now
-            asyncio.run_coroutine_threadsafe(_edit_progress(done, total), loop)
-
-        album_groups, solo_tracks = await asyncio.to_thread(
-            group_missing_by_album, tracks, nd_user, nd_pass, _on_progress)
-
-        await _tg_send(bot, chat_id,
-            f"Found {len(album_groups)} album group(s), "
-            f"{len(solo_tracks)} individual track(s). "
-            f"{'Auto-downloading' if auto else 'Searching'} — updates will follow.")
-
-        queued       = []
-        auto_albums  = 0
-        n_albums     = len(album_groups)
-        # Album-first downloads
-        for idx, group in enumerate(album_groups, 1):
-            await asyncio.sleep(1)  # let slskd release its one-at-a-time lock
-            artist  = group["artist"]
-            album   = group["album"]
-            label   = f"{artist} - {album}"
-            await _tg_send(bot, chat_id,
-                f"🔍 [{idx}/{n_albums}] Searching Soulseek for {label}…")
-            folders = await asyncio.to_thread(
-                _search_album_with_context, artist, album,
-                group["total_tracks"], group.get("release_mbid", ""), None,
-                None, [t.get("title", "") for t in
-                       group.get("missing_tracks") or [] if t.get("title")])
-            if not folders:
-                await _tg_send(bot, chat_id,
-                    f"❌ Album not found on Soulseek: {label}. "
-                    f"Falling back to individual tracks.")
-                solo_tracks.extend(group["missing_tracks"])
-                continue
-            if auto and _auto_download_choice(folders, artist, album,
-                                              album_list=True) is None:
-                reason, _token = _no_unattended_source_reason(folders, artist, album)
-                await _tg_send(bot, chat_id, f"⚠️ {label}: {reason}:")
-                await _send_album_prompt(bot, chat_id, token, label, group,
-                                         folders)
-                continue
-            if auto:
-                ok, total = await _auto_enqueue_album(
-                    bot, chat_id, token, label, folders,
-                    release_mbid=group.get("release_mbid", ""),
-                    missing_tracks=group.get("missing_tracks", []))
-                if ok:
-                    auto_albums += 1
-                    queued.append(f"{label} (album: {ok}/{total} files)")
-                else:
-                    await _tg_send(bot, chat_id,
-                        f"⚠️ Could not queue album: {label}. "
-                        f"Falling back to individual tracks.")
-                    solo_tracks.extend(group["missing_tracks"])
-            else:
-                await _tg_send(bot, chat_id,
-                    f"📂 Found {len(folders)} source(s) for {label}.")
-                await _send_album_prompt(bot, chat_id, token, label, group, folders)
-
-        # Individual track downloads
-        for track in solo_tracks:
-            await asyncio.sleep(1)
-            label      = f"{track['artist']} - {track['title']}"
-            nd_u, nd_p = _user_nd(token)
-            dup        = await asyncio.to_thread(nd_find_duplicate, track, nd_u, nd_p)
-            result     = await asyncio.to_thread(slskd_search_and_pick, track)
-            status     = result["status"]
-
-            if status == "ok":
-                # In auto mode, skip the duplicate prompt only when it's the
-                # SAME recording; a genuinely different version still asks.
-                if dup:
-                    await _send_dup_prompt(bot, chat_id, token, label, track,
-                                           dup, result.get("folders", []))
-                elif await asyncio.to_thread(
-                        slskd_enqueue, result["username"], result["file"],
-                        track=track, token=token, chat_id=chat_id,
-                        candidates=result.get("folders", [])[1:]):
-                    queued.append(f"{label} [{_format_info(result['file'])}]")
-                else:
-                    await _send_retry(bot, chat_id, token, label, track,
-                                      "Enqueue failed after successful search")
-            elif status in ("live_only", "low_quality"):
-                reason = ("Only live recording found" if status == "live_only"
-                          else "Only low-quality format (no FLAC/Opus)")
-                await _send_approval(bot, chat_id, token, label, reason,
-                                     result["file"], result["username"], track,
-                                     candidates=result.get("folders", [])[1:])
-            elif status == "not_found":
-                await _send_retry(bot, chat_id, token, label, track,
-                                  "No FLAC/Opus found on Soulseek — check log")
-            else:
-                await _send_retry(bot, chat_id, token, label, track, "Search error")
-
-        if auto:
-            summary = (f"Done. {auto_albums} album(s) auto-queued, "
-                       f"{len(queued) - auto_albums} individual track(s) queued. "
-                       f"Use /status to watch progress.")
-        else:
-            summary = (f"Done searching. {len(queued)} track(s) auto-queued. "
-                       f"Album prompts sent above.")
-        lines = [summary] + [f"- {q}" for q in queued]
-        text  = "\n".join(lines)
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            await _tg_send(bot, chat_id, chunk)
-        await asyncio.to_thread(_save_state)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"  _dlall_worker exception: {e}")
-        await _tg_send(bot, chat_id,
-            f"Download worker error: {e}\nCheck the log for details.")
+        _save_state()
+        return {"ok": False, "status": "failed",
+                "error": f"Placement failed: {result['error']}"}
+    rec["status"] = "imported"
+    # The record names what the folder was filed as, not what the fill had
+    # asked for (ruling D7b): everything else on the album page acts on it.
+    rec["release_mbid"] = release_mbid
+    rec["artist"] = result.get("artist") or artist
+    rec["album"] = result.get("album") or album
+    _note_folder_imported(album_dir)
+    _nd_scan_after_import(rec.get("token", ""))
+    _save_state()
+    return {"ok": True, "status": "imported", "error": "",
+            "moved": int(result.get("moved") or 0),
+            "dest": os.path.basename(result.get("dest_folder") or "")}
 
 # ---------------------------------------------------------------------------
-# Commands
+# Download folders
 # ---------------------------------------------------------------------------
-
-async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download a whole album by name: resolve on MusicBrainz, then confirm."""
-    token   = _resolve_token(context)
-    chat_id = str(update.effective_chat.id)
-    query   = " ".join(context.args).strip()
-    if not query:
-        await update.message.reply_text(
-            "Usage: /album Artist - Album   (or just the album name)")
-        return
-    if await _telegram_downloads_off(update):
-        return
-
-    await update.message.reply_text(f"🔎 Looking up \u201c{query}\u201d on MusicBrainz…")
-    mb_query   = query.replace(" - ", " ")
-    candidates = await asyncio.to_thread(mbz_search_release_groups, mb_query, 5)
-    # Prefer proper albums, then by MB relevance score
-    candidates.sort(key=lambda c: (0 if c["primary_type"] == "album" else 1, -c["score"]))
-    if not candidates:
-        await update.message.reply_text(
-            "Couldn't find that album on MusicBrainz. "
-            "Try '/album Artist - Album' with the exact name.")
-        return
-
-    top       = candidates[0]
-    confident = (top["score"] >= 88 and
-                 (len(candidates) == 1 or top["score"] - candidates[1]["score"] >= 12))
-
-    if confident:
-        await update.message.reply_text(
-            f"📀 Found: {top['title']} — {top['artist']}. Resolving tracklist…")
-        resolved = await asyncio.to_thread(mbz_resolve_album, top["rgid"])
-        if not resolved.get("release_mbid"):
-            await update.message.reply_text(
-                "Found the album but couldn't resolve a release. "
-                "Try a more specific query.")
-            return
-        if ALBUM_AUTO_DOWNLOAD:
-            asyncio.create_task(_album_download_worker(
-                context.bot, chat_id, token, resolved["artist"], resolved["title"],
-                resolved["release_mbid"], resolved["total_tracks"], manual=False))
-        else:
-            await _send_album_card(context.bot, chat_id, token, resolved)
-        await asyncio.to_thread(_save_state)
-        return
-
-    # Ambiguous → small picker (the one place a tap earns its keep)
-    rid = _uid("alg")
-    _uid_to_token[rid]  = token
-    _pending_album[rid] = {"token": token, "chat_id": chat_id,
-                           "query": query, "candidates": candidates[:4]}
-    lines   = [f"Which album did you mean? (\u201c{query}\u201d)"]
-    buttons = []
-    for i, c in enumerate(candidates[:4]):
-        yr  = f" ({c['year']})" if c["year"] else ""
-        typ = f" · {c['primary_type']}" if c["primary_type"] else ""
-        lines.append(f"{i+1}. {c['title']} — {c['artist']}{yr}{typ}")
-        buttons.append([InlineKeyboardButton(
-            f"{i+1}. {c['title'][:32]}", callback_data=f"ALG|{rid}|{i}")])
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=f"ALC|{rid}")])
-    await update.message.reply_text(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-    await asyncio.to_thread(_save_state)
-
-def _search_entry(token, sid):
-    """Return (folders, query) for a stored manual search; handles legacy list form."""
-    e = manual_search_results.get(token, {}).get(sid)
-    if e is None:
-        return None, ""
-    if isinstance(e, dict):
-        return e.get("folders", []), e.get("query", "")
-    return e, ""   # legacy: bare list
-
-def _render_search_results(sid, folders, query, page, per=10):
-    """Build (text, InlineKeyboardMarkup) for one page of search results."""
-    import math
-    pages = max(1, math.ceil(len(folders) / per))
-    page  = max(0, min(page, pages - 1))
-    start = page * per
-    chunk = folders[start:start + per]
-    lines = [f"Results for: {query}  (page {page+1}/{pages}, {len(folders)} total)\n"]
-    buttons = []
-    for i, fd in enumerate(chunk):
-        gidx        = start + i
-        quality     = _folder_quality(fd["files"])
-        speed_mb    = round((fd.get("upload_speed", 0) or 0) / 1024 / 1024, 1)
-        file_count  = len(fd["files"])
-        queue       = fd.get("queue_length", 0)
-        free_slot   = "⚡" if fd.get("has_free_upload_slot") else " "
-        folder_name = fd["folder"].replace("\\", "/").split("/")[-1][:60]
-        comp_flag   = "(compilation) " if COMPILATION_RE.search(fd["folder"]) else ""
-        live_flag   = "(live) " if LIVE_RE.search(fd["folder"]) else ""
-        lines.append(
-            f"{gidx+1}. {free_slot}{comp_flag}{live_flag}{folder_name}\n"
-            f"   {quality} | {file_count} files | {speed_mb} MB/s"
-            f"{f' | queue: {queue}' if queue else ''} | @{fd['username']}")
-        buttons.append([
-            InlineKeyboardButton(f"Best file #{gidx+1}",  callback_data=f"DF|{sid}|{gidx}"),
-            InlineKeyboardButton(f"Full album #{gidx+1}", callback_data=f"DA|{sid}|{gidx}"),
-        ])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"SPG|{sid}|{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"SPG|{sid}|{page+1}"))
-    if nav:
-        buttons.append(nav)
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
-
-async def _do_search_and_render(bot, chat_id, token, args):
-    """Run a Soulseek search and send page 1 of results with pagination."""
-    folders = await asyncio.to_thread(slskd_run_search, args, 0)
-    if not folders:
-        await _tg_send(bot, chat_id, f"No FLAC/Opus results found for: {args}")
-        return
-    sid = _uid("s")
-    _uid_to_token[sid] = token
-    manual_search_results.setdefault(token, {})[sid] = {"folders": folders, "query": args}
-    text, markup = _render_search_results(sid, folders, args, 0)
-    await _tg_send(bot, chat_id, text, reply_markup=markup)
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token   = _resolve_token(context)
-    chat_id = str(update.effective_chat.id)
-    args    = " ".join(context.args).strip()
-    if not args:
-        await update.message.reply_text("Usage: /search Artist - Title")
-        return
-    if await _telegram_downloads_off(update):
-        return
-    await update.message.reply_text(
-        f"Searching slskd for: {args}\n(may take up to {SEARCH_TIMEOUT}s...)")
-    await _do_search_and_render(context.bot, chat_id, token, args)
 
 def _list_download_folders() -> list:
     """
@@ -27806,7 +26412,6 @@ def _record_import_recovery(token: str, chat_id, label: str, album_dir: str,
                             import_result: dict = None) -> str:
     import_result = import_result or {}
     recid = _uid("rec")
-    _uid_to_token[recid] = token
     _albums[recid] = {
         "token": token,
         "chat_id": chat_id,
@@ -27822,6 +26427,7 @@ def _record_import_recovery(token: str, chat_id, label: str, album_dir: str,
         "recommended_action": import_result.get("recommended_action", ""),
         "still_in_downloads": bool(import_result.get("still_in_downloads")),
         "ts": time.time(),
+        "updated_at": time.time(),
         "review_group_id": review_group_id,
         "match_mode": match_mode,
     }
@@ -27864,210 +26470,6 @@ def _import_result_message(result: dict) -> str:
         return "Imported to your library" + (f":\n{dest[0]}" if dest and dest[0] else ".")
     return f"beets import failed: {result.get('raw_tail', '')[:500]}"
 
-async def beets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /beets
-    Lists all folders in the downloads directory containing audio files.
-    Presents each as a button to import with beets, plus an "Import all" option.
-    """
-    chat_id = str(update.effective_chat.id)
-    token   = _resolve_token(context)
-
-    await update.message.reply_text("Scanning downloads folder...")
-
-    folders = await asyncio.to_thread(_list_download_folders)
-
-    if not folders:
-        if not os.path.isdir(SLSKD_DOWNLOAD_DIR):
-            await update.message.reply_text(
-                f"⚠️ The downloads folder isn't visible to the bot:\n"
-                f"{SLSKD_DOWNLOAD_DIR}\n\n"
-                f"This path doesn't exist inside the bot container, so beets "
-                f"can't see anything and completed downloads can't be imported. "
-                f"Mount slskd's downloads directory into this container at that "
-                f"path (the bot and slskd must share the same volume). Run /diag "
-                f"to check.")
-        else:
-            await update.message.reply_text(
-                f"No audio folders found in:\n{SLSKD_DOWNLOAD_DIR}")
-        return
-
-    # Store for callback handler
-    bid = _uid("b")
-    _uid_to_token[bid] = token
-    _pending_beets[bid] = {"chat_id": chat_id, "folders": folders}
-
-    # Telegram allows at most 100 buttons per message — cap the per-folder
-    # buttons and let "Import ALL" cover the rest.
-    MAX_FOLDER_BTNS = 96
-    shown = folders[:MAX_FOLDER_BTNS]
-
-    lines   = [f"Found {len(folders)} folder(s) in downloads. Pick one to import:"]
-    buttons = []
-    for i, fd in enumerate(shown):
-        done = "  ✓ imported" if fd["path"] in _imported_folders else ""
-        lines.append(f"{i+1}. {fd['name']}  ({fd['file_count']} {fd['formats']} files){done}")
-        label = ("Re-import" if fd["path"] in _imported_folders else "Import")
-        buttons.append([InlineKeyboardButton(
-            f"{label} #{i+1}: {fd['name'][:28]}",
-            callback_data=f"BI|{bid}|{i}")])
-    if len(folders) > MAX_FOLDER_BTNS:
-        lines.append(f"…and {len(folders) - MAX_FOLDER_BTNS} more (buttons capped — "
-                     f"use Import ALL, or re-run /beets after importing some)")
-
-    buttons.append([InlineKeyboardButton(
-        f"Import ALL ({len(folders)} folders)", callback_data=f"BA|{bid}")])
-    buttons.append([InlineKeyboardButton(
-        "Cancel", callback_data=f"BC|{bid}")])
-
-    text = "\n".join(lines)
-    for chunk_i, chunk in enumerate(
-            [text[i:i+3800] for i in range(0, len(text), 3800)]):
-        is_last = (chunk_i == (len(text) - 1) // 3800)
-        await update.message.reply_text(
-            chunk,
-            reply_markup=InlineKeyboardMarkup(buttons) if is_last else None)
-
-def _register_review_album(token, chat_id, folder_path, folder_name, status):
-    """Register a manually-imported folder so it gets Adjust/Import-as-is buttons."""
-    # Best-effort split "Artist - Album" if the folder name has it; else album only.
-    artist, _, album = folder_name.partition(" - ")
-    if not album:
-        artist, album = "", folder_name
-    recid = _uid("rec")
-    _uid_to_token[recid] = token
-    _albums[recid] = {
-        "token": token, "chat_id": chat_id, "label": folder_name,
-        "artist": artist.strip(), "album": album.strip(),
-        "release_mbid": "", "rgid": "", "album_dir": folder_path,
-        "status": status, "ts": time.time(),
-    }
-    if len(_albums) > 500:
-        _albums.pop(next(iter(_albums)), None)
-    return recid
-
-async def _beets_worker(bot, chat_id: str, target: str, label: str = "", token: str = ""):
-    """Place a downloaded album folder into the music library (deterministic)."""
-    try:
-        display = label or target
-        await _tg_send(bot, chat_id,
-            f"📚 Placing {display} into your library…")
-        artist, _, album_name = (label or os.path.basename(target)).partition(" - ")
-        if not album_name:
-            artist, album_name = "", artist
-        # Placement needs a MusicBrainz release to tag against, and this flow
-        # has no bot-side context to draw one from -- identify the folder from
-        # its tags/name first.
-        ident = await asyncio.to_thread(_identity_for_path, target)
-        result = await asyncio.to_thread(
-            _deterministic_album_import, target, ident.get("release_mbid", ""),
-            ident.get("artist", "") or artist.strip(),
-            ident.get("album", "") or album_name.strip())
-        if result["ok"]:
-            await asyncio.to_thread(_note_folder_imported, target)
-            dest = os.path.basename(result["dest_folder"])
-            msg = f"✅ Placed {result['moved']} file(s) into {dest}."
-            if token and await asyncio.to_thread(_nd_scan_after_import, token):
-                msg += "\n🔄 Navidrome quick scan triggered."
-        else:
-            recid = _register_review_album(token, chat_id, target, display, "failed")
-            msg = (f"⚠️ Placement failed for {display}: {result['error']}\n"
-                   "Use the Adjust buttons to retry with a MusicBrainz release pinned.")
-            await _tg_send(bot, chat_id, msg,
-                           reply_markup=_album_action_markup(recid, "failed"))
-            return
-        await _tg_send(bot, chat_id, msg)
-    except Exception as e:
-        await _tg_send(bot, chat_id, f"Import worker error: {e}")
-
-async def spplaylist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /spplaylist <spotify_url_or_id>
-    Fetch a public Spotify playlist, check which tracks are missing from
-    Navidrome, then offer album-first download exactly like the weekly scan.
-    """
-    token = _resolve_token(context)
-    user  = _user_for_token(token)
-    if not user:
-        await update.message.reply_text("Could not identify user.")
-        return
-    if not SPOTIFY_CLIENT_ID:
-        await update.message.reply_text(
-            "Spotify not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET.")
-        return
-
-    args = " ".join(context.args).strip()
-    if not args:
-        await update.message.reply_text("Usage: /spplaylist <spotify_playlist_url>")
-        return
-
-    pl_id = spotify_playlist_id(args)
-    await update.message.reply_text(
-        f"Fetching Spotify playlist {pl_id}...\n"
-        f"Looking up MusicBrainz IDs and checking Navidrome — "
-        f"this may take a few minutes for large playlists.")
-
-    nd_user = user["navidrome_user"]
-    nd_pass = user["navidrome_password"]
-    chat_id = str(update.effective_chat.id)
-
-    try:
-        tracks = await asyncio.to_thread(spotify_get_playlist_tracks, pl_id)
-    except SpotifyError as e:
-        msg = str(e)
-        if "403" in msg or "premium" in msg.lower():
-            await update.message.reply_text(
-                "⚠️ Spotify refused the request (403). This is a Spotify-side "
-                "account issue, not the bot: the Spotify app whose Client ID/Secret "
-                "you configured must be owned by an account with active Premium, and "
-                "the playlist must be public.\n\n"
-                f"Spotify said: {msg}")
-        else:
-            await update.message.reply_text(f"Spotify error — {msg}")
-        return
-    except RuntimeError as e:
-        await update.message.reply_text(f"Spotify error: {e}")
-        return
-    except Exception as e:
-        await update.message.reply_text(f"Failed to fetch playlist: {e}")
-        return
-
-    if not tracks:
-        await update.message.reply_text(
-            "No tracks found. Make sure the playlist is public (added to the owner's profile).")
-        return
-
-    await update.message.reply_text(
-        f"Fetched {len(tracks)} tracks. Checking Navidrome...")
-
-    # Reuse the same scan logic as the weekly flow
-    missing = await asyncio.to_thread(_check_missing, tracks, nd_user, nd_pass)
-
-    if not missing:
-        await update.message.reply_text(
-            f"All {len(tracks)} tracks already in your library!")
-        return
-
-    await update.message.reply_text(
-        f"{len(missing)} missing track(s). Grouping by album...")
-
-    # Register under a synthetic playlist name so dlall can find them
-    pl_name = f"Spotify:{pl_id[:8]}"
-    pl_uid  = _register_playlist(token, pl_name)
-    missing_by_playlist.setdefault(token, {})[pl_name] = missing
-
-    lines = [f"Missing from Spotify playlist ({len(missing)} tracks)"]
-    for t in missing:
-        lines.append(f"- {t['artist']} - {t['title']}")
-    text = "\n".join(lines)
-    kb   = [[InlineKeyboardButton(
-        f"Download all ({len(missing)})", callback_data=f"dlall|{pl_uid}")]]
-    for i, chunk in enumerate([text[j:j+3900] for j in range(0, len(text), 3900)]):
-        is_last = (i == (len(text)-1)//3900)
-        await update.message.reply_text(
-            chunk,
-            reply_markup=InlineKeyboardMarkup(kb) if is_last else None)
-
 def _check_missing(tracks: list, nd_user: str, nd_pass: str) -> list:
     """Run nd_has_track for each track, return those not in Navidrome."""
     retry_misses = not _nd_index_is_warm(nd_user, nd_pass)
@@ -28082,122 +26484,6 @@ def _check_missing(tracks: list, nd_user: str, nd_pass: str) -> list:
         if not nd_has_track(track, nd_user, nd_pass, retry=retry_misses):
             missing.append(track)
     return missing
-
-async def checkalbums_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = _resolve_token(context)
-    user  = _user_for_token(token)
-    if not user:
-        await update.message.reply_text("Could not identify user.")
-        return
-    nd_user, nd_pass = user["navidrome_user"], user["navidrome_password"]
-    chat_id = str(update.effective_chat.id)
-
-    status_msg = await update.message.reply_text(
-        "Checking library for incomplete albums…\n"
-        "Querying MusicBrainz for every album with an MBID — may take several minutes.")
-    loop      = asyncio.get_running_loop()
-    last_edit = [0.0]
-
-    async def _edit(done, total):
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=status_msg.message_id,
-                text=f"Checking albums against MusicBrainz… "
-                     f"{_progress_bar(done, total)} {done}/{total}")
-        except Exception:
-            pass
-
-    def _progress(done, total):
-        now = time.time()
-        if now - last_edit[0] < 3 and done < total:
-            return
-        last_edit[0] = now
-        asyncio.run_coroutine_threadsafe(_edit(done, total), loop)
-
-    incomplete = await asyncio.to_thread(
-        find_incomplete_albums, nd_user, nd_pass, _progress)
-    if not incomplete:
-        await update.message.reply_text("No incomplete albums found!")
-        return
-
-    await update.message.reply_text(
-        f"Found {len(incomplete)} incomplete album(s). "
-        f"Tap to download the missing tracks for any of them:")
-
-    # One message per album so each can carry its own Download button.
-    # Paced + flood-aware: a large library can produce dozens of messages.
-    for a in incomplete:
-        cid = _uid("cd")
-        _uid_to_token[cid] = token
-        _pending_checkdl[cid] = {
-            "token":   token, "chat_id": chat_id,
-            "artist":  a["artist"], "album": a["album"],
-            "tracks":  a["missing_tracks"],
-        }
-        text = (f"{a['artist']} - {a['album']}\n"
-                f"{a['present']}/{a['total']} tracks present — {a['missing']} missing")
-        await _tg_send(
-            context.bot, chat_id, text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"Download {a['missing']} missing",
-                                     callback_data=f"CD|{cid}")]]))
-        await asyncio.sleep(0.35)
-    await asyncio.to_thread(_save_state)
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await help_command(update, context)
-
-async def rescan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trigger a Navidrome library scan: /rescan (quick) or /rescan full."""
-    token = _resolve_token(context)
-    user  = _user_for_token(token)
-    if not user:
-        await update.message.reply_text("Could not identify user.")
-        return
-    full = bool(context.args) and context.args[0].lower() == "full"
-    nd_u, nd_p = user["navidrome_user"], user["navidrome_password"]
-
-    status = await asyncio.to_thread(nd_get_scan_status, nd_u, nd_p)
-    if status.get("scanning"):
-        await update.message.reply_text(
-            f"Navidrome is already scanning "
-            f"({status.get('count', '?')} items so far) — no need to start another.")
-        return
-
-    ok = await asyncio.to_thread(nd_start_scan, nd_u, nd_p, full)
-    if not ok:
-        await update.message.reply_text(
-            "⚠️ Couldn't trigger the Navidrome scan — check /diag.")
-        return
-
-    # Brief poll so the reply can usually say "done" instead of "started".
-    kind = "Full" if full else "Quick"
-    for _ in range(6):
-        await asyncio.sleep(2)
-        status = await asyncio.to_thread(nd_get_scan_status, nd_u, nd_p)
-        if status and not status.get("scanning"):
-            await update.message.reply_text(
-                f"✅ {kind} scan finished — {status.get('count', '?')} items scanned.")
-            return
-    await update.message.reply_text(
-        f"🔄 {kind} scan running ({status.get('count', '?')} items so far) — "
-        f"it'll keep going in the background.")
-
-HELP_TEXT = (
-    "🎵 lb-bot — ListenBrainz → Soulseek\n\n"
-    "/scan — scan your playlists now for missing tracks\n"
-    "/status — show active downloads and album progress\n"
-    "/pending — albums in progress or needing review\n"
-    "/diag — check what the bot can reach\n"
-    "/album Artist - Album — download a whole album by name\n"
-    "/search Artist - Title — manual Soulseek search\n"
-    "/spplaylist <spotify_url> — import a public Spotify playlist\n"
-    "/checkalbums — find incomplete albums in your library\n"
-    "/beets — import downloaded folders with beets\n"
-    "/rescan — trigger a Navidrome quick scan (/rescan full for a full scan)\n"
-    "/help — this message\n\n"
-    "Weekly scans run automatically Tuesday 09:00."
-)
 
 # B-070: Navidrome hands a Subsonic client a path it makes up from the tags
 # unless "Report Real Path" is on for that client's player (measured on the
@@ -28416,20 +26702,6 @@ def _run_diagnostics(user: dict) -> list:
             except Exception as e:
                 checks.append((False, probe.__name__.strip("_"), str(e)[:80]))
     return checks
-
-async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Report what the bot can and can't reach, to localise setup problems."""
-    token = _resolve_token(context)
-    user  = _user_for_token(token)
-    if not user:
-        await update.message.reply_text("Could not identify user.")
-        return
-    await update.message.reply_text("Running diagnostics…")
-    checks = await asyncio.to_thread(_run_diagnostics, user)
-    lines  = ["Diagnostics:"]
-    for ok, label, detail in checks:
-        lines.append(f"{'✅' if ok else '❌'} {label}: {detail}")
-    await update.message.reply_text("\n".join(lines))
 
 # ---------------------------------------------------------------------------
 # Web dashboard
@@ -29266,7 +27538,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int,
                 if slskd_enqueue(
                         fd_try["username"], best, track=track,
                         token=_web_user_key(),
-                        chat_id=str(user.get("chat_id", "")),
+                        chat_id="",
                         candidates=ordered_sources[try_pos + 1:],
                         review_group_id=group.get("id", ""),
                         review_track_index=track.get("_review_track_index"),
@@ -29312,7 +27584,7 @@ def _enqueue_group_source_inner(group: dict, source_index: int,
 
     ok, total, ag_id = slskd_enqueue_folder(
         fd["username"], full, token=_web_user_key(),
-        chat_id=str(user.get("chat_id", "")), label=group.get("album", ""),
+        chat_id="", label=group.get("album", ""),
         release_mbid=group.get("canonical_mbid", ""),
         alt_sources=_unattended_alternates(folders, fd, 6, group.get("artist", ""),
                                            group.get("album", ""),
@@ -29427,7 +27699,7 @@ def _rescue_leftover_tracks(group: dict, leftovers: list, folders: list,
             if slskd_enqueue(
                     alt["username"], best, track=track,
                     token=_web_user_key(),
-                    chat_id=str(user.get("chat_id", "")),
+                    chat_id="",
                     candidates=alts[pos + 1:],
                     review_group_id=group.get("id", ""),
                     review_track_index=idx,
@@ -29522,11 +27794,10 @@ def _pick_file_for_track(group: dict, track_index: int, source_index: int,
     t["_review_track_index"] = idx
     t["_match_mode"] = "manual"
     t["_target_release_mbid"] = group.get("canonical_mbid", "")
-    user = _default_web_user() or {}
     if not slskd_enqueue(
             fd.get("username", ""), chosen, track=t,
             token=_web_user_key(),
-            chat_id=str(user.get("chat_id", "")),
+            chat_id="",
             review_group_id=group.get("id", ""),
             review_track_index=idx,
             match_mode="manual",
@@ -30469,7 +28740,7 @@ def _album_download_search_and_enqueue(task_id: str, release_mbid: str, artist: 
         ok, total, ag_id = slskd_enqueue_folder(
             candidate["username"], full or candidate.get("files", []),
             token=_web_user_key(),
-            chat_id=str(_default_web_user().get("chat_id", "")),
+            chat_id="",
             label=album, release_mbid=release_mbid,
             alt_sources=rest,
             artist=artist, album=album, quality=quality, allow_mp3=bool(allow_mp3),
@@ -31518,6 +29789,9 @@ def _auto_index_tick(state: dict, now: float, user: dict) -> str:
 # verdicts `_title_key` can change (ruling: no INDEX_SCAN_VERSION bump, which
 # would rescan every artist of a large library against MusicBrainz's 1 req/s).
 _TITLE_KEY_STALE_MIGRATION = "b060_title_key_stale"
+# (Its log lines say "migration b060_title_key_stale — …", not ": …": the log
+# tee's redaction takes the word after a name holding "key" and a colon for
+# its value, `_redact_log_line`.)
 # Seconds between tries while Navidrome's album list cannot be read whole.
 TITLE_KEY_STALE_RETRY_SECS = 300
 
@@ -31602,7 +29876,7 @@ def _index_mark_title_key_stale(albums: list) -> int:
                 "INSERT OR IGNORE INTO migrations (name, applied_at, detail) VALUES (?, ?, ?)",
                 (_TITLE_KEY_STALE_MIGRATION, time.time(),
                  json.dumps({"marked": len(keys), "albums": len(albums or [])})))
-    print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: marked {len(keys)} artist(s) "
+    print(f"  migration {_TITLE_KEY_STALE_MIGRATION} — marked {len(keys)} artist(s) "
           f"with titles in other scripts stale, for the auto-indexer to rescan")
     return len(keys)
 
@@ -31626,13 +29900,13 @@ def _title_key_stale_step(state: dict, now: float, user: dict) -> None:
         albums = nd_get_all_albums((user or {}).get("navidrome_user", ""),
                                    (user or {}).get("navidrome_password", ""), stats)
         if not albums or stats.get("partial"):
-            print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: Navidrome's album list "
+            print(f"  migration {_TITLE_KEY_STALE_MIGRATION} — Navidrome's album list "
                   f"was not read whole; will try again")
             return
         _index_mark_title_key_stale(albums)
         state["title_keys_done"] = True
     except Exception as e:  # noqa: BLE001 — a background errand never exits
-        print(f"  migration {_TITLE_KEY_STALE_MIGRATION}: skipped ({e}); will try again")
+        print(f"  migration {_TITLE_KEY_STALE_MIGRATION} — skipped ({e}); will try again")
 
 def _auto_index_worker(clock=time.time, sleeper=time.sleep) -> None:
     """The `auto-index` daemon thread. A no-op when LB_BOT_AUTO_INDEX is off or
@@ -31992,11 +30266,13 @@ def _action_center_snapshot(review_state: dict = None, downloads: dict = None,
         },
     }
 
+# (`bot<token>` is how Telegram's own URLs carry it.)
+_TELEGRAM_TOKEN_SHAPE = re.compile(r"(?<![\w:])(?:bot)?\d{5,12}:[A-Za-z0-9_-]{20,}(?![\w-])")
+
 def _redact_secrets(value) -> str:
     text = str(value or "")
     secrets = [
         SLSKD_API_KEY, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, MBZ_CONTACT,
-        *(u.get("telegram_token", "") for u in USERS),
         *(u.get("navidrome_password", "") for u in USERS),
     ]
     for secret in secrets:
@@ -32014,6 +30290,10 @@ def _redact_secrets(value) -> str:
                           "[redacted]", text)
     text = re.sub(r"(?i)(token|password|secret|api[_-]?key)(=|:)[^\s,;}]+",
                   r"\1\2[redacted]", text)
+    # A Telegram bot token, by its shape (`<bot id>:<secret>`), never by the
+    # value: TELEGRAM_TOKEN is not read since Worbus 0.4, but a reason or an
+    # error written before then can still carry one.
+    text = _TELEGRAM_TOKEN_SHAPE.sub("[redacted]", text)
     # Subsonic auth rides in the query string: t (md5 token) + s (salt) replay
     # as a login, p is the password itself, u the user. requests prints the
     # whole URL in its exceptions, and since 2026-09-26 printed lines reach the
@@ -32097,8 +30377,8 @@ def _settings_cards(user: dict = None, diagnostics: list = None) -> dict:
             "host": WEB_UI_HOST,
             "port": WEB_UI_PORT,
             "build": WEB_BUILD,
-        }, bool(WEB_UI_ENABLED),
-            "Set LB_BOT_WEB=1 and publish port 8899 on your LAN host."),
+        }, True,
+            "Publish port 8899 on your LAN host."),
     ]
     return {"cards": cards}
 
@@ -33777,7 +32057,7 @@ def _folder_identity_for(folder: dict) -> dict:
 def _folder_entry_for_path(path: str) -> dict:
     """The {name, path, file_count, formats} entry for a download folder,
     synthesized when the path isn't one of SLSKD_DOWNLOAD_DIR's immediate
-    subdirs (the telegram flows can target any folder)."""
+    subdirs (a folder a person names, or an import record's, can be anywhere)."""
     for f in _download_folders_cached():
         if f.get("path") == path:
             return f
@@ -34494,8 +32774,8 @@ def _needs_placement_view(include_filed: bool = False) -> list:
     rows = []
     for folder in folders:
         # Already-imported and user-dismissed folders are not "waiting to be
-        # filed" — only this view filters them; the Import tab and telegram
-        # /beets listing deliberately keep showing everything on disk.
+        # filed" — only this view filters them; the download-folders list
+        # (`/api/download-folders`) deliberately keeps showing everything on disk.
         path = folder.get("path", "")
         filed = ("imported" if path in _imported_folders
                  else "dismissed" if path in _dismissed_folders else "")
@@ -35062,6 +33342,10 @@ def _summary_view() -> dict:
         },
         "index": _index_progress_view(),
         "downloads": "on" if _downloads_on() else "off",
+        # Import records that need a person (Needs you's imports list), for
+        # the web UI's to-fix number (`needs.js`); `/api/attention`'s
+        # `counts.imports` is the same number.
+        "imports": {"open": _open_imports_count()},
         "ts": time.time(),
     }
 
@@ -35190,6 +33474,10 @@ def _attention_view() -> dict:
             "folders": len(placements),
             "foldersUnidentified": _unidentified_count(placements),
             "picks": len(picks),
+            # Import records at `needs_review` or `failed` (Worbus P4 S3):
+            # what Needs you's imports list holds. Clients add it to the
+            # to-fix number and link to the web page's `#/needs/imports`.
+            "imports": _open_imports_count(),
         },
         "albums": albums[:ATTENTION_ALBUMS_MAX],
         "folders": folders[:ATTENTION_FOLDERS_MAX],
@@ -35471,6 +33759,9 @@ _ROUTE_ACCESS_ADMIN = (
     "POST /api/imports/<recid>/retry",
     "POST /api/imports/<recid>/remove-stale-and-retry",
     "POST /api/imports/<recid>/merge-retry",
+    "GET /api/imports/attention",
+    "POST /api/imports/<recid>/as-is",
+    "POST /api/imports/<recid>/dismiss",
     "POST /api/groups/<group_id>/match-mode",
     "POST /api/groups/<group_id>/downloads/<download_id>/match-selected",
     "POST /api/groups/<group_id>/downloads/<download_id>/match",
@@ -35709,8 +34000,6 @@ def primary_only(view):
     return wrapper
 
 def start_web_dashboard() -> None:
-    if not WEB_UI_ENABLED:
-        return
     try:
         from flask import Flask, jsonify, request, send_from_directory, abort
     except Exception as e:
@@ -36717,16 +35006,15 @@ def start_web_dashboard() -> None:
         if idx < 0 or idx >= len(folders):
             return jsonify({"error": "Result index out of range"}), 400
         fd = folders[idx]
-        user = _default_web_user()
         if mode == "file":
             file = min(fd.get("files", []), key=lambda f: _score_file(f, fd.get("upload_speed", 0)) or (99,))
             ok = slskd_enqueue(fd["username"], file, token=_web_user_key(),
-                               chat_id=str(user.get("chat_id", "")))
+                               chat_id="")
             return jsonify({"ok": ok})
         full = slskd_expand_directory(fd["username"], fd, fd["files"][0] if fd.get("files") else {})
         ok, total, ag_id = slskd_enqueue_folder(
             fd["username"], full or fd.get("files", []), token=_web_user_key(),
-            chat_id=str(user.get("chat_id", "")), label=fd.get("folder", ""))
+            chat_id="", label=fd.get("folder", ""))
         return jsonify({"ok": bool(ok), "queued": ok, "total": total, "album_group_id": ag_id})
 
     @app.get("/api/album/lookup")
@@ -38100,6 +36388,7 @@ def start_web_dashboard() -> None:
             imported = result.get("ok", False)
             rec["status"] = "imported" if imported else "failed"
             rec["import_state"] = "imported" if imported else "downloaded_not_imported"
+            _stamp_import_outcome(rec, result)
             if imported:
                 _note_folder_imported(rec.get("album_dir", ""))
                 _nd_scan_after_import(rec.get("token", ""))
@@ -38129,6 +36418,7 @@ def start_web_dashboard() -> None:
             imported = result.get("ok", False)
             rec["status"] = "imported" if imported else "failed"
             rec["import_state"] = "imported" if imported else "downloaded_not_imported"
+            _stamp_import_outcome(rec, result)
             if imported:
                 _note_folder_imported(album_dir)
                 _nd_scan_after_import(rec.get("token", ""))
@@ -38165,6 +36455,7 @@ def start_web_dashboard() -> None:
             rec["release_mbid"] = release_mbid
             rec["status"] = "imported" if imported else "failed"
             rec["import_state"] = "imported" if imported else "downloaded_not_imported"
+            _stamp_import_outcome(rec, result)
             if imported:
                 _note_folder_imported(album_dir)
                 _nd_scan_after_import(rec.get("token", ""))
@@ -38178,6 +36469,44 @@ def start_web_dashboard() -> None:
         if rec.get("review_group_id"):
             _save_review_state()
         return jsonify({"ok": imported, "status": rec["status"], "import_result": result})
+
+    @app.get("/api/imports/attention")
+    def api_imports_attention():
+        """Needs you › Imports that need you (Worbus P4 S3): the import records
+        at `needs_review` or `failed`. Admin only. See `_imports_attention_view`."""
+        return jsonify(_imports_attention_view())
+
+    @app.post("/api/imports/<recid>/as-is")
+    @needs_downloads
+    def api_import_as_is(recid):
+        """Import as-is: place the record's folder as what the folder itself
+        is (`_import_record_as_is`, Telegram's IMPAS until Worbus 0.4). Admin
+        only. `{"ok": true}`, or `{"ok": false, "error"}` saying why not; 409
+        for a record that is not waiting for anybody (B-334: an imported
+        album is never placed again). A dismissed one may still be placed."""
+        rec = _albums.get(recid)
+        if not isinstance(rec, dict):
+            return jsonify({"error": "Import record not found"}), 404
+        if rec.get("status") not in (*IMPORT_STATUSES_NEEDING_YOU, IMPORT_DISMISSED):
+            return jsonify({"error": "This import is not waiting for you."}), 409
+        result = _import_record_as_is(recid)
+        if result.get("ok"):
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": _wire_text(result.get("error", ""))})
+
+    @app.post("/api/imports/<recid>/dismiss")
+    def api_import_dismiss(recid):
+        """Dismiss on Needs you's imports list (ruling R20): the record stops
+        needing a person — out of the list, `counts.imports` and `imports.open`.
+        Admin only. `{"ok": true}`; 404 for an unknown record, 409 for one that
+        is not waiting for anybody. See `_dismiss_import_record`."""
+        rec = _albums.get(recid)
+        if not isinstance(rec, dict):
+            return jsonify({"error": "Import record not found"}), 404
+        if not _dismiss_import_record(rec):
+            return jsonify({"error": "This import is not waiting for you."}), 409
+        _save_state()
+        return jsonify({"ok": True})
 
     @app.post("/api/groups/<group_id>/match-mode")
     def api_group_match_mode(group_id):
@@ -38451,9 +36780,8 @@ def start_web_dashboard() -> None:
         app.run(host=WEB_UI_HOST, port=WEB_UI_PORT, threaded=True, use_reloader=False)
 
     threading.Thread(target=_run, daemon=True, name="album-review-web").start()
-    # The wishlist's slow re-search. Started here rather than at import so a
-    # process running only the Telegram half doesn't grow a background thread
-    # whose results nothing would surface.
+    # The wishlist's slow re-search. Started here rather than at import, so
+    # importing the module (the test suite) grows no background thread.
     threading.Thread(target=_wishlist_sweep_loop, daemon=True,
                      name="wishlist-sweep").start()
     # The hub push for the index mirror's "new channel" leg (contract §1a).
@@ -38479,125 +36807,14 @@ def start_web_dashboard() -> None:
     threading.Thread(target=_listens_sync_worker, daemon=True,
                      name="listens-sync").start()
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
-
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trigger a scan on demand for the bot that received the command."""
-    token = _resolve_token(context)
-    user  = _user_for_token(token)
-    app   = next((a for a in _APPS if a.bot.token == token), None)
-    if not user or app is None:
-        await update.message.reply_text("Could not identify user.")
-        return
-    lbz_user = user["listenbrainz_user"]
-    if not _lbz_user_of(user):
-        await update.message.reply_text(NO_LISTENBRAINZ_USER)
-        return
-    if lbz_user in _scans_running:
-        await update.message.reply_text(
-            "A scan is already running for you — results will arrive when it "
-            "finishes.")
-        return
-    _scans_running.add(lbz_user)
-    await update.message.reply_text(
-        f"Scanning playlists for {lbz_user}... "
-        f"this can take a few minutes.")
-    try:
-        missing = await asyncio.to_thread(scan_user, user)
-    except LBZError as e:
-        print(f"  /scan LBZ error: {e}")
-        await update.message.reply_text(
-            "⚠️ Couldn't reach ListenBrainz just now (timed out after retries). "
-            "Nothing was scanned — please try /scan again in a moment.")
-        return
-    except Exception as e:
-        print(f"  /scan error: {e}")
-        await update.message.reply_text(
-            f"⚠️ Scan failed: {e}\nRun /diag to check connectivity.")
-        return
-    finally:
-        _scans_running.discard(lbz_user)
-    if missing:
-        await send_missing_tracks(app, user, missing)
-    else:
-        await update.message.reply_text("Everything is up to date — nothing missing.")
-    await asyncio.to_thread(_save_state)
-
-async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List in-progress albums and any finished albums needing attention."""
-    token = _resolve_token(context)
-    groups = [ag for ag in pending_album_groups.values()
-              if _token_owns(ag.get("token"), token)]
-    review = [(rid, r) for rid, r in _albums.items()
-              if _token_owns(r.get("token"), token)
-              and r.get("status") in ("needs_review", "failed")]
-
-    if groups:
-        for ag in groups:
-            done = ag["completed"] + ag["failed"]
-            await update.message.reply_text(
-                f"⬇️ {ag['label']} — {done}/{ag['total']} "
-                f"{_progress_bar(done, ag['total'])} (from @{ag.get('source_user','?')})")
-    if review:
-        for rid, r in review[:20]:
-            tag = "⚠️ needs review" if r["status"] == "needs_review" else "❌ import failed"
-            await update.message.reply_text(
-                f"{tag}: {r['label']}",
-                reply_markup=_album_action_markup(rid, r["status"]))
-    if not groups and not review:
-        await update.message.reply_text(
-            "Nothing pending. Albums needing attention show up here after download.")
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show active transfers and album-group progress for this user."""
-    token = _resolve_token(context)
-    mine  = [v for v in pending_downloads.values() if _token_owns(v.get("token"), token)]
-    groups = [ag for ag in pending_album_groups.values()
-              if _token_owns(ag.get("token"), token)]
-
-    lines = []
-    if groups:
-        lines.append(f"Albums in progress ({len(groups)}):")
-        for ag in groups:
-            done = ag["completed"] + ag["failed"]
-            bar  = _progress_bar(done, ag["total"])
-            fail = f", {ag['failed']} failed" if ag["failed"] else ""
-            lines.append(f"  {bar} {done}/{ag['total']}{fail} — {ag['label']}")
-    indiv = [v for v in mine if not v.get("album_group_id")]
-    if indiv:
-        lines.append(f"\nIndividual tracks downloading ({len(indiv)}):")
-        for v in indiv[:20]:
-            t = v.get("track") or {}
-            lines.append(f"  • {t.get('artist','?')} - {t.get('title','?')}")
-        if len(indiv) > 20:
-            lines.append(f"  …and {len(indiv) - 20} more")
-    if not lines:
-        await update.message.reply_text(
-            "Nothing in progress. Use /scan to look for missing tracks.")
-        return
-    await update.message.reply_text("\n".join(lines))
-
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
 def _scan_users() -> list:
     """The users the scheduled playlist scan is for: those with a
-    ListenBrainz user. Telegram has nothing to do with it any more."""
+    ListenBrainz user."""
     return [u for u in USERS if (u.get("listenbrainz_user") or "").strip()]
-
-async def _telegram_apps_settled(timeout: float = 300.0) -> None:
-    """Wait (bounded) until main() has finished starting the Telegram apps,
-    so a scan that finishes early does not read "no Telegram" for a user
-    whose app is still starting. No-op outside main()."""
-    event = _TELEGRAM_STARTED
-    if event is None:
-        return
-    try:
-        await asyncio.wait_for(event.wait(), timeout)
-    except Exception:  # noqa: BLE001 — a slow start only changes where results go
-        pass
 
 async def scheduled_scan(force: bool = False):
     users = _scan_users()
@@ -38631,19 +36848,14 @@ async def scheduled_scan(force: bool = False):
             continue
         finally:
             _scans_running.discard(lbz_user)
-        await _telegram_apps_settled()
-        app = _token_to_app().get(user.get("telegram_token") or "")
         if missing:
             print(f"  {len(missing)} missing tracks for {lbz_user}")
         else:
             print(f"  Everything up to date for {lbz_user}")
-        if app is not None:
-            # As before Worbus P1: the results are a Telegram message.
-            if missing:
-                await send_missing_tracks(app, user, missing)
-        elif user is _default_web_user():
-            # No Telegram for this user: the results land where the web UI's
-            # own "Scan playlists" puts them, the review's playlist origin.
+        if user is _default_web_user():
+            # The results land where the web UI's own "Scan playlists" puts
+            # them, the review's playlist origin (the only path since
+            # Telegram was removed in Worbus 0.4).
             try:
                 await asyncio.to_thread(_land_playlist_scan, user, missing)
             except Exception as e:  # noqa: BLE001
@@ -38651,9 +36863,8 @@ async def scheduled_scan(force: bool = False):
     _save_state()
 
 async def _playlist_scan_loop():
-    """The startup and Tuesday 09:00 playlist scan, independent of Telegram
-    (Worbus P1 S1). It used to run inside the Telegram apps' scheduler, so a
-    server with no Telegram never scanned. Returns at once when no user has
+    """The startup and Tuesday 09:00 playlist scan (Worbus P1 S1: it used to
+    run inside the Telegram apps' scheduler). Returns at once when no user has
     a ListenBrainz user: there is nothing to scan, and nothing to log."""
     if not _scan_users():
         print("  playlist scan: no ListenBrainz user configured — off")
@@ -38697,31 +36908,18 @@ async def state_flush_loop():
         await asyncio.to_thread(_save_mbz_cache)
 
 async def housekeeping_loop():
-    """Drop untouched button state so memory doesn't grow without bound."""
+    """Forget the creation time of ids older than `UID_TTL`, so `_uid_ts`
+    doesn't grow without bound. (It swept Telegram's button state too, until
+    Telegram was removed in Worbus 0.4.)"""
     while True:
         await asyncio.sleep(SWEEP_INT)
         try:
-            now     = time.time()
-            # Playlist "Download all" buttons (uid ^p\d+$) are exempt: their
-            # backing tracks in missing_by_playlist are never swept, and the
-            # weekly scan's buttons must outlive the 24h TTL or they'd be dead
-            # for 6 of 7 days. They get replaced on each new scan anyway.
-            stale   = [uid for uid, ts in list(_uid_ts.items())
-                       if now - ts > UID_TTL and not re.fullmatch(r"p\d+", uid)]
-            removed = 0
+            now   = time.time()
+            stale = [uid for uid, ts in list(_uid_ts.items()) if now - ts > UID_TTL]
             for uid in stale:
-                tok = _uid_to_token.pop(uid, None)
-                _uid_to_playlist.pop(uid, None)
                 _uid_ts.pop(uid, None)
-                for store in (pending_approvals, pending_retries, manual_search_results):
-                    if tok in store and uid in store[tok]:
-                        store[tok].pop(uid, None)
-                for store in (_pending_beets, _pending_checkdl, _pending_dlall,
-                              _pending_album, _pending_pick):
-                    store.pop(uid, None)
-                removed += 1
-            if removed:
-                print(f"  housekeeping: dropped {removed} stale button state(s)")
+            if stale:
+                print(f"  housekeeping: forgot {len(stale)} old id(s)")
                 await asyncio.to_thread(_save_state)
         except Exception as e:
             print(f"  housekeeping error: {e}")
@@ -38729,43 +36927,6 @@ async def housekeeping_loop():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
-BOT_COMMANDS = [
-    ("scan",        "Scan playlists now for missing tracks"),
-    ("status",      "Show in-progress downloads and album groups"),
-    ("pending",     "Albums in progress or needing review"),
-    ("diag",        "Check what the bot can reach (downloads, slskd, APIs)"),
-    ("album",       "Download a whole album by name"),
-    ("search",      "Search Soulseek: /search Artist - Title"),
-    ("spplaylist",  "Import a public Spotify playlist"),
-    ("checkalbums", "Find incomplete albums in your library"),
-    ("beets",       "Import downloaded folders with beets"),
-    ("rescan",      "Trigger a Navidrome quick scan"),
-    ("help",        "Show available commands"),
-]
-
-async def on_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Global PTB error handler: without one, a handler exception dies silently
-    and the user sees a button that does nothing."""
-    import traceback
-    err = context.error
-    tb  = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-    print(f"  Telegram handler error: {err}\n{tb}")
-    _web_log(f"telegram handler error: {err}")
-    chat_id = None
-    try:
-        if isinstance(update, Update):
-            if update.effective_chat is not None:
-                chat_id = update.effective_chat.id
-            elif (update.callback_query is not None
-                  and update.callback_query.message is not None):
-                chat_id = update.callback_query.message.chat_id
-        if chat_id is not None:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Something went wrong handling that action:\n{err}")
-    except Exception as notify_err:
-        print(f"  Failed to notify chat about handler error: {notify_err}")
 
 def _mark_interrupted_jobs() -> None:
     """Startup: the rows a job was working on when lb-bot stopped read
@@ -38781,6 +36942,27 @@ def _mark_interrupted_jobs() -> None:
             check()
         except Exception as e:  # noqa: BLE001
             print(f"  {what}: could not check for interrupted work: {e}")
+
+# The one line a TELEGRAM_* setting left in an env file gets (design §6.5).
+TELEGRAM_REMOVED = "Telegram was removed in Worbus 0.4; this setting is ignored"
+
+def _retired_setting_lines(env=None) -> list:
+    """The start-up lines for settings that no longer do anything: one for
+    `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` (names only, never a value) and one
+    for `LB_BOT_WEB=0`. Read once, here; nothing else reads them."""
+    env = os.environ if env is None else env
+    lines = []
+    named = [name for name in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
+             if (env.get(name) or "").strip()]
+    if named:
+        # Not "TELEGRAM_TOKEN: …": the log tee's redaction takes a word after a
+        # name holding "token" and a colon for its value (`_redact_log_line`).
+        lines.append(f"  config: {', '.join(named)} {'is' if len(named) == 1 else 'are'} "
+                     f"set. {TELEGRAM_REMOVED}")
+    if (env.get("LB_BOT_WEB") or "").strip().lower() in ("0", "false", "no"):
+        lines.append("  config: LB_BOT_WEB=0 is ignored: the web dashboard always "
+                     "runs since Worbus 0.4")
+    return lines
 
 def _missing_required_config() -> list:
     """The names of the settings a stranger's server needs that are empty:
@@ -38798,67 +36980,8 @@ def _missing_required_config() -> list:
               ("LB_BOT_HUB_TOKEN", HUB_NOTIFY_TOKEN))
     return [name for name, value in checks if not str(value or "").strip()]
 
-def _telegram_app_for(user: dict):
-    """One user's Telegram Application, built with every handler."""
-    app = Application.builder().token(user["telegram_token"].strip()).build()
-    app.add_error_handler(on_telegram_error)
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(CommandHandler("start", help_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("pending", pending_command))
-    app.add_handler(CommandHandler("diag", diag_command))
-    app.add_handler(CommandHandler("album", album_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("checkalbums", checkalbums_command))
-    app.add_handler(CommandHandler("spplaylist", spplaylist_command))
-    app.add_handler(CommandHandler("beets", beets_command))
-    app.add_handler(CommandHandler("rescan", rescan_command))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-    return app
-
-async def _build_telegram_apps(users: list) -> list:
-    """`[(user, Application)]`: one started app per user with a non-empty
-    token. A build, initialise or start-polling failure is logged once — the
-    exception's type and a redacted message, never the token — and that user
-    is skipped; everything else keeps running (Worbus P1 S1)."""
-    pairs = []
-    for n, user in enumerate(users, 1):
-        if not (user.get("telegram_token") or "").strip():
-            continue
-        app = None
-        try:
-            app = _telegram_app_for(user)
-            await app.initialize()
-            await app.start()
-            # Explicit allowed_updates: Telegram persists the previous setting
-            # server-side when omitted, so a past poller with a restricted set
-            # would silently drop callback_query updates (dead buttons).
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        except Exception as e:  # noqa: BLE001 — Telegram never stops the rest
-            print(f"  Telegram bot for user {n} could not start "
-                  f"({type(e).__name__}: {_redact_secrets(e)[:200]}) — "
-                  f"running without it")
-            if app is not None:
-                for step in ("stop", "shutdown"):
-                    try:
-                        await getattr(app, step)()
-                    except Exception:  # noqa: BLE001 — best effort
-                        pass
-            continue
-        # Register the Telegram command menu for autocomplete + the "/" menu
-        try:
-            await app.bot.set_my_commands(BOT_COMMANDS)
-        except Exception as e:
-            print(f"  set_my_commands failed: {_redact_secrets(e)[:200]}")
-        pairs.append((user, app))
-        print(f"  Bot started for {user.get('listenbrainz_user') or f'user {n}'}")
-    return pairs
-
 async def main():
-    if WEB_UI_ENABLED:
-        _install_log_tee()
+    _install_log_tee()
     print("Bot starting...")
     _sweep_orphaned_state_tmp_files()
     _load_state()
@@ -38892,40 +37015,29 @@ async def main():
               f"umask={LB_BOT_UMASK or 'inherited'}")
     except AttributeError:
         pass  # os.getuid is POSIX-only; harmless when developing on Windows
-    print(f"  config: WEB_UI={'on' if WEB_UI_ENABLED else 'off'} "
-          f"{WEB_UI_HOST}:{WEB_UI_PORT}")
+    print(f"  config: WEB_UI={WEB_UI_HOST}:{WEB_UI_PORT}")
     print(f"  config: WEB_BUILD={WEB_BUILD}")
     print(f"  config: downloading is {'on' if _downloads_on() else 'off'}"
           + ("" if _downloads_on() else " (SLSKD_API_KEY is not set)"))
     if _downloads_on() and not os.path.isdir(SLSKD_DOWNLOAD_DIR):
         print(f"  WARNING: SLSKD_DOWNLOAD_DIR '{SLSKD_DOWNLOAD_DIR}' does not exist "
-              f"inside this container. Completed downloads cannot be imported and "
-              f"/beets will be empty until you mount slskd's downloads volume here.")
+              f"inside this container. Completed downloads cannot be placed, and the "
+              f"web page's download folders will be empty, until you mount slskd's "
+              f"downloads volume here.")
     missing_config = _missing_required_config()
     # Names only, never a value.
     print("  config: required settings missing: " + ", ".join(missing_config)
           if missing_config else "  config: required settings all present")
 
-    # The web UI and the workers first, and independently of Telegram
-    # (Worbus P1 S1): an empty or rejected TELEGRAM_TOKEN used to raise at
-    # the Telegram app's build before any of them started, and the container
-    # crash-looped.
-    global _APPS, _TELEGRAM_APPS, _TELEGRAM_STARTED
-    _TELEGRAM_STARTED = asyncio.Event()
+    for line in _retired_setting_lines():
+        print(line)
+
     start_web_dashboard()
 
     asyncio.create_task(_playlist_scan_loop())
     asyncio.create_task(poll_downloads_loop())
     asyncio.create_task(state_flush_loop())
     asyncio.create_task(housekeeping_loop())
-
-    # Then the Telegram apps, one per user with a token; one that fails to
-    # start is logged and skipped.
-    pairs = await _build_telegram_apps(USERS)
-    _TELEGRAM_APPS = pairs
-    # So on-demand commands (/scan) can reach every bot instance.
-    _APPS = [app for _user, app in pairs]
-    _TELEGRAM_STARTED.set()
 
     try:
         while True:

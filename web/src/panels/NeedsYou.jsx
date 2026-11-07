@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useApp, navigate, replaceRoute, goArtist, goAlbum, lsGet, lsSet } from '../App.jsx'
 import { api } from '../lib/api.js'
 import { entryBefore } from '../lib/router.js'
@@ -6,7 +6,7 @@ import { isListEntry, offeredOrAny, showsSelected } from '../lib/view.js'
 import { hasKeptPlace, letGoOfPlace, useSessionState, useViewState } from '../lib/useView.js'
 import { fixRowView, keepListed } from '../lib/artistMatch.js'
 import { artistsTouched, keepSets, setRowView, toFixNote, toFixWaiting } from '../lib/merges.js'
-import { failedGaps, failedRequests, foldersToFile, toFixCount } from '../lib/needs.js'
+import { failedGaps, failedRequests, foldersToFile, needsView, openImports, toFixCount } from '../lib/needs.js'
 import { useNarrow } from '../lib/useNarrow.js'
 import Cover from '../components/Cover.jsx'
 import Page, { Dot, Grp, Meter, Pick, Seg } from '../components/Page.jsx'
@@ -714,12 +714,183 @@ function IdentifyAction({ unidentified, identify }) {
   )
 }
 
+// ── Imports that need you (Worbus P4) ───────────────────────────────────────
+// An album lb-bot downloaded and could not file: placement failed, or it wants
+// a person to say which release the folder is. Telegram used to send each one
+// as a card with these same actions; both apps link here (`#/needs/imports`).
+
+const IMPORT_WORD = { failed: 'Import failed', needs_review: 'Needs a decision', imported: 'Filed',
+  dismissed: 'Dismissed' }
+
+/** `GET /api/imports/attention`, read on arrival, whenever the summary's count
+ *  moves, and after each action here. `null` until the first answer. */
+function useImports() {
+  const { state } = useApp()
+  const [imports, setImports] = useState(null)
+  const [error, setError] = useState('')
+  const seq = useRef(0)
+  const read = useCallback(async () => {
+    const n = ++seq.current
+    try {
+      const r = await api('/api/imports/attention')
+      if (n === seq.current) { setImports(r); setError('') }
+    } catch (e) {
+      if (n === seq.current) { setImports(prev => prev || { items: [] }); setError(e.message || 'failed') }
+    }
+  }, [])
+  const open = state.summary?.imports?.open
+  useEffect(() => { read() }, [read, open])
+  return { imports, error, read }
+}
+
+/** The release picker behind "Pin release & retry": the album's own releases
+ *  (`/api/album/releases`, what the album page lists), each a retry pinned to
+ *  that release (`/merge-retry`, Telegram's "Pin MBID & retry"). */
+function PinRelease({ i, busy, onPin }) {
+  const [rels, setRels] = useState(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let dead = false
+    api('/api/album/releases?rgid=' + encodeURIComponent(i.rgid), { timeoutMs: 15000 })
+      .then(r => { if (!dead) setRels(r.releases || r.variants || []) })
+      .catch(e => { if (!dead) { setRels([]); setError(e.message || 'failed') } })
+    return () => { dead = true }
+  }, [i.rgid])
+  if (rels === null) return <p className="muted text-caption mt-2">Looking up the album’s releases…</p>
+  if (error) return <p className="bad text-caption mt-2">Couldn’t list its releases: {error}.</p>
+  if (!rels.length) return <p className="muted text-caption mt-2">MusicBrainz lists no release for this album.</p>
+  return (
+    <div className="rows mt-2 fadein">
+      {rels.map(v => (
+        <div key={v.releaseMbid} className="row wrap">
+          <div className="grow">
+            <div>{v.title}{v.disambiguation ? <span className="muted"> ({v.disambiguation})</span> : null}</div>
+            <div className="muted text-caption">
+              {[v.year, v.country, v.trackCount ? `${v.trackCount} tracks` : '', v.releaseMbid === i.releaseMbid ? 'the one it was filed as' : '']
+                .filter(Boolean).join(' · ')}
+            </div>
+          </div>
+          <button className="sm" disabled={!!busy} aria-busy={busy === `pin:${v.releaseMbid}`}
+            onClick={() => onPin(v.releaseMbid)}>Pin and retry</button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** One import, with what can be done about it. Acting on it keeps it here,
+ *  saying what became of it (`onActed` holds it in the list). */
+function ImportDetail({ i, onActed }) {
+  const { action, pushToast } = useApp()
+  const [busy, setBusy] = useState('')
+  const [picking, setPicking] = useState(false)
+  const [result, setResult] = useState(null)   // { ok, text }
+  const word = IMPORT_WORD[i.status] || i.status
+
+  async function run(key, path, body, done) {
+    if (busy) return
+    setBusy(key)
+    try {
+      const r = await action(path, body)
+      const ok = !!r.ok
+      const why = r.error || r.import_result?.error || ''
+      setResult({ ok, text: ok ? done : `Not filed${why ? `: ${why}` : '.'}` })
+      onActed(i.recid, ok ? 'imported' : 'failed', ok ? '' : why)
+      if (ok) pushToast(done)
+    } catch (e) {
+      setResult({ ok: false, text: e.message || 'failed' })
+      pushToast(`${e.message || 'failed'}`, 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Dismiss (ruling R20): lb-bot stops counting it; nothing on disk changes.
+  // A refusal leaves the record as it was.
+  async function dismiss() {
+    if (busy) return
+    setBusy('dismiss')
+    try {
+      await action(`/api/imports/${i.recid}/dismiss`, {})
+      setResult({ ok: true, text: 'Dismissed. The folder is still in the downloads folder.' })
+      onActed(i.recid, 'dismissed', '')
+      pushToast('Dismissed')
+    } catch (e) {
+      setResult({ ok: false, text: e.message || 'failed' })
+      pushToast(`${e.message || 'failed'}`, 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const filed = i.status === 'imported'
+  const dismissed = i.status === 'dismissed'
+  const open = !filed && !dismissed
+  return (
+    <>
+      <div className="hero">
+        <Cover url={caaCover(i.rgid)} name={i.album || '?'} size={96} />
+        <div className="grow">
+          <h2>{i.album || i.releaseMbid || 'An album'}</h2>
+          <p className="muted mt-1">
+            {i.artist}{i.artist ? ' · ' : ''}{word.toLowerCase()}
+            {i.updatedAt ? ` · ${ago(i.updatedAt)} ago` : ''}
+          </p>
+        </div>
+      </div>
+      <div className={`why${open ? ' bad' : ''}`}>
+        <div className="font-semibold">{filed ? 'Filed into the library'
+          : dismissed ? 'Dismissed: lb-bot no longer counts it as needing you'
+          : 'lb-bot couldn’t finish filing this album'}</div>
+        {open && i.reason ? <div className="mt-0.5">{i.reason}</div> : null}
+        {open && !i.reason && i.status === 'needs_review'
+          ? <div className="mt-0.5">The download is in the downloads folder, waiting for you to say which release it is.</div> : null}
+      </div>
+      {result && <p className={`text-caption mt-2 fadein ${result.ok ? 'muted' : 'bad'}`} role="status">{result.text}</p>}
+      {open && (
+        <div className="acts">
+          <button className="primary" disabled={!!busy} aria-busy={busy === 'retry'}
+            title="File the folder again as the release it was downloaded for"
+            onClick={() => run('retry', `/api/imports/${i.recid}/retry`, {}, 'Filed into the library')}>Retry</button>
+          <button disabled={!!busy || !i.rgid} aria-expanded={picking}
+            title={i.rgid ? 'Pick the release the folder is, then file it as that' : 'lb-bot does not know which album this is'}
+            onClick={() => setPicking(v => !v)}>Pin release & retry</button>
+          <button disabled={!!busy} aria-busy={busy === 'asis'}
+            title="File the folder as what its own tags say it is"
+            onClick={() => run('asis', `/api/imports/${i.recid}/as-is`, {}, 'Filed as what the folder is')}>Import as-is</button>
+          <button className="quiet" disabled={!i.rgid} onClick={() => goAlbum(i.rgid)}
+            title={i.rgid ? 'The album page: choose its cover, or download it again' : 'lb-bot does not know which album this is'}>Open album</button>
+          <button className="quiet" disabled={!!busy} aria-busy={busy === 'dismiss'}
+            title="Stop counting this import as needing you. Nothing on disk changes."
+            onClick={dismiss}>Dismiss</button>
+        </div>
+      )}
+      {open && picking && i.rgid && (
+        <PinRelease i={i} busy={busy}
+          onPin={mbid => run(`pin:${mbid}`, `/api/imports/${i.recid}/merge-retry`, { release_mbid: mbid },
+            'Filed as the release you picked')} />
+      )}
+      {!open && i.rgid && <div className="acts mt-3"><button onClick={() => goAlbum(i.rgid)}>Open album</button></div>}
+    </>
+  )
+}
+
 const ARTISTS_SHOWN = 6
 
-function FixTab({ routeId, onOpened }) {
+function FixTab({ routeId, focus, onOpened }) {
   const { state, dispatch, action, pushToast, downloadsOn } = useApp()
   const { gaps, fills, transfers, gapDetail } = state
   const narrow = useNarrow()
+
+  // Imports that need you, and what was done to one from here: it stays where
+  // it was, saying so, until something else is picked (`acted`, recid ->
+  // {status, reason}).
+  const { imports, error: importsError, read: readImports } = useImports()
+  const [acted, setActed] = useState({})
+  const onImportActed = useCallback((recid, status, reason) => {
+    setActed(prev => ({ ...prev, [recid]: { status, reason } }))
+    readImports()
+  }, [readImports])
 
   // Artists to match ride on the overrides answer: read once per visit, and
   // again — behind what is on the page — when the picker has changed a match.
@@ -776,13 +947,17 @@ function FixTab({ routeId, onOpened }) {
     ]
     const folders = foldersToFile(transfers).map(p => ({ key: `dir:${p.id}`, kind: 'dir', p }))
     const left = (leftovers || []).map(p => ({ key: `left:${p.id}`, kind: 'dir', p }))
-    return { failed, folders, arts, twos: sets, left }
-  }, [gaps, fills, transfers, arts, sets, leftovers])
+    const imps = openImports(imports).map(i => ({ key: `imp:${i.recid}`, kind: 'imp', i }))
+    return { failed, imports: imps, folders, arts, twos: sets, left }
+  }, [gaps, fills, transfers, arts, sets, leftovers, imports])
 
   const shownArts = allArtists ? groups.arts : groups.arts.slice(0, ARTISTS_SHOWN)
   const shownSets = allSets ? groups.twos : groups.twos.slice(0, ARTISTS_SHOWN)
-  const ready = !!gaps && !!transfers
-  const lists = { failed: groups.failed, folders: groups.folders, arts: shownArts, twos: shownSets, left: groups.left }
+  // (The imports are read too before anything is selected: an address that
+  // names one — the apps' link — must not land on another row meanwhile.)
+  const ready = !!gaps && !!transfers && imports !== null
+  const lists = { failed: groups.failed, imports: groups.imports, folders: groups.folders, arts: shownArts,
+    twos: shownSets, left: groups.left }
 
   // The item you are on stays while you are on it. Trying the next source
   // makes a failed fill a running one, and filing a folder takes it off the
@@ -807,6 +982,9 @@ function FixTab({ routeId, onOpened }) {
     const item = was.item.kind === 'gap' ? (now ? { ...was.item, g: now, moved: true } : null)
       : was.item.kind === 'req' ? { ...was.item, f: now && now.state !== 'unknown' ? now : was.item.f, moved: true }
       : was.item.kind === 'dir' ? { ...was.item, moved: true }
+      // Filed from here (or elsewhere): off lb-bot's list, kept on the page as filed.
+      : was.item.kind === 'imp' ? { ...was.item, i: { ...was.item.i, status: 'imported', reason: '',
+          ...(acted[was.item.i.recid] || {}) }, moved: true }
       // An artist or a set is still listed, only not among the few shown: it
       // is what its own list says of it now, not "matched" for being folded away.
       : groups[was.group]?.find(i => i.key === was.key) || was.item
@@ -818,7 +996,7 @@ function FixTab({ routeId, onOpened }) {
     }
   }
   useEffect(() => { if (found) stuckRef.current = found })
-  const all = [...lists.failed, ...lists.folders, ...lists.arts, ...lists.twos, ...lists.left]
+  const all = [...lists.failed, ...lists.imports, ...lists.folders, ...lists.arts, ...lists.twos, ...lists.left]
   // An artist or a set the address names is not "gone" while lb-bot's list of
   // them is still on its way: arriving at one (a reload, a link) used to land
   // on the first thing in the list instead, because that list comes after the
@@ -829,6 +1007,8 @@ function FixTab({ routeId, onOpened }) {
   const orderRef = useRef([])
   const sel = found?.item || kept?.item
     || (!ready || awaited ? null : (() => {
+        // Arriving at `#/needs/imports`: the first of them.
+        if (focus === 'imports' && !routeId && lists.imports.length) return lists.imports[0]
         const at = orderRef.current.indexOf(routeId)
         return all[at >= 0 ? Math.min(at, all.length - 1) : 0] || null
       })())
@@ -839,6 +1019,15 @@ function FixTab({ routeId, onOpened }) {
     if (sel && sel.key !== routeId && (!narrow || open)) replaceRoute('needs', 'fix', sel.key)
     if (!sel && routeId && !awaited) replaceRoute('needs', 'fix')
   }, [sel, routeId, ready, narrow, open, awaited])
+
+  // On a phone the list is what `#/needs/imports` opens: at its imports.
+  const importsRef = useRef(null)
+  const landedRef = useRef(false)
+  useEffect(() => {
+    if (landedRef.current || !ready || focus !== 'imports' || routeId) return
+    landedRef.current = true
+    if (narrow) importsRef.current?.scrollIntoView({ block: 'start' })
+  }, [ready, focus, routeId, narrow])
 
   function select(key) {
     if (narrow && !open) onOpened()
@@ -882,6 +1071,16 @@ function FixTab({ routeId, onOpened }) {
         sub={`${f.artist ? `${f.artist} · ` : ''}${failed ? failWords(f.failureKind) : meta.word.toLowerCase()}`}
         status={<span className={`st ${failed ? 'bad' : meta.tone}`} aria-label={meta.word} title={meta.word} />} />
     }
+    if (i.kind === 'imp') {
+      const r = i.i
+      const filed = r.status === 'imported'
+      return <ListRow key={i.key} {...common}
+        cover={<Cover url={caaCover(r.rgid)} name={r.album || '?'} size={40} />}
+        title={r.album || r.releaseMbid || 'An album'}
+        sub={`${r.artist ? `${r.artist} · ` : ''}${(IMPORT_WORD[r.status] || r.status).toLowerCase()}`}
+        status={<span className={`st ${filed ? 'ok' : r.status === 'failed' ? 'bad' : r.status === 'dismissed' ? '' : 'wait'}`}
+          aria-label={IMPORT_WORD[r.status] || r.status} title={IMPORT_WORD[r.status] || r.status} />} />
+    }
     if (i.kind === 'dir') {
       const p = i.p
       return <ListRow key={i.key} {...common}
@@ -906,7 +1105,8 @@ function FixTab({ routeId, onOpened }) {
       status={<span className={`st ${v.tone}`} aria-label={v.word} title={v.word} />} />
   }
 
-  const nothing = !lists.failed.length && !lists.folders.length && !lists.arts.length && !lists.twos.length
+  const nothing = !lists.failed.length && !lists.imports.length && !lists.folders.length && !lists.arts.length
+    && !lists.twos.length
   // lb-bot did not give its list of artists to match, or of sets — or gave no
   // answer: said as that (lib `toFixNote`), never as "nothing needs a decision".
   // While a read is out, the lists are not held and the page draws neither of
@@ -937,6 +1137,17 @@ function FixTab({ routeId, onOpened }) {
             <div className="rows">{lists.failed.map(row)}</div>
           </>
         )}
+        {/* Listed wherever they came from: a record outlives a change of the
+            downloading mode, and each is counted in the to-fix number. */}
+        <div ref={importsRef}>
+          {lists.imports.length > 0 && (
+            <>
+              <Grp n={groups.imports.length || ''}>Imports that need you</Grp>
+              <div className="rows">{lists.imports.map(row)}</div>
+            </>
+          )}
+          {importsError && <p className="bad text-caption">Couldn’t list the imports: {importsError}.</p>}
+        </div>
         {downloadsOn && (lists.folders.length > 0 || transfers.identify?.running) && (
           <>
             <Grp n={groups.folders.length}
@@ -1005,6 +1216,8 @@ function FixTab({ routeId, onOpened }) {
             onHide={hidden => hideGap(sel.g, hidden)} />
         ) : sel.kind === 'req' ? (
           <RequestDetail key={sel.key} f={sel.f} />
+        ) : sel.kind === 'imp' ? (
+          <ImportDetail key={sel.key} i={sel.i} onActed={onImportActed} />
         ) : sel.kind === 'dir' ? (
           <FolderDetail key={sel.key} p={sel.p}
             onGone={() => { releasedRef.current.add(sel.key); if (sel.p.filed) loadLeftovers() }} />
@@ -1022,8 +1235,11 @@ function FixTab({ routeId, onOpened }) {
 export default function NeedsYou() {
   const { state, dispatch, pushToast, refresh } = useApp()
   const { gaps, gapFilter, gapHidden, routeParams } = state
-  const tab = routeParams[0] === 'fix' ? 'fix' : 'gaps'
-  const routeId = routeParams[1] || ''
+  // `#/needs/gaps`, `#/needs/fix`, and `#/needs/imports` — To fix, on its
+  // imports — which is the address both apps link to (lib `needsView`).
+  const view = needsView(routeParams)
+  const tab = view.tab
+  const routeId = view.key
   const narrow = useNarrow()
   const q = useGapsQueue()
 
@@ -1053,10 +1269,13 @@ export default function NeedsYou() {
   const fixN = toFixCount(state)
   const failedN = state.summary?.gaps?.failed ?? failedGaps(gaps).length
   const foldersN = state.summary?.transfers?.needsPlacement ?? 0
+  const importsN = state.summary?.imports?.open ?? 0
   const sub = tab === 'gaps'
     ? (gaps ? `${(counts.needs ?? 0).toLocaleString()} albums with missing tracks` : '')
     : (fixN
-        ? [failedN ? `${failedN} failed or stuck` : null, foldersN ? `${foldersN} folder${foldersN === 1 ? '' : 's'} to file` : null]
+        ? [failedN ? `${failedN} failed or stuck` : null,
+           importsN ? `${importsN} import${importsN === 1 ? '' : 's'} to finish` : null,
+           foldersN ? `${foldersN} folder${foldersN === 1 ? '' : 's'} to file` : null]
             .filter(Boolean).join(' · ')
         : 'Nothing to fix')
 
@@ -1105,7 +1324,7 @@ export default function NeedsYou() {
       {tab === 'gaps'
         ? <GapsTab q={{ ...q, watchTask, watched }} routeId={routeId} statusChips={statusChips}
             onOpened={noop} />
-        : <FixTab routeId={routeId} onOpened={noop} />}
+        : <FixTab routeId={routeId} focus={view.list} onOpened={noop} />}
     </Page>
   )
 }

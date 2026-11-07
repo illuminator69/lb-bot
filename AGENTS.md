@@ -5,9 +5,10 @@ gap-fill / repair pipeline.
 
 ## What this is
 
-A single-file Python bot (`listenbrainz_bot.py`, ~10.3k lines) that fills gaps in a
-self-hosted music library. It exposes a Telegram bot **and** a Flask web UI
-(port 8899). It talks to:
+A single-file Python bot (`listenbrainz_bot.py`, ~37k lines) that fills gaps in a
+self-hosted music library. It exposes a Flask web UI (port 8899) and the routes the
+Worbus hub proxies. (Its Telegram bot was removed in Worbus 0.4; a `TELEGRAM_*`
+setting is ignored with one start-up line — see `CLAUDE.md`.) It talks to:
 
 - **Navidrome** — music server, Subsonic API. `http://navidrome:4533`.
   This is the source of truth for what's in the library and the success oracle

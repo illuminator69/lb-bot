@@ -18,15 +18,36 @@ export const failedRequests = fills =>
 
 export const foldersToFile = transfers => transfers?.needsPlacement || []
 
+// An import lb-bot could not finish filing — placement failed, or it wants a
+// person to say which release the folder is (Worbus P4: Telegram used to send
+// these as a card). The server's rule, `IMPORT_STATUSES_NEEDING_YOU`.
+const IMPORT_OPEN = new Set(['needs_review', 'failed'])
+/** The rows of `GET /api/imports/attention` that still need you. */
+export const openImports = imports => (imports?.items || []).filter(i => IMPORT_OPEN.has(i.status))
+
 /** The number on the sidebar. Each part comes from the summary when the server
  *  sends it there (so it is the same on every page) and from the page's own
- *  list otherwise. */
+ *  list otherwise. Imports are counted too (the summary's `imports.open`, the
+ *  same number as `/api/attention`'s `counts.imports`); a server from before
+ *  them sends neither and adds nothing. */
 export function toFixCount(state) {
   const s = state.summary
   const gaps = s?.gaps?.failed ?? (state.gaps ? failedGaps(state.gaps).length : 0)
   const requests = s?.requests?.failed ?? (state.fills ? failedRequests(state.fills).length : 0)
   const folders = s?.transfers?.needsPlacement ?? foldersToFile(state.transfers).length
-  return gaps + requests + folders
+  const imports = s?.imports?.open ?? openImports(state.imports).length
+  return gaps + requests + folders + imports
+}
+
+/** Which tab of Needs you an address opens, which of To fix's lists it is
+ *  for, and the row it names. `#/needs/imports` (the address both apps'
+ *  "Open in lb-bot" links to) is To fix, on its imports, an import named by
+ *  its record id (`#/needs/imports/<recid>`) selected. */
+export function needsView(params = []) {
+  const [head, id = ''] = params
+  if (head === 'imports') return { tab: 'fix', list: 'imports', key: id ? `imp:${id}` : '' }
+  if (head === 'fix') return { tab: 'fix', list: '', key: id }
+  return { tab: 'gaps', list: '', key: head === 'gaps' ? id : '' }
 }
 
 /** How far a gap fill has got, as a whole album: finished files plus the

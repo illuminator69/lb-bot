@@ -1,5 +1,3 @@
-python-telegram-bot==21.10
-httpx==0.28.1
 requests==2.32.3
 Flask==3.1.0
 # mutagen — tag read/write for placement. Previously transitive via beets;

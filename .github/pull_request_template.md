@@ -1,0 +1,1 @@
+Thanks for the patch. It is read as a report: the fix is written and tested in the main tree, and you are credited in the release notes. Bugs and ideas go to the one tracker: https://github.com/illuminator69/worbus/issues/new/choose

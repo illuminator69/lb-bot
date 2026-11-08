@@ -3,8 +3,9 @@
 The discography index inside [Worbus Server](https://github.com/illuminator69/worbus): it
 **shows every album your library is missing, and where to find it.** It reads a Navidrome
 library, matches each artist to MusicBrainz, and keeps the full discography beside what you
-own, so the gaps are a list rather than a hunch. A stranger needs nothing else: a Navidrome
-server, a MusicBrainz contact address and this container. It runs as a single long-lived Python
+own, so the gaps are a list rather than a hunch. It needs a Navidrome server and a
+MusicBrainz contact address, and, for the Worbus apps to reach it, the Worbus Server hub's
+address and token (the three REQUIRED groups in `.env.example`). It runs as a single long-lived Python
 process exposing **a React web UI behind a Navidrome login**. (Its Telegram bot was removed in
 Worbus 0.4: a failed import is listed on the web page, under Needs you, and the apps link there.)
 
@@ -34,10 +35,11 @@ The core loop, in the confirmed spec order:
    Navidrome holds (and, if you like, with your ListenBrainz or Spotify playlists).
 2. **Review** — a list of the missing albums and tracks you can inspect, each with
    links to where it can be found.
-3. **Place** — an album that arrives in the library's import folder (see
-   [Downloading (optional)](#downloading-optional)) is moved into the existing album
-   folder, tagged from canonical MusicBrainz metadata, and verified present in
-   Navidrome. No existing library files are retagged.
+3. **Place** (optional, only when you turn on downloading; see
+   [Downloading (optional)](#downloading-optional)) — an album that arrives in the
+   library's import folder is moved into the existing album folder, tagged from
+   canonical MusicBrainz metadata, and verified present in Navidrome. No existing
+   library files are retagged.
 
 Indexing and review run unattended. Placement files nothing that has not shown
 the album. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
@@ -101,10 +103,10 @@ fetching is kept careful, are in [`docs/DOWNLOADING.md`](docs/DOWNLOADING.md).
 
 | | |
 |---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | What the process is doing: the three concurrent halves, the state files and index schema, the systems it talks to, the `/api/*` surface, the overrides and the listens mirror, and how acquisition and placement actually work. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | What the process is doing: the three concurrent halves, the state files and index schema, the systems it talks to, the `/api/*` surface, the overrides and the listens mirror, and how placement and the optional downloading actually work. |
 | [`docs/DOWNLOADING.md`](docs/DOWNLOADING.md) | The optional downloading mode: what it needs, how to turn it on, and the rules a download is held to. |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, mounts and ownership, what Navidrome must be set to, every environment variable, local development, what replaced the Telegram commands. |
-| [`CLAUDE.md`](CLAUDE.md) | The long-form design notes: every rule with its reason, written as the work was done, oldest sections kept as history. Where it and the architecture page disagree about the present, the architecture page is the current one. **Read the relevant section before touching acquisition or placement.** |
+| [`CLAUDE.md`](CLAUDE.md) | The long-form design notes: every rule with its reason, written as the work was done, oldest sections kept as history. Where it and the architecture page disagree about the present, the architecture page is the current one. **Read the relevant section before touching placement or the downloading path.** |
 | [`docs/STATUS.md`](docs/STATUS.md) | How far to trust each part: what has been confirmed on a live stack, what is built and not confirmed, and the known limits. |
 
 Line numbers in `CLAUDE.md` and in code comments are snapshot hints and drift —

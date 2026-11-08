@@ -3,11 +3,22 @@
 # Worbus P7 design §9 #5: a stranger reads discographies and gaps first; the
 # optional downloading setup lives in docs/DOWNLOADING.md, off the launch path.
 # The whole file is scanned, image paths and code blocks included.
-# Exit 0 clean, 1 on a hit (each printed as file:line:text).
+# Exit 0 clean, 1 on a hit (each printed as file:line:text), 2 when the check
+# could not run (README.md missing or unreadable, or grep failed): it fails closed.
 set -u
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 re='soulseek|slskd|torrent|acquir|\bfills?\b|download(s|ed|ing)? (the |an? )?(album|music|song|track)'
-hits="$(grep -n -i -E "$re" "$root/README.md")"
+readme="$root/README.md"
+if [ ! -r "$readme" ]; then
+  echo "check_front_door: cannot read $readme; nothing was checked" >&2
+  exit 2
+fi
+hits="$(grep -n -i -E "$re" "$readme")"
+rc=$?
+if [ "$rc" -gt 1 ]; then
+  echo "check_front_door: grep failed (status $rc); nothing was checked" >&2
+  exit 2
+fi
 if [ -n "$hits" ]; then
   printf '%s\n' "$hits" | sed 's/^/README.md:/' >&2
   echo "check_front_door: README.md says a banned word (see above)" >&2

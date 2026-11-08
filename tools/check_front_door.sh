@@ -8,12 +8,15 @@
 set -u
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 re='soulseek|slskd|torrent|acquir|\bfills?\b|download(s|ed|ing)? (the |an? )?(album|music|song|track)'
+# wide: what the fixed regex misses, "acquisition" and the fill family (Worbus P7 C1). "fetch" stays allowed in the
+# "Downloading (optional)" section (ruling R17).
+wide='acqui|\bfill(s|ed|ing|er)?\b'
 readme="$root/README.md"
 if [ ! -r "$readme" ]; then
   echo "check_front_door: cannot read $readme; nothing was checked" >&2
   exit 2
 fi
-hits="$(grep -n -i -E "$re" "$readme")"
+hits="$(grep -n -i -E -e "$re" -e "$wide" "$readme")"
 rc=$?
 if [ "$rc" -gt 1 ]; then
   echo "check_front_door: grep failed (status $rc); nothing was checked" >&2

@@ -6,6 +6,7 @@ import { AppearanceControls } from '../components/AppearanceMenu.jsx'
 import Page, { Grp, Meter, Pick, Seg } from '../components/Page.jsx'
 import { ago, Badge, fmtDuration, StatusChip, Toggle } from '../components/ui.jsx'
 import OverridesTab from './Overrides.jsx'
+import { cardState, fingerprintShown, healthRows, logFilters, settingsCards } from '../lib/systemStatus.js'
 
 // System: is lb-bot healthy, how does it choose sources, what is it doing in
 // the background, what has it logged, and how this browser looks.
@@ -319,7 +320,7 @@ function IndexBuild({ progress }) {
 }
 
 function Status() {
-  const { state, dispatch, pushToast, confirmAction } = useApp()
+  const { state, dispatch, pushToast, confirmAction, downloadsOn } = useApp()
   const { health, systemStatus: st } = state
   // The block the sidebar reads, on the app's own poll.
   const progress = indexProgress(state.summary?.index)
@@ -378,7 +379,7 @@ function Status() {
         <Grp>Connections<span className="note">{health?.lastRun ? `checked ${ago(health.lastRun)} ago` : ''}</span></Grp>
         {!health ? <p className="muted">Running the checks. This takes a few seconds…</p> : (
           <div className="rows">
-            {health.checks.map(c => (
+            {healthRows(health.checks, downloadsOn).map(c => (
               <KV key={c.id} label={c.label} st={c.ok ? 'Pass' : 'Fail'}
                 note={!c.ok && c.howToFix ? c.howToFix : null}
                 actions={rescanFixes(c) && <button className="sm" onClick={rescanNavidrome}>Rescan Navidrome</button>}>
@@ -425,6 +426,7 @@ function Status() {
               <KV label="Wishlist search" st="On">
                 one album every {fmtDuration(st.wishlist?.intervalSeconds || 0)}, each at most every {fmtDuration(st.wishlist?.cooldownSeconds || 0)}
               </KV>
+              {fingerprintShown(downloadsOn) && (
               <KV label="Audio fingerprint check" st={acOn ? 'On' : 'Off'}
                 actions={ac.rejectedSources > 0 && <button className="sm danger" onClick={clearRejected}>Forget rejected peers</button>}
                 note={[
@@ -435,6 +437,7 @@ function Status() {
                 {' · '}minimum score {ac.minScore ?? '…'} · <span className="num">{ac.rejectedSources ?? 0}</span> peers rejected
                 {ac.unavailable === 'import' && <span className="bad"> · pyacoustid is not installed, so verification is off</span>}
               </KV>
+              )}
             </div>
 
             <Grp>Integrations</Grp>
@@ -472,12 +475,12 @@ function Status() {
         {settings?.cards?.length ? (
           <>
             <Grp>Configuration<span className="note">from environment variables on the container</span></Grp>
-            {settings.cards.map((c, i) => (
+            {settingsCards(settings.cards, downloadsOn).map((c, i) => (
               <div className="rows mb-2.5" key={i}>
                 {/* A feature that is off (downloading, with no slskd key) is no
                     failure: it says so, and how to turn it on. */}
                 <KV label={<span className="t" style={{ color: 'var(--fg)' }}>{c.title}</span>}
-                  st={c.state === 'off' ? 'Off' : c.ok ? 'OK' : 'Check'}
+                  st={cardState(c)}
                   note={(c.state === 'off' || !c.ok) && c.fix ? c.fix : null} />
                 {Object.entries(c.values || {}).map(([k, v]) => <KV key={k} label={k} mono>{String(v)}</KV>)}
               </div>
@@ -577,14 +580,14 @@ function Activity() {
 const LOG_FILTERS = [['', 'All lines'], ['errors', 'Errors'], ['slskd', 'slskd'], ['navidrome', 'Navidrome'], ['placement', 'Placement'], ['scan', 'Scans']]
 
 function Logs() {
-  const { state, dispatch } = useApp()
+  const { state, dispatch, downloadsOn } = useApp()
   const { logEntries, logFilter } = state
   const [text, setText] = useState('')
   const q = text.trim().toLowerCase()
   const rows = (logEntries || []).filter(e => !q || (e.msg || '').toLowerCase().includes(q)).slice().reverse()
   const bar = (
     <>
-      <Pick label="Show" value={logFilter} onChange={k => dispatch({ type: 'SET_LOG_FILTER', filter: k })} options={LOG_FILTERS} />
+      <Pick label="Show" value={logFilter} onChange={k => dispatch({ type: 'SET_LOG_FILTER', filter: k })} options={logFilters(LOG_FILTERS, downloadsOn)} />
       <input className="find" type="search" placeholder="Filter text" aria-label="Filter log lines"
         value={text} onChange={e => setText(e.target.value)} />
       <span className="muted">{logEntries ? `${rows.length.toLocaleString()} lines, newest first` : ''}</span>

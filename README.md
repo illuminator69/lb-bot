@@ -132,3 +132,11 @@ navigate by function name.
   baseline is **0 errors, 0 failures** (the 32 stale beets tests were deleted);
   the test count drifts as tests are added, so check the 0/0 invariant, not a
   total. Anything beyond that is yours.
+
+## Licence
+
+lb-bot is free software under the GNU General Public License, version 3 or later (`GPL-3.0-or-later`); the text is
+in [LICENSE](LICENSE). Copyright (C) 2026 Worbus contributors.
+
+It uses [mutagen](https://github.com/quodlibet/mutagen) (GPL-2.0-or-later) and other libraries, each under its own
+licence (`requirements.txt` lists them).
